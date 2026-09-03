@@ -95,6 +95,10 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_sync::http::preview_outbound,
         crate::google_sync::http::approve_outbound,
         crate::google_sync::http::enqueue_outbound,
+        crate::google_sync::http::preview_schedule_publication,
+        crate::google_sync::http::approve_schedule_publication,
+        crate::google_sync::http::enqueue_schedule_publication,
+        crate::google_sync::http::schedule_publication_status,
         crate::credential_auth::http::create_device_enrollment,
         crate::credential_auth::http::consume_device_enrollment,
         crate::credential_auth::http::refresh_session,
@@ -227,6 +231,13 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_sync::GoogleOutboundPreview,
         crate::google_sync::GoogleOutboundApproval,
         crate::google_sync::OutboundOperation,
+        crate::google_sync::ScheduleGooglePublicationOperation,
+        crate::google_sync::ScheduleGooglePublicationChange,
+        crate::google_sync::ScheduleGooglePublicationPreview,
+        crate::google_sync::ScheduleGooglePublicationApproval,
+        crate::google_sync::ScheduleGooglePublicationAccepted,
+        crate::google_sync::ScheduleGooglePublicationState,
+        crate::google_sync::ScheduleGooglePublicationStatus,
         crate::google_sync::http::GoogleCollectionsResponse,
         crate::google_sync::http::ConfigureGoogleCollectionRequest,
         crate::google_sync::http::GoogleCollectionResponse,
@@ -238,6 +249,9 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_sync::http::ApproveGoogleOutboundRequest,
         crate::google_sync::http::GoogleOutboundApprovalResponse,
         crate::google_sync::http::GoogleOutboundResponse,
+        crate::google_sync::http::PreviewScheduleGooglePublicationRequest,
+        crate::google_sync::http::ApproveScheduleGooglePublicationRequest,
+        crate::google_sync::http::EnqueueScheduleGooglePublicationRequest,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -971,5 +985,162 @@ fn map_service_error(error: ProposalServiceError) -> ApiError {
             ApiError::conflict("suggestion already exists")
         }
         ProposalServiceError::Repository(RepositoryError::Internal) => ApiError::internal(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keeps the four-route OpenAPI contract in one consistency assertion.
+    fn openapi_includes_generated_schedule_google_publication_contract() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI document");
+        let preview_path =
+            "/v1/integrations/google/accounts/{account_id}/schedule-publications/previews";
+        let approve_path = "/v1/integrations/google/accounts/{account_id}/schedule-publications/previews/{preview_id}/approve";
+        let enqueue_path = "/v1/integrations/google/accounts/{account_id}/schedule-publications";
+        let status_path =
+            "/v1/integrations/google/accounts/{account_id}/schedule-publications/{publication_id}";
+
+        for (path, method) in [
+            (preview_path, "post"),
+            (approve_path, "post"),
+            (enqueue_path, "post"),
+            (status_path, "get"),
+        ] {
+            let operation = &document["paths"][path][method];
+            assert!(operation.is_object(), "missing {method} {path}");
+            assert_eq!(operation["security"][0]["bearer_token"], json!([]));
+            let description = operation["description"]
+                .as_str()
+                .expect("schedule-publication operation description");
+            assert!(description.contains("native Device"), "{path}");
+            assert!(description.contains("ScheduleRead"), "{path}");
+            assert!(
+                description.contains("exact user/workspace tenant"),
+                "{path}"
+            );
+            assert!(
+                operation["responses"].get("400").is_some(),
+                "{path} must document invalid JSON/path parameters"
+            );
+            assert!(
+                operation["responses"].get("422").is_some(),
+                "{path} must document nil/validation failures"
+            );
+        }
+
+        for path in [preview_path, approve_path, enqueue_path] {
+            let operation = &document["paths"][path]["post"];
+            assert!(
+                operation["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("GoogleWrite"))
+            );
+            assert!(
+                operation["responses"].get("413").is_some(),
+                "{path} must document oversized bodies"
+            );
+            assert!(
+                operation["responses"].get("502").is_some(),
+                "{path} must document bounded projection/provider failures"
+            );
+        }
+        assert!(
+            document["paths"][status_path]["get"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("GoogleRead"))
+        );
+
+        let approve_responses = &document["paths"][approve_path]["post"]["responses"];
+        assert!(
+            approve_responses["409"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("unknown"))
+        );
+        assert!(
+            !approve_responses["404"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("preview"))
+        );
+
+        let enqueue_responses = &document["paths"][enqueue_path]["post"]["responses"];
+        assert!(
+            enqueue_responses["409"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("unknown") && description.contains("malformed")
+                })
+        );
+        assert!(
+            !enqueue_responses["404"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("preview"))
+        );
+
+        assert!(
+            document["paths"][preview_path]["post"]["responses"]
+                .get("429")
+                .is_some()
+        );
+        assert!(
+            document["paths"][status_path]["get"]["responses"]["503"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("not configured")
+                        && description.contains("write gate is disabled")
+                })
+        );
+
+        for schema in [
+            "ScheduleGooglePublicationOperation",
+            "ScheduleGooglePublicationChange",
+            "ScheduleGooglePublicationPreview",
+            "ScheduleGooglePublicationApproval",
+            "ScheduleGooglePublicationAccepted",
+            "ScheduleGooglePublicationState",
+            "ScheduleGooglePublicationStatus",
+            "PreviewScheduleGooglePublicationRequest",
+            "ApproveScheduleGooglePublicationRequest",
+            "EnqueueScheduleGooglePublicationRequest",
+        ] {
+            assert!(
+                document["components"]["schemas"][schema].is_object(),
+                "missing OpenAPI schema {schema}"
+            );
+        }
+
+        let expected_preview_hash = &document["components"]["schemas"]["ApproveScheduleGooglePublicationRequest"]
+            ["properties"]["expected_preview_hash"];
+        assert_eq!(expected_preview_hash["minLength"], json!(64));
+        assert_eq!(expected_preview_hash["maxLength"], json!(64));
+        assert_eq!(expected_preview_hash["pattern"], json!("^[0-9a-f]{64}$"));
+
+        let approval_capability = &document["components"]["schemas"]["EnqueueScheduleGooglePublicationRequest"]
+            ["properties"]["approval_capability"];
+        assert_eq!(approval_capability["minLength"], json!(51));
+        assert_eq!(approval_capability["maxLength"], json!(51));
+        assert_eq!(
+            approval_capability["pattern"],
+            json!("^dw_gsa1_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")
+        );
+
+        let status_properties =
+            &document["components"]["schemas"]["ScheduleGooglePublicationStatus"]["properties"];
+        for content_field in [
+            "changes",
+            "summary",
+            "starts_at",
+            "ends_at",
+            "provider_resource_id",
+            "provider_etag",
+            "payload",
+        ] {
+            assert!(
+                status_properties.get(content_field).is_none(),
+                "status schema leaked {content_field}"
+            );
+        }
     }
 }

@@ -184,7 +184,14 @@ Only sanitized account-qualified destination, operation, user-visible fields, an
 review; ownership proof, hashes, identifiers, bearer tokens, and approval capabilities never enter
 display or diagnostics. **Approve & Queue** is the only approval path. Success means the durable
 server outbox accepted the exact mutation—it does not claim that Google has already applied it.
-Automatic schedule-block publication remains a separate future Android slice.
+The server now has a separate, default-off preview → approve → enqueue → status batch
+contract for explicitly publishing not-yet-elapsed generated firm `planned` and `pinned` blocks
+from the exact current immutable published schedule, but Android does not invoke it. This Inbox
+action remains single-item publication. Published elapsed events are immutable Calendar history:
+the batch path never rewrites, deletes, or reuses them. A native schedule review/recovery journal
+and trigger, automatic firm-horizon rolling/publication, and inbound interpretation of Google
+edits, moves, or deletions remain future Android/integration work. Tentative blocks remain app-only
+and are never accepted by this server path; the milestone does not complete `SCH-006`.
 
 The encrypted Room snapshot journals `INTENT → PREVIEWED → APPROVAL_ATTEMPTED → APPROVED` before
 each consequential request. The journal binds entity kind and operation as well as canonical

@@ -260,6 +260,9 @@ pub struct Config {
     /// External Google writes require both this explicit deployment opt-in and
     /// a consumed, content-bound approval capability. The safe default is off.
     pub google_outbound_enabled: bool,
+    /// Schedule-block publication is a narrower opt-in layered on top of the
+    /// general Google outbound gate. The safe default is off.
+    pub google_schedule_outbound_enabled: bool,
     pub google_outbound_approval_ttl: Duration,
     pub log_filter: String,
     pub json_logs: bool,
@@ -407,6 +410,17 @@ impl Config {
         if google_outbound_enabled && google_oauth.is_none() {
             return Err(ConfigError::GoogleOutboundRequiresOAuth);
         }
+        let google_schedule_outbound_enabled = match values
+            .get("DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED")
+            .map(String::as_str)
+        {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(ConfigError::InvalidGoogleScheduleOutboundEnabled),
+        };
+        if google_schedule_outbound_enabled && !google_outbound_enabled {
+            return Err(ConfigError::GoogleScheduleOutboundRequiresOutbound);
+        }
         let google_outbound_approval_ttl_minutes = values
             .get("DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")
             .map_or(Ok(DEFAULT_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES), |value| {
@@ -432,6 +446,7 @@ impl Config {
             database,
             google_oauth,
             google_outbound_enabled,
+            google_schedule_outbound_enabled,
             google_outbound_approval_ttl: Duration::from_secs(
                 google_outbound_approval_ttl_minutes * 60,
             ),
@@ -523,6 +538,10 @@ pub enum ConfigError {
     InvalidGoogleOutboundEnabled,
     #[error("Google outbound publication requires Google OAuth")]
     GoogleOutboundRequiresOAuth,
+    #[error("DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED must be true or false")]
+    InvalidGoogleScheduleOutboundEnabled,
+    #[error("Google schedule outbound publication requires Google outbound publication")]
+    GoogleScheduleOutboundRequiresOutbound,
     #[error("invalid DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")]
     InvalidGoogleOutboundApprovalTtl,
     #[error("DAYWEAVE_ASSISTANT_ENABLED must be true or false")]
@@ -809,12 +828,14 @@ fn google_oauth_config(
         Some("true") => true,
         Some(_) => return Err(ConfigError::InvalidGoogleOAuthEnabled),
     };
-    let google_settings_present = values.keys().any(|key| {
+    let google_settings_present = values.iter().any(|(key, value)| {
         key.starts_with("DAYWEAVE_GOOGLE_")
+            && !value.trim().is_empty()
             && !matches!(
                 key.as_str(),
                 "DAYWEAVE_GOOGLE_OAUTH_ENABLED"
                     | "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED"
+                    | "DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED"
                     | "DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES"
             )
     });
@@ -1057,6 +1078,7 @@ mod tests {
         assert!(config.assistant.is_none());
         assert!(config.google_oauth.is_none());
         assert!(!config.google_outbound_enabled);
+        assert!(!config.google_schedule_outbound_enabled);
         assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(10));
     }
 
@@ -1382,6 +1404,45 @@ mod tests {
     }
 
     #[test]
+    fn google_schedule_outbound_opt_in_is_strict_and_requires_google_outbound() {
+        let mut values = valid_values();
+        values.insert(
+            "DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED".to_owned(),
+            "yes".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values).expect_err("ambiguous schedule outbound switch must fail"),
+            ConfigError::InvalidGoogleScheduleOutboundEnabled
+        );
+
+        values.insert(
+            "DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED".to_owned(),
+            "true".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values).expect_err("schedule outbound requires Google outbound"),
+            ConfigError::GoogleScheduleOutboundRequiresOutbound
+        );
+
+        values.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED".to_owned(),
+            "false".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values)
+                .expect_err("schedule outbound rejects an explicitly disabled Google outbound"),
+            ConfigError::GoogleScheduleOutboundRequiresOutbound
+        );
+
+        values.insert(
+            "DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED".to_owned(),
+            "false".to_owned(),
+        );
+        let config = Config::from_map(&values).expect("disabled schedule outbound is inert");
+        assert!(!config.google_schedule_outbound_enabled);
+    }
+
+    #[test]
     fn rejects_missing_and_short_tokens() {
         assert_eq!(
             Config::from_map(&HashMap::new()).expect_err("missing token must fail"),
@@ -1548,6 +1609,21 @@ mod tests {
     #[test]
     fn google_oauth_is_explicit_strict_and_redacted() {
         let mut disabled = valid_values();
+        for key in [
+            "DAYWEAVE_GOOGLE_CLIENT_ID",
+            "DAYWEAVE_GOOGLE_CLIENT_SECRET",
+            "DAYWEAVE_GOOGLE_REDIRECT_URI",
+            "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS",
+            "DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION",
+            "DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION",
+            "DAYWEAVE_GOOGLE_OAUTH_SESSION_TTL_MINUTES",
+        ] {
+            disabled.insert(key.to_owned(), String::new());
+        }
+        let config = Config::from_map(&disabled)
+            .expect("empty Compose passthroughs are absent while Google OAuth is disabled");
+        assert!(config.google_oauth.is_none());
+
         disabled.insert(
             "DAYWEAVE_GOOGLE_CLIENT_ID".to_owned(),
             "ignored-client-id".to_owned(),
@@ -1606,6 +1682,7 @@ mod tests {
         );
         let config = Config::from_map(&enabled).expect("complete OAuth config");
         assert!(config.google_outbound_enabled);
+        assert!(!config.google_schedule_outbound_enabled);
         assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(30));
         let google = config.google_oauth.expect("enabled");
         assert_eq!(google.active_key_version, 2);
@@ -1614,6 +1691,13 @@ mod tests {
         let debug = format!("{google:?}");
         assert!(!debug.contains("never-print-this-client-secret"));
         assert!(!debug.contains(&"11".repeat(32)));
+
+        enabled.insert(
+            "DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED".to_owned(),
+            "true".to_owned(),
+        );
+        let config = Config::from_map(&enabled).expect("schedule outbound with Google outbound");
+        assert!(config.google_schedule_outbound_enabled);
     }
 
     #[test]

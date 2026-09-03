@@ -31,7 +31,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
         ]
     );
 
@@ -57,6 +57,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0019_schedule_deferred_placements.sql"),
         include_str!("../migrations/0020_execution_progress_ledger.sql"),
         include_str!("../migrations/0021_execution_defer_approval.sql"),
+        include_str!("../migrations/0022_google_schedule_publication.sql"),
     ]
     .join("\n");
     for table in [
@@ -103,6 +104,12 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_outbound_previews",
         "google_provider_identity_roots",
         "google_sync_refresh_requests",
+        "google_schedule_publication_mapping_origins",
+        "google_schedule_publication_previews",
+        "google_schedule_publication_preview_changes",
+        "google_schedule_publication_batches",
+        "google_schedule_publication_outbox",
+        "google_schedule_publication_observations",
         "proposal_apply_previews",
         "proposal_apply_preview_members",
         "proposal_applications",
@@ -146,6 +153,9 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("schedule_simulations_evidence_guard"));
     assert!(schema.contains("mcp_proposal_submissions_verify_simulation"));
     assert!(schema.contains("compiled_payload_hash IS NOT NULL"));
+    assert!(schema.contains("provider_sync_mappings_active_schedule_identity_uq"));
+    assert!(schema.contains("google_schedule_publication_preview_changes_immutable"));
+    assert!(schema.contains("google_schedule_publication_batch_aggregate_exact"));
 }
 
 #[tokio::test]

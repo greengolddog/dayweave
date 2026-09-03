@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -8,7 +10,11 @@ use super::{
     GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRefreshAccepted,
     GoogleSyncRole, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
     OutboundDispatchPermit, OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
-    RemoteCalendarSeriesChange, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
+    RemoteCalendarSeriesChange, RemoteItemChange, ScheduleGooglePublicationAccepted,
+    ScheduleGooglePublicationPreview, ScheduleGooglePublicationStatus,
+    SchedulePublicationApprovalSpec, SchedulePublicationDispatchPermit,
+    SchedulePublicationEnqueueSpec, SchedulePublicationPreviewSpec, SchedulePublicationResult,
+    SchedulePublicationSource, SchedulePublicationWork, StoredCursor, SyncClaim, SyncCounts,
     SyncFailureKind,
 };
 
@@ -111,6 +117,7 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
         &self,
         claim: &SyncClaim,
         counts: &SyncCounts,
+        include_schedule_due: bool,
         now: DateTime<Utc>,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError>;
@@ -263,6 +270,112 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError>;
 
+    async fn load_schedule_publication_source(
+        &self,
+        account_id: Uuid,
+        collection_id: Uuid,
+        expected_schedule_revision_id: Uuid,
+    ) -> Result<SchedulePublicationSource, GoogleSyncRepositoryError>;
+
+    async fn create_schedule_publication_preview(
+        &self,
+        spec: SchedulePublicationPreviewSpec,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncRepositoryError>;
+
+    async fn approve_schedule_publication(
+        &self,
+        spec: SchedulePublicationApprovalSpec,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, GoogleSyncRepositoryError>;
+
+    async fn enqueue_schedule_publication(
+        &self,
+        spec: SchedulePublicationEnqueueSpec,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleGooglePublicationAccepted, GoogleSyncRepositoryError>;
+
+    /// Looks up only an already-consumed, exact publication tuple. This
+    /// response-loss recovery path intentionally outlives later account,
+    /// collection, and feature-gate changes and never creates new work.
+    async fn schedule_publication_acceptance(
+        &self,
+        spec: &SchedulePublicationEnqueueSpec,
+    ) -> Result<Option<ScheduleGooglePublicationAccepted>, GoogleSyncRepositoryError>;
+
+    async fn schedule_publication_status(
+        &self,
+        account_id: Uuid,
+        publication_id: Uuid,
+    ) -> Result<ScheduleGooglePublicationStatus, GoogleSyncRepositoryError>;
+
+    /// Resolves provider IDs already owned by generated-schedule publication
+    /// so inbound sparse records and tombstones cannot be imported as items.
+    async fn known_schedule_publication_remote_ids(
+        &self,
+        account_id: Uuid,
+        collection_id: Uuid,
+        remote_ids: &[String],
+    ) -> Result<BTreeSet<String>, GoogleSyncRepositoryError>;
+
+    async fn claim_schedule_publication(
+        &self,
+        claim: &SyncClaim,
+        now: DateTime<Utc>,
+    ) -> Result<Option<SchedulePublicationWork>, GoogleSyncRepositoryError>;
+
+    async fn renew_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
+    async fn authorize_schedule_publication_dispatch(
+        &self,
+        work: &SchedulePublicationWork,
+        provider_write: bool,
+        now: DateTime<Utc>,
+    ) -> Result<SchedulePublicationDispatchPermit, GoogleSyncRepositoryError>;
+
+    async fn cancel_schedule_publication_before_send(
+        &self,
+        work: &SchedulePublicationWork,
+        code: &'static str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
+    /// Handles a provider reconciliation reporting no effect from a previously
+    /// authorized write. `true` means the row was safely retained in
+    /// uncertainty backoff without another provider write. Possible Creates,
+    /// stale guardians, and unresolved/oversized provider success responses
+    /// always take this path because a negative read cannot prove that the
+    /// write will never surface. `false` is reserved for a current conditional
+    /// Update/Delete whose exact old state permits retry. `ClaimLost` never
+    /// authorizes a retry.
+    async fn reconcile_schedule_publication_no_effect(
+        &self,
+        work: &SchedulePublicationWork,
+        code: &'static str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, GoogleSyncRepositoryError>;
+
+    async fn complete_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        result: SchedulePublicationResult,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
+    async fn fail_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        terminal_state: &'static str,
+        code: &'static str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
     async fn outbox_counts(
         &self,
         account_id: Uuid,
@@ -277,8 +390,18 @@ pub(crate) enum GoogleSyncRepositoryError {
     CollectionNotFound,
     #[error("canonical item was not found")]
     ItemNotFound,
+    #[error("published schedule revision was not found")]
+    ScheduleRevisionNotFound,
+    #[error("generated-schedule Google publication was not found")]
+    SchedulePublicationNotFound,
     #[error("revision conflict: expected {expected}, found {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error("schedule revision conflict: expected {expected}, found {actual}")]
+    ScheduleRevisionConflict { expected: Uuid, actual: Uuid },
+    #[error("generated-schedule Google publication is invalid")]
+    InvalidSchedulePublication,
+    #[error("too many active generated-schedule Google publication previews")]
+    PreviewLimitExceeded,
     #[error("Google collection cannot be configured for that role")]
     InvalidCollectionRole,
     #[error("Google collection is deleted")]

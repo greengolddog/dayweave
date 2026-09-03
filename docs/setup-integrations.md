@@ -320,7 +320,11 @@ External publication remains deployment-disabled by default. Set
 `DAYWEAVE_GOOGLE_OUTBOUND_ENABLED=true` only after OAuth, PostgreSQL, storage
 encryption, backups, and operator monitoring are ready. Approval lifetimes use
 `DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES` (default 10, accepted range
-1–30). The complete mutation flow is intentionally three-step:
+1–30). Generated-schedule publication has a second, narrower default-off gate:
+set `DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED=true` only when the general
+outbound gate is also enabled. Configuration is rejected if the schedule gate
+is enabled on its own. The complete single-item mutation flow is intentionally
+three-step:
 
 1. `POST .../outbound/previews` validates the canonical revision, selected
    writable collection, provider account, exact full write scope, publication
@@ -393,6 +397,111 @@ deletion is refused until the canonical item is in recoverable trash. Rate
 limits and temporary provider failures use bounded retry/backoff; non-idempotent
 Tasks creates are the deliberate fail-closed exception. Older unpublished item
 revisions are durably marked `superseded`.
+
+#### Generated firm-schedule publication
+
+The generated-schedule API is a separate server-first batch flow. It does not
+reuse the Inbox's single-item `dayweave_firm_block` request. The caller supplies
+one selected writable Calendar and the expected ID of the current immutable
+published schedule. Outbound creates and updates are admitted only for its
+not-yet-elapsed generated firm `planned` and `pinned` blocks. Imported
+`external_fixed`/Calendar blocks are never re-exported, exact elapsed instances
+can only be no-ops, and this slice has no tentative-block publication path.
+
+The four REST steps are:
+
+1. `POST /v1/integrations/google/accounts/{account_id}/schedule-publications/previews`
+   with `collection_id` and `expected_schedule_revision_id`. The server
+   revalidates the current published revision, publication hash, exact writable
+   collection revision and remote ID, full Calendar scope, retained mappings,
+   and ETags. It returns an expiring review-safe batch with create, update,
+   delete, and no-op counts and an exact preview hash.
+2. `POST .../schedule-publications/previews/{preview_id}/approve` with
+   `expected_preview_hash`. Approval is an explicit action by an eligible,
+   tenant-bound native device and returns one expiring OS-CSPRNG capability
+   exactly once. Only its hash is stored, and request/response types carrying it
+   are excluded from debug output.
+3. `POST .../schedule-publications` with the same `preview_id`, `collection_id`,
+   `expected_schedule_revision_id`, and `approval_capability`. Consumption is
+   atomic and content-bound. Success is HTTP `202`; an exact replay returns the
+   same publication receipt and cannot enqueue a second batch.
+4. `GET .../schedule-publications/{publication_id}` returns only aggregate
+   pending, delivering, published, conflicted, failed, and superseded counts.
+   `pending_count` includes both work awaiting its first attempt and retryable
+   work waiting in durable backoff; `delivering_count` is in-flight work. The
+   response contains no block title or provider payload and is the authoritative
+   delivery check after queue acceptance.
+
+Preview admission is serialized across each provider account. A retry can reuse
+the newest live, unconsumed preview only after the server revalidates every
+stored child against the current schedule, collection, and mapping state. An
+account may retain at most eight active unconsumed previews and 20,000 summed
+active change rows; the next request returns HTTP `429` without adding storage.
+Expired, unconsumed preview payloads that have no publication batch are pruned,
+including previously approved ones, while their approval audit evidence is
+retained. Consumed previews and publication history remain immutable.
+
+The mutation routes require a DayWeave device principal with both Google write
+authority and `schedule_read`; status requires Google read authority plus the
+same device/schedule scope and exact user/workspace binding. All responses use
+`Cache-Control: no-store`. This API currently has no native macOS or Android
+trigger, so it is directly API/test accessible to an eligible device credential
+rather than an owner-facing workflow.
+
+Each generated session has a stable logical slot derived from workspace, item,
+occurrence, and session index rather than from its placement-dependent schedule
+block UUID. A move in a later schedule therefore updates the same Google event.
+A previously published future slot absent from the new firm schedule becomes a
+reviewed conditional delete. Elapsed events are immutable Calendar history and
+are never rewritten, deleted, or reused; once their mapping is retired, any
+later reuse of the logical slot receives a new incarnation and provider event
+ID. Provider event IDs and authenticated ownership proofs are account/calendar
+scoped, keyed, and non-reversible.
+
+Generated events are confirmed, opaque, private, timed, and attendee-free. A
+sensitive block is titled `Busy`; a non-sensitive block receives only its
+bounded title. Description, location, recurrence, conference data,
+attachments, and raw DayWeave identifiers are omitted. Reminders are explicitly
+disabled with `reminders.useDefault=false` and an empty `overrides` list, and
+create, update, and delete requests use `sendUpdates=none` so Google does not
+send attendee notifications. The private ownership proof stays in the
+server-side provider payload rather than the reviewed summary.
+
+After enqueue, the existing Google sync worker leases each non-no-op change
+from durable PostgreSQL state. Immediately before network I/O it rechecks the
+current schedule, account/scope, collection revision and role, mapping/ETag,
+parent-run generation, claim, intent hash, and short-lived dispatch nonce.
+Creates use deterministic Google IDs: after an ambiguous result, recovery first
+reads that ID and adopts it only when the complete event and authenticated proof
+still match. Updates and deletes use `If-Match`. Retryable provider failures
+back off durably, partial batches remain observable, and a newer schedule
+supersedes work that has not been sent. A response observed after a guardian
+changes is retained as conflict/reconciliation evidence instead of being
+discarded or blindly repeated.
+
+When a create may have reached Google and the exact authenticated lookup remains
+negative, neither elapsed time nor a number of negative reads is evidence that
+the mutation had no effect. The row remains durably unresolved with exponential
+backoff capped at one hour and prevents later publication for that selected
+Google account/calendar target. A later positive authenticated observation can
+release that fence. This checkpoint exposes no schedule-specific operator
+reconciliation endpoint or supported database-intervention runbook.
+
+Claim and final dispatch authorization independently recheck whether the block
+has become Calendar history. For update/delete, the deadline is the earlier of
+the reviewed desired end and the immutable mapped event end. Definitely unsent
+elapsed work becomes superseded. Possible-send work may still perform an exact
+read and adopt the observed effect, but it cannot receive a new write permit.
+A success response with an unusable identity or a body over the processing cap
+stays in active backoff, preserves that reason through worker/account recovery,
+and continues to block successor publication until reconciled.
+
+This server milestone does not complete `SCH-006`. Neither native client has a
+review/recovery journal or trigger for this API, no scheduler or firm-horizon
+automation enqueues it, and inbound edits to these generated Google events are
+not supported. Google move → local pin and delete → local unschedule
+interpretation plus the firm/tentative transition model are still required.
+Tentative blocks remain app-only.
 
 Calendar planning policy is stored per collection. Safe defaults block only
 confirmed opaque busy events; tentative, transparent/free, birthdays, and

@@ -393,7 +393,8 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             &Method::GET,
             "/integrations/google/accounts"
             | "/integrations/google/accounts/{account_id}/collections"
-            | "/integrations/google/accounts/{account_id}/sync",
+            | "/integrations/google/accounts/{account_id}/sync"
+            | "/integrations/google/accounts/{account_id}/schedule-publications/{publication_id}",
         ) => Some(Scope::GoogleRead),
         (
             &Method::POST | &Method::PUT | &Method::DELETE,
@@ -407,7 +408,10 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/integrations/google/accounts/{account_id}/sync/refresh"
             | "/integrations/google/accounts/{account_id}/outbound/previews"
             | "/integrations/google/accounts/{account_id}/outbound/previews/{preview_id}/approve"
-            | "/integrations/google/accounts/{account_id}/outbound",
+            | "/integrations/google/accounts/{account_id}/outbound"
+            | "/integrations/google/accounts/{account_id}/schedule-publications/previews"
+            | "/integrations/google/accounts/{account_id}/schedule-publications/previews/{preview_id}/approve"
+            | "/integrations/google/accounts/{account_id}/schedule-publications",
         ) => Some(Scope::GoogleWrite),
         (&Method::GET, "/auth/sessions") => Some(Scope::AuthSessionsRead),
         (
@@ -611,6 +615,32 @@ mod tests {
                 Some("/v1/integrations/google/accounts/{account_id}/sync/refresh")
             ),
             Some(Scope::GoogleWrite)
+        );
+        for path in [
+            "/v1/integrations/google/accounts/{account_id}/schedule-publications/previews",
+            "/v1/integrations/google/accounts/{account_id}/schedule-publications/previews/{preview_id}/approve",
+            "/v1/integrations/google/accounts/{account_id}/schedule-publications",
+        ] {
+            assert_eq!(
+                required_rest_scope(&Method::POST, Some(path)),
+                Some(Scope::GoogleWrite)
+            );
+        }
+        assert_eq!(
+            required_rest_scope(
+                &Method::GET,
+                Some(
+                    "/v1/integrations/google/accounts/{account_id}/schedule-publications/{publication_id}"
+                )
+            ),
+            Some(Scope::GoogleRead)
+        );
+        assert_eq!(
+            required_rest_scope(
+                &Method::GET,
+                Some("/v1/integrations/google/accounts/{account_id}/schedule-publications")
+            ),
+            None
         );
         assert_eq!(
             required_rest_scope(&Method::GET, Some("/v1/auth/mcp-clients")),

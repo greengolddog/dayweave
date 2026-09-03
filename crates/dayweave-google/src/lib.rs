@@ -21,6 +21,16 @@ use url::Url;
 pub use auth::{AccessTokenProvider, StaticAccessToken};
 pub use error::GoogleError;
 
+// General reads may return paginated Calendar or Tasks collections. Thirty-two
+// MiB matches the event-list ceiling and leaves room for legitimate full pages
+// without permitting an unbounded provider response.
+const MAX_GENERAL_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+// Mutation responses contain one Calendar or Tasks resource, rather than a
+// collection. One MiB leaves ample room for rich single-resource metadata
+// while keeping a compromised or malfunctioning provider response bounded.
+const MAX_MUTATION_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// A fully authorized and serialized provider request that has not touched the
 /// network yet. Services can finish their durable authorization fence after
 /// OAuth refresh/request construction, then consume this value exactly once.
@@ -59,7 +69,7 @@ impl PreparedGoogleRequest {
             .await
             .map_err(GoogleError::Transport)?;
         let response = ensure_success(response)?;
-        response.json().await.map_err(GoogleError::Transport)
+        json_response_limited(response, MAX_MUTATION_RESPONSE_BYTES).await
     }
 
     /// Sends a prepared request whose successful response body is ignored.
@@ -165,7 +175,7 @@ impl GoogleClient {
     ) -> Result<T, GoogleError> {
         let response = request.send().await.map_err(GoogleError::Transport)?;
         let response = ensure_success(response)?;
-        response.json().await.map_err(GoogleError::Transport)
+        json_response_limited(response, MAX_GENERAL_RESPONSE_BYTES).await
     }
 
     /// Reads a successful JSON response incrementally and never accumulates
@@ -178,26 +188,8 @@ impl GoogleClient {
         max_bytes: usize,
     ) -> Result<T, GoogleError> {
         let response = request.send().await.map_err(GoogleError::Transport)?;
-        let mut response = ensure_success(response)?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_bytes as u64)
-        {
-            return Err(GoogleError::ResponseTooLarge);
-        }
-        let initial_capacity = response
-            .content_length()
-            .and_then(|length| usize::try_from(length).ok())
-            .unwrap_or(0)
-            .min(max_bytes);
-        let mut body = Vec::with_capacity(initial_capacity);
-        while let Some(chunk) = response.chunk().await.map_err(GoogleError::Transport)? {
-            if chunk.len() > max_bytes.saturating_sub(body.len()) {
-                return Err(GoogleError::ResponseTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&body).map_err(|_| GoogleError::InvalidResponse)
+        let response = ensure_success(response)?;
+        json_response_limited(response, max_bytes).await
     }
 
     pub(crate) fn prepare(
@@ -213,6 +205,31 @@ impl GoogleClient {
     pub(crate) fn body<T: Serialize + ?Sized>(request: RequestBuilder, body: &T) -> RequestBuilder {
         request.json(body)
     }
+}
+
+async fn json_response_limited<T: DeserializeOwned>(
+    mut response: Response,
+    max_bytes: usize,
+) -> Result<T, GoogleError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(GoogleError::ResponseTooLarge);
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await.map_err(GoogleError::Transport)? {
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(GoogleError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| GoogleError::InvalidResponse)
 }
 
 fn ensure_success(response: Response) -> Result<Response, GoogleError> {
@@ -275,6 +292,32 @@ mod tests {
             .await
             .expect("authorized request");
         client.json_limited(request, limit).await
+    }
+
+    async fn general_request(base_url: &str) -> Result<Value, GoogleError> {
+        let client = GoogleClient::with_base_url(
+            Arc::new(StaticAccessToken::new("test-access-token")),
+            base_url,
+        )
+        .expect("test base URL");
+        let url = client.endpoint(&["general"]).expect("test endpoint");
+        let request = client
+            .request(Method::GET, url)
+            .await
+            .expect("authorized request");
+        client.json(request).await
+    }
+
+    #[tokio::test]
+    async fn general_json_rejects_declared_oversize_before_reading_the_body() {
+        let base_url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33554433\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = general_request(&base_url)
+            .await
+            .expect_err("declared response exceeds the general 32 MiB limit");
+        assert!(matches!(error, GoogleError::ResponseTooLarge));
     }
 
     #[tokio::test]

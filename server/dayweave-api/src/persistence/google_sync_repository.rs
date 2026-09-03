@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use dayweave_google::calendar::GoogleEvent;
 use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -23,11 +24,25 @@ use crate::{
         GoogleSyncRefreshAccepted, GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole,
         GoogleSyncRunState, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
         OutboundDispatchPermit, OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec,
-        OutboundResult, OutboundWork, OutboxCounts, RemoteCalendarSeriesChange, RemoteItemChange,
+        OutboundResult, OutboundWork, OutboxCounts, PreparedSchedulePublicationChange,
+        RemoteCalendarSeriesChange, RemoteItemChange, ScheduleBlockMapping,
+        ScheduleGooglePublicationAccepted, ScheduleGooglePublicationChange,
+        ScheduleGooglePublicationOperation, ScheduleGooglePublicationPreview,
+        ScheduleGooglePublicationState, ScheduleGooglePublicationStatus,
+        SchedulePublicationApprovalSpec, SchedulePublicationBlock,
+        SchedulePublicationDispatchPermit, SchedulePublicationEnqueueSpec,
+        SchedulePublicationObservationSource, SchedulePublicationPreviewSpec,
+        SchedulePublicationResult, SchedulePublicationSource, SchedulePublicationWork,
         StoredCursor, SyncClaim, SyncCounts, SyncFailureKind, outbound_intent_hash,
-        outbound_preview_hash,
+        outbound_preview_hash, schedule_desired_payload_hash,
+        schedule_publication_desired_set_hash, schedule_publication_intent_hash,
+        schedule_publication_preview_hash, schedule_publication_slot_id,
     },
     items::{Item, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy},
+    scheduling::{
+        assert_current_calendar_projection, assert_current_item_snapshot,
+        assert_current_planning_policy_tx, published_planning_policy_tx,
+    },
 };
 
 use super::DatabaseScope;
@@ -42,6 +57,8 @@ const COLLECTION_COLUMNS: &str = "id, provider_account_id, collection_kind, remo
 
 const MAX_CALENDAR_PROJECTION_ENTRIES: usize = 10_000;
 const MAX_CALENDAR_PROJECTION_WINDOW_DAYS: i64 = 150;
+const MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEWS: i64 = 8;
+const MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEW_CHANGES: i64 = 20_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresGoogleSyncRepository {
@@ -707,6 +724,37 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .execute(&mut *transaction)
         .await
         .map_err(internal)?;
+        let recovered_schedule_batches = sqlx::query_scalar::<_, Uuid>(
+            "WITH recovered AS (UPDATE google_schedule_publication_outbox SET \
+             state = 'backoff', claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             available_at = $3, terminal_at = NULL, \
+             last_error_code = CASE \
+                 WHEN provider_post_may_have_started AND last_error_code IN \
+                      ('provider_identity_unresolved', 'provider_response_too_large') \
+                 THEN last_error_code \
+                 WHEN provider_post_may_have_started \
+                 THEN 'worker_restarted_after_dispatch_authorization' \
+                 ELSE 'worker_restarted_before_send' END, updated_at = $3 \
+             WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering' \
+             RETURNING publication_id) SELECT DISTINCT publication_id FROM recovered",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for publication_id in recovered_schedule_batches {
+            refresh_schedule_publication_batch_tx(
+                &mut transaction,
+                self.scope,
+                publication_id,
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE google_sync_runs SET state = 'backoff', claim_id = NULL, lease_until = NULL, \
              next_attempt_at = $3, last_error_code = 'worker_restarted', last_error_at = $3, \
@@ -903,6 +951,33 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         // Reconcile every child delivery while the expired parent identity is
         // still visible. This makes takeover itself the fence: an old worker
         // cannot authorize or complete even if the outbox lease was newer.
+        let expired_schedule_claims = sqlx::query(
+            "SELECT provider_account_id, claim_id, claim_generation FROM google_sync_runs \
+             WHERE workspace_id = $1 AND user_id = $2 AND state = 'running' \
+               AND lease_until <= $3 AND claim_id IS NOT NULL FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for row in expired_schedule_claims {
+            reconcile_schedule_publication_for_parent_end(
+                &mut transaction,
+                self.scope,
+                &SyncClaim {
+                    account_id: row.try_get("provider_account_id").map_err(internal)?,
+                    claim_id: row.try_get("claim_id").map_err(internal)?,
+                    claim_generation: i64_to_u64(
+                        row.try_get("claim_generation").map_err(internal)?,
+                    )?,
+                },
+                "parent_run_lease_expired_with_active_schedule_delivery",
+                now,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE google_sync_outbox outbox SET \
              state = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
@@ -1021,6 +1096,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         &self,
         claim: &SyncClaim,
         counts: &SyncCounts,
+        include_schedule_due: bool,
         now: DateTime<Utc>,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError> {
@@ -1034,11 +1110,28 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             now,
         )
         .await?;
+        reconcile_schedule_publication_for_parent_end(
+            &mut transaction,
+            self.scope,
+            claim,
+            "parent_run_completed_with_active_schedule_delivery",
+            now,
+        )
+        .await?;
         let updated = sqlx::query(
             "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
              completed_at = $5, completed_refresh_generation = claimed_refresh_generation, \
              next_attempt_at = CASE WHEN refresh_generation > claimed_refresh_generation \
-                                    THEN $5 ELSE $6 END, \
+                                    THEN $5 ELSE LEAST($6, GREATEST($5, COALESCE(( \
+                 SELECT min(outbox.available_at) FROM google_schedule_publication_outbox outbox \
+                 JOIN google_schedule_publication_batches batch \
+                   ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+                 WHERE outbox.workspace_id = google_sync_runs.workspace_id \
+                   AND outbox.user_id = google_sync_runs.user_id \
+                   AND batch.provider_account_id = google_sync_runs.provider_account_id \
+                   AND $13 \
+                   AND outbox.state IN ('pending', 'backoff') \
+             ), $6))) END, \
              requested_at = CASE WHEN refresh_generation > claimed_refresh_generation \
                                  THEN requested_at ELSE NULL END, \
              consecutive_failures = 0, last_error_code = NULL, last_error_at = NULL, \
@@ -1060,6 +1153,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(u64_to_i64(counts.conflicts)?)
         .bind(u64_to_i64(counts.rejected)?)
         .bind(u64_to_i64(claim.claim_generation)?)
+        .bind(include_schedule_due)
         .execute(&mut *transaction)
         .await
         .map_err(internal)?
@@ -1092,6 +1186,14 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             self.scope,
             claim,
             "parent_run_failed_with_active_delivery",
+            now,
+        )
+        .await?;
+        reconcile_schedule_publication_for_parent_end(
+            &mut transaction,
+            self.scope,
+            claim,
+            "parent_run_failed_with_active_schedule_delivery",
             now,
         )
         .await?;
@@ -3288,6 +3390,1853 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         }
     }
 
+    async fn load_schedule_publication_source(
+        &self,
+        account_id: Uuid,
+        collection_id: Uuid,
+        expected_schedule_revision_id: Uuid,
+    ) -> Result<SchedulePublicationSource, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        let source = load_schedule_publication_source_tx(
+            self,
+            &mut transaction,
+            account_id,
+            collection_id,
+            expected_schedule_revision_id,
+            observed_at,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(source)
+    }
+
+    async fn create_schedule_publication_preview(
+        &self,
+        spec: SchedulePublicationPreviewSpec,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncRepositoryError> {
+        if spec.id.is_nil()
+            || spec.source.workspace_id != self.scope.workspace_id
+            || spec.source.user_id != self.scope.user_id
+            || spec.expires_at <= now
+            || spec.expires_at > now + chrono::Duration::minutes(30)
+        {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let current = load_schedule_publication_source_tx(
+            self,
+            &mut transaction,
+            spec.source.account_id,
+            spec.source.collection.id,
+            spec.source.schedule_revision_id,
+            now,
+        )
+        .await?;
+        if !schedule_publication_sources_match(&current, &spec.source) {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let validated = validate_schedule_publication_changes(&current, &spec.changes, now)?;
+        let desired_set_hash =
+            schedule_publication_desired_set_hash(&current, &spec.changes).map_err(internal)?;
+        lock_schedule_publication_preview_space_tx(
+            &mut transaction,
+            self.scope,
+            current.account_id,
+        )
+        .await?;
+        prune_expired_schedule_publication_previews_tx(
+            &mut transaction,
+            self.scope,
+            current.account_id,
+            now,
+        )
+        .await?;
+        if let Some(existing) = reusable_schedule_publication_preview_tx(
+            &mut transaction,
+            self.scope,
+            &current,
+            desired_set_hash,
+            &validated,
+            &spec.changes,
+            now,
+        )
+        .await?
+        {
+            transaction.commit().await.map_err(internal)?;
+            return Ok(existing);
+        }
+        let (active_count, active_change_count): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), COALESCE(sum(change_count), 0) \
+             FROM google_schedule_publication_previews \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > GREATEST($4, statement_timestamp())",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(current.account_id)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if schedule_publication_preview_limit_exceeded(
+            active_count,
+            active_change_count,
+            i64::from(validated.change_count),
+        ) {
+            return Err(GoogleSyncRepositoryError::PreviewLimitExceeded);
+        }
+        let preview_hash =
+            schedule_publication_preview_hash(spec.id, &current, &spec.changes, spec.expires_at)
+                .map_err(internal)?;
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             collection_display_name, required_scope, schedule_revision_id, \
+             schedule_revision_number, schedule_publication_hash, desired_set_hash, timezone_name, \
+             horizon_start, horizon_end, preview_hash, change_count, create_count, update_count, \
+             delete_count, noop_count, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, \
+             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
+             $22, $23, $24, $24)",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(current.account_id)
+        .bind(current.collection.id)
+        .bind(u64_to_i64(current.collection.revision)?)
+        .bind(&current.collection.remote_collection_id)
+        .bind(&current.collection.display_name)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(current.schedule_revision_id)
+        .bind(u64_to_i64(current.schedule_revision_number)?)
+        .bind(current.schedule_publication_hash.as_slice())
+        .bind(desired_set_hash.as_slice())
+        .bind(&current.timezone_name)
+        .bind(current.horizon_start)
+        .bind(current.horizon_end)
+        .bind(preview_hash.as_slice())
+        .bind(u32_to_i32(validated.change_count)?)
+        .bind(u32_to_i32(validated.create_count)?)
+        .bind(u32_to_i32(validated.update_count)?)
+        .bind(u32_to_i32(validated.delete_count)?)
+        .bind(u32_to_i32(validated.noop_count)?)
+        .bind(spec.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for change in &spec.changes {
+            sqlx::query(
+                "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, \
+                 user_id, preview_id, provider_account_id, collection_id, schedule_revision_id, \
+                 ordinal, slot_id, source_block_id, item_id, occurrence_id, session_index, \
+                 incarnation, operation, mapping_id, remote_resource_id, expected_etag, \
+                 desired_payload_hash, intent_hash, provider_payload, review_summary, starts_at, \
+                 ends_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.id)
+            .bind(current.account_id)
+            .bind(current.collection.id)
+            .bind(current.schedule_revision_id)
+            .bind(u32_to_i32(change.ordinal)?)
+            .bind(change.slot_id)
+            .bind(change.source_block_id)
+            .bind(change.item_id)
+            .bind(change.occurrence_id)
+            .bind(i32::from(change.session_index))
+            .bind(i64::from(change.incarnation))
+            .bind(change.operation.as_db())
+            .bind(change.mapping_id)
+            .bind(&change.remote_resource_id)
+            .bind(&change.expected_etag)
+            .bind(change.desired_payload_hash.as_slice())
+            .bind(change.intent_hash.as_slice())
+            .bind(&change.payload)
+            .bind(&change.review_summary)
+            .bind(change.starts_at)
+            .bind(change.ends_at)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(ScheduleGooglePublicationPreview {
+            id: spec.id,
+            account_id: current.account_id,
+            collection_id: current.collection.id,
+            collection_revision: current.collection.revision,
+            collection_display_name: current.collection.display_name,
+            schedule_revision_id: current.schedule_revision_id,
+            schedule_revision_number: current.schedule_revision_number,
+            preview_hash: encode_hex_bytes(&preview_hash),
+            create_count: validated.create_count,
+            update_count: validated.update_count,
+            delete_count: validated.delete_count,
+            noop_count: validated.noop_count,
+            changes: validated.public_changes,
+            expires_at: spec.expires_at,
+        })
+    }
+
+    async fn approve_schedule_publication(
+        &self,
+        spec: SchedulePublicationApprovalSpec,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        let preview = sqlx::query(
+            "SELECT provider_account_id, collection_id, schedule_revision_id, \
+             schedule_revision_number, preview_hash, change_count, create_count, update_count, \
+             delete_count, noop_count, expires_at, approved_at FROM \
+             google_schedule_publication_previews WHERE workspace_id = $1 AND user_id = $2 \
+             AND id = $3 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+        if preview
+            .try_get::<Uuid, _>("provider_account_id")
+            .map_err(internal)?
+            != spec.account_id
+            || preview
+                .try_get::<Vec<u8>, _>("preview_hash")
+                .map_err(internal)?
+                != spec.expected_preview_hash
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let expires_at: DateTime<Utc> = preview.try_get("expires_at").map_err(internal)?;
+        if expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ApprovalExpired);
+        }
+        if preview
+            .try_get::<Option<DateTime<Utc>>, _>("approved_at")
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalAlreadyIssued);
+        }
+        revalidate_schedule_publication_preview_tx(self, &mut transaction, spec.preview_id, now)
+            .await?;
+
+        let audit_id = Uuid::new_v4();
+        let schedule_revision_id: Uuid =
+            preview.try_get("schedule_revision_id").map_err(internal)?;
+        let schedule_revision_number: i64 = preview
+            .try_get("schedule_revision_number")
+            .map_err(internal)?;
+        sqlx::query(
+            "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+             entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
+             VALUES ($1, $2, $3, 'google.schedule_publication.approved', 'schedule_revision', \
+             $4, $5, $5, 'succeeded', $6, $7)",
+        )
+        .bind(audit_id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(schedule_revision_id)
+        .bind(schedule_revision_number)
+        .bind(json!({
+            "preview_id": spec.preview_id,
+            "account_id": spec.account_id,
+            "collection_id": preview.try_get::<Uuid, _>("collection_id").map_err(internal)?,
+            "change_count": preview.try_get::<i32, _>("change_count").map_err(internal)?,
+            "create_count": preview.try_get::<i32, _>("create_count").map_err(internal)?,
+            "update_count": preview.try_get::<i32, _>("update_count").map_err(internal)?,
+            "delete_count": preview.try_get::<i32, _>("delete_count").map_err(internal)?,
+            "noop_count": preview.try_get::<i32, _>("noop_count").map_err(internal)?,
+            "expires_at": expires_at,
+        }))
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_previews SET approved_at = $4, \
+             capability_hash = $5, approval_audit_id = $6, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND approved_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .bind(now)
+        .bind(spec.capability_hash.as_slice())
+        .bind(audit_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ApprovalAlreadyIssued);
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(expires_at)
+    }
+
+    async fn enqueue_schedule_publication(
+        &self,
+        spec: SchedulePublicationEnqueueSpec,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleGooglePublicationAccepted, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        let preview = sqlx::query(
+            "SELECT provider_account_id, collection_id, collection_revision, \
+             collection_remote_id, required_scope, schedule_revision_id, schedule_revision_number, \
+             schedule_publication_hash, change_count, create_count, update_count, delete_count, \
+             noop_count, expires_at, approved_at, approval_audit_id, consumed_at \
+             FROM google_schedule_publication_previews WHERE workspace_id = $1 AND user_id = $2 \
+             AND id = $3 AND capability_hash = $4 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .bind(spec.capability_hash.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+        let account_id: Uuid = preview.try_get("provider_account_id").map_err(internal)?;
+        let collection_id: Uuid = preview.try_get("collection_id").map_err(internal)?;
+        let schedule_revision_id: Uuid =
+            preview.try_get("schedule_revision_id").map_err(internal)?;
+        if account_id != spec.account_id
+            || collection_id != spec.collection_id
+            || schedule_revision_id != spec.expected_schedule_revision_id
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        if preview
+            .try_get::<Option<DateTime<Utc>>, _>("consumed_at")
+            .map_err(internal)?
+            .is_some()
+        {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM google_schedule_publication_batches \
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3 \
+                   AND provider_account_id = $4 AND collection_id = $5 \
+                   AND schedule_revision_id = $6)",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.preview_id)
+            .bind(spec.account_id)
+            .bind(spec.collection_id)
+            .bind(spec.expected_schedule_revision_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            if !exists {
+                return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+            }
+            transaction.commit().await.map_err(internal)?;
+            return Ok(ScheduleGooglePublicationAccepted {
+                publication_id: spec.preview_id,
+                replayed: true,
+            });
+        }
+        let expires_at: DateTime<Utc> = preview.try_get("expires_at").map_err(internal)?;
+        if expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ApprovalExpired);
+        }
+        if preview
+            .try_get::<Option<DateTime<Utc>>, _>("approved_at")
+            .map_err(internal)?
+            .is_none()
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        revalidate_schedule_publication_preview_tx(self, &mut transaction, spec.preview_id, now)
+            .await?;
+
+        let uncertain_prior_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM google_schedule_publication_outbox outbox \
+             JOIN google_schedule_publication_batches batch \
+               ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+               AND batch.provider_account_id = $3 AND batch.collection_id = $4 \
+               AND batch.id <> $5 AND outbox.state IN ('pending', 'delivering', 'backoff') \
+               AND outbox.provider_post_may_have_started)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(spec.preview_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if uncertain_prior_exists {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+
+        // Past generated events remain on Google as history, but they no
+        // longer own the logical slot locally once the approved desired set
+        // omits them. Retiring only at one-shot enqueue keeps preview review
+        // read-only and lets later slot reuse advance the incarnation.
+        let elapsed_mapping_ids = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE google_schedule_publication_mapping_origins origin SET \
+             retired_at = $6, retirement_reason = 'elapsed_history', updated_at = $6 \
+             WHERE origin.workspace_id = $1 AND origin.user_id = $2 \
+               AND origin.provider_account_id = $3 AND origin.collection_id = $4 \
+               AND origin.retired_at IS NULL AND origin.last_ends_at <= $6 \
+               AND NOT EXISTS (SELECT 1 FROM google_schedule_publication_preview_changes change \
+                 WHERE change.workspace_id = origin.workspace_id AND change.preview_id = $5 \
+                   AND change.mapping_id = origin.mapping_id) \
+             RETURNING origin.mapping_id",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(spec.preview_id)
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if !elapsed_mapping_ids.is_empty() {
+            let retired = sqlx::query(
+                "UPDATE provider_sync_mappings SET tombstoned_at = $4, updated_at = $4 \
+                 WHERE workspace_id = $1 AND provider_account_id = $2 \
+                   AND id = ANY($3) AND entity_kind = 'schedule_block' \
+                   AND tombstoned_at IS NULL",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(account_id)
+            .bind(&elapsed_mapping_ids)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?
+            .rows_affected();
+            if retired != elapsed_mapping_ids.len() as u64 {
+                return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+            }
+        }
+
+        let stale_batches = sqlx::query_scalar::<_, Uuid>(
+            "WITH changed AS (UPDATE google_schedule_publication_outbox outbox SET \
+             state = 'superseded', claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, terminal_at = $5, \
+             last_error_code = 'superseded_by_newer_schedule', updated_at = $5 \
+             FROM google_schedule_publication_batches batch \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+               AND batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+               AND batch.provider_account_id = $3 AND batch.collection_id = $4 \
+               AND batch.id <> $6 \
+               AND outbox.state IN ('pending', 'delivering', 'backoff') \
+               AND NOT outbox.provider_post_may_have_started \
+             RETURNING outbox.publication_id) SELECT DISTINCT publication_id FROM changed",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(now)
+        .bind(spec.preview_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for publication_id in stale_batches {
+            refresh_schedule_publication_batch_tx(
+                &mut transaction,
+                self.scope,
+                publication_id,
+                now,
+            )
+            .await?;
+        }
+
+        let change_count = i32_to_u32(preview.try_get("change_count").map_err(internal)?)?;
+        let create_count = i32_to_u32(preview.try_get("create_count").map_err(internal)?)?;
+        let update_count = i32_to_u32(preview.try_get("update_count").map_err(internal)?)?;
+        let delete_count = i32_to_u32(preview.try_get("delete_count").map_err(internal)?)?;
+        let noop_count = i32_to_u32(preview.try_get("noop_count").map_err(internal)?)?;
+        let pending_count = change_count
+            .checked_sub(noop_count)
+            .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+        let state = if pending_count == 0 {
+            "published"
+        } else {
+            "pending"
+        };
+        let completed_at = (pending_count == 0).then_some(now);
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_batches (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             required_scope, schedule_revision_id, schedule_revision_number, \
+             schedule_publication_hash, state, total_count, create_count, update_count, \
+             delete_count, noop_count, pending_count, delivering_count, backoff_count, \
+             published_count, conflict_count, failed_count, superseded_count, completed_at, \
+             created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+             $12, $13, $14, $15, $16, $17, $18, 0, 0, $19, 0, 0, 0, $20, $21, $21)",
+        )
+        .bind(spec.preview_id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(
+            preview
+                .try_get::<i64, _>("collection_revision")
+                .map_err(internal)?,
+        )
+        .bind(
+            preview
+                .try_get::<String, _>("collection_remote_id")
+                .map_err(internal)?,
+        )
+        .bind(
+            preview
+                .try_get::<String, _>("required_scope")
+                .map_err(internal)?,
+        )
+        .bind(schedule_revision_id)
+        .bind(
+            preview
+                .try_get::<i64, _>("schedule_revision_number")
+                .map_err(internal)?,
+        )
+        .bind(
+            preview
+                .try_get::<Vec<u8>, _>("schedule_publication_hash")
+                .map_err(internal)?,
+        )
+        .bind(state)
+        .bind(u32_to_i32(change_count)?)
+        .bind(u32_to_i32(create_count)?)
+        .bind(u32_to_i32(update_count)?)
+        .bind(u32_to_i32(delete_count)?)
+        .bind(u32_to_i32(noop_count)?)
+        .bind(u32_to_i32(pending_count)?)
+        .bind(u32_to_i32(noop_count)?)
+        .bind(completed_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let changes = sqlx::query(
+            "SELECT id, ordinal, operation FROM google_schedule_publication_preview_changes \
+             WHERE workspace_id = $1 AND user_id = $2 AND preview_id = $3 ORDER BY ordinal",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for change in changes {
+            let operation: String = change.try_get("operation").map_err(internal)?;
+            let noop = operation == "noop";
+            sqlx::query(
+                "INSERT INTO google_schedule_publication_outbox (id, workspace_id, user_id, \
+                 publication_id, change_id, ordinal, operation, state, available_at, terminal_at, \
+                 created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, $9)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.preview_id)
+            .bind(change.try_get::<Uuid, _>("id").map_err(internal)?)
+            .bind(change.try_get::<i32, _>("ordinal").map_err(internal)?)
+            .bind(&operation)
+            .bind(if noop { "published" } else { "pending" })
+            .bind(now)
+            .bind(noop.then_some(now))
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        let consumed = sqlx::query(
+            "UPDATE google_schedule_publication_previews SET consumed_at = $4, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND consumed_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if consumed != 1 {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
+        sqlx::query(
+            "UPDATE google_sync_runs SET requested_at = $4, \
+             next_attempt_at = LEAST(next_attempt_at, $4), refresh_generation = refresh_generation + 1, \
+             revision = revision + 1, updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
+             AND provider_account_id = $3",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(ScheduleGooglePublicationAccepted {
+            publication_id: spec.preview_id,
+            replayed: false,
+        })
+    }
+
+    async fn claim_schedule_publication(
+        &self,
+        claim: &SyncClaim,
+        now: DateTime<Utc>,
+    ) -> Result<Option<SchedulePublicationWork>, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
+        let mut changed_publications = BTreeSet::new();
+        for _ in 0..MAX_CALENDAR_PROJECTION_ENTRIES {
+            let claim_id = Uuid::new_v4();
+            let row = sqlx::query(
+                "WITH candidate AS (SELECT outbox.id FROM google_schedule_publication_outbox outbox \
+                   JOIN google_schedule_publication_batches batch \
+                     ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+                   WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+                     AND batch.provider_account_id = $3 \
+                     AND outbox.state IN ('pending', 'backoff') AND outbox.available_at <= $4 \
+                   ORDER BY outbox.available_at, outbox.created_at, outbox.id \
+                   FOR UPDATE OF outbox SKIP LOCKED LIMIT 1), \
+                 claimed AS (UPDATE google_schedule_publication_outbox outbox SET \
+                   state = 'delivering', claim_id = $5, claimed_at = $4, run_claim_id = $6, \
+                   run_claim_generation = $7, dispatch_nonce = NULL, \
+                   dispatch_provider_write = NULL, dispatch_authorized_at = NULL, \
+                   dispatch_expires_at = NULL, updated_at = $4 FROM candidate \
+                   WHERE outbox.id = candidate.id RETURNING outbox.*) \
+                 SELECT claimed.id AS outbox_id, claimed.publication_id, claimed.change_id, \
+                   claimed.ordinal, batch.provider_account_id, batch.collection_id, \
+                   batch.collection_revision, batch.collection_remote_id, batch.schedule_revision_id, \
+                   batch.schedule_revision_number, batch.schedule_publication_hash, batch.required_scope, \
+                   change.slot_id, change.source_block_id, change.item_id, change.occurrence_id, \
+                   change.session_index, change.incarnation, change.operation, change.mapping_id, \
+                   change.remote_resource_id, change.expected_etag, change.desired_payload_hash, \
+                   change.provider_payload, change.intent_hash, claimed.run_claim_id, \
+                   claimed.run_claim_generation, claimed.provider_post_may_have_started, claimed.attempts, \
+                   CASE WHEN change.operation = 'create' THEN change.ends_at \
+                        ELSE LEAST(change.ends_at, origin.last_ends_at) END AS dispatch_deadline \
+                 FROM claimed JOIN google_schedule_publication_batches batch \
+                   ON batch.workspace_id = claimed.workspace_id AND batch.id = claimed.publication_id \
+                 JOIN google_schedule_publication_preview_changes change \
+                   ON change.workspace_id = claimed.workspace_id AND change.id = claimed.change_id \
+                 LEFT JOIN google_schedule_publication_mapping_origins origin \
+                   ON origin.workspace_id = change.workspace_id AND origin.mapping_id = change.mapping_id \
+                  AND origin.provider_account_id = change.provider_account_id \
+                  AND origin.collection_id = change.collection_id AND origin.slot_id = change.slot_id \
+                  AND origin.incarnation = change.incarnation",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(claim.account_id)
+            .bind(now)
+            .bind(claim_id)
+            .bind(claim.claim_id)
+            .bind(u64_to_i64(claim.claim_generation)?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            let Some(row) = row else {
+                break;
+            };
+            let work = schedule_publication_work_from_row(&row, claim_id)?;
+            let dispatch_deadline: DateTime<Utc> =
+                row.try_get("dispatch_deadline").map_err(internal)?;
+            if dispatch_deadline <= now && !work.provider_post_may_have_started {
+                if !supersede_elapsed_schedule_publication_before_send_tx(
+                    &mut transaction,
+                    self.scope,
+                    &work,
+                    now,
+                )
+                .await?
+                {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                changed_publications.insert(work.publication_id);
+                continue;
+            }
+            let policy_current = schedule_publication_policy_current_tx(
+                &mut transaction,
+                self.scope,
+                work.schedule_revision_id,
+                work.schedule_publication_hash,
+            )
+            .await?;
+            let target_current =
+                schedule_publication_target_current_tx(&mut transaction, self.scope, &work).await?;
+            if (!policy_current || !target_current) && !work.provider_post_may_have_started {
+                let updated = sqlx::query(
+                    "UPDATE google_schedule_publication_outbox SET state = $4, claim_id = NULL, \
+                     claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+                     dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+                     dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+                     terminal_at = $5, last_error_code = $6, updated_at = $5 \
+                     WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND claim_id = $7 \
+                       AND state = 'delivering' AND NOT provider_post_may_have_started",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(self.scope.user_id)
+                .bind(work.outbox_id)
+                .bind(if policy_current {
+                    "conflict"
+                } else {
+                    "superseded"
+                })
+                .bind(now)
+                .bind(if policy_current {
+                    "schedule_publication_target_changed"
+                } else {
+                    "schedule_superseded_before_send"
+                })
+                .bind(claim_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if updated != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                changed_publications.insert(work.publication_id);
+                // Keep draining stale, definitely-unsent rows under this one
+                // parent claim/transaction.  Returning None after each row
+                // would otherwise interleave a full inbound sync per discard.
+                continue;
+            }
+            changed_publications.insert(work.publication_id);
+            for publication_id in changed_publications {
+                refresh_schedule_publication_batch_tx(
+                    &mut transaction,
+                    self.scope,
+                    publication_id,
+                    now,
+                )
+                .await?;
+            }
+            transaction.commit().await.map_err(internal)?;
+            return Ok(Some(work));
+        }
+        for publication_id in changed_publications {
+            refresh_schedule_publication_batch_tx(
+                &mut transaction,
+                self.scope,
+                publication_id,
+                now,
+            )
+            .await?;
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(None)
+    }
+
+    async fn renew_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        ensure_run_claim(
+            &mut transaction,
+            self.scope,
+            &SyncClaim {
+                account_id: work.account_id,
+                claim_id: work.run_claim_id,
+                claim_generation: work.run_claim_generation,
+            },
+            now,
+        )
+        .await?;
+        let policy_current = schedule_publication_policy_current_tx(
+            &mut transaction,
+            self.scope,
+            work.schedule_revision_id,
+            work.schedule_publication_hash,
+        )
+        .await?;
+        let target_current =
+            schedule_publication_target_current_tx(&mut transaction, self.scope, work).await?;
+        if (!policy_current || !target_current) && !work.provider_post_may_have_started {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET claimed_at = $8, updated_at = $8 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+               AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+               AND run_claim_generation = $7",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    async fn authorize_schedule_publication_dispatch(
+        &self,
+        work: &SchedulePublicationWork,
+        provider_write: bool,
+        now: DateTime<Utc>,
+    ) -> Result<SchedulePublicationDispatchPermit, GoogleSyncRepositoryError> {
+        let nonce = Uuid::new_v4();
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        if provider_write {
+            ensure_run_claim(
+                &mut transaction,
+                self.scope,
+                &SyncClaim {
+                    account_id: work.account_id,
+                    claim_id: work.run_claim_id,
+                    claim_generation: work.run_claim_generation,
+                },
+                now,
+            )
+            .await?;
+        } else {
+            ensure_run_identity(
+                &mut transaction,
+                self.scope,
+                work.account_id,
+                work.run_claim_id,
+                work.run_claim_generation,
+            )
+            .await?;
+        }
+        let (provider_post_may_have_started, dispatch_deadline) =
+            lock_schedule_publication_dispatch_deadline_tx(&mut transaction, self.scope, work)
+                .await?;
+        if dispatch_deadline <= now {
+            if !provider_post_may_have_started {
+                if !supersede_elapsed_schedule_publication_before_send_tx(
+                    &mut transaction,
+                    self.scope,
+                    work,
+                    now,
+                )
+                .await?
+                {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                refresh_schedule_publication_batch_tx(
+                    &mut transaction,
+                    self.scope,
+                    work.publication_id,
+                    now,
+                )
+                .await?;
+                transaction.commit().await.map_err(internal)?;
+                return Err(GoogleSyncRepositoryError::ClaimLost);
+            }
+            if provider_write {
+                if !backoff_elapsed_possible_schedule_publication_tx(
+                    &mut transaction,
+                    self.scope,
+                    work,
+                    now,
+                )
+                .await?
+                {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                refresh_schedule_publication_batch_tx(
+                    &mut transaction,
+                    self.scope,
+                    work.publication_id,
+                    now,
+                )
+                .await?;
+                transaction.commit().await.map_err(internal)?;
+                return Err(GoogleSyncRepositoryError::ClaimLost);
+            }
+        }
+        let expires_at = if provider_write {
+            (now + chrono::Duration::seconds(30)).min(dispatch_deadline)
+        } else {
+            now + chrono::Duration::seconds(30)
+        };
+        let policy_current = schedule_publication_policy_current_tx(
+            &mut transaction,
+            self.scope,
+            work.schedule_revision_id,
+            work.schedule_publication_hash,
+        )
+        .await?;
+        let target_current =
+            schedule_publication_target_current_tx(&mut transaction, self.scope, work).await?;
+        // A read-reconciliation permit is allowed after a recorded possible
+        // send even if the schedule has since moved. It can only persist the
+        // provider observation; it cannot initiate another provider write.
+        if !schedule_dispatch_guard_allows(
+            policy_current,
+            target_current,
+            provider_write,
+            work.provider_post_may_have_started,
+        ) {
+            if !work.provider_post_may_have_started {
+                sqlx::query(
+                    "UPDATE google_schedule_publication_outbox SET state = $6, claim_id = NULL, \
+                     claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+                     dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+                     dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+                     terminal_at = $7, last_error_code = $8, updated_at = $7 \
+                     WHERE workspace_id = $1 AND user_id = $2 AND id = $3 \
+                       AND publication_id = $4 AND claim_id = $5 AND state = 'delivering'",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(self.scope.user_id)
+                .bind(work.outbox_id)
+                .bind(work.publication_id)
+                .bind(work.claim_id)
+                .bind(if policy_current {
+                    "conflict"
+                } else {
+                    "superseded"
+                })
+                .bind(now)
+                .bind(if policy_current {
+                    "dispatch_target_changed"
+                } else {
+                    "schedule_superseded_before_send"
+                })
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?;
+                refresh_schedule_publication_batch_tx(
+                    &mut transaction,
+                    self.scope,
+                    work.publication_id,
+                    now,
+                )
+                .await?;
+                transaction.commit().await.map_err(internal)?;
+            }
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox outbox SET dispatch_nonce = $8, \
+               dispatch_provider_write = $11, dispatch_authorized_at = $9, \
+               dispatch_expires_at = $10, claimed_at = $9, \
+               provider_post_may_have_started = outbox.provider_post_may_have_started OR $11, \
+               send_started_at = CASE WHEN $11 THEN COALESCE(outbox.send_started_at, $9) \
+                                      ELSE outbox.send_started_at END, updated_at = $9 \
+             FROM google_schedule_publication_preview_changes change, google_sync_runs run \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+               AND outbox.publication_id = $4 AND outbox.change_id = $5 \
+               AND outbox.claim_id = $6 AND outbox.state = 'delivering' \
+               AND outbox.dispatch_nonce IS NULL \
+               AND outbox.run_claim_id = $7 AND outbox.run_claim_generation = $12 \
+               AND change.workspace_id = outbox.workspace_id AND change.id = outbox.change_id \
+               AND change.intent_hash = $13 AND change.provider_payload = $14 \
+               AND change.operation = $15 AND change.slot_id = $16 \
+               AND change.mapping_id IS NOT DISTINCT FROM $17 \
+               AND change.remote_resource_id IS NOT DISTINCT FROM $18 \
+               AND change.expected_etag IS NOT DISTINCT FROM $19 \
+               AND change.desired_payload_hash = $20 \
+               AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = change.provider_account_id \
+               AND run.claim_id = $7 AND run.claim_generation = $12 \
+               AND (NOT $11 OR (run.state = 'running' AND run.lease_until >= $10)) \
+               AND (NOT $11 OR $10 <= $21)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.change_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(nonce)
+        .bind(now)
+        .bind(expires_at)
+        .bind(provider_write)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(work.intent_hash.as_slice())
+        .bind(&work.payload)
+        .bind(work.operation.as_db())
+        .bind(work.slot_id)
+        .bind(work.mapping_id)
+        .bind(&work.remote_resource_id)
+        .bind(&work.expected_etag)
+        .bind(work.desired_payload_hash.as_slice())
+        .bind(dispatch_deadline)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(SchedulePublicationDispatchPermit {
+            nonce,
+            intent_hash: work.intent_hash,
+            expires_at,
+        })
+    }
+
+    async fn cancel_schedule_publication_before_send(
+        &self,
+        work: &SchedulePublicationWork,
+        code: &'static str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = 'backoff', claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             provider_post_may_have_started = false, send_started_at = NULL, \
+             available_at = $8, terminal_at = NULL, last_error_code = $9, updated_at = $10 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+               AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+               AND run_claim_generation = $7 AND dispatch_expires_at <= $10",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(available_at)
+        .bind(code)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        refresh_schedule_publication_batch_tx(
+            &mut transaction,
+            self.scope,
+            work.publication_id,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    async fn reconcile_schedule_publication_no_effect(
+        &self,
+        work: &SchedulePublicationWork,
+        code: &'static str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, GoogleSyncRepositoryError> {
+        if code.trim().is_empty() || code.len() > 64 || !work.provider_post_may_have_started {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let row = sqlx::query(
+            "SELECT outbox.id AS outbox_id, outbox.publication_id, outbox.change_id, \
+               outbox.ordinal, batch.provider_account_id, batch.collection_id, \
+               batch.collection_revision, batch.collection_remote_id, batch.schedule_revision_id, \
+               batch.schedule_revision_number, batch.schedule_publication_hash, batch.required_scope, \
+               change.slot_id, change.source_block_id, change.item_id, change.occurrence_id, \
+               change.session_index, change.incarnation, change.operation, change.mapping_id, \
+               change.remote_resource_id, change.expected_etag, change.desired_payload_hash, \
+               change.provider_payload, change.intent_hash, outbox.run_claim_id, \
+               outbox.run_claim_generation, outbox.provider_post_may_have_started, outbox.attempts, \
+               outbox.send_started_at, outbox.no_effect_observation_count, \
+               outbox.last_error_code \
+             FROM google_schedule_publication_outbox outbox \
+             JOIN google_schedule_publication_batches batch \
+               ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+             JOIN google_schedule_publication_preview_changes change \
+               ON change.workspace_id = outbox.workspace_id AND change.id = outbox.change_id \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+               AND outbox.publication_id = $4 AND outbox.state = 'delivering' \
+               AND outbox.claim_id = $5 AND outbox.run_claim_id = $6 \
+               AND outbox.run_claim_generation = $7 \
+               AND outbox.provider_post_may_have_started AND outbox.dispatch_nonce IS NULL \
+             FOR UPDATE OF outbox",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+        let persisted = schedule_publication_work_from_row(&row, work.claim_id)?;
+        if !schedule_publication_work_identity_matches(work, &persisted)
+            || !persisted.provider_post_may_have_started
+        {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let policy_current = schedule_publication_policy_current_tx(
+            &mut transaction,
+            self.scope,
+            work.schedule_revision_id,
+            work.schedule_publication_hash,
+        )
+        .await?;
+        let target_current =
+            schedule_publication_target_current_tx(&mut transaction, self.scope, &persisted)
+                .await?;
+        let persisted_error_code: Option<String> =
+            row.try_get("last_error_code").map_err(internal)?;
+        let provider_result_identity_uncertain = matches!(
+            persisted_error_code.as_deref(),
+            Some("provider_identity_unresolved" | "provider_response_too_large")
+        );
+        if policy_current
+            && target_current
+            && persisted.operation != ScheduleGooglePublicationOperation::Create
+            && !provider_result_identity_uncertain
+        {
+            transaction.commit().await.map_err(internal)?;
+            return Ok(false);
+        }
+
+        let send_started_at: DateTime<Utc> = row
+            .try_get::<Option<DateTime<Utc>>, _>("send_started_at")
+            .map_err(internal)?
+            .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+        let observation_count: i32 = row
+            .try_get("no_effect_observation_count")
+            .map_err(internal)?;
+        if observation_count < 0 || now < send_started_at {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let next_observation_count = observation_count
+            .checked_add(1)
+            .ok_or(GoogleSyncRepositoryError::Internal)?;
+        let available_at = schedule_no_effect_retry_at(now, next_observation_count);
+        let retained_error_code = if provider_result_identity_uncertain {
+            persisted_error_code
+                .as_deref()
+                .ok_or(GoogleSyncRepositoryError::Internal)?
+        } else {
+            code
+        };
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = 'backoff', \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_provider_write = NULL, dispatch_authorized_at = NULL, \
+             dispatch_expires_at = NULL, \
+             attempts = attempts + 1, \
+             no_effect_observation_count = no_effect_observation_count + 1, \
+             last_no_effect_observed_at = $8, available_at = $9, terminal_at = NULL, \
+             last_error_code = $10, updated_at = $8 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+               AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+               AND run_claim_generation = $7 AND provider_post_may_have_started \
+               AND dispatch_nonce IS NULL AND no_effect_observation_count = $11",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(now)
+        .bind(available_at)
+        .bind(retained_error_code)
+        .bind(observation_count)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        refresh_schedule_publication_batch_tx(
+            &mut transaction,
+            self.scope,
+            work.publication_id,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(true)
+    }
+
+    async fn complete_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        result: SchedulePublicationResult,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        if result.remote_resource_id.trim().is_empty() || result.remote_resource_id.len() > 1000 {
+            return Err(GoogleSyncRepositoryError::Internal);
+        }
+        let result_etag = result
+            .remote_etag
+            .as_deref()
+            .filter(|etag| !etag.trim().is_empty() && etag.len() <= 1000);
+        let valid_result = match work.operation {
+            ScheduleGooglePublicationOperation::Create => {
+                work.mapping_id.is_none()
+                    && work.remote_resource_id.is_none()
+                    && work.expected_etag.is_none()
+                    && work.payload.get("id").and_then(Value::as_str)
+                        == Some(result.remote_resource_id.as_str())
+                    && result_etag.is_some()
+            }
+            ScheduleGooglePublicationOperation::Update => {
+                work.mapping_id.is_some()
+                    && work.remote_resource_id.as_deref()
+                        == Some(result.remote_resource_id.as_str())
+                    && work.expected_etag.is_some()
+                    && result_etag.is_some()
+            }
+            ScheduleGooglePublicationOperation::Delete => {
+                work.mapping_id.is_some()
+                    && work.remote_resource_id.as_deref()
+                        == Some(result.remote_resource_id.as_str())
+                    && work.expected_etag.is_some()
+                    && result.remote_etag.is_none()
+            }
+            ScheduleGooglePublicationOperation::Noop => false,
+        };
+        if !valid_result {
+            return Err(GoogleSyncRepositoryError::Internal);
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let row = sqlx::query(
+            "SELECT outbox.id AS outbox_id, outbox.publication_id, outbox.change_id, \
+               outbox.ordinal, batch.provider_account_id, batch.collection_id, \
+               batch.collection_revision, batch.collection_remote_id, batch.schedule_revision_id, \
+               batch.schedule_revision_number, batch.schedule_publication_hash, batch.required_scope, \
+               change.slot_id, change.source_block_id, change.item_id, change.occurrence_id, \
+               change.session_index, change.incarnation, change.operation, change.mapping_id, \
+               change.remote_resource_id, change.expected_etag, change.desired_payload_hash, \
+               change.provider_payload, change.intent_hash, outbox.run_claim_id, \
+               outbox.run_claim_generation, outbox.provider_post_may_have_started, outbox.attempts, \
+               outbox.dispatch_provider_write, preview.approval_audit_id \
+             FROM google_schedule_publication_outbox outbox \
+             JOIN google_schedule_publication_batches batch \
+               ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+             JOIN google_schedule_publication_preview_changes change \
+               ON change.workspace_id = outbox.workspace_id AND change.id = outbox.change_id \
+             JOIN google_schedule_publication_previews preview \
+               ON preview.workspace_id = outbox.workspace_id AND preview.id = outbox.publication_id \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+               AND outbox.publication_id = $4 AND outbox.state = 'delivering' \
+               AND outbox.claim_id = $5 AND outbox.dispatch_nonce = $6 \
+               AND outbox.run_claim_id = $7 AND outbox.run_claim_generation = $8 \
+               AND outbox.dispatch_authorized_at IS NOT NULL \
+             FOR UPDATE OF outbox",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(result.dispatch_nonce)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+        let persisted = schedule_publication_work_from_row(&row, work.claim_id)?;
+        if !schedule_publication_work_identity_matches(work, &persisted) {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let dispatch_provider_write: bool = row
+            .try_get::<Option<bool>, _>("dispatch_provider_write")
+            .map_err(internal)?
+            .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+        if result.observation_source == SchedulePublicationObservationSource::ProviderResponse
+            && !dispatch_provider_write
+        {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let approval_audit_id: Uuid = row
+            .try_get::<Option<Uuid>, _>("approval_audit_id")
+            .map_err(internal)?
+            .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+        let policy_current = schedule_publication_policy_current_tx(
+            &mut transaction,
+            self.scope,
+            work.schedule_revision_id,
+            work.schedule_publication_hash,
+        )
+        .await?;
+        let target_current =
+            schedule_publication_target_current_tx(&mut transaction, self.scope, &persisted)
+                .await?;
+
+        let mapping_id = match work.operation {
+            ScheduleGooglePublicationOperation::Create => {
+                let mapping_id = Uuid::new_v4();
+                let remote_etag = result_etag.ok_or(GoogleSyncRepositoryError::Internal)?;
+                let inserted = sqlx::query(
+                    "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+                     collection_id, entity_kind, local_entity_id, remote_resource_id, remote_etag, \
+                     remote_updated_at, remote_payload_hash, local_revision, sync_state, ownership, \
+                     approval_audit_id, created_at, updated_at) VALUES ($1, $2, $3, $4, \
+                     'schedule_block', $5, $6, $7, $8, $9, $10, 'synced', 'dayweave', $11, $12, $12) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(mapping_id)
+                .bind(self.scope.workspace_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(work.slot_id)
+                .bind(&result.remote_resource_id)
+                .bind(remote_etag)
+                .bind(result.remote_updated_at)
+                .bind(result.payload_hash.as_slice())
+                .bind(u64_to_i64(work.schedule_revision_number)?)
+                .bind(approval_audit_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if inserted != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                let source_block_id = work
+                    .source_block_id
+                    .ok_or(GoogleSyncRepositoryError::Internal)?;
+                sqlx::query(
+                    "INSERT INTO google_schedule_publication_mapping_origins (workspace_id, \
+                     user_id, mapping_id, provider_account_id, collection_id, slot_id, item_id, \
+                     occurrence_id, session_index, incarnation, source_schedule_revision_id, \
+                     source_block_id, remote_resource_id, last_starts_at, last_ends_at, \
+                     last_desired_hash, created_at, updated_at) \
+                     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+                            change.starts_at, change.ends_at, $14, $15, $15 \
+                     FROM google_schedule_publication_preview_changes change \
+                     WHERE change.workspace_id = $1 AND change.id = $16 \
+                       AND change.preview_id = $17 AND change.slot_id = $6",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(self.scope.user_id)
+                .bind(mapping_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(work.slot_id)
+                .bind(work.item_id)
+                .bind(work.occurrence_id)
+                .bind(i32::from(work.session_index))
+                .bind(i64::from(work.incarnation))
+                .bind(work.schedule_revision_id)
+                .bind(source_block_id)
+                .bind(&result.remote_resource_id)
+                .bind(work.desired_payload_hash.as_slice())
+                .bind(now)
+                .bind(work.change_id)
+                .bind(work.publication_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?;
+                mapping_id
+            }
+            ScheduleGooglePublicationOperation::Update => {
+                let mapping_id = work.mapping_id.ok_or(GoogleSyncRepositoryError::Internal)?;
+                let remote_etag = result_etag.ok_or(GoogleSyncRepositoryError::Internal)?;
+                let updated = sqlx::query(
+                    "UPDATE provider_sync_mappings SET remote_etag = $8, remote_updated_at = $9, \
+                     remote_payload_hash = $10, local_revision = $11, sync_state = 'synced', \
+                     conflict_metadata = NULL, updated_at = $12 \
+                     WHERE workspace_id = $1 AND id = $2 AND provider_account_id = $3 \
+                       AND collection_id = $4 AND entity_kind = 'schedule_block' \
+                       AND local_entity_id = $5 AND remote_resource_id = $6 AND remote_etag = $7 \
+                       AND ownership = 'dayweave' AND tombstoned_at IS NULL",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(mapping_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(work.slot_id)
+                .bind(&result.remote_resource_id)
+                .bind(&work.expected_etag)
+                .bind(remote_etag)
+                .bind(result.remote_updated_at)
+                .bind(result.payload_hash.as_slice())
+                .bind(u64_to_i64(work.schedule_revision_number)?)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if updated != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                let origin_updated = sqlx::query(
+                    "UPDATE google_schedule_publication_mapping_origins origin SET \
+                     source_schedule_revision_id = $6, source_block_id = $7, \
+                     last_starts_at = change.starts_at, last_ends_at = change.ends_at, \
+                     last_desired_hash = $8, updated_at = $9 \
+                     FROM google_schedule_publication_preview_changes change \
+                     WHERE origin.workspace_id = $1 AND origin.mapping_id = $2 \
+                       AND origin.provider_account_id = $3 AND origin.collection_id = $4 \
+                       AND origin.incarnation = $5 AND origin.retired_at IS NULL \
+                       AND change.workspace_id = origin.workspace_id AND change.id = $10 \
+                       AND change.preview_id = $11 AND change.slot_id = origin.slot_id",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(mapping_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(i64::from(work.incarnation))
+                .bind(work.schedule_revision_id)
+                .bind(work.source_block_id)
+                .bind(work.desired_payload_hash.as_slice())
+                .bind(now)
+                .bind(work.change_id)
+                .bind(work.publication_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if origin_updated != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                mapping_id
+            }
+            ScheduleGooglePublicationOperation::Delete => {
+                let mapping_id = work.mapping_id.ok_or(GoogleSyncRepositoryError::Internal)?;
+                let updated = sqlx::query(
+                    "UPDATE provider_sync_mappings SET remote_updated_at = $8, \
+                     remote_payload_hash = $9, sync_state = 'deleted_remote', tombstoned_at = $10, \
+                     conflict_metadata = NULL, updated_at = $10 \
+                     WHERE workspace_id = $1 AND id = $2 AND provider_account_id = $3 \
+                       AND collection_id = $4 AND entity_kind = 'schedule_block' \
+                       AND local_entity_id = $5 AND remote_resource_id = $6 AND remote_etag = $7 \
+                       AND ownership = 'dayweave' AND tombstoned_at IS NULL",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(mapping_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(work.slot_id)
+                .bind(&result.remote_resource_id)
+                .bind(&work.expected_etag)
+                .bind(result.remote_updated_at)
+                .bind(result.payload_hash.as_slice())
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if updated != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                let retired = sqlx::query(
+                    "UPDATE google_schedule_publication_mapping_origins SET retired_at = $6, \
+                     retirement_reason = 'provider_deleted', updated_at = $6 \
+                     WHERE workspace_id = $1 AND mapping_id = $2 AND provider_account_id = $3 \
+                       AND collection_id = $4 AND incarnation = $5 AND retired_at IS NULL",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(mapping_id)
+                .bind(work.account_id)
+                .bind(work.collection_id)
+                .bind(i64::from(work.incarnation))
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .rows_affected();
+                if retired != 1 {
+                    return Err(GoogleSyncRepositoryError::ClaimLost);
+                }
+                mapping_id
+            }
+            ScheduleGooglePublicationOperation::Noop => {
+                return Err(GoogleSyncRepositoryError::Internal);
+            }
+        };
+
+        let schedule_was_current = policy_current && target_current;
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_observations (workspace_id, user_id, \
+             outbox_id, publication_id, ordinal, mapping_id, incarnation, dispatch_nonce, \
+             observation_source, result_kind, remote_resource_id, remote_etag, remote_updated_at, \
+             payload_hash, schedule_was_current, observed_at) VALUES ($1, $2, $3, $4, $5, $6, \
+             $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(u32_to_i32(work.ordinal)?)
+        .bind(mapping_id)
+        .bind(i64::from(work.incarnation))
+        .bind(result.dispatch_nonce)
+        .bind(result.observation_source.as_db())
+        .bind(
+            if work.operation == ScheduleGooglePublicationOperation::Delete {
+                "event_absent"
+            } else {
+                "event_present"
+            },
+        )
+        .bind(&result.remote_resource_id)
+        .bind(&result.remote_etag)
+        .bind(result.remote_updated_at)
+        .bind(result.payload_hash.as_slice())
+        .bind(schedule_was_current)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+
+        let terminal_state = if schedule_was_current {
+            "published"
+        } else if !policy_current {
+            "superseded"
+        } else {
+            "conflict"
+        };
+        let error_code = if schedule_was_current {
+            None
+        } else if !policy_current {
+            Some("schedule_superseded_after_send")
+        } else {
+            Some("publication_target_changed_after_send")
+        };
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = $9, claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             attempts = attempts + 1, terminal_at = $10, last_error_code = $11, updated_at = $10 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+               AND state = 'delivering' AND claim_id = $5 AND dispatch_nonce = $6 \
+               AND run_claim_id = $7 AND run_claim_generation = $8",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(result.dispatch_nonce)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(terminal_state)
+        .bind(now)
+        .bind(error_code)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        sqlx::query(
+            "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+             entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
+             VALUES ($1, $2, $3, 'google.schedule_publication.observed', 'schedule_revision', \
+             $4, $5, $5, $6, $7, $8)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.schedule_revision_id)
+        .bind(u64_to_i64(work.schedule_revision_number)?)
+        .bind(if schedule_was_current {
+            "succeeded"
+        } else {
+            "conflicted"
+        })
+        .bind(json!({
+            "publication_id": work.publication_id,
+            "collection_id": work.collection_id,
+            "ordinal": work.ordinal,
+            "operation": work.operation.as_db(),
+            "state": terminal_state,
+        }))
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        refresh_schedule_publication_batch_tx(
+            &mut transaction,
+            self.scope,
+            work.publication_id,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    async fn fail_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+        terminal_state: &'static str,
+        code: &'static str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        if !matches!(terminal_state, "backoff" | "conflict" | "failed")
+            || code.trim().is_empty()
+            || code.len() > 64
+        {
+            return Err(GoogleSyncRepositoryError::Internal);
+        }
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = $8, claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             attempts = attempts + 1, available_at = $9, \
+             terminal_at = CASE WHEN $8 = 'backoff' THEN NULL ELSE $10 END, \
+             last_error_code = CASE WHEN $8 = 'backoff' \
+               AND provider_post_may_have_started AND last_error_code IN \
+                 ('provider_identity_unresolved', 'provider_response_too_large') \
+               THEN last_error_code ELSE $11 END, updated_at = $10 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+               AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+               AND run_claim_generation = $7",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.outbox_id)
+        .bind(work.publication_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(terminal_state)
+        .bind(available_at)
+        .bind(now)
+        .bind(code)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        refresh_schedule_publication_batch_tx(
+            &mut transaction,
+            self.scope,
+            work.publication_id,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    async fn schedule_publication_acceptance(
+        &self,
+        spec: &SchedulePublicationEnqueueSpec,
+    ) -> Result<Option<ScheduleGooglePublicationAccepted>, GoogleSyncRepositoryError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM google_schedule_publication_previews preview \
+             JOIN google_schedule_publication_batches batch \
+               ON batch.workspace_id = preview.workspace_id AND batch.user_id = preview.user_id \
+              AND batch.id = preview.id \
+             WHERE preview.workspace_id = $1 AND preview.user_id = $2 AND preview.id = $3 \
+               AND preview.provider_account_id = $4 AND preview.collection_id = $5 \
+               AND preview.schedule_revision_id = $6 AND preview.capability_hash = $7 \
+               AND preview.approved_at IS NOT NULL AND preview.consumed_at IS NOT NULL \
+               AND batch.provider_account_id = preview.provider_account_id \
+               AND batch.collection_id = preview.collection_id \
+               AND batch.schedule_revision_id = preview.schedule_revision_id)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .bind(spec.account_id)
+        .bind(spec.collection_id)
+        .bind(spec.expected_schedule_revision_id)
+        .bind(spec.capability_hash.as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(internal)?;
+        Ok(exists.then_some(ScheduleGooglePublicationAccepted {
+            publication_id: spec.preview_id,
+            replayed: true,
+        }))
+    }
+
+    async fn schedule_publication_status(
+        &self,
+        account_id: Uuid,
+        publication_id: Uuid,
+    ) -> Result<ScheduleGooglePublicationStatus, GoogleSyncRepositoryError> {
+        let row = sqlx::query(
+            "SELECT id, provider_account_id, collection_id, schedule_revision_id, state, \
+             total_count, pending_count, delivering_count, backoff_count, published_count, \
+             conflict_count, failed_count, superseded_count, created_at, completed_at, \
+             last_error_code FROM google_schedule_publication_batches \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(publication_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::SchedulePublicationNotFound)?;
+        schedule_publication_status_from_row(&row)
+    }
+
+    async fn known_schedule_publication_remote_ids(
+        &self,
+        account_id: Uuid,
+        collection_id: Uuid,
+        remote_ids: &[String],
+    ) -> Result<BTreeSet<String>, GoogleSyncRepositoryError> {
+        if remote_ids.len() > MAX_CALENDAR_PROJECTION_ENTRIES
+            || remote_ids
+                .iter()
+                .any(|remote_id| remote_id.trim().is_empty() || remote_id.len() > 1000)
+        {
+            return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+        }
+        if remote_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let rows = sqlx::query_scalar::<_, String>(
+            "WITH known(remote_resource_id) AS ( \
+               SELECT origin.remote_resource_id \
+               FROM google_schedule_publication_mapping_origins origin \
+               JOIN google_sync_collections collection \
+                 ON collection.workspace_id = origin.workspace_id \
+                AND collection.user_id = origin.user_id \
+                AND collection.provider_account_id = origin.provider_account_id \
+                AND collection.id = origin.collection_id \
+               WHERE origin.workspace_id = $1 AND origin.user_id = $2 \
+                 AND origin.provider_account_id = $3 AND origin.collection_id = $4 \
+                 AND origin.remote_resource_id = ANY($5) \
+               UNION \
+               SELECT change.provider_payload ->> 'id' \
+               FROM google_schedule_publication_batches batch \
+               JOIN google_schedule_publication_preview_changes change \
+                 ON change.workspace_id = batch.workspace_id AND change.preview_id = batch.id \
+               WHERE batch.workspace_id = $1 AND batch.user_id = $2 \
+                 AND batch.provider_account_id = $3 AND batch.collection_id = $4 \
+                 AND change.operation = 'create' \
+                 AND change.provider_payload ->> 'id' = ANY($5) \
+             ) SELECT DISTINCT remote_resource_id FROM known ORDER BY remote_resource_id",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(remote_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(internal)?;
+        Ok(rows.into_iter().collect())
+    }
+
     async fn outbox_counts(
         &self,
         account_id: Uuid,
@@ -3453,6 +5402,1636 @@ async fn reconcile_outbound_for_parent_end(
     .await
     .map_err(internal)?;
     Ok(())
+}
+
+async fn reconcile_schedule_publication_for_parent_end(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    claim: &SyncClaim,
+    code: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let publications = sqlx::query_scalar::<_, Uuid>(
+        "WITH reconciled AS (UPDATE google_schedule_publication_outbox outbox SET \
+         state = 'backoff', claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+         run_claim_generation = NULL, dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $7, terminal_at = NULL, \
+         last_error_code = CASE WHEN outbox.provider_post_may_have_started \
+           AND outbox.last_error_code IN \
+             ('provider_identity_unresolved', 'provider_response_too_large') \
+           THEN outbox.last_error_code ELSE $6 END, updated_at = $7 \
+         FROM google_schedule_publication_batches batch \
+         WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+           AND batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+           AND batch.provider_account_id = $3 AND outbox.state = 'delivering' \
+           AND outbox.run_claim_id = $4 AND outbox.run_claim_generation = $5 \
+         RETURNING outbox.publication_id) SELECT DISTINCT publication_id FROM reconciled",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(claim.account_id)
+    .bind(claim.claim_id)
+    .bind(u64_to_i64(claim.claim_generation)?)
+    .bind(code)
+    .bind(now)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    for publication_id in publications {
+        refresh_schedule_publication_batch_tx(transaction, scope, publication_id, now).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ValidatedSchedulePublicationChanges {
+    change_count: u32,
+    create_count: u32,
+    update_count: u32,
+    delete_count: u32,
+    noop_count: u32,
+    public_changes: Vec<ScheduleGooglePublicationChange>,
+}
+
+async fn schedule_publication_policy_current_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    expected_revision_id: Uuid,
+    expected_publication_hash: [u8; 32],
+) -> Result<bool, GoogleSyncRepositoryError> {
+    super::database::lock_execution_and_canonical_item_space(transaction, scope.workspace_id)
+        .await
+        .map_err(internal)?;
+    let Ok(policy) = published_planning_policy_tx(transaction, scope).await else {
+        return Ok(false);
+    };
+    if policy.revision_id != expected_revision_id
+        || policy.publication_hash != expected_publication_hash
+    {
+        return Ok(false);
+    }
+    let bounds = sqlx::query(
+        "SELECT horizon_start, horizon_end FROM schedule_revisions \
+         WHERE workspace_id = $1 AND id = $2 AND state = 'published' FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(expected_revision_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(bounds) = bounds else {
+        return Ok(false);
+    };
+    if assert_current_item_snapshot(transaction, scope, &policy.source_item_revisions)
+        .await
+        .is_err()
+        || assert_current_calendar_projection(
+            transaction,
+            scope,
+            bounds.try_get("horizon_start").map_err(internal)?,
+            bounds.try_get("horizon_end").map_err(internal)?,
+            &policy.calendar_projection_stamps,
+        )
+        .await
+        .is_err()
+        || assert_current_planning_policy_tx(transaction, scope, expected_revision_id)
+            .await
+            .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_lines)] // One transaction materializes and fences the complete source snapshot.
+async fn load_schedule_publication_source_tx(
+    repository: &PostgresGoogleSyncRepository,
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: Uuid,
+    collection_id: Uuid,
+    expected_schedule_revision_id: Uuid,
+    cutoff: DateTime<Utc>,
+) -> Result<SchedulePublicationSource, GoogleSyncRepositoryError> {
+    if account_id.is_nil() || collection_id.is_nil() || expected_schedule_revision_id.is_nil() {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    super::database::lock_execution_and_canonical_item_space(
+        transaction,
+        repository.scope.workspace_id,
+    )
+    .await
+    .map_err(internal)?;
+    let granted_scopes = repository
+        .ensure_account(transaction, account_id, true)
+        .await?;
+    if !granted_scopes
+        .iter()
+        .any(|scope| scope == GOOGLE_CALENDAR_SCOPE)
+    {
+        return Err(GoogleSyncRepositoryError::WriteScopeMissing);
+    }
+    let collection_row = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {COLLECTION_COLUMNS} FROM google_sync_collections \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4 \
+         FOR SHARE"
+    )))
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .bind(account_id)
+    .bind(collection_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(GoogleSyncRepositoryError::CollectionNotFound)?;
+    let collection = collection_from_row(&collection_row)?;
+    if collection.kind != GoogleCollectionKind::Calendar
+        || !collection.selected
+        || collection.provider_deleted
+        || collection.sync_role != GoogleSyncRole::Writable
+        || collection.remote_collection_id.trim().is_empty()
+    {
+        return Err(GoogleSyncRepositoryError::CollectionNotWritable);
+    }
+
+    let current = sqlx::query(
+        "SELECT id, revision_number, publication_hash, timezone_name, horizon_start, horizon_end \
+         FROM schedule_revisions WHERE workspace_id = $1 AND created_by_user_id = $2 \
+           AND state = 'published' FOR SHARE",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(current) = current else {
+        return Err(GoogleSyncRepositoryError::ScheduleRevisionNotFound);
+    };
+    let actual_revision_id: Uuid = current.try_get("id").map_err(internal)?;
+    if actual_revision_id != expected_schedule_revision_id {
+        return Err(GoogleSyncRepositoryError::ScheduleRevisionConflict {
+            expected: expected_schedule_revision_id,
+            actual: actual_revision_id,
+        });
+    }
+    let publication_hash = fixed_hash(
+        &current
+            .try_get::<Vec<u8>, _>("publication_hash")
+            .map_err(internal)?,
+    )?;
+    let horizon_start: DateTime<Utc> = current.try_get("horizon_start").map_err(internal)?;
+    let horizon_end: DateTime<Utc> = current.try_get("horizon_end").map_err(internal)?;
+    let policy = published_planning_policy_tx(transaction, repository.scope)
+        .await
+        .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    if policy.revision_id != actual_revision_id || policy.publication_hash != publication_hash {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    assert_current_item_snapshot(transaction, repository.scope, &policy.source_item_revisions)
+        .await
+        .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    assert_current_calendar_projection(
+        transaction,
+        repository.scope,
+        horizon_start,
+        horizon_end,
+        &policy.calendar_projection_stamps,
+    )
+    .await
+    .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    assert_current_planning_policy_tx(transaction, repository.scope, actual_revision_id)
+        .await
+        .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+
+    let origin_rows = sqlx::query(
+        "SELECT origin.mapping_id, origin.slot_id, origin.item_id, origin.occurrence_id, \
+           origin.session_index, origin.incarnation, origin.source_block_id, \
+           origin.remote_resource_id, mapping.remote_etag, origin.last_desired_hash, \
+           origin.last_starts_at, origin.last_ends_at \
+         FROM google_schedule_publication_mapping_origins origin \
+         JOIN provider_sync_mappings mapping ON mapping.workspace_id = origin.workspace_id \
+           AND mapping.id = origin.mapping_id \
+         WHERE origin.workspace_id = $1 AND origin.user_id = $2 \
+           AND origin.provider_account_id = $3 AND origin.collection_id = $4 \
+           AND origin.retired_at IS NULL AND mapping.entity_kind = 'schedule_block' \
+           AND mapping.ownership = 'dayweave' AND mapping.tombstoned_at IS NULL \
+           AND mapping.sync_state <> 'deleted_remote' \
+         ORDER BY origin.slot_id FOR SHARE OF origin, mapping",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .bind(account_id)
+    .bind(collection_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let mut all_active_mappings = Vec::with_capacity(origin_rows.len());
+    let mut active_slots = HashSet::new();
+    for row in origin_rows {
+        let slot_id: Uuid = row.try_get("slot_id").map_err(internal)?;
+        let incarnation = i64_to_u32(row.try_get("incarnation").map_err(internal)?)?;
+        if !active_slots.insert(slot_id) {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        all_active_mappings.push(ScheduleBlockMapping {
+            mapping_id: row.try_get("mapping_id").map_err(internal)?,
+            slot_id,
+            item_id: row.try_get("item_id").map_err(internal)?,
+            occurrence_id: row.try_get("occurrence_id").map_err(internal)?,
+            session_index: i32_to_u16(row.try_get("session_index").map_err(internal)?)?,
+            incarnation,
+            source_block_id: row.try_get("source_block_id").map_err(internal)?,
+            remote_resource_id: row.try_get("remote_resource_id").map_err(internal)?,
+            remote_etag: row.try_get("remote_etag").map_err(internal)?,
+            desired_payload_hash: fixed_hash(
+                &row.try_get::<Vec<u8>, _>("last_desired_hash")
+                    .map_err(internal)?,
+            )?,
+            last_starts_at: row.try_get("last_starts_at").map_err(internal)?,
+            last_ends_at: row.try_get("last_ends_at").map_err(internal)?,
+        });
+    }
+
+    let historical_rows = sqlx::query(
+        "SELECT slot_id, max(incarnation) AS max_incarnation \
+         FROM google_schedule_publication_mapping_origins \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND collection_id = $4 GROUP BY slot_id",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .bind(account_id)
+    .bind(collection_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let mut historical_incarnations = BTreeMap::new();
+    for row in historical_rows {
+        historical_incarnations.insert(
+            row.try_get::<Uuid, _>("slot_id").map_err(internal)?,
+            i64_to_u32(row.try_get("max_incarnation").map_err(internal)?)?,
+        );
+    }
+
+    let block_rows = sqlx::query(
+        "SELECT source_block_id, item_id, title_snapshot, starts_at, ends_at, is_sensitive, \
+           constraint_snapshot ->> 'source_block_id' AS evidence_source_block_id, \
+           constraint_snapshot ->> 'occurrence_id' AS occurrence_id, \
+           constraint_snapshot ->> 'session_index' AS session_index, \
+           constraint_snapshot ->> 'core_kind' AS core_kind \
+         FROM schedule_blocks WHERE workspace_id = $1 AND schedule_revision_id = $2 \
+           AND item_id IS NOT NULL AND block_kind IN ('planned', 'pinned') \
+         ORDER BY item_id, constraint_snapshot ->> 'occurrence_id' NULLS FIRST, \
+           constraint_snapshot ->> 'session_index', source_block_id FOR SHARE",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(actual_revision_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if block_rows.len() > MAX_CALENDAR_PROJECTION_ENTRIES {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    let mut blocks = Vec::with_capacity(block_rows.len());
+    let mut seen_slots = HashSet::new();
+    for row in block_rows {
+        let source_block_id: Uuid = row.try_get("source_block_id").map_err(internal)?;
+        let item_id: Uuid = row.try_get("item_id").map_err(internal)?;
+        let evidence_source: Option<String> =
+            row.try_get("evidence_source_block_id").map_err(internal)?;
+        let occurrence_id = row
+            .try_get::<Option<String>, _>("occurrence_id")
+            .map_err(internal)?
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(internal)?;
+        let session_index = row
+            .try_get::<Option<String>, _>("session_index")
+            .map_err(internal)?
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+        if evidence_source.as_deref() != Some(source_block_id.to_string().as_str())
+            || row
+                .try_get::<Option<String>, _>("core_kind")
+                .map_err(internal)?
+                != Some("planned".to_owned())
+                && row
+                    .try_get::<Option<String>, _>("core_kind")
+                    .map_err(internal)?
+                    != Some("pinned".to_owned())
+        {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let slot_id = schedule_publication_slot_id(
+            repository.scope.workspace_id,
+            item_id,
+            occurrence_id,
+            session_index,
+        );
+        if !seen_slots.insert(slot_id) {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let starts_at: DateTime<Utc> = row.try_get("starts_at").map_err(internal)?;
+        let ends_at: DateTime<Utc> = row.try_get("ends_at").map_err(internal)?;
+        let active_mapping = all_active_mappings
+            .iter()
+            .find(|mapping| mapping.slot_id == slot_id);
+        let exact_historical_instance = active_mapping.is_some_and(|mapping| {
+            mapping.source_block_id == source_block_id
+                && mapping.item_id == item_id
+                && mapping.occurrence_id == occurrence_id
+                && mapping.session_index == session_index
+                && mapping.last_starts_at == starts_at
+                && mapping.last_ends_at == ends_at
+        });
+        if ends_at <= cutoff && !exact_historical_instance {
+            continue;
+        }
+        let reusable_mapping = active_mapping
+            .filter(|mapping| mapping.last_ends_at > cutoff || exact_historical_instance);
+        let incarnation = if let Some(active) = reusable_mapping {
+            active.incarnation
+        } else {
+            historical_incarnations
+                .get(&slot_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?
+        };
+        blocks.push(SchedulePublicationBlock {
+            source_block_id,
+            item_id,
+            occurrence_id,
+            session_index,
+            incarnation,
+            title: row
+                .try_get::<Option<String>, _>("title_snapshot")
+                .map_err(internal)?
+                .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?,
+            starts_at,
+            ends_at,
+            is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
+        });
+    }
+    let mut mappings = all_active_mappings
+        .into_iter()
+        .filter(|mapping| {
+            mapping.last_ends_at > cutoff
+                || blocks.iter().any(|block| {
+                    block.item_id == mapping.item_id
+                        && block.occurrence_id == mapping.occurrence_id
+                        && block.session_index == mapping.session_index
+                        && block.source_block_id == mapping.source_block_id
+                        && block.starts_at == mapping.last_starts_at
+                        && block.ends_at == mapping.last_ends_at
+                })
+        })
+        .collect::<Vec<_>>();
+    mappings.sort_by_key(|mapping| mapping.slot_id);
+    Ok(SchedulePublicationSource {
+        workspace_id: repository.scope.workspace_id,
+        user_id: repository.scope.user_id,
+        account_id,
+        collection,
+        schedule_revision_id: actual_revision_id,
+        schedule_revision_number: i64_to_u64(
+            current.try_get("revision_number").map_err(internal)?,
+        )?,
+        schedule_publication_hash: publication_hash,
+        timezone_name: current.try_get("timezone_name").map_err(internal)?,
+        horizon_start,
+        horizon_end,
+        blocks,
+        mappings,
+    })
+}
+
+fn schedule_publication_sources_match(
+    left: &SchedulePublicationSource,
+    right: &SchedulePublicationSource,
+) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.user_id == right.user_id
+        && left.account_id == right.account_id
+        && left.collection == right.collection
+        && left.schedule_revision_id == right.schedule_revision_id
+        && left.schedule_revision_number == right.schedule_revision_number
+        && left.schedule_publication_hash == right.schedule_publication_hash
+        && left.timezone_name == right.timezone_name
+        && left.horizon_start == right.horizon_start
+        && left.horizon_end == right.horizon_end
+        && left.blocks.len() == right.blocks.len()
+        && left.blocks.iter().zip(&right.blocks).all(|(left, right)| {
+            left.source_block_id == right.source_block_id
+                && left.item_id == right.item_id
+                && left.occurrence_id == right.occurrence_id
+                && left.session_index == right.session_index
+                && left.incarnation == right.incarnation
+                && left.title == right.title
+                && left.starts_at == right.starts_at
+                && left.ends_at == right.ends_at
+                && left.is_sensitive == right.is_sensitive
+        })
+        && left.mappings.len() == right.mappings.len()
+        && left
+            .mappings
+            .iter()
+            .zip(&right.mappings)
+            .all(|(left, right)| {
+                left.mapping_id == right.mapping_id
+                    && left.slot_id == right.slot_id
+                    && left.item_id == right.item_id
+                    && left.occurrence_id == right.occurrence_id
+                    && left.session_index == right.session_index
+                    && left.incarnation == right.incarnation
+                    && left.source_block_id == right.source_block_id
+                    && left.remote_resource_id == right.remote_resource_id
+                    && left.remote_etag == right.remote_etag
+                    && left.desired_payload_hash == right.desired_payload_hash
+                    && left.last_starts_at == right.last_starts_at
+                    && left.last_ends_at == right.last_ends_at
+            })
+}
+
+fn validate_schedule_event_payload(
+    timezone_name: &str,
+    change: &PreparedSchedulePublicationChange,
+) -> Result<String, GoogleSyncRepositoryError> {
+    let event: GoogleEvent = serde_json::from_value(change.payload.clone())
+        .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    let summary = event
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty() && summary.chars().count() <= 500)
+        .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    let start = event
+        .start
+        .as_ref()
+        .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    let end = event
+        .end
+        .as_ref()
+        .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    let parsed_start = start
+        .date_time
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(internal)?
+        .map(|value| value.with_timezone(&Utc));
+    let parsed_end = end
+        .date_time
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(internal)?
+        .map(|value| value.with_timezone(&Utc));
+    let properties = event
+        .extended_properties
+        .as_ref()
+        .ok_or(GoogleSyncRepositoryError::InvalidSchedulePublication)?;
+    if event.id.trim().is_empty()
+        || event.id.len() > 1000
+        || event.etag.is_some()
+        || event.status.as_deref() != Some("confirmed")
+        || event.description.is_some()
+        || event.location.is_some()
+        || start.date.is_some()
+        || end.date.is_some()
+        || parsed_start != Some(change.starts_at)
+        || parsed_end != Some(change.ends_at)
+        || start.time_zone.as_deref() != Some(timezone_name)
+        || end.time_zone.as_deref() != Some(timezone_name)
+        || event.recurring_event_id.is_some()
+        || event.original_start_time.is_some()
+        || !event.recurrence.is_empty()
+        || event.transparency.as_deref() != Some("opaque")
+        || event.visibility.as_deref() != Some("private")
+        || event.event_type.as_deref() != Some("default")
+        || !event.attendees.is_empty()
+        || event.conference_data.is_some()
+        || !event.attachments.is_empty()
+        || event.updated.is_some()
+        || event.sequence.is_some()
+        || properties.private.len() != 1
+        || properties
+            .private
+            .get("dayweaveScheduleOwnershipProof")
+            .is_none_or(|proof| proof.trim().is_empty())
+        || !properties.shared.is_empty()
+        || event.additional_properties
+            != BTreeMap::from([(
+                "reminders".to_owned(),
+                json!({"useDefault": false, "overrides": []}),
+            )])
+        || change.review_summary
+            != json!({
+                "summary": summary,
+                "starts_at": change.starts_at,
+                "ends_at": change.ends_at,
+            })
+        || schedule_desired_payload_hash(
+            change.slot_id,
+            change.incarnation,
+            summary,
+            change.starts_at,
+            change.ends_at,
+            timezone_name,
+        )
+        .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?
+            != change.desired_payload_hash
+    {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    Ok(summary.to_owned())
+}
+
+#[allow(clippy::too_many_lines)] // The boundary validates every operation variant and shared invariant together.
+fn validate_schedule_publication_changes(
+    source: &SchedulePublicationSource,
+    changes: &[PreparedSchedulePublicationChange],
+    now: DateTime<Utc>,
+) -> Result<ValidatedSchedulePublicationChanges, GoogleSyncRepositoryError> {
+    if changes.len() > MAX_CALENDAR_PROJECTION_ENTRIES {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    let blocks = source
+        .blocks
+        .iter()
+        .map(|block| {
+            (
+                schedule_publication_slot_id(
+                    source.workspace_id,
+                    block.item_id,
+                    block.occurrence_id,
+                    block.session_index,
+                ),
+                block,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if blocks.len() != source.blocks.len() {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    let mappings = source
+        .mappings
+        .iter()
+        .map(|mapping| (mapping.slot_id, mapping))
+        .collect::<BTreeMap<_, _>>();
+    if mappings.len() != source.mappings.len() {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    let mut seen_slots = HashSet::new();
+    let mut public_changes = Vec::with_capacity(changes.len());
+    let mut create_count = 0_u32;
+    let mut update_count = 0_u32;
+    let mut delete_count = 0_u32;
+    let mut noop_count = 0_u32;
+    for (index, change) in changes.iter().enumerate() {
+        if usize::try_from(change.ordinal).ok() != Some(index)
+            || change.slot_id.is_nil()
+            || change.item_id.is_nil()
+            || change.incarnation == 0
+            || change.ends_at <= change.starts_at
+            || !seen_slots.insert(change.slot_id)
+            || schedule_publication_slot_id(
+                source.workspace_id,
+                change.item_id,
+                change.occurrence_id,
+                change.session_index,
+            ) != change.slot_id
+            || schedule_publication_intent_hash(source, change).map_err(internal)?
+                != change.intent_hash
+        {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let block = blocks.get(&change.slot_id).copied();
+        let mapping = mappings.get(&change.slot_id).copied();
+        let summary = match change.operation {
+            ScheduleGooglePublicationOperation::Create => {
+                create_count = create_count.saturating_add(1);
+                if block.is_none()
+                    || mapping.is_some()
+                    || change.mapping_id.is_some()
+                    || change.remote_resource_id.is_some()
+                    || change.expected_etag.is_some()
+                {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                }
+                validate_schedule_event_payload(&source.timezone_name, change)?
+            }
+            ScheduleGooglePublicationOperation::Update
+            | ScheduleGooglePublicationOperation::Noop => {
+                if change.operation == ScheduleGooglePublicationOperation::Update {
+                    update_count = update_count.saturating_add(1);
+                } else {
+                    noop_count = noop_count.saturating_add(1);
+                }
+                let (Some(block), Some(mapping)) = (block, mapping) else {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                };
+                // A block that has already elapsed is immutable provider
+                // history.  If the published schedule still contains the
+                // exact same source instance, keep its active mapping as a
+                // Noop even when mutable presentation inputs (for example a
+                // title/privacy snapshot) now produce a different desired
+                // hash.  Requiring the exact source id and exact bounds keeps
+                // a later block that reuses the logical slot on the normal
+                // new-incarnation/Create path.
+                let exact_elapsed_history = mapping.last_ends_at <= now
+                    && mapping.source_block_id == block.source_block_id
+                    && mapping.last_starts_at == block.starts_at
+                    && mapping.last_ends_at == block.ends_at;
+                let expected_noop = exact_elapsed_history
+                    || change.desired_payload_hash == mapping.desired_payload_hash;
+                if change.mapping_id != Some(mapping.mapping_id)
+                    || change.remote_resource_id.as_deref()
+                        != Some(mapping.remote_resource_id.as_str())
+                    || change.expected_etag.as_deref() != Some(mapping.remote_etag.as_str())
+                    || (change.operation == ScheduleGooglePublicationOperation::Noop)
+                        != expected_noop
+                {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                }
+                let summary = validate_schedule_event_payload(&source.timezone_name, change)?;
+                if change.payload.get("id").and_then(Value::as_str)
+                    != Some(mapping.remote_resource_id.as_str())
+                {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                }
+                if block.source_block_id != change.source_block_id.unwrap_or_default() {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                }
+                summary
+            }
+            ScheduleGooglePublicationOperation::Delete => {
+                delete_count = delete_count.saturating_add(1);
+                let Some(mapping) = mapping else {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                };
+                if block.is_some()
+                    || mapping.last_ends_at <= now
+                    || change.source_block_id.is_some()
+                    || change.mapping_id != Some(mapping.mapping_id)
+                    || change.remote_resource_id.as_deref()
+                        != Some(mapping.remote_resource_id.as_str())
+                    || change.expected_etag.as_deref() != Some(mapping.remote_etag.as_str())
+                    || change.desired_payload_hash != mapping.desired_payload_hash
+                    || change.payload != json!({})
+                    || change.starts_at != mapping.last_starts_at
+                    || change.ends_at != mapping.last_ends_at
+                    || change.review_summary
+                        != json!({
+                            "summary": "Previously published DayWeave block",
+                            "starts_at": mapping.last_starts_at,
+                            "ends_at": mapping.last_ends_at,
+                        })
+                {
+                    return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+                }
+                "Previously published DayWeave block".to_owned()
+            }
+        };
+        if let Some(block) = block {
+            if change.source_block_id != Some(block.source_block_id)
+                || change.item_id != block.item_id
+                || change.occurrence_id != block.occurrence_id
+                || change.session_index != block.session_index
+                || change.incarnation != block.incarnation
+                || change.starts_at != block.starts_at
+                || change.ends_at != block.ends_at
+            {
+                return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+            }
+        } else if let Some(mapping) = mapping
+            && (change.item_id != mapping.item_id
+                || change.occurrence_id != mapping.occurrence_id
+                || change.session_index != mapping.session_index
+                || change.incarnation != mapping.incarnation)
+        {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        public_changes.push(ScheduleGooglePublicationChange {
+            ordinal: change.ordinal,
+            slot_id: change.slot_id,
+            source_block_id: change.source_block_id,
+            operation: change.operation,
+            provider_resource_id: change.remote_resource_id.clone(),
+            provider_etag: change.expected_etag.clone(),
+            summary,
+            starts_at: change.starts_at,
+            ends_at: change.ends_at,
+        });
+    }
+    let expected_slots = blocks.len()
+        + mappings
+            .values()
+            .filter(|mapping| !blocks.contains_key(&mapping.slot_id) && mapping.last_ends_at > now)
+            .count();
+    if seen_slots.len() != expected_slots
+        || blocks.keys().any(|slot| !seen_slots.contains(slot))
+        || mappings.values().any(|mapping| {
+            !blocks.contains_key(&mapping.slot_id)
+                && mapping.last_ends_at > now
+                && !seen_slots.contains(&mapping.slot_id)
+        })
+    {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    Ok(ValidatedSchedulePublicationChanges {
+        change_count: u32::try_from(changes.len())
+            .map_err(|_| GoogleSyncRepositoryError::InvalidSchedulePublication)?,
+        create_count,
+        update_count,
+        delete_count,
+        noop_count,
+        public_changes,
+    })
+}
+
+fn parse_schedule_publication_operation(
+    value: &str,
+) -> Result<ScheduleGooglePublicationOperation, GoogleSyncRepositoryError> {
+    match value {
+        "create" => Ok(ScheduleGooglePublicationOperation::Create),
+        "update" => Ok(ScheduleGooglePublicationOperation::Update),
+        "delete" => Ok(ScheduleGooglePublicationOperation::Delete),
+        "noop" => Ok(ScheduleGooglePublicationOperation::Noop),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+fn prepared_schedule_change_from_row(
+    row: &PgRow,
+) -> Result<PreparedSchedulePublicationChange, GoogleSyncRepositoryError> {
+    Ok(PreparedSchedulePublicationChange {
+        ordinal: i32_to_u32(row.try_get("ordinal").map_err(internal)?)?,
+        slot_id: row.try_get("slot_id").map_err(internal)?,
+        source_block_id: row.try_get("source_block_id").map_err(internal)?,
+        item_id: row.try_get("item_id").map_err(internal)?,
+        occurrence_id: row.try_get("occurrence_id").map_err(internal)?,
+        session_index: i32_to_u16(row.try_get("session_index").map_err(internal)?)?,
+        incarnation: i64_to_u32(row.try_get("incarnation").map_err(internal)?)?,
+        operation: parse_schedule_publication_operation(
+            &row.try_get::<String, _>("operation").map_err(internal)?,
+        )?,
+        mapping_id: row.try_get("mapping_id").map_err(internal)?,
+        remote_resource_id: row.try_get("remote_resource_id").map_err(internal)?,
+        expected_etag: row.try_get("expected_etag").map_err(internal)?,
+        desired_payload_hash: fixed_hash(
+            &row.try_get::<Vec<u8>, _>("desired_payload_hash")
+                .map_err(internal)?,
+        )?,
+        payload: row.try_get("provider_payload").map_err(internal)?,
+        review_summary: row.try_get("review_summary").map_err(internal)?,
+        starts_at: row.try_get("starts_at").map_err(internal)?,
+        ends_at: row.try_get("ends_at").map_err(internal)?,
+        intent_hash: fixed_hash(&row.try_get::<Vec<u8>, _>("intent_hash").map_err(internal)?)?,
+    })
+}
+
+fn schedule_publication_work_from_row(
+    row: &PgRow,
+    claim_id: Uuid,
+) -> Result<SchedulePublicationWork, GoogleSyncRepositoryError> {
+    Ok(SchedulePublicationWork {
+        outbox_id: row.try_get("outbox_id").map_err(internal)?,
+        publication_id: row.try_get("publication_id").map_err(internal)?,
+        change_id: row.try_get("change_id").map_err(internal)?,
+        ordinal: i32_to_u32(row.try_get("ordinal").map_err(internal)?)?,
+        account_id: row.try_get("provider_account_id").map_err(internal)?,
+        collection_id: row.try_get("collection_id").map_err(internal)?,
+        collection_revision: i64_to_u64(row.try_get("collection_revision").map_err(internal)?)?,
+        collection_remote_id: row.try_get("collection_remote_id").map_err(internal)?,
+        schedule_revision_id: row.try_get("schedule_revision_id").map_err(internal)?,
+        schedule_revision_number: i64_to_u64(
+            row.try_get("schedule_revision_number").map_err(internal)?,
+        )?,
+        schedule_publication_hash: fixed_hash(
+            &row.try_get::<Vec<u8>, _>("schedule_publication_hash")
+                .map_err(internal)?,
+        )?,
+        slot_id: row.try_get("slot_id").map_err(internal)?,
+        source_block_id: row.try_get("source_block_id").map_err(internal)?,
+        item_id: row.try_get("item_id").map_err(internal)?,
+        occurrence_id: row.try_get("occurrence_id").map_err(internal)?,
+        session_index: i32_to_u16(row.try_get("session_index").map_err(internal)?)?,
+        incarnation: i64_to_u32(row.try_get("incarnation").map_err(internal)?)?,
+        operation: parse_schedule_publication_operation(
+            &row.try_get::<String, _>("operation").map_err(internal)?,
+        )?,
+        mapping_id: row.try_get("mapping_id").map_err(internal)?,
+        remote_resource_id: row.try_get("remote_resource_id").map_err(internal)?,
+        expected_etag: row.try_get("expected_etag").map_err(internal)?,
+        desired_payload_hash: fixed_hash(
+            &row.try_get::<Vec<u8>, _>("desired_payload_hash")
+                .map_err(internal)?,
+        )?,
+        payload: row.try_get("provider_payload").map_err(internal)?,
+        required_scope: row.try_get("required_scope").map_err(internal)?,
+        intent_hash: fixed_hash(&row.try_get::<Vec<u8>, _>("intent_hash").map_err(internal)?)?,
+        claim_id,
+        run_claim_id: row.try_get("run_claim_id").map_err(internal)?,
+        run_claim_generation: i64_to_u64(row.try_get("run_claim_generation").map_err(internal)?)?,
+        provider_post_may_have_started: row
+            .try_get("provider_post_may_have_started")
+            .map_err(internal)?,
+        attempts: i32_to_u32(row.try_get("attempts").map_err(internal)?)?,
+    })
+}
+
+fn schedule_publication_work_identity_matches(
+    left: &SchedulePublicationWork,
+    right: &SchedulePublicationWork,
+) -> bool {
+    left.outbox_id == right.outbox_id
+        && left.publication_id == right.publication_id
+        && left.change_id == right.change_id
+        && left.ordinal == right.ordinal
+        && left.account_id == right.account_id
+        && left.collection_id == right.collection_id
+        && left.collection_revision == right.collection_revision
+        && left.collection_remote_id == right.collection_remote_id
+        && left.schedule_revision_id == right.schedule_revision_id
+        && left.schedule_revision_number == right.schedule_revision_number
+        && left.schedule_publication_hash == right.schedule_publication_hash
+        && left.slot_id == right.slot_id
+        && left.source_block_id == right.source_block_id
+        && left.item_id == right.item_id
+        && left.occurrence_id == right.occurrence_id
+        && left.session_index == right.session_index
+        && left.incarnation == right.incarnation
+        && left.operation == right.operation
+        && left.mapping_id == right.mapping_id
+        && left.remote_resource_id == right.remote_resource_id
+        && left.expected_etag == right.expected_etag
+        && left.desired_payload_hash == right.desired_payload_hash
+        && left.payload == right.payload
+        && left.required_scope == right.required_scope
+        && left.intent_hash == right.intent_hash
+        && left.claim_id == right.claim_id
+        && left.run_claim_id == right.run_claim_id
+        && left.run_claim_generation == right.run_claim_generation
+        && left.attempts == right.attempts
+}
+
+#[allow(clippy::too_many_lines)] // Locks and revalidates the complete immutable dispatch identity.
+async fn lock_schedule_publication_dispatch_deadline_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    work: &SchedulePublicationWork,
+) -> Result<(bool, DateTime<Utc>), GoogleSyncRepositoryError> {
+    let row = sqlx::query(
+        "SELECT outbox.id AS outbox_id, outbox.publication_id, outbox.change_id, \
+           outbox.ordinal, batch.provider_account_id, batch.collection_id, \
+           batch.collection_revision, batch.collection_remote_id, batch.schedule_revision_id, \
+           batch.schedule_revision_number, batch.schedule_publication_hash, batch.required_scope, \
+           change.slot_id, change.source_block_id, change.item_id, change.occurrence_id, \
+           change.session_index, change.incarnation, change.operation, change.mapping_id, \
+           change.remote_resource_id, change.expected_etag, change.desired_payload_hash, \
+           change.provider_payload, change.intent_hash, change.ends_at AS change_ends_at, \
+           origin.last_ends_at AS origin_ends_at, outbox.run_claim_id, \
+           outbox.run_claim_generation, outbox.provider_post_may_have_started, outbox.attempts \
+         FROM google_schedule_publication_outbox outbox \
+         JOIN google_schedule_publication_batches batch \
+           ON batch.workspace_id = outbox.workspace_id AND batch.id = outbox.publication_id \
+         JOIN google_schedule_publication_preview_changes change \
+           ON change.workspace_id = outbox.workspace_id AND change.id = outbox.change_id \
+         LEFT JOIN google_schedule_publication_mapping_origins origin \
+           ON origin.workspace_id = change.workspace_id AND origin.mapping_id = change.mapping_id \
+          AND origin.provider_account_id = change.provider_account_id \
+          AND origin.collection_id = change.collection_id AND origin.slot_id = change.slot_id \
+          AND origin.incarnation = change.incarnation \
+         WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+           AND outbox.publication_id = $4 AND outbox.change_id = $5 \
+           AND outbox.state = 'delivering' AND outbox.claim_id = $6 \
+           AND outbox.run_claim_id = $7 AND outbox.run_claim_generation = $8 \
+           AND outbox.dispatch_nonce IS NULL \
+         FOR UPDATE OF outbox",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(work.outbox_id)
+    .bind(work.publication_id)
+    .bind(work.change_id)
+    .bind(work.claim_id)
+    .bind(work.run_claim_id)
+    .bind(u64_to_i64(work.run_claim_generation)?)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(GoogleSyncRepositoryError::ClaimLost)?;
+    let persisted = schedule_publication_work_from_row(&row, work.claim_id)?;
+    if !schedule_publication_work_identity_matches(work, &persisted)
+        || persisted.provider_post_may_have_started != work.provider_post_may_have_started
+    {
+        return Err(GoogleSyncRepositoryError::ClaimLost);
+    }
+    let change_ends_at: DateTime<Utc> = row.try_get("change_ends_at").map_err(internal)?;
+    let origin_ends_at: Option<DateTime<Utc>> = row.try_get("origin_ends_at").map_err(internal)?;
+    let dispatch_deadline = match persisted.operation {
+        ScheduleGooglePublicationOperation::Create => change_ends_at,
+        ScheduleGooglePublicationOperation::Update | ScheduleGooglePublicationOperation::Delete => {
+            change_ends_at.min(origin_ends_at.ok_or(GoogleSyncRepositoryError::ClaimLost)?)
+        }
+        ScheduleGooglePublicationOperation::Noop => {
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+    };
+    Ok((persisted.provider_post_may_have_started, dispatch_deadline))
+}
+
+async fn supersede_elapsed_schedule_publication_before_send_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    work: &SchedulePublicationWork,
+    now: DateTime<Utc>,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    let updated = sqlx::query(
+        "UPDATE google_schedule_publication_outbox SET state = 'superseded', \
+           claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+           run_claim_generation = NULL, dispatch_nonce = NULL, \
+           dispatch_provider_write = NULL, dispatch_authorized_at = NULL, \
+           dispatch_expires_at = NULL, terminal_at = $8, \
+           last_error_code = 'schedule_block_elapsed_before_send', updated_at = $8 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+           AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+           AND run_claim_generation = $7 AND NOT provider_post_may_have_started \
+           AND dispatch_nonce IS NULL",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(work.outbox_id)
+    .bind(work.publication_id)
+    .bind(work.claim_id)
+    .bind(work.run_claim_id)
+    .bind(u64_to_i64(work.run_claim_generation)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+async fn backoff_elapsed_possible_schedule_publication_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    work: &SchedulePublicationWork,
+    now: DateTime<Utc>,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    let updated = sqlx::query(
+        "UPDATE google_schedule_publication_outbox SET state = 'backoff', \
+           claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+           run_claim_generation = NULL, dispatch_nonce = NULL, \
+           dispatch_provider_write = NULL, dispatch_authorized_at = NULL, \
+           dispatch_expires_at = NULL, attempts = attempts + 1, \
+           available_at = $8 + interval '30 seconds', terminal_at = NULL, \
+           last_error_code = CASE WHEN last_error_code IN \
+             ('provider_identity_unresolved', 'provider_response_too_large') \
+             THEN last_error_code ELSE 'schedule_block_elapsed_possible_send' END, updated_at = $8 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND publication_id = $4 \
+           AND state = 'delivering' AND claim_id = $5 AND run_claim_id = $6 \
+           AND run_claim_generation = $7 AND provider_post_may_have_started \
+           AND dispatch_nonce IS NULL",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(work.outbox_id)
+    .bind(work.publication_id)
+    .bind(work.claim_id)
+    .bind(work.run_claim_id)
+    .bind(u64_to_i64(work.run_claim_generation)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+#[allow(clippy::fn_params_excessive_bools)] // Each independent fence is deliberately explicit.
+fn schedule_dispatch_guard_allows(
+    policy_current: bool,
+    target_current: bool,
+    provider_write: bool,
+    provider_post_may_have_started: bool,
+) -> bool {
+    (policy_current && target_current) || (!provider_write && provider_post_may_have_started)
+}
+
+fn schedule_no_effect_retry_at(now: DateTime<Utc>, observation_count: i32) -> DateTime<Utc> {
+    let exponent = u32::try_from(observation_count.saturating_sub(1))
+        .unwrap_or(0)
+        .min(7);
+    let delay_seconds = (30_i64 * (1_i64 << exponent)).min(3_600);
+    now + chrono::Duration::seconds(delay_seconds)
+}
+
+fn reported_schedule_pending_count(pending: u32, backoff: u32) -> u32 {
+    pending.saturating_add(backoff)
+}
+
+fn schedule_publication_preview_limit_exceeded(
+    active_count: i64,
+    active_change_count: i64,
+    proposed_change_count: i64,
+) -> bool {
+    active_count >= MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEWS
+        || active_change_count
+            .checked_add(proposed_change_count)
+            .is_none_or(|count| count > MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEW_CHANGES)
+}
+
+async fn lock_schedule_publication_preview_space_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+) -> Result<(), GoogleSyncRepositoryError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.google.schedule-preview.v1:' || $1::text || ':' || $2::text || ':' || \
+         $3::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn prune_expired_schedule_publication_previews_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    // The database clock is part of the deletion guard. `LEAST` makes an
+    // ahead-of-database application clock conservative rather than allowing
+    // it to erase still-live approval content.
+    let preview_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM google_schedule_publication_previews \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND consumed_at IS NULL \
+           AND expires_at <= LEAST($4, statement_timestamp()) \
+           AND NOT EXISTS (SELECT 1 FROM google_schedule_publication_batches batch \
+             WHERE batch.workspace_id = google_schedule_publication_previews.workspace_id \
+               AND batch.id = google_schedule_publication_previews.id) \
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if preview_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM google_schedule_publication_preview_changes \
+         WHERE workspace_id = $1 AND user_id = $2 AND preview_id = ANY($3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(&preview_ids)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let deleted = sqlx::query(
+        "DELETE FROM google_schedule_publication_previews \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = ANY($3) \
+           AND consumed_at IS NULL",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(&preview_ids)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if deleted != u64::try_from(preview_ids.len()).map_err(internal)? {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Exact reuse revalidates the full stored header and every child.
+async fn reusable_schedule_publication_preview_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    source: &SchedulePublicationSource,
+    desired_set_hash: [u8; 32],
+    expected_counts: &ValidatedSchedulePublicationChanges,
+    proposed_changes: &[PreparedSchedulePublicationChange],
+    now: DateTime<Utc>,
+) -> Result<Option<ScheduleGooglePublicationPreview>, GoogleSyncRepositoryError> {
+    let candidates = sqlx::query(
+        "SELECT id, preview_hash, expires_at, change_count, create_count, update_count, \
+           delete_count, noop_count FROM google_schedule_publication_previews \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND collection_id = $4 AND collection_revision = $5 \
+           AND collection_remote_id = $6 AND collection_display_name = $7 \
+           AND required_scope = $8 AND schedule_revision_id = $9 \
+           AND schedule_revision_number = $10 AND schedule_publication_hash = $11 \
+           AND desired_set_hash = $12 AND timezone_name = $13 \
+           AND horizon_start = $14 AND horizon_end = $15 \
+           AND change_count = $16 AND create_count = $17 AND update_count = $18 \
+           AND delete_count = $19 AND noop_count = $20 \
+           AND approved_at IS NULL AND consumed_at IS NULL \
+           AND expires_at > GREATEST($21, statement_timestamp()) \
+         ORDER BY created_at DESC, id DESC FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(source.account_id)
+    .bind(source.collection.id)
+    .bind(u64_to_i64(source.collection.revision)?)
+    .bind(&source.collection.remote_collection_id)
+    .bind(&source.collection.display_name)
+    .bind(GOOGLE_CALENDAR_SCOPE)
+    .bind(source.schedule_revision_id)
+    .bind(u64_to_i64(source.schedule_revision_number)?)
+    .bind(source.schedule_publication_hash.as_slice())
+    .bind(desired_set_hash.as_slice())
+    .bind(&source.timezone_name)
+    .bind(source.horizon_start)
+    .bind(source.horizon_end)
+    .bind(u32_to_i32(expected_counts.change_count)?)
+    .bind(u32_to_i32(expected_counts.create_count)?)
+    .bind(u32_to_i32(expected_counts.update_count)?)
+    .bind(u32_to_i32(expected_counts.delete_count)?)
+    .bind(u32_to_i32(expected_counts.noop_count)?)
+    .bind(now)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    for candidate in candidates {
+        let preview_id: Uuid = candidate.try_get("id").map_err(internal)?;
+        let rows = sqlx::query(
+            "SELECT ordinal, slot_id, source_block_id, item_id, occurrence_id, session_index, \
+               incarnation, operation, mapping_id, remote_resource_id, expected_etag, \
+               desired_payload_hash, intent_hash, provider_payload, review_summary, starts_at, ends_at \
+             FROM google_schedule_publication_preview_changes \
+             WHERE workspace_id = $1 AND user_id = $2 AND preview_id = $3 \
+             ORDER BY ordinal FOR SHARE",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(preview_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        let changes = rows
+            .iter()
+            .map(prepared_schedule_change_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let Ok(validated) = validate_schedule_publication_changes(source, &changes, now) else {
+            continue;
+        };
+        if changes.len() != proposed_changes.len()
+            || changes
+                .iter()
+                .zip(proposed_changes)
+                .any(|(stored, proposed)| {
+                    !schedule_publication_preview_change_reusable(stored, proposed)
+                })
+        {
+            continue;
+        }
+        let expires_at: DateTime<Utc> = candidate.try_get("expires_at").map_err(internal)?;
+        let preview_hash = fixed_hash(
+            &candidate
+                .try_get::<Vec<u8>, _>("preview_hash")
+                .map_err(internal)?,
+        )?;
+        if schedule_publication_desired_set_hash(source, &changes).map_err(internal)?
+            != desired_set_hash
+            || schedule_publication_preview_hash(preview_id, source, &changes, expires_at)
+                .map_err(internal)?
+                != preview_hash
+        {
+            continue;
+        }
+        return Ok(Some(ScheduleGooglePublicationPreview {
+            id: preview_id,
+            account_id: source.account_id,
+            collection_id: source.collection.id,
+            collection_revision: source.collection.revision,
+            collection_display_name: source.collection.display_name.clone(),
+            schedule_revision_id: source.schedule_revision_id,
+            schedule_revision_number: source.schedule_revision_number,
+            preview_hash: encode_hex_bytes(&preview_hash),
+            create_count: validated.create_count,
+            update_count: validated.update_count,
+            delete_count: validated.delete_count,
+            noop_count: validated.noop_count,
+            changes: validated.public_changes,
+            expires_at,
+        }));
+    }
+    Ok(None)
+}
+
+fn schedule_publication_preview_change_reusable(
+    stored: &PreparedSchedulePublicationChange,
+    proposed: &PreparedSchedulePublicationChange,
+) -> bool {
+    stored.ordinal == proposed.ordinal
+        && stored.slot_id == proposed.slot_id
+        && stored.source_block_id == proposed.source_block_id
+        && stored.item_id == proposed.item_id
+        && stored.occurrence_id == proposed.occurrence_id
+        && stored.session_index == proposed.session_index
+        && stored.incarnation == proposed.incarnation
+        && stored.operation == proposed.operation
+        && stored.mapping_id == proposed.mapping_id
+        && stored.remote_resource_id == proposed.remote_resource_id
+        && stored.expected_etag == proposed.expected_etag
+        && stored.desired_payload_hash == proposed.desired_payload_hash
+        && stored.review_summary == proposed.review_summary
+        && stored.starts_at == proposed.starts_at
+        && stored.ends_at == proposed.ends_at
+        && schedule_payload_without_ownership_proof(&stored.payload)
+            == schedule_payload_without_ownership_proof(&proposed.payload)
+}
+
+fn schedule_payload_without_ownership_proof(payload: &Value) -> Value {
+    let mut normalized = payload.clone();
+    if let Some(private) = normalized
+        .get_mut("extendedProperties")
+        .and_then(|properties| properties.get_mut("private"))
+        .and_then(Value::as_object_mut)
+    {
+        private.remove("dayweaveScheduleOwnershipProof");
+    }
+    normalized
+}
+
+#[allow(clippy::too_many_lines)] // Target validity is one atomic identity and mapping fence.
+async fn schedule_publication_target_current_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    work: &SchedulePublicationWork,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    let target_valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM google_sync_collections collection \
+         JOIN provider_accounts account ON account.workspace_id = collection.workspace_id \
+           AND account.user_id = collection.user_id \
+           AND account.id = collection.provider_account_id \
+         JOIN google_schedule_publication_previews preview \
+           ON preview.workspace_id = collection.workspace_id \
+          AND preview.user_id = collection.user_id AND preview.id = $5 \
+         WHERE collection.workspace_id = $1 AND collection.user_id = $2 \
+           AND collection.provider_account_id = $3 AND collection.id = $4 \
+           AND collection.collection_kind = 'calendar' AND collection.selected \
+           AND NOT collection.provider_deleted AND collection.sync_role = 'writable' \
+           AND collection.revision = $6 AND collection.remote_collection_id = $7 \
+           AND account.provider = 'google' AND account.status = 'active' \
+           AND account.sync_enabled AND account.tombstoned_at IS NULL \
+           AND $8 = ANY(account.granted_scopes) AND $8 = $9 \
+           AND preview.approved_at IS NOT NULL AND preview.consumed_at IS NOT NULL \
+           AND preview.provider_account_id = collection.provider_account_id \
+           AND preview.collection_id = collection.id \
+           AND preview.collection_revision = collection.revision \
+           AND preview.collection_remote_id = collection.remote_collection_id \
+           AND preview.schedule_revision_id = $10 \
+           AND preview.schedule_revision_number = $11 \
+           AND preview.schedule_publication_hash = $12)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(work.account_id)
+    .bind(work.collection_id)
+    .bind(work.publication_id)
+    .bind(u64_to_i64(work.collection_revision)?)
+    .bind(&work.collection_remote_id)
+    .bind(&work.required_scope)
+    .bind(GOOGLE_CALENDAR_SCOPE)
+    .bind(work.schedule_revision_id)
+    .bind(u64_to_i64(work.schedule_revision_number)?)
+    .bind(work.schedule_publication_hash.as_slice())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if !target_valid {
+        return Ok(false);
+    }
+    match work.operation {
+        ScheduleGooglePublicationOperation::Create => {
+            let remote_id = work.payload.get("id").and_then(Value::as_str).unwrap_or("");
+            if remote_id.is_empty()
+                || work.mapping_id.is_some()
+                || work.remote_resource_id.is_some()
+                || work.expected_etag.is_some()
+            {
+                return Ok(false);
+            }
+            sqlx::query_scalar(
+                "SELECT NOT EXISTS(SELECT 1 FROM provider_sync_mappings mapping \
+                   WHERE mapping.workspace_id = $1 AND mapping.provider_account_id = $2 \
+                     AND mapping.collection_id = $3 AND mapping.entity_kind = 'schedule_block' \
+                     AND mapping.tombstoned_at IS NULL \
+                     AND (mapping.local_entity_id = $4 OR mapping.remote_resource_id = $5)) \
+                 AND NOT EXISTS(SELECT 1 FROM google_schedule_publication_mapping_origins origin \
+                   WHERE origin.workspace_id = $1 AND origin.provider_account_id = $2 \
+                     AND origin.collection_id = $3 AND origin.slot_id = $4 \
+                     AND origin.retired_at IS NULL)",
+            )
+            .bind(scope.workspace_id)
+            .bind(work.account_id)
+            .bind(work.collection_id)
+            .bind(work.slot_id)
+            .bind(remote_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(internal)
+        }
+        ScheduleGooglePublicationOperation::Update | ScheduleGooglePublicationOperation::Delete => {
+            let Some(mapping_id) = work.mapping_id else {
+                return Ok(false);
+            };
+            let Some(remote_id) = work.remote_resource_id.as_deref() else {
+                return Ok(false);
+            };
+            let Some(expected_etag) = work.expected_etag.as_deref() else {
+                return Ok(false);
+            };
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM provider_sync_mappings mapping \
+                 JOIN google_schedule_publication_mapping_origins origin \
+                   ON origin.workspace_id = mapping.workspace_id AND origin.mapping_id = mapping.id \
+                 WHERE mapping.workspace_id = $1 AND mapping.id = $2 \
+                   AND mapping.provider_account_id = $3 AND mapping.collection_id = $4 \
+                   AND mapping.entity_kind = 'schedule_block' AND mapping.local_entity_id = $5 \
+                   AND mapping.remote_resource_id = $6 AND mapping.remote_etag = $7 \
+                   AND mapping.ownership = 'dayweave' AND mapping.tombstoned_at IS NULL \
+                   AND mapping.sync_state <> 'deleted_remote' AND origin.retired_at IS NULL \
+                   AND origin.provider_account_id = mapping.provider_account_id \
+                   AND origin.collection_id = mapping.collection_id AND origin.slot_id = $5 \
+                   AND origin.item_id = $8 AND origin.occurrence_id IS NOT DISTINCT FROM $9 \
+                   AND origin.session_index = $10 AND origin.incarnation = $11 \
+                   AND origin.remote_resource_id = mapping.remote_resource_id)",
+            )
+            .bind(scope.workspace_id)
+            .bind(mapping_id)
+            .bind(work.account_id)
+            .bind(work.collection_id)
+            .bind(work.slot_id)
+            .bind(remote_id)
+            .bind(expected_etag)
+            .bind(work.item_id)
+            .bind(work.occurrence_id)
+            .bind(i32::from(work.session_index))
+            .bind(i64::from(work.incarnation))
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(internal)
+        }
+        ScheduleGooglePublicationOperation::Noop => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Revalidation repeats the complete immutable preview boundary.
+async fn revalidate_schedule_publication_preview_tx(
+    repository: &PostgresGoogleSyncRepository,
+    transaction: &mut Transaction<'_, Postgres>,
+    preview_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let header = sqlx::query(
+        "SELECT provider_account_id, collection_id, collection_revision, collection_remote_id, \
+           schedule_revision_id, schedule_revision_number, schedule_publication_hash, \
+           desired_set_hash, timezone_name, horizon_start, horizon_end, preview_hash, \
+           change_count, create_count, update_count, delete_count, noop_count, expires_at \
+         FROM google_schedule_publication_previews \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3 FOR SHARE",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .bind(preview_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+    let account_id: Uuid = header.try_get("provider_account_id").map_err(internal)?;
+    let collection_id: Uuid = header.try_get("collection_id").map_err(internal)?;
+    let schedule_revision_id: Uuid = header.try_get("schedule_revision_id").map_err(internal)?;
+    let source = load_schedule_publication_source_tx(
+        repository,
+        transaction,
+        account_id,
+        collection_id,
+        schedule_revision_id,
+        now,
+    )
+    .await?;
+    if source.collection.revision
+        != i64_to_u64(header.try_get("collection_revision").map_err(internal)?)?
+        || source.collection.remote_collection_id
+            != header
+                .try_get::<String, _>("collection_remote_id")
+                .map_err(internal)?
+        || source.schedule_revision_number
+            != i64_to_u64(
+                header
+                    .try_get("schedule_revision_number")
+                    .map_err(internal)?,
+            )?
+        || source.schedule_publication_hash
+            != fixed_hash(
+                &header
+                    .try_get::<Vec<u8>, _>("schedule_publication_hash")
+                    .map_err(internal)?,
+            )?
+        || source.timezone_name
+            != header
+                .try_get::<String, _>("timezone_name")
+                .map_err(internal)?
+        || source.horizon_start
+            != header
+                .try_get::<DateTime<Utc>, _>("horizon_start")
+                .map_err(internal)?
+        || source.horizon_end
+            != header
+                .try_get::<DateTime<Utc>, _>("horizon_end")
+                .map_err(internal)?
+    {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    let rows = sqlx::query(
+        "SELECT ordinal, slot_id, source_block_id, item_id, occurrence_id, session_index, \
+           incarnation, operation, mapping_id, remote_resource_id, expected_etag, \
+           desired_payload_hash, intent_hash, provider_payload, review_summary, starts_at, ends_at \
+         FROM google_schedule_publication_preview_changes \
+         WHERE workspace_id = $1 AND user_id = $2 AND preview_id = $3 ORDER BY ordinal FOR SHARE",
+    )
+    .bind(repository.scope.workspace_id)
+    .bind(repository.scope.user_id)
+    .bind(preview_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let changes = rows
+        .iter()
+        .map(prepared_schedule_change_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let validated = validate_schedule_publication_changes(&source, &changes, now)?;
+    let expires_at: DateTime<Utc> = header.try_get("expires_at").map_err(internal)?;
+    if validated.change_count != i32_to_u32(header.try_get("change_count").map_err(internal)?)?
+        || validated.create_count != i32_to_u32(header.try_get("create_count").map_err(internal)?)?
+        || validated.update_count != i32_to_u32(header.try_get("update_count").map_err(internal)?)?
+        || validated.delete_count != i32_to_u32(header.try_get("delete_count").map_err(internal)?)?
+        || validated.noop_count != i32_to_u32(header.try_get("noop_count").map_err(internal)?)?
+        || schedule_publication_desired_set_hash(&source, &changes).map_err(internal)?
+            != fixed_hash(
+                &header
+                    .try_get::<Vec<u8>, _>("desired_set_hash")
+                    .map_err(internal)?,
+            )?
+        || schedule_publication_preview_hash(preview_id, &source, &changes, expires_at)
+            .map_err(internal)?
+            != fixed_hash(
+                &header
+                    .try_get::<Vec<u8>, _>("preview_hash")
+                    .map_err(internal)?,
+            )?
+    {
+        return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+    }
+    Ok(())
+}
+
+async fn refresh_schedule_publication_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    publication_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let counts = sqlx::query(
+        "SELECT count(*)::integer AS total_count, \
+           count(*) FILTER (WHERE state = 'pending')::integer AS pending_count, \
+           count(*) FILTER (WHERE state = 'delivering')::integer AS delivering_count, \
+           count(*) FILTER (WHERE state = 'backoff')::integer AS backoff_count, \
+           count(*) FILTER (WHERE state = 'published')::integer AS published_count, \
+           count(*) FILTER (WHERE state = 'conflict')::integer AS conflict_count, \
+           count(*) FILTER (WHERE state = 'failed')::integer AS failed_count, \
+           count(*) FILTER (WHERE state = 'superseded')::integer AS superseded_count, \
+           (array_agg(last_error_code ORDER BY updated_at DESC, id DESC) \
+             FILTER (WHERE last_error_code IS NOT NULL))[1] AS last_error_code \
+         FROM google_schedule_publication_outbox \
+         WHERE workspace_id = $1 AND user_id = $2 AND publication_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(publication_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let total: i32 = counts.try_get("total_count").map_err(internal)?;
+    let pending: i32 = counts.try_get("pending_count").map_err(internal)?;
+    let delivering: i32 = counts.try_get("delivering_count").map_err(internal)?;
+    let backoff: i32 = counts.try_get("backoff_count").map_err(internal)?;
+    let published: i32 = counts.try_get("published_count").map_err(internal)?;
+    let conflict: i32 = counts.try_get("conflict_count").map_err(internal)?;
+    let failed: i32 = counts.try_get("failed_count").map_err(internal)?;
+    let superseded: i32 = counts.try_get("superseded_count").map_err(internal)?;
+    let state = if delivering > 0 {
+        "delivering"
+    } else if pending > 0 {
+        "pending"
+    } else if backoff > 0 {
+        "backoff"
+    } else if published == total {
+        "published"
+    } else if published > 0 {
+        "partially_published"
+    } else if conflict > 0 {
+        "conflict"
+    } else if failed > 0 {
+        "failed"
+    } else {
+        "superseded"
+    };
+    let active = pending + delivering + backoff > 0;
+    let last_error_code: Option<String> = counts.try_get("last_error_code").map_err(internal)?;
+    sqlx::query(
+        "UPDATE google_schedule_publication_batches SET state = $4, pending_count = $5, \
+           delivering_count = $6, backoff_count = $7, published_count = $8, \
+           conflict_count = $9, failed_count = $10, superseded_count = $11, \
+           last_error_code = $12, last_error_at = CASE WHEN $12::varchar IS NULL THEN NULL ELSE $13 END, \
+           started_at = CASE WHEN $6 > 0 THEN COALESCE(started_at, $13) ELSE started_at END, \
+           completed_at = CASE WHEN $14 THEN NULL ELSE COALESCE(completed_at, $13) END, updated_at = $13 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(publication_id)
+    .bind(state)
+    .bind(pending)
+    .bind(delivering)
+    .bind(backoff)
+    .bind(published)
+    .bind(conflict)
+    .bind(failed)
+    .bind(superseded)
+    .bind(last_error_code)
+    .bind(now)
+    .bind(active)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+fn schedule_publication_status_from_row(
+    row: &PgRow,
+) -> Result<ScheduleGooglePublicationStatus, GoogleSyncRepositoryError> {
+    let state = match row
+        .try_get::<String, _>("state")
+        .map_err(internal)?
+        .as_str()
+    {
+        "pending" => ScheduleGooglePublicationState::Pending,
+        "delivering" => ScheduleGooglePublicationState::Delivering,
+        "backoff" => ScheduleGooglePublicationState::Backoff,
+        "partially_published" => ScheduleGooglePublicationState::PartiallyPublished,
+        "published" => ScheduleGooglePublicationState::Published,
+        "conflict" => ScheduleGooglePublicationState::Conflict,
+        "failed" => ScheduleGooglePublicationState::Failed,
+        "superseded" => ScheduleGooglePublicationState::Superseded,
+        _ => return Err(GoogleSyncRepositoryError::Internal),
+    };
+    let pending = i32_to_u32(row.try_get("pending_count").map_err(internal)?)?;
+    let backoff = i32_to_u32(row.try_get("backoff_count").map_err(internal)?)?;
+    Ok(ScheduleGooglePublicationStatus {
+        publication_id: row.try_get("id").map_err(internal)?,
+        account_id: row.try_get("provider_account_id").map_err(internal)?,
+        collection_id: row.try_get("collection_id").map_err(internal)?,
+        schedule_revision_id: row.try_get("schedule_revision_id").map_err(internal)?,
+        state,
+        total_count: i32_to_u32(row.try_get("total_count").map_err(internal)?)?,
+        pending_count: reported_schedule_pending_count(pending, backoff),
+        delivering_count: i32_to_u32(row.try_get("delivering_count").map_err(internal)?)?,
+        published_count: i32_to_u32(row.try_get("published_count").map_err(internal)?)?,
+        conflicted_count: i32_to_u32(row.try_get("conflict_count").map_err(internal)?)?,
+        failed_count: i32_to_u32(row.try_get("failed_count").map_err(internal)?)?,
+        superseded_count: i32_to_u32(row.try_get("superseded_count").map_err(internal)?)?,
+        created_at: row.try_get("created_at").map_err(internal)?,
+        completed_at: row.try_get("completed_at").map_err(internal)?,
+        last_error_code: row.try_get("last_error_code").map_err(internal)?,
+    })
+}
+
+fn i64_to_u32(value: i64) -> Result<u32, GoogleSyncRepositoryError> {
+    u32::try_from(value).map_err(|_| GoogleSyncRepositoryError::Internal)
+}
+
+fn i32_to_u16(value: i32) -> Result<u16, GoogleSyncRepositoryError> {
+    u16::try_from(value).map_err(|_| GoogleSyncRepositoryError::Internal)
 }
 
 fn validate_calendar_projection_batch(
@@ -6671,6 +10250,10 @@ mod tests {
             PostgresItemRepository,
         },
         proposals::SystemClock,
+        scheduling::{
+            ComposeScheduleRequest, PostgresSchedulingRepository, PublishScheduleSpec,
+            ScheduleAccess, compose_canonical_schedule,
+        },
     };
 
     use super::*;
@@ -6683,6 +10266,171 @@ mod tests {
         collection: GoogleSyncCollection,
         claim: SyncClaim,
         now: DateTime<Utc>,
+    }
+
+    fn schedule_payload_change() -> PreparedSchedulePublicationChange {
+        let starts_at: DateTime<Utc> = "2026-09-03T10:00:00Z".parse().expect("start");
+        let ends_at = starts_at + Duration::hours(1);
+        let slot_id = Uuid::from_u128(11);
+        let incarnation = 1;
+        let summary = "Planning block";
+        let desired_payload_hash =
+            schedule_desired_payload_hash(slot_id, incarnation, summary, starts_at, ends_at, "UTC")
+                .expect("desired payload hash");
+        PreparedSchedulePublicationChange {
+            ordinal: 0,
+            slot_id,
+            source_block_id: Some(Uuid::from_u128(12)),
+            item_id: Uuid::from_u128(13),
+            occurrence_id: None,
+            session_index: 0,
+            incarnation,
+            operation: ScheduleGooglePublicationOperation::Create,
+            mapping_id: None,
+            remote_resource_id: None,
+            expected_etag: None,
+            desired_payload_hash,
+            payload: json!({
+                "id": "schedule-event-id",
+                "etag": null,
+                "status": "confirmed",
+                "summary": summary,
+                "description": null,
+                "location": null,
+                "start": {"date": null, "dateTime": starts_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), "timeZone": "UTC"},
+                "end": {"date": null, "dateTime": ends_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), "timeZone": "UTC"},
+                "recurringEventId": null,
+                "originalStartTime": null,
+                "recurrence": [],
+                "transparency": "opaque",
+                "visibility": "private",
+                "eventType": "default",
+                "attendees": [],
+                "conferenceData": null,
+                "attachments": [],
+                "updated": null,
+                "sequence": null,
+                "extendedProperties": {
+                    "private": {"dayweaveScheduleOwnershipProof": "dwsm1.v1.test"},
+                    "shared": {}
+                },
+                "reminders": {"useDefault": false, "overrides": []}
+            }),
+            review_summary: json!({
+                "summary": summary,
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+            }),
+            starts_at,
+            ends_at,
+            intent_hash: [0; 32],
+        }
+    }
+
+    #[test]
+    fn schedule_payload_boundary_rejects_every_unreviewed_provider_field() {
+        let valid = schedule_payload_change();
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &valid),
+            Ok("Planning block".to_owned())
+        );
+
+        let mut visible_description = valid.clone();
+        visible_description.payload["description"] = json!("must never leave the server");
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &visible_description),
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication)
+        );
+
+        let mut uncontrolled = valid.clone();
+        uncontrolled.payload["guestsCanModify"] = json!(true);
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &uncontrolled),
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication)
+        );
+
+        let mut notifications = valid.clone();
+        notifications.payload["reminders"]["useDefault"] = json!(true);
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &notifications),
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication)
+        );
+
+        let mut review_drift = valid;
+        review_drift.review_summary["summary"] = json!("different");
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &review_drift),
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication)
+        );
+    }
+
+    #[test]
+    fn schedule_payload_title_limit_counts_unicode_scalars() {
+        let mut change = schedule_payload_change();
+        let accepted = "🧶".repeat(500);
+        change.payload["summary"] = json!(accepted);
+        change.review_summary["summary"] = json!(accepted);
+        change.desired_payload_hash = schedule_desired_payload_hash(
+            change.slot_id,
+            change.incarnation,
+            &accepted,
+            change.starts_at,
+            change.ends_at,
+            "UTC",
+        )
+        .expect("multibyte title hash");
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &change),
+            Ok(accepted)
+        );
+
+        let rejected = "🧶".repeat(501);
+        change.payload["summary"] = json!(rejected);
+        change.review_summary["summary"] = json!(rejected);
+        change.desired_payload_hash = schedule_desired_payload_hash(
+            change.slot_id,
+            change.incarnation,
+            &rejected,
+            change.starts_at,
+            change.ends_at,
+            "UTC",
+        )
+        .expect("oversized multibyte title hash");
+        assert_eq!(
+            validate_schedule_event_payload("UTC", &change),
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication)
+        );
+    }
+
+    #[test]
+    fn schedule_dispatch_guard_only_relaxes_stale_fences_for_post_send_observation() {
+        assert!(schedule_dispatch_guard_allows(true, true, true, false));
+        assert!(schedule_dispatch_guard_allows(true, true, false, false));
+        assert!(schedule_dispatch_guard_allows(false, false, false, true));
+        assert!(schedule_dispatch_guard_allows(false, true, false, true));
+        assert!(schedule_dispatch_guard_allows(true, false, false, true));
+        assert!(!schedule_dispatch_guard_allows(false, false, true, true));
+        assert!(!schedule_dispatch_guard_allows(false, true, true, true));
+        assert!(!schedule_dispatch_guard_allows(true, false, true, true));
+        assert!(!schedule_dispatch_guard_allows(false, false, false, false));
+    }
+
+    #[test]
+    fn schedule_status_reports_backoff_as_pending_work() {
+        assert_eq!(reported_schedule_pending_count(3, 4), 7);
+        assert_eq!(reported_schedule_pending_count(u32::MAX, 1), u32::MAX);
+    }
+
+    #[test]
+    fn schedule_preview_limits_bound_both_receipts_and_stored_children() {
+        assert!(!schedule_publication_preview_limit_exceeded(7, 19_999, 1));
+        assert!(schedule_publication_preview_limit_exceeded(8, 8, 1));
+        assert!(schedule_publication_preview_limit_exceeded(2, 19_999, 2));
+        assert!(schedule_publication_preview_limit_exceeded(
+            1,
+            i64::MAX,
+            10_000
+        ));
     }
 
     async fn sync_fixture(database_url: &str) -> SyncFixture {
@@ -6767,6 +10515,2271 @@ mod tests {
             claim,
             now,
         }
+    }
+
+    struct PublishedScheduleFixture {
+        sync: SyncFixture,
+        source: SchedulePublicationSource,
+    }
+
+    fn digest_bytes(value: &str) -> [u8; 32] {
+        let hex = value
+            .strip_prefix("sha256:")
+            .expect("digest has sha256 prefix")
+            .as_bytes();
+        assert_eq!(hex.len(), 64, "digest has 32 bytes");
+        let mut output = [0_u8; 32];
+        for (index, pair) in hex.chunks_exact(2).enumerate() {
+            let nibble = |value| match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                _ => panic!("digest is lowercase hexadecimal"),
+            };
+            output[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+        }
+        output
+    }
+
+    async fn published_schedule_fixture(
+        database_url: &str,
+        item_count: usize,
+    ) -> PublishedScheduleFixture {
+        published_schedule_fixture_with_first_title(database_url, item_count, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn published_schedule_fixture_with_first_title(
+        database_url: &str,
+        item_count: usize,
+        first_title: Option<&str>,
+    ) -> PublishedScheduleFixture {
+        let mut sync = sync_fixture(database_url).await;
+        let ignore_calendar = GoogleCalendarPolicy {
+            confirmed_busy: GoogleEventDisposition::Ignore,
+            tentative: GoogleEventDisposition::Ignore,
+            free: GoogleEventDisposition::Ignore,
+            all_day: GoogleEventDisposition::Ignore,
+            publish_all_day: false,
+            publish_tentative: false,
+            publish_free: false,
+        };
+        sync.collection = sync
+            .repository
+            .configure_collection(
+                sync.account_id,
+                sync.collection.id,
+                sync.collection.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                ignore_calendar,
+                sync.now + Duration::seconds(1),
+            )
+            .await
+            .expect("nonblocking writable publication calendar");
+
+        let wall_now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let horizon_start = wall_now + Duration::days(2);
+        let horizon_end = horizon_start + Duration::days(1);
+        let mut transaction = sync.database.pool.begin().await.expect("item transaction");
+        for index in 0..item_count {
+            let default_title = format!("Schedule publication task {index}");
+            let title = if index == 0 {
+                first_title.unwrap_or(&default_title)
+            } else {
+                &default_title
+            };
+            let item = local_task(Uuid::new_v4(), title, horizon_start);
+            insert_imported_item(&mut transaction, sync.scope, &item)
+                .await
+                .expect("schedule item fixture");
+        }
+        transaction.commit().await.expect("schedule items commit");
+
+        let items = Arc::new(ItemService::new(
+            Arc::new(PostgresItemRepository::new(
+                sync.database.pool.clone(),
+                sync.scope,
+            )),
+            Arc::new(SystemClock),
+        ));
+        let schedules = PostgresSchedulingRepository::new(sync.database.pool.clone(), sync.scope);
+        let request: ComposeScheduleRequest = serde_json::from_value(json!({
+            "as_of": horizon_start,
+            "horizon_start": horizon_start,
+            "horizon_end": horizon_end,
+            "timezone_name": "UTC",
+            "availability": [{
+                "start": horizon_start + Duration::hours(1),
+                "end": horizon_start + Duration::hours(12),
+                "contexts": [],
+                "location": null,
+                "energy": "deep"
+            }],
+            "fixed_blocks": [],
+            "previous_assignments": [],
+            "config": {
+                "slot_granularity_minutes": 5,
+                "stability_weight": 4,
+                "default_soft_weight": 100
+            },
+            "recurrence_context": {}
+        }))
+        .expect("schedule request");
+        let result = compose_canonical_schedule(&items, &schedules, request)
+            .await
+            .expect("compose schedule publication fixture");
+        assert_eq!(result.plan.blocks.len(), item_count);
+        let input_digest = digest_bytes(&result.input_digest);
+        let publication = schedules
+            .publish(
+                &ScheduleAccess {
+                    subject: format!("schedule-publication-test-{}", sync.scope.user_id),
+                    include_sensitive: true,
+                    workspace_id: Some(sync.scope.workspace_id),
+                    user_id: Some(sync.scope.user_id),
+                },
+                PublishScheduleSpec {
+                    idempotency_key: Uuid::new_v4(),
+                    request_hash: [91; 32],
+                    input_digest,
+                    timezone_name: "UTC".to_owned(),
+                    manual_placement_approvals: Vec::new(),
+                    result,
+                    published_at: wall_now,
+                },
+            )
+            .await
+            .expect("publish schedule fixture");
+        let source = sync
+            .repository
+            .load_schedule_publication_source(
+                sync.account_id,
+                sync.collection.id,
+                publication.revision.id,
+            )
+            .await
+            .expect("load generated schedule publication source");
+        PublishedScheduleFixture { sync, source }
+    }
+
+    fn schedule_event_payload(
+        remote_id: &str,
+        summary: &str,
+        starts_at: DateTime<Utc>,
+        ends_at: DateTime<Utc>,
+    ) -> Value {
+        json!({
+            "id": remote_id,
+            "etag": null,
+            "status": "confirmed",
+            "summary": summary,
+            "description": null,
+            "location": null,
+            "start": {
+                "date": null,
+                "dateTime": starts_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "timeZone": "UTC"
+            },
+            "end": {
+                "date": null,
+                "dateTime": ends_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "timeZone": "UTC"
+            },
+            "recurringEventId": null,
+            "originalStartTime": null,
+            "recurrence": [],
+            "transparency": "opaque",
+            "visibility": "private",
+            "eventType": "default",
+            "attendees": [],
+            "conferenceData": null,
+            "attachments": [],
+            "updated": null,
+            "sequence": null,
+            "extendedProperties": {
+                "private": {"dayweaveScheduleOwnershipProof": "dwsm1.v1.test"},
+                "shared": {}
+            },
+            "reminders": {"useDefault": false, "overrides": []}
+        })
+    }
+
+    fn prepared_schedule_create_change(
+        source: &SchedulePublicationSource,
+        block: &SchedulePublicationBlock,
+        summary: &str,
+        remote_id: &str,
+        ownership_proof: &str,
+    ) -> PreparedSchedulePublicationChange {
+        let slot_id = schedule_publication_slot_id(
+            source.workspace_id,
+            block.item_id,
+            block.occurrence_id,
+            block.session_index,
+        );
+        let desired_payload_hash = schedule_desired_payload_hash(
+            slot_id,
+            block.incarnation,
+            summary,
+            block.starts_at,
+            block.ends_at,
+            &source.timezone_name,
+        )
+        .expect("desired payload hash");
+        let mut payload =
+            schedule_event_payload(remote_id, summary, block.starts_at, block.ends_at);
+        payload["extendedProperties"]["private"]["dayweaveScheduleOwnershipProof"] =
+            json!(ownership_proof);
+        let mut change = PreparedSchedulePublicationChange {
+            ordinal: 0,
+            slot_id,
+            source_block_id: Some(block.source_block_id),
+            item_id: block.item_id,
+            occurrence_id: block.occurrence_id,
+            session_index: block.session_index,
+            incarnation: block.incarnation,
+            operation: ScheduleGooglePublicationOperation::Create,
+            mapping_id: None,
+            remote_resource_id: None,
+            expected_etag: None,
+            desired_payload_hash,
+            payload,
+            review_summary: json!({
+                "summary": summary,
+                "starts_at": block.starts_at,
+                "ends_at": block.ends_at,
+            }),
+            starts_at: block.starts_at,
+            ends_at: block.ends_at,
+            intent_hash: [0; 32],
+        };
+        change.intent_hash =
+            schedule_publication_intent_hash(source, &change).expect("intent hash");
+        change
+    }
+
+    fn prepared_schedule_update_change(
+        source: &SchedulePublicationSource,
+        block: &SchedulePublicationBlock,
+        mapping: &ScheduleBlockMapping,
+        ownership_proof: &str,
+    ) -> PreparedSchedulePublicationChange {
+        let desired_payload_hash = schedule_desired_payload_hash(
+            mapping.slot_id,
+            mapping.incarnation,
+            &block.title,
+            block.starts_at,
+            block.ends_at,
+            &source.timezone_name,
+        )
+        .expect("desired payload hash");
+        let mut payload = schedule_event_payload(
+            &mapping.remote_resource_id,
+            &block.title,
+            block.starts_at,
+            block.ends_at,
+        );
+        payload["extendedProperties"]["private"]["dayweaveScheduleOwnershipProof"] =
+            json!(ownership_proof);
+        let mut change = PreparedSchedulePublicationChange {
+            ordinal: 0,
+            slot_id: mapping.slot_id,
+            source_block_id: Some(block.source_block_id),
+            item_id: block.item_id,
+            occurrence_id: block.occurrence_id,
+            session_index: block.session_index,
+            incarnation: mapping.incarnation,
+            operation: ScheduleGooglePublicationOperation::Update,
+            mapping_id: Some(mapping.mapping_id),
+            remote_resource_id: Some(mapping.remote_resource_id.clone()),
+            expected_etag: Some(mapping.remote_etag.clone()),
+            desired_payload_hash,
+            payload,
+            review_summary: json!({
+                "summary": block.title,
+                "starts_at": block.starts_at,
+                "ends_at": block.ends_at,
+            }),
+            starts_at: block.starts_at,
+            ends_at: block.ends_at,
+            intent_hash: [0; 32],
+        };
+        change.intent_hash =
+            schedule_publication_intent_hash(source, &change).expect("intent hash");
+        change
+    }
+
+    fn schedule_preview_spec(
+        source: &SchedulePublicationSource,
+        block: &SchedulePublicationBlock,
+        id: Uuid,
+        summary: &str,
+        remote_id: &str,
+        ownership_proof: &str,
+        expires_at: DateTime<Utc>,
+    ) -> SchedulePublicationPreviewSpec {
+        SchedulePublicationPreviewSpec {
+            id,
+            source: source.clone(),
+            changes: vec![prepared_schedule_create_change(
+                source,
+                block,
+                summary,
+                remote_id,
+                ownership_proof,
+            )],
+            expires_at,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn seed_expired_schedule_preview(
+        fixture: &PublishedScheduleFixture,
+        approved: bool,
+        marker: u8,
+        wall_now: DateTime<Utc>,
+    ) -> (Uuid, Option<Uuid>) {
+        let source = &fixture.source;
+        let block = &source.blocks[0];
+        let preview_id = Uuid::new_v4();
+        let created_at = wall_now - Duration::minutes(40);
+        let expires_at = wall_now - Duration::minutes(10);
+        let approved_at = approved.then_some(created_at + Duration::minutes(1));
+        let audit_id = approved.then(Uuid::new_v4);
+        let change = prepared_schedule_create_change(
+            source,
+            block,
+            &block.title,
+            &format!("expired-preview-{marker}"),
+            &format!("dwsm1.v1.expired-{marker}"),
+        );
+        let desired_set_hash =
+            schedule_publication_desired_set_hash(source, std::slice::from_ref(&change))
+                .expect("expired desired-set hash");
+        let preview_hash = schedule_publication_preview_hash(
+            preview_id,
+            source,
+            std::slice::from_ref(&change),
+            expires_at,
+        )
+        .expect("expired preview hash");
+        let mut transaction = fixture
+            .sync
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("expired preview transaction");
+        if let Some(audit_id) = audit_id {
+            sqlx::query(
+                "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+                 entity_type, entity_id, base_revision, result_revision, outcome, metadata, \
+                 occurred_at) VALUES ($1, $2, $3, 'google.schedule_publication.approved', \
+                 'schedule_revision', $4, $5, $5, 'succeeded', '{}'::jsonb, $6)",
+            )
+            .bind(audit_id)
+            .bind(fixture.sync.scope.workspace_id)
+            .bind(fixture.sync.scope.user_id)
+            .bind(source.schedule_revision_id)
+            .bind(u64_to_i64(source.schedule_revision_number).expect("revision fits"))
+            .bind(approved_at.expect("approved timestamp"))
+            .execute(&mut *transaction)
+            .await
+            .expect("expired approval audit");
+        }
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             collection_display_name, required_scope, schedule_revision_id, \
+             schedule_revision_number, schedule_publication_hash, desired_set_hash, timezone_name, \
+             horizon_start, horizon_end, preview_hash, change_count, create_count, update_count, \
+             delete_count, noop_count, expires_at, approved_at, capability_hash, approval_audit_id, \
+             consumed_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+             $10, $11, $12, $13, $14, $15, $16, $17, 1, 1, 0, 0, 0, $18, $19, $20, $21, \
+             NULL, $22, $23)",
+        )
+        .bind(preview_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(source.account_id)
+        .bind(source.collection.id)
+        .bind(u64_to_i64(source.collection.revision).expect("collection revision fits"))
+        .bind(&source.collection.remote_collection_id)
+        .bind(&source.collection.display_name)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(source.schedule_revision_id)
+        .bind(u64_to_i64(source.schedule_revision_number).expect("schedule revision fits"))
+        .bind(source.schedule_publication_hash.as_slice())
+        .bind(desired_set_hash.as_slice())
+        .bind(&source.timezone_name)
+        .bind(source.horizon_start)
+        .bind(source.horizon_end)
+        .bind(preview_hash.as_slice())
+        .bind(expires_at)
+        .bind(approved_at)
+        .bind(approved.then_some([marker; 32].to_vec()))
+        .bind(audit_id)
+        .bind(created_at)
+        .bind(approved_at.unwrap_or(created_at))
+        .execute(&mut *transaction)
+        .await
+        .expect("expired preview header");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, user_id, \
+             preview_id, provider_account_id, collection_id, schedule_revision_id, ordinal, \
+             slot_id, source_block_id, item_id, occurrence_id, session_index, incarnation, \
+             operation, mapping_id, remote_resource_id, expected_etag, desired_payload_hash, \
+             intent_hash, provider_payload, review_summary, starts_at, ends_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11, $12, $13, 'create', \
+             NULL, NULL, NULL, $14, $15, $16, $17, $18, $19, $20)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(preview_id)
+        .bind(source.account_id)
+        .bind(source.collection.id)
+        .bind(source.schedule_revision_id)
+        .bind(change.slot_id)
+        .bind(change.source_block_id)
+        .bind(change.item_id)
+        .bind(change.occurrence_id)
+        .bind(i32::from(change.session_index))
+        .bind(i64::from(change.incarnation))
+        .bind(change.desired_payload_hash.as_slice())
+        .bind(change.intent_hash.as_slice())
+        .bind(&change.payload)
+        .bind(&change.review_summary)
+        .bind(change.starts_at)
+        .bind(change.ends_at)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("expired preview child");
+        transaction.commit().await.expect("expired preview commit");
+        (preview_id, audit_id)
+    }
+
+    async fn insert_schedule_mapping(
+        fixture: &PublishedScheduleFixture,
+        block: &SchedulePublicationBlock,
+        remote_id: &str,
+        remote_etag: &str,
+        desired_payload_hash: [u8; 32],
+    ) -> Uuid {
+        let mapping_id = Uuid::new_v4();
+        let slot_id = schedule_publication_slot_id(
+            fixture.sync.scope.workspace_id,
+            block.item_id,
+            block.occurrence_id,
+            block.session_index,
+        );
+        let created_at = fixture.sync.now + Duration::seconds(2);
+        let mut transaction = fixture
+            .sync
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("mapping transaction");
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+             collection_id, entity_kind, local_entity_id, remote_resource_id, remote_etag, \
+             remote_payload_hash, local_revision, sync_state, ownership, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'schedule_block', $5, $6, $7, $8, $9, \
+             'synced', 'dayweave', $10, $10)",
+        )
+        .bind(mapping_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(slot_id)
+        .bind(remote_id)
+        .bind(remote_etag)
+        .bind([73_u8; 32].as_slice())
+        .bind(u64_to_i64(fixture.source.schedule_revision_number).expect("revision fits"))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule provider mapping");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_mapping_origins (workspace_id, user_id, \
+             mapping_id, provider_account_id, collection_id, slot_id, item_id, occurrence_id, \
+             session_index, incarnation, source_schedule_revision_id, source_block_id, \
+             remote_resource_id, last_starts_at, last_ends_at, last_desired_hash, created_at, \
+             updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, \
+             $13, $14, $15, $16, $16)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(mapping_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(slot_id)
+        .bind(block.item_id)
+        .bind(block.occurrence_id)
+        .bind(i32::from(block.session_index))
+        .bind(fixture.source.schedule_revision_id)
+        .bind(block.source_block_id)
+        .bind(remote_id)
+        .bind(block.starts_at)
+        .bind(block.ends_at)
+        .bind(desired_payload_hash.as_slice())
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule mapping origin");
+        transaction.commit().await.expect("schedule mapping commit");
+        mapping_id
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn seed_accepted_schedule_change(
+        fixture: &PublishedScheduleFixture,
+        source: &SchedulePublicationSource,
+        block: &SchedulePublicationBlock,
+        mapping: Option<&ScheduleBlockMapping>,
+        operation: ScheduleGooglePublicationOperation,
+        remote_id: &str,
+        marker: u8,
+        now: DateTime<Utc>,
+    ) -> Uuid {
+        let publication_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        let audit_id = Uuid::new_v4();
+        let slot_id = schedule_publication_slot_id(
+            fixture.sync.scope.workspace_id,
+            block.item_id,
+            block.occurrence_id,
+            block.session_index,
+        );
+        let (source_block_id, mapping_id, expected_remote_id, expected_etag, payload) =
+            match operation {
+                ScheduleGooglePublicationOperation::Create => (
+                    Some(block.source_block_id),
+                    None,
+                    None,
+                    None,
+                    schedule_event_payload(remote_id, &block.title, block.starts_at, block.ends_at),
+                ),
+                ScheduleGooglePublicationOperation::Update => {
+                    let mapping = mapping.expect("update mapping");
+                    (
+                        Some(block.source_block_id),
+                        Some(mapping.mapping_id),
+                        Some(mapping.remote_resource_id.clone()),
+                        Some(mapping.remote_etag.clone()),
+                        schedule_event_payload(
+                            &mapping.remote_resource_id,
+                            &block.title,
+                            block.starts_at,
+                            block.ends_at,
+                        ),
+                    )
+                }
+                ScheduleGooglePublicationOperation::Delete => {
+                    let mapping = mapping.expect("delete mapping");
+                    (
+                        None,
+                        Some(mapping.mapping_id),
+                        Some(mapping.remote_resource_id.clone()),
+                        Some(mapping.remote_etag.clone()),
+                        json!({}),
+                    )
+                }
+                ScheduleGooglePublicationOperation::Noop => panic!("Noop is never operational"),
+            };
+        let (create_count, update_count, delete_count) = match operation {
+            ScheduleGooglePublicationOperation::Create => (1, 0, 0),
+            ScheduleGooglePublicationOperation::Update => (0, 1, 0),
+            ScheduleGooglePublicationOperation::Delete => (0, 0, 1),
+            ScheduleGooglePublicationOperation::Noop => unreachable!(),
+        };
+        let mut transaction = fixture
+            .sync
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("accepted change transaction");
+        sqlx::query(
+            "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+             entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
+             VALUES ($1, $2, $3, 'google.schedule_publication.approved', 'schedule_revision', \
+             $4, $5, $5, 'succeeded', '{}'::jsonb, $6)",
+        )
+        .bind(audit_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(source.schedule_revision_id)
+        .bind(u64_to_i64(source.schedule_revision_number).expect("revision fits"))
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .expect("approval audit");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             collection_display_name, required_scope, schedule_revision_id, \
+             schedule_revision_number, schedule_publication_hash, desired_set_hash, timezone_name, \
+             horizon_start, horizon_end, preview_hash, change_count, create_count, update_count, \
+             delete_count, noop_count, expires_at, approved_at, capability_hash, approval_audit_id, \
+             consumed_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+             $10, $11, $12, $13, $14, $15, $16, $17, 1, $18, $19, $20, 0, $21, $22, $23, \
+             $24, $22, $22, $22)",
+        )
+        .bind(publication_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(u64_to_i64(fixture.sync.collection.revision).expect("collection revision fits"))
+        .bind(&fixture.sync.collection.remote_collection_id)
+        .bind(&fixture.sync.collection.display_name)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(source.schedule_revision_id)
+        .bind(u64_to_i64(source.schedule_revision_number).expect("schedule revision fits"))
+        .bind(source.schedule_publication_hash.as_slice())
+        .bind([marker; 32].as_slice())
+        .bind(&source.timezone_name)
+        .bind(source.horizon_start)
+        .bind(source.horizon_end)
+        .bind([marker.wrapping_add(1); 32].as_slice())
+        .bind(create_count)
+        .bind(update_count)
+        .bind(delete_count)
+        .bind(now + Duration::minutes(20))
+        .bind(now)
+        .bind([marker.wrapping_add(2); 32].as_slice())
+        .bind(audit_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("accepted preview");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, user_id, \
+             preview_id, provider_account_id, collection_id, schedule_revision_id, ordinal, slot_id, \
+             source_block_id, item_id, occurrence_id, session_index, incarnation, operation, \
+             mapping_id, remote_resource_id, expected_etag, desired_payload_hash, intent_hash, \
+             provider_payload, review_summary, starts_at, ends_at, created_at) VALUES ($1, $2, $3, \
+             $4, $5, $6, $7, 0, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
+             $20, $21, $22, $23, $24)",
+        )
+        .bind(change_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(publication_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(source.schedule_revision_id)
+        .bind(slot_id)
+        .bind(source_block_id)
+        .bind(block.item_id)
+        .bind(block.occurrence_id)
+        .bind(i32::from(block.session_index))
+        .bind(i64::from(mapping.map_or(block.incarnation, |mapping| mapping.incarnation)))
+        .bind(operation.as_db())
+        .bind(mapping_id)
+        .bind(&expected_remote_id)
+        .bind(&expected_etag)
+        .bind([marker.wrapping_add(3); 32].as_slice())
+        .bind([marker.wrapping_add(4); 32].as_slice())
+        .bind(payload)
+        .bind(json!({
+            "summary": block.title,
+            "starts_at": block.starts_at,
+            "ends_at": block.ends_at,
+        }))
+        .bind(block.starts_at)
+        .bind(block.ends_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .expect("accepted preview change");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_batches (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             required_scope, schedule_revision_id, schedule_revision_number, \
+             schedule_publication_hash, state, total_count, create_count, update_count, \
+             delete_count, noop_count, pending_count, delivering_count, backoff_count, \
+             published_count, conflict_count, failed_count, superseded_count, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', 1, $12, $13, \
+             $14, 0, 1, 0, 0, 0, 0, 0, 0, $15, $15)",
+        )
+        .bind(publication_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(u64_to_i64(fixture.sync.collection.revision).expect("collection revision fits"))
+        .bind(&fixture.sync.collection.remote_collection_id)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(source.schedule_revision_id)
+        .bind(u64_to_i64(source.schedule_revision_number).expect("schedule revision fits"))
+        .bind(source.schedule_publication_hash.as_slice())
+        .bind(create_count)
+        .bind(update_count)
+        .bind(delete_count)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .expect("accepted publication batch");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_outbox (id, workspace_id, user_id, \
+             publication_id, change_id, ordinal, operation, state, available_at, created_at, \
+             updated_at) VALUES ($1, $2, $3, $4, $5, 0, $6, 'pending', $7, $7, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(publication_id)
+        .bind(change_id)
+        .bind(operation.as_db())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .expect("accepted publication outbox");
+        transaction
+            .commit()
+            .await
+            .expect("accepted schedule change commit");
+        publication_id
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_elapsed_exact_schedule_history_remains_noop_through_approval_revalidation() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let multibyte_title = "🧶".repeat(500);
+        let fixture =
+            published_schedule_fixture_with_first_title(&database_url, 1, Some(&multibyte_title))
+                .await;
+        let block = fixture.source.blocks[0].clone();
+        assert_eq!(block.title.chars().count(), 500);
+        let old_desired_hash = [17_u8; 32];
+        let mapping_id = insert_schedule_mapping(
+            &fixture,
+            &block,
+            "elapsed-schedule-event",
+            "etag-elapsed",
+            old_desired_hash,
+        )
+        .await;
+        let source = fixture
+            .sync
+            .repository
+            .load_schedule_publication_source(
+                fixture.sync.account_id,
+                fixture.sync.collection.id,
+                fixture.source.schedule_revision_id,
+            )
+            .await
+            .expect("reload exact historical mapping");
+        let mapping = source
+            .mappings
+            .iter()
+            .find(|mapping| mapping.mapping_id == mapping_id)
+            .expect("exact elapsed mapping remains visible")
+            .clone();
+        let now = block.ends_at + Duration::minutes(1);
+        let desired_payload_hash = schedule_desired_payload_hash(
+            mapping.slot_id,
+            mapping.incarnation,
+            &block.title,
+            block.starts_at,
+            block.ends_at,
+            &source.timezone_name,
+        )
+        .expect("desired payload hash");
+        assert_ne!(desired_payload_hash, old_desired_hash);
+        let mut change = PreparedSchedulePublicationChange {
+            ordinal: 0,
+            slot_id: mapping.slot_id,
+            source_block_id: Some(block.source_block_id),
+            item_id: block.item_id,
+            occurrence_id: block.occurrence_id,
+            session_index: block.session_index,
+            incarnation: mapping.incarnation,
+            operation: ScheduleGooglePublicationOperation::Noop,
+            mapping_id: Some(mapping.mapping_id),
+            remote_resource_id: Some(mapping.remote_resource_id.clone()),
+            expected_etag: Some(mapping.remote_etag.clone()),
+            desired_payload_hash,
+            payload: schedule_event_payload(
+                &mapping.remote_resource_id,
+                &block.title,
+                block.starts_at,
+                block.ends_at,
+            ),
+            review_summary: json!({
+                "summary": block.title,
+                "starts_at": block.starts_at,
+                "ends_at": block.ends_at,
+            }),
+            starts_at: block.starts_at,
+            ends_at: block.ends_at,
+            intent_hash: [0; 32],
+        };
+        change.intent_hash =
+            schedule_publication_intent_hash(&source, &change).expect("intent hash");
+        let preview_id = Uuid::new_v4();
+        let expires_at = now + Duration::minutes(10);
+        let preview_hash = schedule_publication_preview_hash(
+            preview_id,
+            &source,
+            std::slice::from_ref(&change),
+            expires_at,
+        )
+        .expect("preview hash");
+        let preview = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                SchedulePublicationPreviewSpec {
+                    id: preview_id,
+                    source,
+                    changes: vec![change],
+                    expires_at,
+                },
+                now,
+            )
+            .await
+            .expect("elapsed exact history preview");
+        assert_eq!(preview.noop_count, 1);
+        assert_eq!(preview.update_count, 0);
+        fixture
+            .sync
+            .repository
+            .approve_schedule_publication(
+                SchedulePublicationApprovalSpec {
+                    account_id: fixture.sync.account_id,
+                    preview_id,
+                    expected_preview_hash: preview_hash,
+                    capability_hash: [29; 32],
+                },
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("approval revalidation preserves elapsed Noop");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_schedule_preview_retries_coalesce_and_active_content_is_bounded() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let first_spec = schedule_preview_spec(
+            &source,
+            &block,
+            Uuid::new_v4(),
+            &block.title,
+            "coalesced-schedule-event",
+            "dwsm1.v1.concurrent-a",
+            now + Duration::minutes(10),
+        );
+        let second_spec = schedule_preview_spec(
+            &source,
+            &block,
+            Uuid::new_v4(),
+            &block.title,
+            "coalesced-schedule-event",
+            "dwsm1.v1.concurrent-b",
+            now + Duration::minutes(11),
+        );
+        let first_repository = fixture.sync.repository.clone();
+        let second_repository = fixture.sync.repository.clone();
+        let (first, second) = tokio::join!(
+            first_repository.create_schedule_publication_preview(first_spec, now),
+            second_repository.create_schedule_publication_preview(second_spec, now),
+        );
+        let first = first.expect("first concurrent preview");
+        let second = second.expect("second concurrent preview");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.preview_hash, second.preview_hash);
+        assert_eq!(first.changes, second.changes);
+
+        let different_target = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    Uuid::new_v4(),
+                    &block.title,
+                    "same-desired-set-different-event-id",
+                    "dwsm1.v1.different-target",
+                    now + Duration::minutes(12),
+                ),
+                now,
+            )
+            .await
+            .expect("desired-set hash alone does not coalesce different exact content");
+        assert_ne!(first.id, different_target.id);
+
+        for marker in 1_u8..7 {
+            let summary = format!("Distinct schedule preview {marker}");
+            fixture
+                .sync
+                .repository
+                .create_schedule_publication_preview(
+                    schedule_preview_spec(
+                        &source,
+                        &block,
+                        Uuid::new_v4(),
+                        &summary,
+                        &format!("distinct-schedule-event-{marker}"),
+                        &format!("dwsm1.v1.distinct-{marker}"),
+                        now + Duration::minutes(12),
+                    ),
+                    now,
+                )
+                .await
+                .expect("distinct active preview within cap");
+        }
+        let before_limit: (i64, i64) = sqlx::query_as(
+            "SELECT count(*), COALESCE(sum(change_count), 0) \
+             FROM google_schedule_publication_previews WHERE workspace_id = $1",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("active preview totals");
+        assert_eq!(before_limit, (8, 8));
+
+        let error = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    Uuid::new_v4(),
+                    "Ninth distinct schedule preview",
+                    "distinct-schedule-event-8",
+                    "dwsm1.v1.distinct-8",
+                    now + Duration::minutes(12),
+                ),
+                now,
+            )
+            .await
+            .expect_err("ninth active preview is rate limited");
+        assert_eq!(error, GoogleSyncRepositoryError::PreviewLimitExceeded);
+        let after_limit: (i64, i64) = sqlx::query_as(
+            "SELECT count(*), (SELECT count(*) FROM \
+             google_schedule_publication_preview_changes WHERE workspace_id = $1) \
+             FROM google_schedule_publication_previews WHERE workspace_id = $1",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("preview totals after rejected growth");
+        assert_eq!(after_limit, (8, 8));
+    }
+
+    #[tokio::test]
+    async fn postgres_schedule_preview_pruning_preserves_audit_and_consumed_history() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let (unapproved_id, no_audit) =
+            seed_expired_schedule_preview(&fixture, false, 51, now).await;
+        assert!(no_audit.is_none());
+        let (approved_id, approval_audit_id) =
+            seed_expired_schedule_preview(&fixture, true, 52, now).await;
+        let approval_audit_id = approval_audit_id.expect("approved preview audit");
+
+        fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    Uuid::new_v4(),
+                    &block.title,
+                    "current-after-preview-prune",
+                    "dwsm1.v1.current-after-prune",
+                    now + Duration::minutes(10),
+                ),
+                now,
+            )
+            .await
+            .expect("new preview prunes expired unconsumed content");
+        let pruned: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND id = ANY($2)), \
+             (SELECT count(*) FROM google_schedule_publication_preview_changes \
+               WHERE workspace_id = $1 AND preview_id = ANY($2))",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(vec![unapproved_id, approved_id])
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("pruned preview contents");
+        assert_eq!(pruned, (0, 0));
+        let audit_survives: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_operations \
+             WHERE workspace_id = $1 AND id = $2)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(approval_audit_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("approval audit survives content expiry");
+        assert!(audit_survives);
+
+        let consumed_id = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "consumed-history-event",
+            61,
+            now,
+        )
+        .await;
+        let child_delete = sqlx::query(
+            "DELETE FROM google_schedule_publication_preview_changes \
+             WHERE workspace_id = $1 AND preview_id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(consumed_id)
+        .execute(&fixture.sync.database.pool)
+        .await;
+        assert!(child_delete.is_err(), "consumed child content is immutable");
+        let header_delete = sqlx::query(
+            "DELETE FROM google_schedule_publication_previews \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(consumed_id)
+        .execute(&fixture.sync.database.pool)
+        .await;
+        assert!(header_delete.is_err(), "consumed preview header is durable");
+        let consumed_survives: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND id = $2), \
+             (SELECT count(*) FROM google_schedule_publication_preview_changes \
+               WHERE workspace_id = $1 AND preview_id = $2), \
+             (SELECT count(*) FROM google_schedule_publication_batches \
+               WHERE workspace_id = $1 AND id = $2)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(consumed_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("consumed history remains complete");
+        assert_eq!(consumed_survives, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_schedule_dispatch_write_permit_requires_a_covering_live_parent_lease() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "lease-fenced-schedule-event",
+            71,
+            now,
+        )
+        .await;
+        let short_claim = fixture
+            .sync
+            .repository
+            .claim_due(now, now + Duration::seconds(20))
+            .await
+            .expect("replace expired fixture run")
+            .expect("short parent claim");
+        let work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&short_claim, now + Duration::seconds(1))
+            .await
+            .expect("claim schedule work")
+            .expect("due schedule work");
+        assert!(matches!(
+            fixture
+                .sync
+                .repository
+                .authorize_schedule_publication_dispatch(&work, true, now + Duration::seconds(1))
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        ));
+        let pre_takeover: (String, bool, Option<Uuid>, Option<bool>) = sqlx::query_as(
+            "SELECT state, provider_post_may_have_started, dispatch_nonce, \
+             dispatch_provider_write FROM google_schedule_publication_outbox \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(work.outbox_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("failed permit leaves no send evidence");
+        assert_eq!(pre_takeover, ("delivering".to_owned(), false, None, None));
+        assert!(matches!(
+            fixture
+                .sync
+                .repository
+                .authorize_schedule_publication_dispatch(&work, true, now + Duration::seconds(21),)
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        ));
+
+        let replacement_claim = fixture
+            .sync
+            .repository
+            .claim_due(now + Duration::seconds(21), now + Duration::minutes(20))
+            .await
+            .expect("expired parent takeover")
+            .expect("replacement claim");
+        assert_ne!(replacement_claim.claim_id, short_claim.claim_id);
+        let replacement_work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&replacement_claim, now + Duration::seconds(21))
+            .await
+            .expect("reclaim schedule work after takeover")
+            .expect("reconciled work remains due");
+        let permit = fixture
+            .sync
+            .repository
+            .authorize_schedule_publication_dispatch(
+                &replacement_work,
+                true,
+                now + Duration::seconds(21),
+            )
+            .await
+            .expect("covering replacement lease authorizes write");
+        let authorized: (bool, Option<Uuid>, Option<bool>) = sqlx::query_as(
+            "SELECT provider_post_may_have_started, dispatch_nonce, dispatch_provider_write \
+             FROM google_schedule_publication_outbox WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(work.outbox_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("authorized dispatch evidence");
+        assert_eq!(authorized, (true, Some(permit.nonce), Some(true)));
+
+        let provenance_flip = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET dispatch_provider_write = false \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(work.outbox_id)
+        .execute(&fixture.sync.database.pool)
+        .await;
+        assert!(
+            provenance_flip.is_err(),
+            "an active dispatch permit cannot change write provenance"
+        );
+        let uncertainty_clear = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET \
+             provider_post_may_have_started = false, send_started_at = NULL \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(work.outbox_id)
+        .execute(&fixture.sync.database.pool)
+        .await;
+        assert!(
+            uncertainty_clear.is_err(),
+            "write-permit uncertainty cannot be erased"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn postgres_elapsed_schedule_changes_are_superseded_without_provider_dispatch() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 2).await;
+        let mapped_block = fixture.source.blocks[0].clone();
+        let create_block = fixture.source.blocks[1].clone();
+        let mapping_id = insert_schedule_mapping(
+            &fixture,
+            &mapped_block,
+            "elapsed-origin-event",
+            "etag-before-elapsed",
+            [131; 32],
+        )
+        .await;
+        let source = fixture
+            .sync
+            .repository
+            .load_schedule_publication_source(
+                fixture.sync.account_id,
+                fixture.sync.collection.id,
+                fixture.source.schedule_revision_id,
+            )
+            .await
+            .expect("source with mapped schedule block");
+        let mapping = source
+            .mappings
+            .iter()
+            .find(|mapping| mapping.mapping_id == mapping_id)
+            .expect("active schedule mapping")
+            .clone();
+        let wall_now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let backoff_create = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &create_block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "elapsed-backoff-create",
+            132,
+            wall_now,
+        )
+        .await;
+        let pending_create = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &create_block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "elapsed-pending-create",
+            133,
+            wall_now + Duration::microseconds(1),
+        )
+        .await;
+        let mut moved_block = mapped_block.clone();
+        moved_block.starts_at += Duration::days(7);
+        moved_block.ends_at += Duration::days(7);
+        let moved_update = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &moved_block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Update,
+            "unused",
+            134,
+            wall_now + Duration::microseconds(2),
+        )
+        .await;
+        let elapsed_delete = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &mapped_block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Delete,
+            "unused",
+            135,
+            wall_now + Duration::microseconds(3),
+        )
+        .await;
+
+        let claim = fixture
+            .sync
+            .repository
+            .claim_due(wall_now, moved_block.ends_at + Duration::days(1))
+            .await
+            .expect("claim parent schedule run")
+            .expect("schedule run is due");
+        let first_work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&claim, wall_now + Duration::microseconds(4))
+            .await
+            .expect("claim first schedule create")
+            .expect("backoff candidate exists");
+        assert_eq!(first_work.publication_id, backoff_create);
+        fixture
+            .sync
+            .repository
+            .fail_schedule_publication(
+                &first_work,
+                "backoff",
+                "provider_rate_limited",
+                create_block.ends_at,
+                wall_now + Duration::microseconds(5),
+            )
+            .await
+            .expect("unsent work enters backoff until after its end");
+
+        let elapsed_at = mapped_block.ends_at.max(create_block.ends_at) + Duration::microseconds(1);
+        assert!(moved_block.ends_at > elapsed_at);
+        assert!(
+            fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, elapsed_at)
+                .await
+                .expect("drain elapsed schedule work")
+                .is_none(),
+            "all definitely-unsent elapsed changes are discarded in one drain"
+        );
+        let publication_ids = vec![backoff_create, pending_create, moved_update, elapsed_delete];
+        let rows: Vec<(
+            Uuid,
+            String,
+            bool,
+            Option<Uuid>,
+            Option<DateTime<Utc>>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT publication_id, state, provider_post_may_have_started, dispatch_nonce, \
+                   terminal_at, last_error_code FROM google_schedule_publication_outbox \
+                 WHERE workspace_id = $1 AND publication_id = ANY($2) ORDER BY publication_id",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(&publication_ids)
+        .fetch_all(&fixture.sync.database.pool)
+        .await
+        .expect("elapsed outbox state");
+        assert_eq!(rows.len(), 4);
+        for (_, state, possible_send, nonce, terminal_at, code) in rows {
+            assert_eq!(state, "superseded");
+            assert!(!possible_send);
+            assert_eq!(nonce, None);
+            assert_eq!(terminal_at, Some(elapsed_at));
+            assert_eq!(code.as_deref(), Some("schedule_block_elapsed_before_send"));
+        }
+        let batch_states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM google_schedule_publication_batches \
+             WHERE workspace_id = $1 AND id = ANY($2) ORDER BY id",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(&publication_ids)
+        .fetch_all(&fixture.sync.database.pool)
+        .await
+        .expect("elapsed batch aggregates");
+        assert_eq!(batch_states, vec!["superseded"; 4]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_possible_create_never_reposts_and_remains_adoptable_after_elapsed() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let first_authorized_at = block.ends_at - Duration::seconds(10);
+        let publication_id = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "possible-create-never-repost",
+            141,
+            first_authorized_at - Duration::seconds(1),
+        )
+        .await;
+        let claim = fixture
+            .sync
+            .repository
+            .claim_due(
+                first_authorized_at - Duration::seconds(1),
+                block.ends_at + Duration::days(1),
+            )
+            .await
+            .expect("claim parent before block end")
+            .expect("schedule run is due");
+        let work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&claim, first_authorized_at)
+            .await
+            .expect("claim pending Create")
+            .expect("Create is due");
+        let first_permit = fixture
+            .sync
+            .repository
+            .authorize_schedule_publication_dispatch(&work, true, first_authorized_at)
+            .await
+            .expect("authorize first and only Create POST");
+        assert_eq!(
+            first_permit.expires_at, block.ends_at,
+            "write permit cannot outlive the generated block"
+        );
+
+        let restarted_at = first_authorized_at + Duration::seconds(1);
+        fixture
+            .sync
+            .repository
+            .recover_startup(restarted_at)
+            .await
+            .expect("simulate lost Create response");
+        let claim = fixture
+            .sync
+            .repository
+            .claim_due(restarted_at, block.ends_at + Duration::days(1))
+            .await
+            .expect("replacement parent claim")
+            .expect("ambiguous Create wakes sync");
+        let work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&claim, restarted_at)
+            .await
+            .expect("claim ambiguous Create")
+            .expect("ambiguous Create remains due");
+        assert!(work.provider_post_may_have_started);
+        assert!(
+            fixture
+                .sync
+                .repository
+                .reconcile_schedule_publication_no_effect(
+                    &work,
+                    "create_not_observed",
+                    restarted_at,
+                )
+                .await
+                .expect("current-policy Create 404 remains unresolved"),
+            "an authenticated 404 never permits a second deterministic Create"
+        );
+
+        let successor_at = restarted_at + Duration::seconds(1);
+        let successor_id = Uuid::new_v4();
+        let successor_expires_at = successor_at + Duration::minutes(5);
+        let successor_change = prepared_schedule_create_change(
+            &source,
+            &block,
+            &block.title,
+            "possible-create-successor",
+            "dwsm1.v1.possible-create-successor",
+        );
+        let successor_hash = schedule_publication_preview_hash(
+            successor_id,
+            &source,
+            std::slice::from_ref(&successor_change),
+            successor_expires_at,
+        )
+        .expect("successor preview hash");
+        fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                SchedulePublicationPreviewSpec {
+                    id: successor_id,
+                    source: source.clone(),
+                    changes: vec![successor_change],
+                    expires_at: successor_expires_at,
+                },
+                successor_at,
+            )
+            .await
+            .expect("successor preview may be reviewed");
+        let capability_hash = [142; 32];
+        fixture
+            .sync
+            .repository
+            .approve_schedule_publication(
+                SchedulePublicationApprovalSpec {
+                    account_id: fixture.sync.account_id,
+                    preview_id: successor_id,
+                    expected_preview_hash: successor_hash,
+                    capability_hash,
+                },
+                successor_at + Duration::microseconds(1),
+            )
+            .await
+            .expect("approve successor preview");
+        assert_eq!(
+            fixture
+                .sync
+                .repository
+                .enqueue_schedule_publication(
+                    SchedulePublicationEnqueueSpec {
+                        account_id: fixture.sync.account_id,
+                        preview_id: successor_id,
+                        collection_id: fixture.sync.collection.id,
+                        expected_schedule_revision_id: source.schedule_revision_id,
+                        capability_hash,
+                    },
+                    successor_at + Duration::microseconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication),
+            "possible-send Create blocks a successor even after a negative provider read"
+        );
+
+        let elapsed_retry_at = block.ends_at + Duration::seconds(21);
+        let elapsed_work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&claim, elapsed_retry_at)
+            .await
+            .expect("claim ambiguous Create after its end")
+            .expect("possible-send evidence remains reconcilable");
+        assert!(matches!(
+            fixture
+                .sync
+                .repository
+                .authorize_schedule_publication_dispatch(&elapsed_work, true, elapsed_retry_at)
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        ));
+        let blocked_write: (String, bool, Option<Uuid>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT state, provider_post_may_have_started, dispatch_nonce, terminal_at \
+                 FROM google_schedule_publication_outbox \
+                 WHERE workspace_id = $1 AND publication_id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(publication_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("elapsed ambiguous Create state");
+        assert_eq!(blocked_write, ("backoff".to_owned(), true, None, None));
+
+        let observed_at = elapsed_retry_at + Duration::seconds(30);
+        let observed_work = fixture
+            .sync
+            .repository
+            .claim_schedule_publication(&claim, observed_at)
+            .await
+            .expect("reclaim ambiguous Create for positive observation")
+            .expect("read reconciliation stays due");
+        let read_permit = fixture
+            .sync
+            .repository
+            .authorize_schedule_publication_dispatch(&observed_work, false, observed_at)
+            .await
+            .expect("authorize read-only adoption after elapsed");
+        fixture
+            .sync
+            .repository
+            .complete_schedule_publication(
+                &observed_work,
+                SchedulePublicationResult {
+                    remote_resource_id: "possible-create-never-repost".to_owned(),
+                    remote_etag: Some("etag-late-create-observation".to_owned()),
+                    remote_updated_at: Some(observed_at),
+                    payload_hash: [143; 32],
+                    dispatch_nonce: read_permit.nonce,
+                    observation_source: SchedulePublicationObservationSource::ReconciliationRead,
+                },
+                observed_at,
+            )
+            .await
+            .expect("adopt exact late Create effect without another write");
+        let adopted: (String, bool, i64, i64) = sqlx::query_as(
+            "SELECT outbox.state, outbox.provider_post_may_have_started, \
+               (SELECT count(*) FROM google_schedule_publication_observations observation \
+                 WHERE observation.workspace_id = outbox.workspace_id \
+                   AND observation.outbox_id = outbox.id \
+                   AND observation.observation_source = 'reconciliation_read'), \
+               (SELECT count(*) FROM google_schedule_publication_mapping_origins origin \
+                 WHERE origin.workspace_id = outbox.workspace_id \
+                   AND origin.remote_resource_id = 'possible-create-never-repost') \
+             FROM google_schedule_publication_outbox outbox \
+             WHERE outbox.workspace_id = $1 AND outbox.publication_id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(publication_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("late Create adoption evidence");
+        assert_eq!(adopted, ("published".to_owned(), true, 1, 1));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn postgres_ambiguous_provider_success_codes_stay_sticky_and_block_successors() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let block = fixture.source.blocks[0].clone();
+        let mapping_id = insert_schedule_mapping(
+            &fixture,
+            &block,
+            "ambiguous-provider-result-event",
+            "etag-before-ambiguous-result",
+            [151; 32],
+        )
+        .await;
+        let source = fixture
+            .sync
+            .repository
+            .load_schedule_publication_source(
+                fixture.sync.account_id,
+                fixture.sync.collection.id,
+                fixture.source.schedule_revision_id,
+            )
+            .await
+            .expect("source with update mapping");
+        let mapping = source
+            .mappings
+            .iter()
+            .find(|mapping| mapping.mapping_id == mapping_id)
+            .expect("active mapped event")
+            .clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let identity_publication = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Update,
+            "unused",
+            152,
+            now,
+        )
+        .await;
+        let oversized_publication = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Update,
+            "unused",
+            153,
+            now + Duration::microseconds(1),
+        )
+        .await;
+        let claim = fixture
+            .sync
+            .repository
+            .claim_due(now, block.ends_at + Duration::days(1))
+            .await
+            .expect("claim schedule run")
+            .expect("schedule run is due");
+        for (offset, code) in [
+            "provider_identity_unresolved",
+            "provider_response_too_large",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dispatch_at =
+                now + Duration::seconds(i64::try_from(offset).expect("offset fits") + 1);
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, dispatch_at)
+                .await
+                .expect("claim ambiguous-success update")
+                .expect("update is due");
+            fixture
+                .sync
+                .repository
+                .authorize_schedule_publication_dispatch(&work, true, dispatch_at)
+                .await
+                .expect("authorize conditional update");
+            fixture
+                .sync
+                .repository
+                .fail_schedule_publication(
+                    &work,
+                    "backoff",
+                    code,
+                    now + Duration::minutes(1),
+                    dispatch_at,
+                )
+                .await
+                .expect("unusable success remains ambiguous");
+        }
+
+        let observed_at = now + Duration::minutes(1);
+        for _ in 0..2 {
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, observed_at)
+                .await
+                .expect("reclaim ambiguous-success update")
+                .expect("ambiguous update remains due");
+            assert!(
+                fixture
+                    .sync
+                    .repository
+                    .reconcile_schedule_publication_no_effect(
+                        &work,
+                        "update_not_observed",
+                        observed_at,
+                    )
+                    .await
+                    .expect("negative read retains ambiguous provider success")
+            );
+        }
+        let ambiguous_rows: Vec<(Uuid, String, bool, Option<DateTime<Utc>>, String)> =
+            sqlx::query_as(
+                "SELECT publication_id, state, provider_post_may_have_started, terminal_at, \
+                   last_error_code FROM google_schedule_publication_outbox \
+                 WHERE workspace_id = $1 AND publication_id = ANY($2) ORDER BY publication_id",
+            )
+            .bind(fixture.sync.scope.workspace_id)
+            .bind(vec![identity_publication, oversized_publication])
+            .fetch_all(&fixture.sync.database.pool)
+            .await
+            .expect("sticky ambiguous-success rows");
+        assert_eq!(ambiguous_rows.len(), 2);
+        let retained_codes = ambiguous_rows
+            .iter()
+            .map(|(_, state, possible_send, terminal_at, code)| {
+                assert_eq!(state, "backoff");
+                assert!(*possible_send);
+                assert_eq!(*terminal_at, None);
+                code.as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            retained_codes,
+            BTreeSet::from([
+                "provider_identity_unresolved",
+                "provider_response_too_large"
+            ])
+        );
+
+        let successor_at = observed_at + Duration::seconds(1);
+        let successor_id = Uuid::new_v4();
+        let successor_expires_at = successor_at + Duration::minutes(10);
+        let successor_change = prepared_schedule_update_change(
+            &source,
+            &block,
+            &mapping,
+            "dwsm1.v1.ambiguous-update-successor",
+        );
+        let successor_hash = schedule_publication_preview_hash(
+            successor_id,
+            &source,
+            std::slice::from_ref(&successor_change),
+            successor_expires_at,
+        )
+        .expect("successor update preview hash");
+        fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                SchedulePublicationPreviewSpec {
+                    id: successor_id,
+                    source: source.clone(),
+                    changes: vec![successor_change],
+                    expires_at: successor_expires_at,
+                },
+                successor_at,
+            )
+            .await
+            .expect("successor update preview");
+        let capability_hash = [200; 32];
+        fixture
+            .sync
+            .repository
+            .approve_schedule_publication(
+                SchedulePublicationApprovalSpec {
+                    account_id: fixture.sync.account_id,
+                    preview_id: successor_id,
+                    expected_preview_hash: successor_hash,
+                    capability_hash,
+                },
+                successor_at + Duration::microseconds(1),
+            )
+            .await
+            .expect("approve successor update");
+        assert_eq!(
+            fixture
+                .sync
+                .repository
+                .enqueue_schedule_publication(
+                    SchedulePublicationEnqueueSpec {
+                        account_id: fixture.sync.account_id,
+                        preview_id: successor_id,
+                        collection_id: fixture.sync.collection.id,
+                        expected_schedule_revision_id: source.schedule_revision_id,
+                        capability_hash,
+                    },
+                    successor_at + Duration::microseconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::InvalidSchedulePublication),
+            "unresolved provider identity prevents successor publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_due_schedule_remainder_yields_to_another_due_account() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "fairness-remainder-event",
+            81,
+            now,
+        )
+        .await;
+        fixture
+            .sync
+            .repository
+            .recover_startup(now)
+            .await
+            .expect("reset fixture parent run");
+
+        let other_account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+             external_account_id, display_label, encrypted_credentials, credential_key_version, \
+             granted_scopes, status, sync_enabled, is_default) VALUES ($1, $2, $3, 'google', \
+             $4, 'Other due account', $5, 1, ARRAY[$6], 'active', true, false)",
+        )
+        .bind(other_account_id)
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(format!("fairness-{other_account_id}"))
+        .bind(vec![9_u8; 64])
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .execute(&fixture.sync.database.pool)
+        .await
+        .expect("second Google account");
+        let other_due_at = now + Duration::microseconds(1);
+        sqlx::query(
+            "INSERT INTO google_sync_runs (workspace_id, user_id, provider_account_id, \
+             next_attempt_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $4, $4)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(other_account_id)
+        .bind(other_due_at)
+        .execute(&fixture.sync.database.pool)
+        .await
+        .expect("second due run");
+
+        let completion_at = now + Duration::microseconds(2);
+        let first_claim = fixture
+            .sync
+            .repository
+            .claim_due(completion_at, completion_at + Duration::minutes(10))
+            .await
+            .expect("first fair claim")
+            .expect("one account is due");
+        assert_eq!(first_claim.account_id, fixture.sync.account_id);
+        fixture
+            .sync
+            .repository
+            .complete_claim(
+                &first_claim,
+                &SyncCounts::default(),
+                true,
+                completion_at,
+                completion_at + Duration::minutes(15),
+            )
+            .await
+            .expect("complete chunk with due schedule remainder");
+        let scheduled_next: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT next_attempt_at FROM google_sync_runs \
+             WHERE workspace_id = $1 AND provider_account_id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.account_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("yielded account scheduling key");
+        assert_eq!(scheduled_next, completion_at);
+
+        let second_claim = fixture
+            .sync
+            .repository
+            .claim_due(completion_at, completion_at + Duration::minutes(10))
+            .await
+            .expect("second fair claim")
+            .expect("another account remains due");
+        assert_eq!(second_claim.account_id, other_account_id);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn postgres_stale_possible_schedule_writes_remain_unknown_until_positive_observation() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 2).await;
+        let mapped_block = fixture.source.blocks[0].clone();
+        let create_block = fixture.source.blocks[1].clone();
+        let mapping_id = insert_schedule_mapping(
+            &fixture,
+            &mapped_block,
+            "ambiguous-mapped-event",
+            "etag-before-send",
+            [41; 32],
+        )
+        .await;
+        let source = fixture
+            .sync
+            .repository
+            .load_schedule_publication_source(
+                fixture.sync.account_id,
+                fixture.sync.collection.id,
+                fixture.source.schedule_revision_id,
+            )
+            .await
+            .expect("source with active mapping");
+        let mapping = source
+            .mappings
+            .iter()
+            .find(|mapping| mapping.mapping_id == mapping_id)
+            .expect("active mapping")
+            .clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let create_publication = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &create_block,
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "ambiguous-create-event",
+            101,
+            now,
+        )
+        .await;
+        let update_publication = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &mapped_block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Update,
+            "unused",
+            111,
+            now + Duration::microseconds(1),
+        )
+        .await;
+        let delete_publication = seed_accepted_schedule_change(
+            &fixture,
+            &source,
+            &mapped_block,
+            Some(&mapping),
+            ScheduleGooglePublicationOperation::Delete,
+            "unused",
+            121,
+            now + Duration::microseconds(2),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .sync
+                .repository
+                .known_schedule_publication_remote_ids(
+                    fixture.sync.account_id,
+                    fixture.sync.collection.id,
+                    &[
+                        "ambiguous-create-event".to_owned(),
+                        "external-event".to_owned()
+                    ],
+                )
+                .await
+                .expect("known generated IDs before mapping completion"),
+            BTreeSet::from(["ambiguous-create-event".to_owned()]),
+            "an accepted deterministic Create ID is inbound-owned before its mapping exists"
+        );
+
+        let mut claim = fixture
+            .sync
+            .repository
+            .claim_due(now, now + Duration::days(31))
+            .await
+            .expect("replace expired fixture run")
+            .expect("schedule run claim");
+        let claimed_run: (String, Option<Uuid>, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT state, claim_id, claim_generation, lease_until FROM google_sync_runs \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("claimed run evidence");
+        assert_eq!(claim.account_id, fixture.sync.account_id);
+        assert_eq!(claimed_run.0, "running");
+        assert_eq!(claimed_run.1, Some(claim.claim_id));
+        assert_eq!(claimed_run.2, u64_to_i64(claim.claim_generation).unwrap());
+        assert_eq!(claimed_run.3, Some(now + Duration::days(31)));
+        for offset in 0_i64..3 {
+            let claim_at = now + Duration::seconds(offset * 2 + 1);
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, claim_at)
+                .await
+                .expect("claim accepted schedule work")
+                .expect("one due schedule change");
+            fixture
+                .sync
+                .repository
+                .authorize_schedule_publication_dispatch(&work, true, claim_at)
+                .await
+                .expect("authorize initial provider write");
+            let recovered_at = claim_at + Duration::seconds(1);
+            fixture
+                .sync
+                .repository
+                .recover_startup(recovered_at)
+                .await
+                .expect("simulate crash after final dispatch authorization");
+            claim = fixture
+                .sync
+                .repository
+                .claim_due(recovered_at, now + Duration::days(31))
+                .await
+                .expect("claim after simulated restart")
+                .expect("schedule work wakes a replacement parent claim");
+        }
+
+        let stale_at = now + Duration::seconds(20);
+        sqlx::query(
+            "UPDATE google_sync_collections SET revision = revision + 1, updated_at = $5 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .bind(fixture.sync.collection.id)
+        .bind(stale_at)
+        .execute(&fixture.sync.database.pool)
+        .await
+        .expect("make publication target stale");
+
+        let first_observed_at = now + Duration::minutes(1);
+        for _ in 0..3 {
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, first_observed_at)
+                .await
+                .expect("claim ambiguous schedule work")
+                .expect("ambiguous row remains due");
+            let code = match work.operation {
+                ScheduleGooglePublicationOperation::Create => "schedule_create_not_observed",
+                ScheduleGooglePublicationOperation::Update => "schedule_update_old_state",
+                ScheduleGooglePublicationOperation::Delete => "schedule_delete_old_live",
+                ScheduleGooglePublicationOperation::Noop => unreachable!(),
+            };
+            assert!(
+                fixture
+                    .sync
+                    .repository
+                    .reconcile_schedule_publication_no_effect(&work, code, first_observed_at)
+                    .await
+                    .expect("first no-effect observation is handled")
+            );
+        }
+        let early_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE state = 'backoff'), \
+             sum(no_effect_observation_count), \
+             (SELECT count(*) FROM google_schedule_publication_observations \
+               WHERE workspace_id = $1) \
+             FROM google_schedule_publication_outbox WHERE workspace_id = $1",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("early no-effect state");
+        assert_eq!(early_counts, (3, 3, 0));
+
+        let repeated_negative_at = now + Duration::minutes(7);
+        for _ in 0..3 {
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, repeated_negative_at)
+                .await
+                .expect("reclaim spaced no-effect work")
+                .expect("spaced observation remains due");
+            let code = match work.operation {
+                ScheduleGooglePublicationOperation::Create => "schedule_create_not_observed",
+                ScheduleGooglePublicationOperation::Update => "schedule_update_old_state",
+                ScheduleGooglePublicationOperation::Delete => "schedule_delete_old_live",
+                ScheduleGooglePublicationOperation::Noop => unreachable!(),
+            };
+            assert!(
+                fixture
+                    .sync
+                    .repository
+                    .reconcile_schedule_publication_no_effect(&work, code, repeated_negative_at,)
+                    .await
+                    .expect("repeated negative observation remains unknown")
+            );
+        }
+        let repeated_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE state = 'backoff'), \
+             sum(no_effect_observation_count), \
+             (SELECT count(*) FROM google_schedule_publication_observations \
+               WHERE workspace_id = $1) \
+             FROM google_schedule_publication_outbox WHERE workspace_id = $1",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("repeated no-effect state");
+        assert_eq!(repeated_counts, (3, 6, 0));
+
+        let positive_effect_at = now + Duration::days(30);
+        for _ in 0..3 {
+            let work = fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, positive_effect_at)
+                .await
+                .expect("reclaim long-lived ambiguous work")
+                .expect("ambiguous row remains recoverable");
+            if work.publication_id == create_publication {
+                let permit = fixture
+                    .sync
+                    .repository
+                    .authorize_schedule_publication_dispatch(&work, false, positive_effect_at)
+                    .await
+                    .expect("authorize read-only late Create adoption");
+                fixture
+                    .sync
+                    .repository
+                    .complete_schedule_publication(
+                        &work,
+                        SchedulePublicationResult {
+                            remote_resource_id: "ambiguous-create-event".to_owned(),
+                            remote_etag: Some("etag-observed-after-long-lag".to_owned()),
+                            remote_updated_at: Some(positive_effect_at),
+                            payload_hash: [201; 32],
+                            dispatch_nonce: permit.nonce,
+                            observation_source:
+                                SchedulePublicationObservationSource::ReconciliationRead,
+                        },
+                        positive_effect_at,
+                    )
+                    .await
+                    .expect("a much-later Create effect remains adoptable");
+            } else {
+                let code = match work.operation {
+                    ScheduleGooglePublicationOperation::Update => "schedule_update_old_state",
+                    ScheduleGooglePublicationOperation::Delete => "schedule_delete_old_live",
+                    ScheduleGooglePublicationOperation::Create
+                    | ScheduleGooglePublicationOperation::Noop => unreachable!(),
+                };
+                assert!(
+                    fixture
+                        .sync
+                        .repository
+                        .reconcile_schedule_publication_no_effect(&work, code, positive_effect_at,)
+                        .await
+                        .expect("long-lived negative observation remains unknown")
+                );
+            }
+        }
+        assert!(
+            fixture
+                .sync
+                .repository
+                .claim_schedule_publication(&claim, positive_effect_at)
+                .await
+                .expect("empty schedule queue")
+                .is_none(),
+            "unknown rows honor their next backoff before another provider read"
+        );
+        let rows: Vec<(
+            Uuid,
+            String,
+            i32,
+            Option<String>,
+            bool,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            "SELECT publication_id, state, no_effect_observation_count, last_error_code, \
+             provider_post_may_have_started, terminal_at, available_at \
+             FROM google_schedule_publication_outbox WHERE workspace_id = $1 \
+             ORDER BY publication_id",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_all(&fixture.sync.database.pool)
+        .await
+        .expect("durable ambiguous rows");
+        assert_eq!(rows.len(), 3);
+        for (
+            publication_id,
+            state,
+            no_effect_count,
+            code,
+            possible_send,
+            terminal_at,
+            available_at,
+        ) in rows
+        {
+            assert!(possible_send);
+            if publication_id == create_publication {
+                assert_eq!(state, "conflict");
+                assert_eq!(no_effect_count, 2);
+                assert_eq!(
+                    code.as_deref(),
+                    Some("publication_target_changed_after_send")
+                );
+                assert_eq!(terminal_at, Some(positive_effect_at));
+            } else {
+                assert_eq!(state, "backoff");
+                assert_eq!(no_effect_count, 3);
+                assert_eq!(terminal_at, None);
+                assert_eq!(available_at, positive_effect_at + Duration::minutes(2));
+                let expected_code = if publication_id == update_publication {
+                    "schedule_update_old_state"
+                } else {
+                    assert_eq!(publication_id, delete_publication);
+                    "schedule_delete_old_live"
+                };
+                assert_eq!(code.as_deref(), Some(expected_code));
+            }
+        }
+        let observation_counts: (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE result_kind = 'event_present'), \
+             count(*) FILTER (WHERE observation_source = 'reconciliation_read') \
+             FROM google_schedule_publication_observations WHERE workspace_id = $1",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("durable reconciliation observations");
+        assert_eq!(observation_counts, (1, 1));
     }
 
     fn oauth_idempotency(
@@ -10429,6 +16442,7 @@ mod tests {
             .complete_claim(
                 &fixture.claim,
                 &SyncCounts::default(),
+                false,
                 first_completed_at,
                 fixture.now + Duration::hours(1),
             )
@@ -10477,6 +16491,7 @@ mod tests {
             .complete_claim(
                 &follow_up,
                 &SyncCounts::default(),
+                false,
                 first_completed_at + Duration::seconds(1),
                 fixture.now + Duration::hours(1),
             )
@@ -13153,6 +19168,7 @@ mod tests {
             .complete_claim(
                 &claim,
                 &counts,
+                false,
                 now + Duration::minutes(5),
                 now + Duration::minutes(15),
             )

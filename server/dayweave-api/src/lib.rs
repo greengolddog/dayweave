@@ -321,6 +321,7 @@ impl AppState {
                 oauth_scope,
                 clock.clone(),
                 config.google_outbound_enabled,
+                config.google_schedule_outbound_enabled,
                 config.google_outbound_approval_ttl,
             ));
             sync.recover_startup()

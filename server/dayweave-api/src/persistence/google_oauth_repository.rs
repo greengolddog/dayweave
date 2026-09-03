@@ -27,6 +27,12 @@ const SESSION_RESOURCE: &str = "google_oauth_session";
 const ACCOUNT_RESOURCE: &str = "google_account";
 const DISCONNECT_RESOURCE: &str = "google_disconnect";
 
+#[derive(Clone, Copy)]
+enum SchedulePublicationAccountTransition {
+    Retry,
+    Conflict,
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresGoogleOAuthRepository {
     pool: PgPool,
@@ -1390,7 +1396,7 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .fetch_all(&mut *transaction)
         .await
         .map_err(internal)?;
-        for account_id in teardown_account_ids {
+        for &account_id in &teardown_account_ids {
             retire_active_calendar_occurrences_for_account(
                 &mut transaction,
                 self.scope,
@@ -1399,6 +1405,15 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
             )
             .await
             .map_err(internal)?;
+            reconcile_schedule_publications_for_account_transition(
+                &mut transaction,
+                self.scope,
+                account_id,
+                SchedulePublicationAccountTransition::Retry,
+                "operator_recovery_revoked_parent_claim",
+                now,
+            )
+            .await?;
         }
 
         let accounts_affected = if recovery {
@@ -1460,6 +1475,50 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .execute(&mut *transaction)
         .await
         .map_err(internal)?;
+        if !teardown_account_ids.is_empty() {
+            // Account recovery is also a parent-run fence. Revoke the exact
+            // identity after every generated-schedule child has been made
+            // claimable again under a future, reauthorized run.
+            sqlx::query(
+                "UPDATE google_sync_outbox SET \
+                 state = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                    AND remote_resource_id IS NULL \
+                                    AND provider_post_may_have_started \
+                               THEN 'conflict' ELSE 'backoff' END, \
+                 claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+                 run_claim_generation = NULL, dispatch_nonce = NULL, \
+                 dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $4, \
+                 last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                             AND remote_resource_id IS NULL \
+                                             AND provider_post_may_have_started \
+                                        THEN 'provider_identity_unresolved' \
+                                        ELSE 'operator_recovery_revoked_parent_claim' END, \
+                 updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
+                   AND provider_account_id = ANY($3) AND state = 'delivering'",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(&teardown_account_ids)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            sqlx::query(
+                "UPDATE google_sync_runs SET state = 'reauthorization_required', claim_id = NULL, \
+                 lease_until = NULL, requested_at = NULL, next_attempt_at = $4, \
+                 last_error_code = 'operator_recovery_required', last_error_at = $4, \
+                 revision = revision + 1, updated_at = $4 \
+                 WHERE workspace_id = $1 AND user_id = $2 \
+                   AND provider_account_id = ANY($3)",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(&teardown_account_ids)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
         sqlx::query(
             "UPDATE google_oauth_scope_state SET credential_generation = credential_generation + 1, \
              revocation_kind = NULL, revocation_owner_id = NULL, revocation_claim_id = NULL, \
@@ -1658,6 +1717,15 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
             // Account pause is a guardian fence for both inbound reconciliation
             // and provider publication. Revoke the run and every live delivery
             // claim in the same transaction as the credential-state change.
+            reconcile_schedule_publications_for_account_transition(
+                &mut transaction,
+                self.scope,
+                account_id,
+                SchedulePublicationAccountTransition::Retry,
+                "account_paused_with_active_schedule_delivery",
+                now,
+            )
+            .await?;
             sqlx::query(
                 "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
                  requested_at = NULL, next_attempt_at = $4, last_error_code = 'account_paused', \
@@ -1889,6 +1957,15 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         // Revoke every local delivery claim in the same transaction that makes
         // the credentials unavailable, so a stale worker cannot acknowledge or
         // later replay provider mutations after the owner disconnects.
+        reconcile_schedule_publications_for_account_transition(
+            &mut transaction,
+            self.scope,
+            account_id,
+            SchedulePublicationAccountTransition::Conflict,
+            "account_disconnecting",
+            now,
+        )
+        .await?;
         sqlx::query(
             "UPDATE google_sync_outbox SET state = 'conflict', claim_id = NULL, \
              claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
@@ -2096,6 +2173,150 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         }
         transaction.commit().await.map_err(internal)
     }
+}
+
+async fn reconcile_schedule_publications_for_account_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    transition: SchedulePublicationAccountTransition,
+    code: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleOAuthRepositoryError> {
+    // Every schedule-publication stage first takes a shared lock on this
+    // parent row. Taking it exclusively before touching children serializes
+    // an OAuth/account fence with authorize/complete, including a response
+    // already in flight at the provider.
+    sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+         AND provider_account_id = $3 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+
+    let terminal = matches!(transition, SchedulePublicationAccountTransition::Conflict);
+    let publication_ids = sqlx::query_scalar::<_, Uuid>(
+        "WITH reconciled AS (UPDATE google_schedule_publication_outbox outbox SET \
+         state = CASE WHEN $4 THEN 'conflict' ELSE 'backoff' END, \
+         claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+         run_claim_generation = NULL, dispatch_nonce = NULL, dispatch_provider_write = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+         available_at = CASE WHEN $4 THEN outbox.available_at ELSE $6 END, \
+         terminal_at = CASE WHEN $4 THEN $6 ELSE NULL END, \
+         last_error_code = CASE \
+           WHEN NOT $4 AND outbox.provider_post_may_have_started \
+             AND outbox.last_error_code IN (\
+               'provider_identity_unresolved', 'provider_response_too_large'\
+             ) THEN outbox.last_error_code \
+           ELSE $5 END, updated_at = $6 \
+         FROM google_schedule_publication_batches batch \
+         WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+           AND batch.workspace_id = outbox.workspace_id AND batch.user_id = outbox.user_id \
+           AND batch.id = outbox.publication_id AND batch.provider_account_id = $3 \
+           AND (outbox.state = 'delivering' \
+                OR ($4 AND outbox.state IN ('pending', 'backoff'))) \
+         RETURNING outbox.publication_id) SELECT DISTINCT publication_id FROM reconciled",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(terminal)
+    .bind(code)
+    .bind(now)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    for publication_id in publication_ids {
+        refresh_schedule_publication_batch(transaction, scope, publication_id, now).await?;
+    }
+    Ok(())
+}
+
+async fn refresh_schedule_publication_batch(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    publication_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleOAuthRepositoryError> {
+    let counts = sqlx::query(
+        "SELECT count(*)::integer AS total_count, \
+           count(*) FILTER (WHERE state = 'pending')::integer AS pending_count, \
+           count(*) FILTER (WHERE state = 'delivering')::integer AS delivering_count, \
+           count(*) FILTER (WHERE state = 'backoff')::integer AS backoff_count, \
+           count(*) FILTER (WHERE state = 'published')::integer AS published_count, \
+           count(*) FILTER (WHERE state = 'conflict')::integer AS conflict_count, \
+           count(*) FILTER (WHERE state = 'failed')::integer AS failed_count, \
+           count(*) FILTER (WHERE state = 'superseded')::integer AS superseded_count, \
+           (array_agg(last_error_code ORDER BY updated_at DESC, id DESC) \
+             FILTER (WHERE last_error_code IS NOT NULL))[1] AS last_error_code \
+         FROM google_schedule_publication_outbox \
+         WHERE workspace_id = $1 AND user_id = $2 AND publication_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(publication_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let total: i32 = counts.try_get("total_count").map_err(internal)?;
+    let pending: i32 = counts.try_get("pending_count").map_err(internal)?;
+    let delivering: i32 = counts.try_get("delivering_count").map_err(internal)?;
+    let backoff: i32 = counts.try_get("backoff_count").map_err(internal)?;
+    let published: i32 = counts.try_get("published_count").map_err(internal)?;
+    let conflict: i32 = counts.try_get("conflict_count").map_err(internal)?;
+    let failed: i32 = counts.try_get("failed_count").map_err(internal)?;
+    let superseded: i32 = counts.try_get("superseded_count").map_err(internal)?;
+    let state = if delivering > 0 {
+        "delivering"
+    } else if pending > 0 {
+        "pending"
+    } else if backoff > 0 {
+        "backoff"
+    } else if published == total {
+        "published"
+    } else if published > 0 {
+        "partially_published"
+    } else if conflict > 0 {
+        "conflict"
+    } else if failed > 0 {
+        "failed"
+    } else {
+        "superseded"
+    };
+    let active = pending + delivering + backoff > 0;
+    let last_error_code: Option<String> = counts.try_get("last_error_code").map_err(internal)?;
+    sqlx::query(
+        "UPDATE google_schedule_publication_batches SET state = $4, pending_count = $5, \
+         delivering_count = $6, backoff_count = $7, published_count = $8, \
+         conflict_count = $9, failed_count = $10, superseded_count = $11, \
+         last_error_code = $12, \
+         last_error_at = CASE WHEN $12::varchar IS NULL THEN NULL ELSE $13 END, \
+         started_at = CASE WHEN $6 > 0 THEN COALESCE(started_at, $13) ELSE started_at END, \
+         completed_at = CASE WHEN $14 THEN NULL ELSE COALESCE(completed_at, $13) END, \
+         updated_at = $13 WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(publication_id)
+    .bind(state)
+    .bind(pending)
+    .bind(delivering)
+    .bind(backoff)
+    .bind(published)
+    .bind(conflict)
+    .bind(failed)
+    .bind(superseded)
+    .bind(last_error_code)
+    .bind(now)
+    .bind(active)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3044,4 +3265,645 @@ fn map_authorization_write_error(error: &sqlx::Error) -> GoogleOAuthRepositoryEr
 
 fn internal<T>(_: T) -> GoogleOAuthRepositoryError {
     GoogleOAuthRepositoryError::Internal
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use chrono::Duration;
+    use serde_json::json;
+    use sqlx::{
+        ConnectOptions, Executor,
+        postgres::{PgConnectOptions, PgPoolOptions},
+    };
+
+    use crate::{
+        google_oauth::{GoogleOAuthRepository, OAuthIdempotency},
+        persistence::MIGRATOR,
+    };
+
+    use super::*;
+
+    struct ScheduleOAuthFixture {
+        database: TestDatabase,
+        repository: PostgresGoogleOAuthRepository,
+        scope: DatabaseScope,
+        account_id: Uuid,
+        publication_id: Uuid,
+        outbox_id: Uuid,
+        parent_claim_id: Uuid,
+        parent_claim_generation: i64,
+        send_started_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    }
+
+    #[tokio::test]
+    async fn postgres_disconnect_reconciles_schedule_delivery_before_send() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; disconnect-before-send test skipped");
+            return;
+        };
+        assert_disconnect_reconciles_schedule_delivery(&database_url, false).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_disconnect_preserves_possible_schedule_send_evidence() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; disconnect-after-send test skipped");
+            return;
+        };
+        assert_disconnect_reconciles_schedule_delivery(&database_url, true).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_operator_recovery_revokes_parent_and_requeues_uncertain_schedule_delivery() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; operator-recovery test skipped");
+            return;
+        };
+        let fixture = schedule_oauth_fixture(&database_url, true).await;
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("sticky response fixture transaction");
+        sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET \
+             last_error_code = 'provider_identity_unresolved' \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.outbox_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("sticky ambiguous response fixture");
+        refresh_schedule_publication_batch(
+            &mut transaction,
+            fixture.scope,
+            fixture.publication_id,
+            fixture.now,
+        )
+        .await
+        .expect("refresh sticky response batch fixture");
+        transaction
+            .commit()
+            .await
+            .expect("commit sticky response fixture");
+        let recovery_owner = Uuid::new_v4();
+        let recovery_claim = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE google_oauth_scope_state SET revocation_kind = 'recovery', \
+             revocation_owner_id = $3, revocation_claim_id = $4, revocation_claimed_at = $5, \
+             revocation_generation = credential_generation \
+             WHERE workspace_id = $1 AND user_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(recovery_owner)
+        .bind(recovery_claim)
+        .bind(fixture.now - Duration::minutes(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("operator recovery fence fixture");
+
+        let result = fixture
+            .repository
+            .acknowledge_operator_recovery(fixture.now)
+            .await
+            .expect("operator recovery acknowledgement");
+        assert_eq!(result.accounts_marked_reauthorization_required, 1);
+        assert_eq!(result.legacy_accounts_finalized, 0);
+
+        let account: (String, bool) = sqlx::query_as(
+            "SELECT status, sync_enabled FROM provider_accounts \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.account_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("recovered account state");
+        assert_eq!(account, ("reauthorization_required".to_owned(), false));
+        assert_parent_run_revoked(&fixture, "reauthorization_required").await;
+        assert_schedule_reconciled(&fixture, "backoff", "provider_identity_unresolved", true).await;
+        assert_stale_schedule_completion_cannot_mutate(&fixture).await;
+        fixture.database.destroy().await;
+    }
+
+    async fn assert_disconnect_reconciles_schedule_delivery(
+        database_url: &str,
+        possible_send: bool,
+    ) {
+        let fixture = schedule_oauth_fixture(database_url, possible_send).await;
+        let mutation = fixture
+            .repository
+            .claim_disconnect(
+                fixture.account_id,
+                1,
+                Uuid::new_v4(),
+                fixture.now,
+                fixture.now - Duration::minutes(5),
+                fixture.now - Duration::minutes(5),
+                OAuthIdempotency {
+                    namespace: "google_oauth_schedule_disconnect_test",
+                    key_hash: [91; 32],
+                    request_fingerprint: [92; 32],
+                    expires_at: fixture.now + Duration::hours(1),
+                },
+            )
+            .await
+            .expect("disconnect claim");
+        assert!(matches!(mutation, DisconnectMutation::Execute(_)));
+
+        assert_parent_run_revoked(&fixture, "idle").await;
+        assert_schedule_reconciled(&fixture, "conflict", "account_disconnecting", possible_send)
+            .await;
+        assert_stale_schedule_completion_cannot_mutate(&fixture).await;
+        fixture.database.destroy().await;
+    }
+
+    async fn assert_parent_run_revoked(fixture: &ScheduleOAuthFixture, expected_state: &str) {
+        let run: (String, Option<Uuid>, Option<DateTime<Utc>>, i64) = sqlx::query_as(
+            "SELECT state, claim_id, lease_until, claim_generation FROM google_sync_runs \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.account_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("parent run after account transition");
+        assert_eq!(run.0, expected_state);
+        assert_eq!(run.1, None);
+        assert_eq!(run.2, None);
+        assert_eq!(run.3, fixture.parent_claim_generation);
+    }
+
+    async fn assert_schedule_reconciled(
+        fixture: &ScheduleOAuthFixture,
+        expected_state: &str,
+        expected_code: &str,
+        possible_send: bool,
+    ) {
+        let outbox = sqlx::query(
+            "SELECT state, claim_id, claimed_at, run_claim_id, run_claim_generation, \
+             dispatch_nonce, dispatch_provider_write, dispatch_authorized_at, dispatch_expires_at, \
+             provider_post_may_have_started, send_started_at, no_effect_observation_count, \
+             last_no_effect_observed_at, last_error_code, terminal_at \
+             FROM google_schedule_publication_outbox WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.outbox_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("schedule outbox after account transition");
+        assert_eq!(outbox.get::<String, _>("state"), expected_state);
+        assert_eq!(outbox.get::<Option<Uuid>, _>("claim_id"), None);
+        assert_eq!(outbox.get::<Option<DateTime<Utc>>, _>("claimed_at"), None);
+        assert_eq!(outbox.get::<Option<Uuid>, _>("run_claim_id"), None);
+        assert_eq!(outbox.get::<Option<i64>, _>("run_claim_generation"), None);
+        assert_eq!(outbox.get::<Option<Uuid>, _>("dispatch_nonce"), None);
+        assert_eq!(
+            outbox.get::<Option<bool>, _>("dispatch_provider_write"),
+            None
+        );
+        assert_eq!(
+            outbox.get::<Option<DateTime<Utc>>, _>("dispatch_authorized_at"),
+            None
+        );
+        assert_eq!(
+            outbox.get::<Option<DateTime<Utc>>, _>("dispatch_expires_at"),
+            None
+        );
+        assert_eq!(
+            outbox.get::<bool, _>("provider_post_may_have_started"),
+            possible_send
+        );
+        assert_eq!(
+            outbox.get::<Option<DateTime<Utc>>, _>("send_started_at"),
+            fixture.send_started_at
+        );
+        assert_eq!(outbox.get::<i32, _>("no_effect_observation_count"), 0);
+        assert_eq!(
+            outbox.get::<Option<DateTime<Utc>>, _>("last_no_effect_observed_at"),
+            None
+        );
+        assert_eq!(outbox.get::<String, _>("last_error_code"), expected_code);
+        let terminal_at = outbox.get::<Option<DateTime<Utc>>, _>("terminal_at");
+        assert_eq!(
+            terminal_at,
+            (expected_state == "conflict").then_some(fixture.now)
+        );
+
+        let batch: (String, i32, i32, i32, i32, Option<DateTime<Utc>>, String) = sqlx::query_as(
+            "SELECT state, pending_count, delivering_count, backoff_count, conflict_count, \
+                 completed_at, last_error_code FROM google_schedule_publication_batches \
+                 WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.publication_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("schedule batch after account transition");
+        assert_eq!(batch.0, expected_state);
+        assert_eq!((batch.1, batch.2), (0, 0));
+        assert_eq!(batch.3, i32::from(expected_state == "backoff"));
+        assert_eq!(batch.4, i32::from(expected_state == "conflict"));
+        assert_eq!(
+            batch.5,
+            (expected_state == "conflict").then_some(fixture.now)
+        );
+        assert_eq!(batch.6, expected_code);
+    }
+
+    async fn assert_stale_schedule_completion_cannot_mutate(fixture: &ScheduleOAuthFixture) {
+        let changed = sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = 'published', claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_provider_write = NULL, dispatch_authorized_at = NULL, \
+             dispatch_expires_at = NULL, terminal_at = $7, updated_at = $7 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND state = 'delivering' \
+               AND run_claim_id = $4 AND run_claim_generation = $5 AND claim_id = $6",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.outbox_id)
+        .bind(fixture.parent_claim_id)
+        .bind(fixture.parent_claim_generation)
+        .bind(Uuid::from_u128(61))
+        .bind(fixture.now + Duration::seconds(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("stale schedule completion fence")
+        .rows_affected();
+        assert_eq!(changed, 0);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn schedule_oauth_fixture(
+        database_url: &str,
+        possible_send: bool,
+    ) -> ScheduleOAuthFixture {
+        let database = TestDatabase::create(database_url).await;
+        MIGRATOR
+            .run(&database.pool)
+            .await
+            .expect("migrations apply");
+        let scope = seed_scope(&database.pool).await;
+        let now: DateTime<Utc> = "2026-09-03T12:00:00Z".parse().expect("fixture time");
+        let created_at = now - Duration::minutes(2);
+        let claimed_at = now - Duration::seconds(30);
+        let authorized_at = now - Duration::seconds(10);
+        let account_id = Uuid::new_v4();
+        let collection_id = Uuid::new_v4();
+        let schedule_revision_id = Uuid::new_v4();
+        let source_block_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        let outbox_id = Uuid::new_v4();
+        let parent_claim_id = Uuid::new_v4();
+        let parent_claim_generation = 7_i64;
+        let child_claim_id = Uuid::from_u128(61);
+        let starts_at = now + Duration::hours(1);
+        let ends_at = starts_at + Duration::hours(1);
+
+        let mut transaction = database.pool.begin().await.expect("begin fixture");
+        sqlx::query("INSERT INTO google_oauth_scope_state (workspace_id, user_id) VALUES ($1, $2)")
+            .bind(scope.workspace_id)
+            .bind(scope.user_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("OAuth scope fixture");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+             external_account_id, display_label, encrypted_credentials, credential_key_version, \
+             granted_scopes, status, sync_enabled, is_default, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'google', $4, 'Schedule OAuth test account', $5, 1, \
+             ARRAY['https://www.googleapis.com/auth/calendar'], 'active', true, true, $6, $6)",
+        )
+        .bind(account_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(format!("schedule-oauth-{account_id}"))
+        .bind(vec![7_u8; 64])
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("Google account fixture");
+        sqlx::query(
+            "INSERT INTO google_sync_collections (id, workspace_id, user_id, provider_account_id, \
+             collection_kind, remote_collection_id, display_name, provider_access_role, \
+             provider_primary, provider_selected, selected, sync_role, revision, discovered_at, \
+             configured_at, created_at, updated_at) VALUES ($1, $2, $3, $4, 'calendar', \
+             'primary@example.test', 'Primary', 'owner', true, true, true, 'writable', 1, \
+             $5, $5, $5, $5)",
+        )
+        .bind(collection_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(account_id)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("Google collection fixture");
+        sqlx::query(
+            "INSERT INTO google_sync_runs (workspace_id, user_id, provider_account_id, state, \
+             claim_id, lease_until, started_at, next_attempt_at, claim_generation, created_at, \
+             updated_at) VALUES ($1, $2, $3, 'running', $4, $5, $6, $6, $7, $6, $6)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(account_id)
+        .bind(parent_claim_id)
+        .bind(now + Duration::minutes(5))
+        .bind(created_at)
+        .bind(parent_claim_generation)
+        .execute(&mut *transaction)
+        .await
+        .expect("running parent fixture");
+        sqlx::query(
+            "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+             timezone_name, duration_seconds, earliest_start_at, deadline_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'task', 'scheduled', 'Schedule publication fixture', 'UTC', \
+             3600, $4, $5, $6, $6)",
+        )
+        .bind(item_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(starts_at)
+        .bind(ends_at)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("item fixture");
+        sqlx::query(
+            "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
+             horizon_start, horizon_end, timezone_name, input_digest, publication_hash, \
+             created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', \
+             $3, $4, 'UTC', $5, $6, $7, $8)",
+        )
+        .bind(schedule_revision_id)
+        .bind(scope.workspace_id)
+        .bind(now)
+        .bind(now + Duration::days(1))
+        .bind(vec![10_u8; 32])
+        .bind(vec![11_u8; 32])
+        .bind(scope.user_id)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule revision fixture");
+        sqlx::query(
+            "INSERT INTO schedule_blocks (id, workspace_id, schedule_revision_id, source_block_id, \
+             item_id, block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal, \
+             constraint_snapshot, created_at) VALUES ($1, $2, $3, $1, $4, 'planned', \
+             'Schedule publication fixture', $5, $6, 'UTC', 0, $7, $8)",
+        )
+        .bind(source_block_id)
+        .bind(scope.workspace_id)
+        .bind(schedule_revision_id)
+        .bind(item_id)
+        .bind(starts_at)
+        .bind(ends_at)
+        .bind(json!({
+            "source_block_id": source_block_id,
+            "occurrence_id": null,
+            "session_index": 0,
+            "core_kind": "planned"
+        }))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule block fixture");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             collection_display_name, required_scope, schedule_revision_id, schedule_revision_number, \
+             schedule_publication_hash, desired_set_hash, timezone_name, horizon_start, horizon_end, \
+             preview_hash, change_count, create_count, update_count, delete_count, noop_count, \
+             expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 1, \
+             'primary@example.test', 'Primary', 'https://www.googleapis.com/auth/calendar', \
+             $6, 1, $7, $8, 'UTC', $9, $10, $11, 1, 1, 0, 0, 0, $12, $13, $13)",
+        )
+        .bind(publication_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(schedule_revision_id)
+        .bind(vec![11_u8; 32])
+        .bind(vec![12_u8; 32])
+        .bind(now)
+        .bind(now + Duration::days(1))
+        .bind(vec![13_u8; 32])
+        .bind(created_at + Duration::minutes(29))
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule preview fixture");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, user_id, \
+             preview_id, provider_account_id, collection_id, schedule_revision_id, ordinal, slot_id, \
+             source_block_id, item_id, session_index, incarnation, operation, desired_payload_hash, \
+             intent_hash, provider_payload, review_summary, starts_at, ends_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, 0, 1, 'create', \
+             $11, $12, $13, $14, $15, $16, $17)",
+        )
+        .bind(change_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(publication_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(schedule_revision_id)
+        .bind(Uuid::new_v4())
+        .bind(source_block_id)
+        .bind(item_id)
+        .bind(vec![14_u8; 32])
+        .bind(vec![15_u8; 32])
+        .bind(json!({"id": "schedule-event-id"}))
+        .bind(json!({"summary": "Schedule publication fixture"}))
+        .bind(starts_at)
+        .bind(ends_at)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule preview change fixture");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_batches (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             required_scope, schedule_revision_id, schedule_revision_number, schedule_publication_hash, \
+             state, total_count, create_count, update_count, delete_count, noop_count, pending_count, \
+             delivering_count, backoff_count, published_count, conflict_count, failed_count, \
+             superseded_count, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 1, \
+             'primary@example.test', 'https://www.googleapis.com/auth/calendar', $6, 1, $7, \
+             'pending', 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, $8, $8)",
+        )
+        .bind(publication_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(schedule_revision_id)
+        .bind(vec![11_u8; 32])
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule publication batch fixture");
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_outbox (id, workspace_id, user_id, \
+             publication_id, change_id, ordinal, operation, state, available_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 0, 'create', 'pending', $6, $6, $6)",
+        )
+        .bind(outbox_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(publication_id)
+        .bind(change_id)
+        .bind(created_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("schedule publication outbox fixture");
+        sqlx::query(
+            "UPDATE google_schedule_publication_outbox SET state = 'delivering', claim_id = $3, \
+             claimed_at = $4, run_claim_id = $5, run_claim_generation = $6, updated_at = $4 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(outbox_id)
+        .bind(child_claim_id)
+        .bind(claimed_at)
+        .bind(parent_claim_id)
+        .bind(parent_claim_generation)
+        .execute(&mut *transaction)
+        .await
+        .expect("claimed schedule publication fixture");
+        let send_started_at = possible_send.then_some(authorized_at);
+        if possible_send {
+            sqlx::query(
+                "UPDATE google_schedule_publication_outbox SET dispatch_nonce = $3, \
+                 dispatch_provider_write = true, dispatch_authorized_at = $4, \
+                 dispatch_expires_at = $5, provider_post_may_have_started = true, \
+                 send_started_at = $4, updated_at = $4 WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(scope.workspace_id)
+            .bind(outbox_id)
+            .bind(Uuid::new_v4())
+            .bind(authorized_at)
+            .bind(authorized_at + Duration::seconds(30))
+            .execute(&mut *transaction)
+            .await
+            .expect("authorized schedule publication fixture");
+        }
+        refresh_schedule_publication_batch(&mut transaction, scope, publication_id, authorized_at)
+            .await
+            .expect("refresh claimed schedule batch fixture");
+        transaction.commit().await.expect("commit schedule fixture");
+
+        let repository = PostgresGoogleOAuthRepository::new(database.pool.clone(), scope);
+        ScheduleOAuthFixture {
+            database,
+            repository,
+            scope,
+            account_id,
+            publication_id,
+            outbox_id,
+            parent_claim_id,
+            parent_claim_generation,
+            send_started_at,
+            now,
+        }
+    }
+
+    async fn seed_scope(pool: &PgPool) -> DatabaseScope {
+        let scope = DatabaseScope {
+            user_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+        };
+        sqlx::query(
+            "INSERT INTO users (id, auth_subject, display_name, timezone_name) \
+             VALUES ($1, $2, 'Schedule OAuth owner', 'UTC')",
+        )
+        .bind(scope.user_id)
+        .bind(format!("schedule-oauth-owner-{}", scope.user_id))
+        .execute(pool)
+        .await
+        .expect("user fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, owner_user_id, slug, name, timezone_name) \
+             VALUES ($1, $2, $3, 'Schedule OAuth workspace', 'UTC')",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(format!("oauth-{}", scope.workspace_id.simple()))
+        .execute(pool)
+        .await
+        .expect("workspace fixture");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .execute(pool)
+        .await
+        .expect("membership fixture");
+        scope
+    }
+
+    struct TestDatabase {
+        admin: PgPool,
+        pool: PgPool,
+        schema: String,
+    }
+
+    impl TestDatabase {
+        async fn create(database_url: &str) -> Self {
+            let options = PgConnectOptions::from_str(database_url)
+                .expect("valid DAYWEAVE_TEST_DATABASE_URL")
+                .disable_statement_logging();
+            let admin = PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(options.clone())
+                .await
+                .expect("connect test PostgreSQL");
+            let schema = format!("dw_oauth_sched_{}", Uuid::new_v4().simple());
+            admin
+                .execute(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+                .await
+                .expect("create isolated test schema");
+            let connection_schema = schema.clone();
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .after_connect(move |connection, _| {
+                    let statement = format!("SET search_path TO {connection_schema}");
+                    Box::pin(async move {
+                        connection.execute(AssertSqlSafe(statement)).await?;
+                        Ok(())
+                    })
+                })
+                .connect_with(options)
+                .await
+                .expect("connect isolated test pool");
+            Self {
+                admin,
+                pool,
+                schema,
+            }
+        }
+
+        async fn destroy(self) {
+            self.pool.close().await;
+            self.admin
+                .execute(AssertSqlSafe(format!(
+                    "DROP SCHEMA {} CASCADE",
+                    self.schema
+                )))
+                .await
+                .expect("drop isolated test schema");
+            self.admin.close().await;
+        }
+    }
 }

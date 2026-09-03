@@ -107,6 +107,19 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **SCH-015** The system shall warn when a deadline is fragile because little or no feasible slack remains.
 - **SCH-016** Learned scheduling preferences shall be inspectable, editable, lockable, and resettable.
 
+The current `SCH-006` implementation checkpoint is not acceptance of the full
+requirement. The backend can explicitly preview, approve, enqueue, and report
+durable delivery of the current immutable published revision's generated
+not-yet-elapsed firm `planned` and `pinned` blocks to one selected writable
+Google Calendar. This server-first path is disabled by default behind both the
+general and schedule-specific outbound gates, uses stable logical
+slot/incarnation mappings, and publishes private/redacted events with reminders
+and attendee updates suppressed. Elapsed published events are never rewritten,
+deleted, or reused. No native client or automatic horizon process triggers this
+flow, and inbound Google edits, moves, or deletions are not interpreted yet;
+tentative blocks remain app-only as required. `SCH-006` remains open until the
+client, automation, and bidirectional behaviors satisfy the requirement.
+
 ### 4.6 Habits
 
 - **HAB-001** Habit recurrence shall support selected weekdays; N times per day/week/month; every N time units; completion-relative recurrence; and custom rules.

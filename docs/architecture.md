@@ -134,7 +134,67 @@ Determinism requires sorted stable inputs, a recorded engine/config version, fix
 
 ### 5.5 Manual overrides and publication
 
-The engine never invents a hard violation. A manual placement that violates a rule is stored with the exact acknowledged violations and treated as pinned demand in later solves. Firm and tentative blocks belong to the same schedule revision; a publication projector emits only firm blocks to Google and transitions tentative blocks when the rolling boundary advances.
+The engine never invents a hard violation. A manual placement that violates a rule is stored with the exact acknowledged violations and treated as pinned demand in later solves. The target model keeps firm and tentative blocks in the same schedule revision; a publication projector emits only firm blocks to Google and transitions tentative blocks when the rolling boundary advances.
+
+The first generated-schedule publication slice is deliberately server-first and
+narrower than that target. Given the exact current immutable published revision
+and one selected writable Google Calendar, it creates or updates only
+not-yet-elapsed generated firm `planned` and `pinned` blocks. Imported/external
+fixed blocks and tentative blocks are not publication candidates. A stable
+logical slot derived from the workspace, item, occurrence, and session index
+survives schedule-revision and block-ID changes, so moving the same generated
+session becomes a conditional update instead of an unrelated delete and create.
+A mapped future slot omitted by the new firm plan becomes a reviewed conditional
+delete. An elapsed event is immutable Calendar history: it is never rewritten,
+deleted, or reused, and any later reuse of its logical slot advances an
+incarnation and receives a distinct provider identity.
+
+The server computes one immutable create/update/delete/no-op batch, exposes it
+through an explicit preview → approve → enqueue sequence, and returns only an
+aggregate status after queue acceptance. Approval creates one expiring,
+content-bound capability whose hash alone is retained and whose exact enqueue
+may be replayed only as the same durable receipt. Events are confirmed, opaque,
+private, attendee-free projections. Sensitive titles become `Busy`; reminders
+are explicitly disabled with `useDefault=false` and no overrides, and every
+write suppresses attendee notifications with `sendUpdates=none`. Notes,
+locations, collaboration fields, and raw DayWeave identities do not enter the
+Google event. The worker uses leased durable work, revision and collection
+fences, deterministic provider identities, conditional ETags, and guarded
+post-response recording to recover without duplicating or silently overwriting
+an event. Aggregate `pending_count` includes both first-attempt work and work in
+durable retry backoff; in-flight delivery is reported separately.
+
+Preview creation is serialized per provider account. An existing live,
+unconsumed preview may be reused only after every stored child is revalidated
+against the current source state. Admission is bounded to eight active
+unconsumed previews and 20,000 active change rows per account; expired,
+unconsumed payloads without a batch are pruned while approval audit evidence is
+retained. This keeps repeated or concurrent preview requests from amplifying
+durable storage.
+
+An initiated create with an unknown outcome is never declared absent merely
+because time passed or repeated authenticated reads were negative. It remains
+durable in bounded backoff, fences later publication for that selected Google
+account/calendar target, and can be resolved automatically only by a positive
+authenticated provider observation. A schedule-specific, audited operator
+reconciliation mechanism remains future work.
+
+The worker evaluates elapsed history both at claim and inside final dispatch
+authorization. An update/delete uses the earlier of the desired event end and
+the immutable mapped event end, so moving a now-historical event into the future
+cannot bypass the rule. Definitely unsent elapsed work is superseded. A row
+whose send may have started remains eligible only for read reconciliation and
+cannot receive another write permit; unusable or oversized success responses
+remain active reconciliation evidence rather than terminal failures.
+
+This path is disabled unless both `DAYWEAVE_GOOGLE_OUTBOUND_ENABLED=true` and
+the narrower `DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED=true` deployment gates
+are set; the schedule-specific gate defaults off. No native client invokes it,
+no scheduler or firm-horizon automation enqueues it, and inbound edits, moves,
+and deletions of its Google events are not interpreted yet. Those client,
+automation, rolling tentative-to-firm promotion, and bidirectional paths remain
+required follow-on work; tentative blocks remain app-only. This slice therefore
+does not complete `SCH-006`.
 
 ## 6. Client architecture
 
@@ -257,6 +317,13 @@ Move and delete semantics are explicit commands:
 - delete the remote block → unschedule it and keep the task;
 - edit an imported event → update the fixed event and recompose;
 - edit attendees/time on an attendee event → stop for review if the effect is not already an approved user action.
+
+These are the required bidirectional semantics, not all current generated-block
+behavior. The server-first generated-schedule publisher currently reconciles
+DayWeave's current firm output to Google only. It does not yet accept any
+inbound generated-event edit: in particular, a remote move is not converted to
+a pinned local placement and a remote deletion is not converted to an
+unschedule command.
 
 ### 8.3 Offline and conflicts
 

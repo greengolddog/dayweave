@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     future::Future,
     sync::Arc,
     time::{Duration as StdDuration, SystemTime},
@@ -44,9 +44,19 @@ use super::{
     GoogleOutboundApproval, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRefreshAccepted,
     GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncStatus,
     OutboundApprovalSpec, OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec,
-    OutboundRequest, OutboundResult, OutboundWork, PreparedOutbound, RejectedRemoteItem,
-    RemoteCalendarSeriesChange, RemoteItemChange, SyncClaim, SyncCounts, SyncFailureKind,
+    OutboundRequest, OutboundResult, OutboundWork, PreparedOutbound,
+    PreparedSchedulePublicationChange, RejectedRemoteItem, RemoteCalendarSeriesChange,
+    RemoteItemChange, ScheduleGooglePublicationAccepted, ScheduleGooglePublicationApproval,
+    ScheduleGooglePublicationOperation, ScheduleGooglePublicationPreview,
+    ScheduleGooglePublicationStatus, SchedulePublicationApprovalSpec,
+    SchedulePublicationDispatchPermit, SchedulePublicationEnqueueSpec,
+    SchedulePublicationObservationSource, SchedulePublicationPreviewSpec,
+    SchedulePublicationResult, SchedulePublicationSource, SchedulePublicationWork, SyncClaim,
+    SyncCounts, SyncFailureKind,
 };
+
+#[cfg(test)]
+use super::{ScheduleBlockMapping, SchedulePublicationBlock};
 
 const MAX_PAGES: usize = 100;
 const MAX_COLLECTIONS: usize = 10_000;
@@ -62,6 +72,7 @@ const RUN_LEASE_MINUTES: i64 = 10;
 const PERIODIC_SYNC_MINUTES: i64 = 15;
 const WORKER_POLL_SECONDS: u64 = 30;
 const APPROVAL_TOKEN_PREFIX: &str = "dw_ga1_";
+const SCHEDULE_APPROVAL_TOKEN_PREFIX: &str = "dw_gsa1_";
 const APPROVAL_TOKEN_RANDOM_BYTES: usize = 32;
 const DISPATCH_PREPARATION_TIMEOUT_SECONDS: u64 = 30;
 
@@ -472,6 +483,7 @@ pub(crate) struct GoogleSyncService {
     scope: OAuthScope,
     clock: Arc<dyn Clock>,
     outbound_enabled: bool,
+    schedule_outbound_enabled: bool,
     approval_ttl: StdDuration,
 }
 
@@ -486,6 +498,11 @@ impl std::fmt::Debug for GoogleSyncService {
 
 impl GoogleSyncService {
     #[must_use]
+    pub(crate) const fn scope(&self) -> OAuthScope {
+        self.scope
+    }
+
+    #[must_use]
     #[allow(clippy::too_many_arguments)] // Builds the complete fail-closed integration boundary.
     pub(crate) fn new(
         repository: Arc<dyn GoogleSyncRepository>,
@@ -496,6 +513,7 @@ impl GoogleSyncService {
         scope: OAuthScope,
         clock: Arc<dyn Clock>,
         outbound_enabled: bool,
+        schedule_outbound_enabled: bool,
         approval_ttl: StdDuration,
     ) -> Self {
         Self {
@@ -507,6 +525,7 @@ impl GoogleSyncService {
             scope,
             clock,
             outbound_enabled,
+            schedule_outbound_enabled,
             approval_ttl,
         }
     }
@@ -523,11 +542,18 @@ impl GoogleSyncService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                if let Err(error) = service.drain_one().await {
-                    tracing::warn!(
-                        error_code = error.code(),
-                        "Google sync worker iteration failed"
-                    );
+                loop {
+                    match service.drain_one().await {
+                        Ok(true) => tokio::task::yield_now().await,
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                error_code = error.code(),
+                                "Google sync worker iteration failed"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -767,14 +793,15 @@ impl GoogleSyncService {
     ) -> Result<GoogleOutboundApproval, GoogleSyncServiceError> {
         self.require_outbound_enabled()?;
         let expected_preview_hash = decode_hash(expected_preview_hash)?;
-        let mut random = [0_u8; APPROVAL_TOKEN_RANDOM_BYTES];
-        getrandom::fill(&mut random).map_err(|_| GoogleSyncServiceError::Randomness)?;
-        let mut capability = String::with_capacity(APPROVAL_TOKEN_PREFIX.len() + 43);
+        let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
+        getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
+        let mut capability =
+            Zeroizing::new(String::with_capacity(APPROVAL_TOKEN_PREFIX.len() + 43));
         capability.push_str(APPROVAL_TOKEN_PREFIX);
-        capability.push_str(&URL_SAFE_NO_PAD.encode(random));
-        random.zeroize();
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
+        capability.push_str(encoded.as_str());
         let capability_hash = Sha256::digest(capability.as_bytes()).into();
-        let expires_at = match self
+        let expires_at = self
             .repository
             .approve_outbound(
                 OutboundApprovalSpec {
@@ -785,17 +812,10 @@ impl GoogleSyncService {
                 },
                 self.clock.now(),
             )
-            .await
-        {
-            Ok(expires_at) => expires_at,
-            Err(error) => {
-                capability.zeroize();
-                return Err(error.into());
-            }
-        };
+            .await?;
         Ok(GoogleOutboundApproval {
             preview_id,
-            approval_capability: capability,
+            approval_capability: std::mem::take(&mut *capability),
             expires_at,
         })
     }
@@ -835,11 +855,162 @@ impl GoogleSyncService {
             .await?)
     }
 
+    pub(crate) async fn preview_schedule_publication(
+        &self,
+        account_id: Uuid,
+        collection_id: Uuid,
+        expected_schedule_revision_id: Uuid,
+    ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncServiceError> {
+        self.require_schedule_outbound_enabled()?;
+        if account_id.is_nil() || collection_id.is_nil() || expected_schedule_revision_id.is_nil() {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+        let account = self.oauth.account_for_sync(account_id).await?;
+        if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) {
+            return Err(GoogleSyncServiceError::MissingWriteScope);
+        }
+        let source = self
+            .repository
+            .load_schedule_publication_source(
+                account_id,
+                collection_id,
+                expected_schedule_revision_id,
+            )
+            .await?;
+        let changes = build_schedule_publication_changes(
+            &source,
+            &self.cipher,
+            self.scope,
+            self.clock.now(),
+        )?;
+        let expires_at = self.clock.now()
+            + Duration::from_std(self.approval_ttl)
+                .map_err(|_| GoogleSyncServiceError::Internal)?;
+        self.repository
+            .create_schedule_publication_preview(
+                SchedulePublicationPreviewSpec {
+                    id: Uuid::new_v4(),
+                    source,
+                    changes,
+                    expires_at,
+                },
+                self.clock.now(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn approve_schedule_publication(
+        &self,
+        account_id: Uuid,
+        preview_id: Uuid,
+        expected_preview_hash: &str,
+    ) -> Result<ScheduleGooglePublicationApproval, GoogleSyncServiceError> {
+        self.require_schedule_outbound_enabled()?;
+        if account_id.is_nil() || preview_id.is_nil() {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+        let expected_preview_hash = decode_hash(expected_preview_hash)?;
+        let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
+        getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
+        let mut capability = Zeroizing::new(String::with_capacity(
+            SCHEDULE_APPROVAL_TOKEN_PREFIX.len() + 43,
+        ));
+        capability.push_str(SCHEDULE_APPROVAL_TOKEN_PREFIX);
+        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
+        capability.push_str(encoded.as_str());
+        let capability_hash = Sha256::digest(capability.as_bytes()).into();
+        let expires_at = self
+            .repository
+            .approve_schedule_publication(
+                SchedulePublicationApprovalSpec {
+                    account_id,
+                    preview_id,
+                    expected_preview_hash,
+                    capability_hash,
+                },
+                self.clock.now(),
+            )
+            .await?;
+        Ok(ScheduleGooglePublicationApproval {
+            preview_id,
+            approval_capability: std::mem::take(&mut *capability),
+            expires_at,
+        })
+    }
+
+    pub(crate) async fn enqueue_schedule_publication(
+        &self,
+        account_id: Uuid,
+        preview_id: Uuid,
+        collection_id: Uuid,
+        expected_schedule_revision_id: Uuid,
+        mut approval_capability: String,
+    ) -> Result<ScheduleGooglePublicationAccepted, GoogleSyncServiceError> {
+        if account_id.is_nil()
+            || preview_id.is_nil()
+            || collection_id.is_nil()
+            || expected_schedule_revision_id.is_nil()
+        {
+            approval_capability.zeroize();
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+        let capability_hash = match schedule_approval_capability_hash(&approval_capability) {
+            Ok(hash) => hash,
+            Err(error) => {
+                approval_capability.zeroize();
+                return Err(error);
+            }
+        };
+        approval_capability.zeroize();
+        let spec = SchedulePublicationEnqueueSpec {
+            account_id,
+            preview_id,
+            collection_id,
+            expected_schedule_revision_id,
+            capability_hash,
+        };
+        if let Some(accepted) = self
+            .repository
+            .schedule_publication_acceptance(&spec)
+            .await?
+        {
+            return Ok(accepted);
+        }
+        self.require_schedule_outbound_enabled()?;
+        self.repository
+            .enqueue_schedule_publication(spec, self.clock.now())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn schedule_publication_status(
+        &self,
+        account_id: Uuid,
+        publication_id: Uuid,
+    ) -> Result<ScheduleGooglePublicationStatus, GoogleSyncServiceError> {
+        if account_id.is_nil() || publication_id.is_nil() {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+        self.repository
+            .schedule_publication_status(account_id, publication_id)
+            .await
+            .map_err(Into::into)
+    }
+
     fn require_outbound_enabled(&self) -> Result<(), GoogleSyncServiceError> {
         if self.outbound_enabled {
             Ok(())
         } else {
             Err(GoogleSyncServiceError::ExternalPublicationDisabled)
+        }
+    }
+
+    fn require_schedule_outbound_enabled(&self) -> Result<(), GoogleSyncServiceError> {
+        if self.outbound_enabled && self.schedule_outbound_enabled {
+            Ok(())
+        } else {
+            Err(GoogleSyncServiceError::SchedulePublicationDisabled)
         }
     }
 
@@ -930,14 +1101,14 @@ impl GoogleSyncService {
         Err(GoogleSyncServiceError::ProviderLimitExceeded)
     }
 
-    async fn drain_one(&self) -> Result<(), GoogleSyncServiceError> {
+    async fn drain_one(&self) -> Result<bool, GoogleSyncServiceError> {
         let now = self.clock.now();
         let claim = self
             .repository
             .claim_due(now, now + Duration::minutes(RUN_LEASE_MINUTES))
             .await?;
         let Some(claim) = claim else {
-            return Ok(());
+            return Ok(false);
         };
         match self.sync_claim(&claim, now).await {
             Ok(counts) => {
@@ -945,6 +1116,7 @@ impl GoogleSyncService {
                     .complete_claim(
                         &claim,
                         &counts,
+                        self.schedule_outbound_enabled,
                         self.clock.now(),
                         self.clock.now() + Duration::minutes(PERIODIC_SYNC_MINUTES),
                     )
@@ -980,7 +1152,7 @@ impl GoogleSyncService {
                 );
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn sync_claim(
@@ -1020,6 +1192,9 @@ impl GoogleSyncService {
         }
         if self.outbound_enabled {
             self.process_outbound(claim).await?;
+        }
+        if self.schedule_outbound_enabled {
+            self.process_schedule_outbound(claim).await?;
         }
         Ok(counts)
     }
@@ -1115,6 +1290,7 @@ impl GoogleSyncService {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // One bounded page loop keeps projection and cursor accounting atomic.
     async fn sync_calendar_pages(
         &self,
         collection: &GoogleSyncCollection,
@@ -1148,6 +1324,19 @@ impl GoogleSyncService {
                     &options,
                 )
                 .await?;
+            let page_remote_ids = page
+                .items
+                .iter()
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>();
+            let known_schedule_remote_ids = self
+                .repository
+                .known_schedule_publication_remote_ids(
+                    collection.account_id,
+                    collection.id,
+                    &page_remote_ids,
+                )
+                .await?;
             for event in page.items {
                 item_count += 1;
                 if item_count.is_multiple_of(100) {
@@ -1160,6 +1349,37 @@ impl GoogleSyncService {
                 validate_remote_id(&remote_id)?;
                 if !seen_remote_ids.insert(remote_id.clone()) {
                     return Err(GoogleSyncServiceError::ProviderProtocol);
+                }
+                match classify_schedule_calendar_event(
+                    &event,
+                    &known_schedule_remote_ids,
+                    collection.account_id,
+                    collection.id,
+                    &self.cipher,
+                    self.scope,
+                ) {
+                    ScheduleCalendarEventDisposition::Generated => {
+                        // Generated schedule events are projections of the
+                        // already-canonical schedule. Re-importing them as
+                        // source events would create a self-conflict and
+                        // consume the same capacity twice.
+                        continue;
+                    }
+                    ScheduleCalendarEventDisposition::Rejected(reason) => {
+                        self.repository
+                            .mark_rejected(
+                                claim,
+                                collection.id,
+                                collection.revision,
+                                &remote_id,
+                                reason,
+                                self.clock.now(),
+                            )
+                            .await?;
+                        counts.rejected += 1;
+                        continue;
+                    }
+                    ScheduleCalendarEventDisposition::External => {}
                 }
                 match normalize_calendar_series_authenticated(
                     collection,
@@ -1233,6 +1453,19 @@ impl GoogleSyncService {
             validate_projection_page(&page, &mut seen_remote_ids, &mut item_count)?;
             let page_timezone = consistent_projection_timezone(&page, &mut projection_timezone)?;
             let next_page_token = page.next_page_token.clone();
+            let page_remote_ids = page
+                .items
+                .iter()
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>();
+            let known_schedule_remote_ids = self
+                .repository
+                .known_schedule_publication_remote_ids(
+                    collection.account_id,
+                    collection.id,
+                    &page_remote_ids,
+                )
+                .await?;
             normalize_calendar_projection_events(
                 collection,
                 window,
@@ -1240,6 +1473,7 @@ impl GoogleSyncService {
                 page.items,
                 &self.cipher,
                 self.scope,
+                &known_schedule_remote_ids,
                 &mut changes,
                 &mut rejected,
                 &mut normalized_bytes,
@@ -1534,6 +1768,121 @@ impl GoogleSyncService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps durable schedule-delivery outcomes beside transitions.
+    async fn process_schedule_outbound(
+        &self,
+        claim: &SyncClaim,
+    ) -> Result<(), GoogleSyncServiceError> {
+        self.require_schedule_outbound_enabled()?;
+        for _ in 0..MAX_OUTBOUND_PER_RUN {
+            self.heartbeat(claim).await?;
+            let Some(work) = self
+                .repository
+                .claim_schedule_publication(claim, self.clock.now())
+                .await?
+            else {
+                return Ok(());
+            };
+            match self.deliver_schedule_publication(&work).await {
+                Ok(result) => match self
+                    .repository
+                    .complete_schedule_publication(&work, result, self.clock.now())
+                    .await
+                {
+                    Ok(()) | Err(GoogleSyncRepositoryError::ClaimLost) => {}
+                    Err(error) => return Err(error.into()),
+                },
+                Err(GoogleSyncServiceError::Google(GoogleError::PreconditionFailed)) => {
+                    self.repository
+                        .fail_schedule_publication(
+                            &work,
+                            "conflict",
+                            "precondition_failed",
+                            self.clock.now(),
+                            self.clock.now(),
+                        )
+                        .await?;
+                }
+                Err(GoogleSyncServiceError::Google(GoogleError::ConditionalWriteRequired)) => {
+                    self.repository
+                        .fail_schedule_publication(
+                            &work,
+                            "conflict",
+                            "conditional_write_required",
+                            self.clock.now(),
+                            self.clock.now(),
+                        )
+                        .await?;
+                }
+                Err(error) if schedule_ambiguous_response_code(&error).is_some() => {
+                    // Both failures can follow a successful provider mutation:
+                    // a response may carry an unusable identity, or exceed the
+                    // bounded response reader. Keep the possible-send row
+                    // claimable for exact read reconciliation and keep it in
+                    // the active fence that blocks successor publication.
+                    let code = schedule_ambiguous_response_code(&error)
+                        .ok_or(GoogleSyncServiceError::Internal)?;
+                    let now = self.clock.now();
+                    self.repository
+                        .fail_schedule_publication(
+                            &work,
+                            "backoff",
+                            code,
+                            now + exponential_backoff(work.attempts),
+                            now,
+                        )
+                        .await?;
+                }
+                Err(GoogleSyncServiceError::Repository(GoogleSyncRepositoryError::ClaimLost)) => {}
+                Err(GoogleSyncServiceError::Google(GoogleError::Api { status })) => {
+                    let code = if status == 404 {
+                        "provider_not_found"
+                    } else {
+                        "provider_rejected"
+                    };
+                    self.repository
+                        .fail_schedule_publication(
+                            &work,
+                            "conflict",
+                            code,
+                            self.clock.now(),
+                            self.clock.now(),
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    let mut failure = error.failure();
+                    if failure.kind == SyncFailureKind::Backoff
+                        && failure.code == "provider_temporary"
+                    {
+                        failure.delay = exponential_backoff(work.attempts);
+                    }
+                    let state = if matches!(
+                        failure.kind,
+                        SyncFailureKind::Backoff | SyncFailureKind::ReauthorizationRequired
+                    ) {
+                        "backoff"
+                    } else {
+                        "failed"
+                    };
+                    self.repository
+                        .fail_schedule_publication(
+                            &work,
+                            state,
+                            failure.code,
+                            self.clock.now() + failure.delay,
+                            self.clock.now(),
+                        )
+                        .await?;
+                    if failure.kind != SyncFailureKind::Failed {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn heartbeat(&self, claim: &SyncClaim) -> Result<(), GoogleSyncServiceError> {
         let now = self.clock.now();
         self.repository
@@ -1725,6 +2074,462 @@ impl GoogleSyncService {
                 })
             }
             _ => Err(GoogleSyncServiceError::OutboundPayloadCorrupt),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Keeps guarded generated-event variants co-located.
+    async fn deliver_schedule_publication(
+        &self,
+        work: &SchedulePublicationWork,
+    ) -> Result<SchedulePublicationResult, GoogleSyncServiceError> {
+        self.require_schedule_outbound_enabled()?;
+        match work.operation {
+            ScheduleGooglePublicationOperation::Create => {
+                if work.remote_resource_id.is_some()
+                    || work.expected_etag.is_some()
+                    || work.mapping_id.is_some()
+                {
+                    return Err(GoogleSyncServiceError::OutboundPayloadCorrupt);
+                }
+                let event: GoogleEvent = serde_json::from_value(work.payload.clone())
+                    .map_err(|_| GoogleSyncServiceError::OutboundPayloadCorrupt)?;
+                if !schedule_calendar_event_owned_by(
+                    &event,
+                    work.slot_id,
+                    work.incarnation,
+                    work.account_id,
+                    work.collection_id,
+                    &self.cipher,
+                    self.scope,
+                ) {
+                    return Err(GoogleSyncServiceError::OutboundPayloadCorrupt);
+                }
+                self.repository
+                    .renew_schedule_publication(work, self.clock.now())
+                    .await?;
+                let (result, nonce, observation_source) = match self
+                    .provider
+                    .get_event(work.account_id, &work.collection_remote_id, &event.id)
+                    .await
+                {
+                    Ok(found) => {
+                        if !schedule_calendar_event_owned_by(
+                            &found,
+                            work.slot_id,
+                            work.incarnation,
+                            work.account_id,
+                            work.collection_id,
+                            &self.cipher,
+                            self.scope,
+                        ) || !schedule_calendar_event_matches_intent(&found, &event)
+                        {
+                            return Err(GoogleError::PreconditionFailed.into());
+                        }
+                        if found.etag.is_none() {
+                            return Err(GoogleError::InvalidResponse.into());
+                        }
+                        let permit = self.authorize_schedule_dispatch(work, false).await?;
+                        (
+                            found,
+                            permit.nonce,
+                            SchedulePublicationObservationSource::ReconciliationRead,
+                        )
+                    }
+                    Err(GoogleError::Api { status: 404 }) => {
+                        if work.provider_post_may_have_started {
+                            self.require_current_schedule_calendar_write_access(work)
+                                .await?;
+                            if self
+                                .repository
+                                .reconcile_schedule_publication_no_effect(
+                                    work,
+                                    "create_not_observed",
+                                    self.clock.now(),
+                                )
+                                .await?
+                            {
+                                return Err(GoogleSyncRepositoryError::ClaimLost.into());
+                            }
+                        }
+                        let prepared = self
+                            .prepare_write(self.provider.prepare_insert_event(
+                                work.account_id,
+                                &work.collection_remote_id,
+                                &event,
+                            ))
+                            .await?;
+                        let permit = self.authorize_schedule_dispatch(work, true).await?;
+                        match self.send_schedule_prepared(work, prepared, &permit).await {
+                            Ok(ProviderWriteResponse::Event(result)) => (
+                                *result,
+                                permit.nonce,
+                                SchedulePublicationObservationSource::ProviderResponse,
+                            ),
+                            Ok(_) => return Err(GoogleError::InvalidResponse.into()),
+                            Err(GoogleSyncServiceError::Google(GoogleError::Api {
+                                status: 409,
+                            })) => {
+                                // Google reserves 409 for a duplicate explicit
+                                // event ID. Re-read that deterministic ID and
+                                // adopt only the exact authenticated intent;
+                                // never manufacture a replacement identity.
+                                let found = match self
+                                    .provider
+                                    .get_event(
+                                        work.account_id,
+                                        &work.collection_remote_id,
+                                        &event.id,
+                                    )
+                                    .await
+                                {
+                                    Ok(found) => found,
+                                    Err(GoogleError::Api { status: 404 }) => {
+                                        return Err(GoogleError::InvalidResponse.into());
+                                    }
+                                    Err(error) => return Err(error.into()),
+                                };
+                                return schedule_create_conflict_result(
+                                    &found,
+                                    &event,
+                                    work.slot_id,
+                                    work.incarnation,
+                                    work.account_id,
+                                    work.collection_id,
+                                    &self.cipher,
+                                    self.scope,
+                                    permit.nonce,
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                validate_schedule_write_response(
+                    &result,
+                    &event,
+                    &event.id,
+                    work.slot_id,
+                    work.incarnation,
+                    work.account_id,
+                    work.collection_id,
+                    &self.cipher,
+                    self.scope,
+                )?;
+                schedule_publication_event_result(&result, nonce, observation_source)
+            }
+            ScheduleGooglePublicationOperation::Update => {
+                let remote_id = work
+                    .remote_resource_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(GoogleSyncServiceError::OutboundPayloadCorrupt)?;
+                let etag = work
+                    .expected_etag
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(GoogleSyncServiceError::ProviderProtocol)?;
+                if work.mapping_id.is_none() {
+                    return Err(GoogleSyncServiceError::OutboundPayloadCorrupt);
+                }
+                let mut event: GoogleEvent = serde_json::from_value(work.payload.clone())
+                    .map_err(|_| GoogleSyncServiceError::OutboundPayloadCorrupt)?;
+                if event.id != remote_id
+                    || !schedule_calendar_event_owned_by(
+                        &event,
+                        work.slot_id,
+                        work.incarnation,
+                        work.account_id,
+                        work.collection_id,
+                        &self.cipher,
+                        self.scope,
+                    )
+                {
+                    return Err(GoogleSyncServiceError::OutboundPayloadCorrupt);
+                }
+                event.etag = Some(etag.to_owned());
+                if work.provider_post_may_have_started {
+                    self.repository
+                        .renew_schedule_publication(work, self.clock.now())
+                        .await?;
+                    let found = match self
+                        .provider
+                        .get_event(work.account_id, &work.collection_remote_id, remote_id)
+                        .await
+                    {
+                        Ok(found) => found,
+                        Err(GoogleError::Api { status: 404 }) => {
+                            self.require_current_schedule_calendar_write_access(work)
+                                .await?;
+                            // A conditional update cannot be retried without
+                            // the exact current ETag. Keep the possible-send
+                            // fence active until a later positive read or
+                            // explicit operator reconciliation.
+                            return Err(GoogleError::InvalidResponse.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    match schedule_update_recovery_action(
+                        &found,
+                        &event,
+                        etag,
+                        work.slot_id,
+                        work.incarnation,
+                        work.account_id,
+                        work.collection_id,
+                        &self.cipher,
+                        self.scope,
+                    )? {
+                        ScheduleUpdateRecoveryAction::Adopt => {
+                            let permit = self.authorize_schedule_dispatch(work, false).await?;
+                            return schedule_publication_event_result(
+                                &found,
+                                permit.nonce,
+                                SchedulePublicationObservationSource::ReconciliationRead,
+                            );
+                        }
+                        ScheduleUpdateRecoveryAction::Retry => {
+                            if self
+                                .repository
+                                .reconcile_schedule_publication_no_effect(
+                                    work,
+                                    "update_not_observed",
+                                    self.clock.now(),
+                                )
+                                .await?
+                            {
+                                return Err(GoogleSyncRepositoryError::ClaimLost.into());
+                            }
+                        }
+                    }
+                    // Dispatch authorization is durable before network I/O.
+                    // A crash between those steps leaves the provider object
+                    // untouched. The still-current old ETag proves that a
+                    // conditional retry cannot overwrite a concurrent edit.
+                }
+                let (response, permit) = self
+                    .execute_guarded_schedule_write(
+                        work,
+                        self.provider.prepare_update_event(
+                            work.account_id,
+                            &work.collection_remote_id,
+                            &event,
+                        ),
+                    )
+                    .await?;
+                let ProviderWriteResponse::Event(result) = response else {
+                    return Err(GoogleError::InvalidResponse.into());
+                };
+                validate_schedule_write_response(
+                    &result,
+                    &event,
+                    remote_id,
+                    work.slot_id,
+                    work.incarnation,
+                    work.account_id,
+                    work.collection_id,
+                    &self.cipher,
+                    self.scope,
+                )?;
+                schedule_publication_event_result(
+                    &result,
+                    permit.nonce,
+                    SchedulePublicationObservationSource::ProviderResponse,
+                )
+            }
+            ScheduleGooglePublicationOperation::Delete => {
+                let remote_id = work
+                    .remote_resource_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(GoogleSyncServiceError::OutboundPayloadCorrupt)?;
+                let etag = work
+                    .expected_etag
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(GoogleSyncServiceError::ProviderProtocol)?;
+                if work.mapping_id.is_none() || work.source_block_id.is_some() {
+                    return Err(GoogleSyncServiceError::OutboundPayloadCorrupt);
+                }
+                if work.provider_post_may_have_started {
+                    self.repository
+                        .renew_schedule_publication(work, self.clock.now())
+                        .await?;
+                    match self
+                        .provider
+                        .get_event(work.account_id, &work.collection_remote_id, remote_id)
+                        .await
+                    {
+                        Err(GoogleError::Api { status: 404 }) => {
+                            self.require_current_schedule_calendar_write_access(work)
+                                .await?;
+                            let permit = self.authorize_schedule_dispatch(work, false).await?;
+                            return Ok(schedule_publication_absent_result(
+                                remote_id,
+                                permit.nonce,
+                                SchedulePublicationObservationSource::ReconciliationRead,
+                            ));
+                        }
+                        Ok(found) => match schedule_delete_recovery_action(
+                            &found,
+                            remote_id,
+                            etag,
+                            work.slot_id,
+                            work.incarnation,
+                            work.account_id,
+                            work.collection_id,
+                            &self.cipher,
+                            self.scope,
+                        )? {
+                            ScheduleDeleteRecoveryAction::Absent => {
+                                let permit = self.authorize_schedule_dispatch(work, false).await?;
+                                return Ok(schedule_publication_absent_result(
+                                    remote_id,
+                                    permit.nonce,
+                                    SchedulePublicationObservationSource::ReconciliationRead,
+                                ));
+                            }
+                            ScheduleDeleteRecoveryAction::Retry => {
+                                if self
+                                    .repository
+                                    .reconcile_schedule_publication_no_effect(
+                                        work,
+                                        "delete_not_observed",
+                                        self.clock.now(),
+                                    )
+                                    .await?
+                                {
+                                    return Err(GoogleSyncRepositoryError::ClaimLost.into());
+                                }
+                            }
+                        },
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let prepared = self
+                    .prepare_write(self.provider.prepare_delete_event(
+                        work.account_id,
+                        &work.collection_remote_id,
+                        remote_id,
+                        etag,
+                    ))
+                    .await?;
+                let permit = self.authorize_schedule_dispatch(work, true).await?;
+                let response = match self.send_schedule_prepared(work, prepared, &permit).await {
+                    Ok(response) => response,
+                    Err(GoogleSyncServiceError::Google(GoogleError::Api { status: 404 })) => {
+                        self.require_current_schedule_calendar_write_access(work)
+                            .await?;
+                        return Ok(schedule_publication_absent_result(
+                            remote_id,
+                            permit.nonce,
+                            SchedulePublicationObservationSource::ProviderResponse,
+                        ));
+                    }
+                    Err(error) if schedule_delete_already_absent(&error) => {
+                        return Ok(schedule_publication_absent_result(
+                            remote_id,
+                            permit.nonce,
+                            SchedulePublicationObservationSource::ProviderResponse,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if !matches!(response, ProviderWriteResponse::Empty) {
+                    return Err(GoogleError::InvalidResponse.into());
+                }
+                Ok(schedule_publication_absent_result(
+                    remote_id,
+                    permit.nonce,
+                    SchedulePublicationObservationSource::ProviderResponse,
+                ))
+            }
+            ScheduleGooglePublicationOperation::Noop => {
+                Err(GoogleSyncServiceError::OutboundPayloadCorrupt)
+            }
+        }
+    }
+
+    async fn require_current_schedule_calendar_write_access(
+        &self,
+        work: &SchedulePublicationWork,
+    ) -> Result<(), GoogleSyncServiceError> {
+        let claim = SyncClaim {
+            account_id: work.account_id,
+            claim_id: work.run_claim_id,
+            claim_generation: work.run_claim_generation,
+        };
+        let calendars = match self.discover_calendars(work.account_id, Some(&claim)).await {
+            Err(GoogleSyncServiceError::Google(GoogleError::Api { status: 404 })) => {
+                return Err(GoogleError::InvalidResponse.into());
+            }
+            result => result?,
+        };
+        if schedule_calendar_write_access_is_current(&calendars, &work.collection_remote_id) {
+            Ok(())
+        } else {
+            // A provider 404 is intentionally ambiguous. Missing or downgraded
+            // calendar access must be reconciled by the next discovery pass;
+            // it is not proof that the exact generated event was deleted.
+            Err(GoogleError::InvalidResponse.into())
+        }
+    }
+
+    async fn authorize_schedule_dispatch(
+        &self,
+        work: &SchedulePublicationWork,
+        provider_write: bool,
+    ) -> Result<SchedulePublicationDispatchPermit, GoogleSyncServiceError> {
+        let now = self.clock.now();
+        let permit = self
+            .repository
+            .authorize_schedule_publication_dispatch(work, provider_write, now)
+            .await?;
+        if permit.intent_hash != work.intent_hash || permit.expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ClaimLost.into());
+        }
+        Ok(permit)
+    }
+
+    async fn execute_guarded_schedule_write<F>(
+        &self,
+        work: &SchedulePublicationWork,
+        preparation: F,
+    ) -> Result<(ProviderWriteResponse, SchedulePublicationDispatchPermit), GoogleSyncServiceError>
+    where
+        F: Future<Output = Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError>>,
+    {
+        sequence_guarded_write(
+            self.prepare_write(preparation),
+            || self.authorize_schedule_dispatch(work, true),
+            |prepared, permit| async move {
+                let response = self.send_schedule_prepared(work, prepared, &permit).await?;
+                Ok((response, permit))
+            },
+        )
+        .await
+    }
+
+    async fn send_schedule_prepared(
+        &self,
+        work: &SchedulePublicationWork,
+        prepared: Box<dyn PreparedGoogleSyncWrite>,
+        permit: &SchedulePublicationDispatchPermit,
+    ) -> Result<ProviderWriteResponse, GoogleSyncServiceError> {
+        match prepared.send(SystemTime::from(permit.expires_at)).await {
+            Err(GoogleError::DispatchInitiationExpired) => {
+                let now = self.clock.now();
+                self.repository
+                    .cancel_schedule_publication_before_send(
+                        work,
+                        "dispatch_initiation_expired_before_send",
+                        now + Duration::seconds(30),
+                        now,
+                    )
+                    .await?;
+                Err(GoogleSyncRepositoryError::ClaimLost.into())
+            }
+            result => result.map_err(Into::into),
         }
     }
 
@@ -1931,12 +2736,39 @@ fn normalize_calendar_projection_events(
     events: Vec<GoogleEvent>,
     cipher: &SecretCipher,
     scope: OAuthScope,
+    known_schedule_remote_ids: &BTreeSet<String>,
     changes: &mut Vec<RemoteItemChange>,
     rejected: &mut Vec<RejectedRemoteItem>,
     normalized_bytes: &mut usize,
 ) -> Result<(), GoogleSyncServiceError> {
     for event in events {
         let remote_id = event.id.clone();
+        match classify_schedule_calendar_event(
+            &event,
+            known_schedule_remote_ids,
+            collection.account_id,
+            collection.id,
+            cipher,
+            scope,
+        ) {
+            ScheduleCalendarEventDisposition::Generated => continue,
+            ScheduleCalendarEventDisposition::Rejected(reason) => {
+                *normalized_bytes = normalized_bytes
+                    .checked_add(
+                        remote_id
+                            .len()
+                            .saturating_add(reason.len())
+                            .saturating_add(64),
+                    )
+                    .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+                if *normalized_bytes > MAX_CALENDAR_PROJECTION_NORMALIZED_BYTES {
+                    return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+                }
+                rejected.push(RejectedRemoteItem { remote_id, reason });
+                continue;
+            }
+            ScheduleCalendarEventDisposition::External => {}
+        }
         match normalize_event_authenticated(collection, page_timezone, event, cipher, scope) {
             Ok(change) => {
                 if let Some(item) = change.item.as_ref() {
@@ -2051,6 +2883,7 @@ fn normalize_calendar_projection_pages(
             page.items,
             cipher,
             scope,
+            &BTreeSet::new(),
             &mut changes,
             &mut rejected,
             &mut normalized_bytes,
@@ -2442,6 +3275,325 @@ fn validate_normalized_item(item: &NewItem) -> Result<(), NormalizationError> {
         .map_err(|_| NormalizationError::Rejected("canonical_item_invalid"))
 }
 
+#[allow(clippy::too_many_arguments)] // Every provider-visible schedule field is explicit.
+fn prepare_schedule_calendar_event(
+    collection: &GoogleSyncCollection,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    slot_id: Uuid,
+    incarnation: u32,
+    title: &str,
+    is_sensitive: bool,
+    starts_at: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
+    timezone_name: &str,
+) -> Result<GoogleEvent, GoogleSyncServiceError> {
+    if slot_id.is_nil()
+        || incarnation == 0
+        || ends_at <= starts_at
+        || timezone_name.trim().is_empty()
+        || timezone_name.len() > 100
+        || timezone_name.parse::<Tz>().is_err()
+    {
+        return Err(GoogleSyncServiceError::InvalidRequest);
+    }
+    let summary = if is_sensitive {
+        "Busy".to_owned()
+    } else {
+        bounded_title(title, "Scheduled task").0
+    };
+    let event_id =
+        deterministic_schedule_calendar_event_id(cipher, scope, collection, slot_id, incarnation)?;
+    let mut private = BTreeMap::new();
+    private.insert(
+        "dayweaveScheduleOwnershipProof".to_owned(),
+        schedule_calendar_ownership_proof(
+            cipher,
+            scope,
+            collection.account_id,
+            collection.id,
+            slot_id,
+            incarnation,
+            &event_id,
+        )?,
+    );
+    let additional_properties = BTreeMap::from([(
+        "reminders".to_owned(),
+        json!({
+            "useDefault": false,
+            "overrides": [],
+        }),
+    )]);
+    Ok(GoogleEvent {
+        id: event_id,
+        etag: None,
+        status: Some("confirmed".to_owned()),
+        summary: Some(summary),
+        description: None,
+        location: None,
+        start: Some(EventDateTime {
+            date: None,
+            date_time: Some(starts_at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+            time_zone: Some(timezone_name.to_owned()),
+        }),
+        end: Some(EventDateTime {
+            date: None,
+            date_time: Some(ends_at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+            time_zone: Some(timezone_name.to_owned()),
+        }),
+        recurring_event_id: None,
+        original_start_time: None,
+        recurrence: Vec::new(),
+        transparency: Some("opaque".to_owned()),
+        visibility: Some("private".to_owned()),
+        event_type: Some("default".to_owned()),
+        attendees: Vec::new(),
+        conference_data: None,
+        attachments: Vec::new(),
+        updated: None,
+        sequence: None,
+        extended_properties: Some(ExtendedProperties {
+            private,
+            shared: BTreeMap::new(),
+        }),
+        additional_properties,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Keeps every reviewed schedule-diff invariant in one auditable projection.
+fn build_schedule_publication_changes(
+    source: &SchedulePublicationSource,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    now: DateTime<Utc>,
+) -> Result<Vec<PreparedSchedulePublicationChange>, GoogleSyncServiceError> {
+    if source.workspace_id != scope.workspace_id
+        || source.user_id != scope.user_id
+        || source.account_id != source.collection.account_id
+        || source.schedule_revision_id.is_nil()
+        || source.schedule_revision_number == 0
+        || source.horizon_end <= source.horizon_start
+        || source.collection.kind != GoogleCollectionKind::Calendar
+        || !source.collection.selected
+        || source.collection.provider_deleted
+        || source.collection.sync_role != GoogleSyncRole::Writable
+        || source.blocks.len() > MAX_CALENDAR_PROJECTION_ITEMS
+        || source.mappings.len() > MAX_CALENDAR_PROJECTION_ITEMS
+    {
+        return Err(GoogleSyncServiceError::InvalidRequest);
+    }
+
+    let mut mappings = BTreeMap::new();
+    for mapping in &source.mappings {
+        if mapping.mapping_id.is_nil()
+            || mapping.slot_id.is_nil()
+            || mapping.item_id.is_nil()
+            || mapping.source_block_id.is_nil()
+            || mapping.incarnation == 0
+            || mapping.remote_resource_id.trim().is_empty()
+            || mapping.remote_etag.trim().is_empty()
+            || mapping.last_ends_at <= mapping.last_starts_at
+            || schedule_publication_slot_id(
+                scope.workspace_id,
+                mapping.item_id,
+                mapping.occurrence_id,
+                mapping.session_index,
+            ) != mapping.slot_id
+        {
+            return Err(GoogleSyncServiceError::Internal);
+        }
+        let expected_remote_id = deterministic_schedule_calendar_event_id(
+            cipher,
+            scope,
+            &source.collection,
+            mapping.slot_id,
+            mapping.incarnation,
+        )?;
+        if mapping.remote_resource_id != expected_remote_id {
+            return Err(GoogleSyncServiceError::ProviderIdentityUnresolved);
+        }
+        if mappings.insert(mapping.slot_id, mapping.clone()).is_some() {
+            return Err(GoogleSyncServiceError::Internal);
+        }
+    }
+
+    let mut blocks = source.blocks.iter().collect::<Vec<_>>();
+    blocks.sort_by_key(|block| (block.item_id, block.occurrence_id, block.session_index));
+    let mut seen_sources = HashSet::new();
+    let mut seen_slots = HashSet::new();
+    for block in &blocks {
+        if block.source_block_id.is_nil()
+            || block.item_id.is_nil()
+            || block.incarnation == 0
+            || block.ends_at <= block.starts_at
+            || block.starts_at < source.horizon_start
+            || block.ends_at > source.horizon_end
+            || !seen_sources.insert(block.source_block_id)
+        {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+        let slot_id = schedule_publication_slot_id(
+            scope.workspace_id,
+            block.item_id,
+            block.occurrence_id,
+            block.session_index,
+        );
+        if !seen_slots.insert(slot_id) {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
+    }
+    let future_stale_count = mappings
+        .values()
+        .filter(|mapping| !seen_slots.contains(&mapping.slot_id) && mapping.last_ends_at > now)
+        .count();
+    if blocks
+        .len()
+        .checked_add(future_stale_count)
+        .is_none_or(|change_count| change_count > MAX_CALENDAR_PROJECTION_ITEMS)
+    {
+        return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+    }
+
+    let mut changes = Vec::with_capacity(blocks.len().saturating_add(mappings.len()));
+    for block in blocks {
+        let slot_id = schedule_publication_slot_id(
+            scope.workspace_id,
+            block.item_id,
+            block.occurrence_id,
+            block.session_index,
+        );
+        let mapping = mappings.remove(&slot_id);
+        if mapping.as_ref().is_some_and(|mapping| {
+            mapping.item_id != block.item_id
+                || mapping.occurrence_id != block.occurrence_id
+                || mapping.session_index != block.session_index
+                || mapping.incarnation != block.incarnation
+        }) {
+            return Err(GoogleSyncServiceError::Internal);
+        }
+        let event = prepare_schedule_calendar_event(
+            &source.collection,
+            cipher,
+            scope,
+            slot_id,
+            block.incarnation,
+            &block.title,
+            block.is_sensitive,
+            block.starts_at,
+            block.ends_at,
+            &source.timezone_name,
+        )?;
+        let summary = event
+            .summary
+            .clone()
+            .ok_or(GoogleSyncServiceError::Internal)?;
+        let desired_payload_hash = schedule_desired_payload_hash(
+            slot_id,
+            block.incarnation,
+            &summary,
+            block.starts_at,
+            block.ends_at,
+            &source.timezone_name,
+        )?;
+        let operation = match mapping.as_ref() {
+            None => ScheduleGooglePublicationOperation::Create,
+            Some(mapping)
+                if mapping.last_ends_at <= now
+                    && mapping.source_block_id == block.source_block_id
+                    && mapping.last_starts_at == block.starts_at
+                    && mapping.last_ends_at == block.ends_at =>
+            {
+                // Once a generated block has elapsed, the provider event is
+                // immutable Calendar history. Canonical edits may still
+                // change its current title/privacy/timezone-derived payload,
+                // but an exact historical source instance is never rewritten.
+                ScheduleGooglePublicationOperation::Noop
+            }
+            Some(mapping) if mapping.desired_payload_hash == desired_payload_hash => {
+                ScheduleGooglePublicationOperation::Noop
+            }
+            Some(_) => ScheduleGooglePublicationOperation::Update,
+        };
+        let remote_resource_id = mapping
+            .as_ref()
+            .map(|mapping| mapping.remote_resource_id.clone());
+        let expected_etag = mapping.as_ref().map(|mapping| mapping.remote_etag.clone());
+        let ordinal = u32::try_from(changes.len())
+            .map_err(|_| GoogleSyncServiceError::ProviderLimitExceeded)?;
+        let mut change = PreparedSchedulePublicationChange {
+            ordinal,
+            slot_id,
+            source_block_id: Some(block.source_block_id),
+            item_id: block.item_id,
+            occurrence_id: block.occurrence_id,
+            session_index: block.session_index,
+            incarnation: block.incarnation,
+            operation,
+            mapping_id: mapping.as_ref().map(|mapping| mapping.mapping_id),
+            remote_resource_id,
+            expected_etag,
+            desired_payload_hash,
+            payload: serde_json::to_value(event).map_err(|_| GoogleSyncServiceError::Internal)?,
+            review_summary: json!({
+                "summary": summary,
+                "starts_at": block.starts_at,
+                "ends_at": block.ends_at,
+            }),
+            starts_at: block.starts_at,
+            ends_at: block.ends_at,
+            intent_hash: [0; 32],
+        };
+        change.intent_hash = schedule_publication_intent_hash(source, &change)
+            .map_err(|_| GoogleSyncServiceError::Internal)?;
+        changes.push(change);
+    }
+
+    let mut stale_mappings = mappings.into_values().collect::<Vec<_>>();
+    stale_mappings.sort_by_key(|mapping| {
+        (
+            mapping.item_id,
+            mapping.occurrence_id,
+            mapping.session_index,
+        )
+    });
+    for mapping in stale_mappings {
+        // Historical schedule events remain useful Calendar history and are
+        // never deleted automatically. Only future capacity is reconciled.
+        if mapping.last_ends_at <= now {
+            continue;
+        }
+        let ordinal = u32::try_from(changes.len())
+            .map_err(|_| GoogleSyncServiceError::ProviderLimitExceeded)?;
+        let mut change = PreparedSchedulePublicationChange {
+            ordinal,
+            slot_id: mapping.slot_id,
+            source_block_id: None,
+            item_id: mapping.item_id,
+            occurrence_id: mapping.occurrence_id,
+            session_index: mapping.session_index,
+            incarnation: mapping.incarnation,
+            operation: ScheduleGooglePublicationOperation::Delete,
+            mapping_id: Some(mapping.mapping_id),
+            remote_resource_id: Some(mapping.remote_resource_id),
+            expected_etag: Some(mapping.remote_etag),
+            desired_payload_hash: mapping.desired_payload_hash,
+            payload: json!({}),
+            review_summary: json!({
+                "summary": "Previously published DayWeave block",
+                "starts_at": mapping.last_starts_at,
+                "ends_at": mapping.last_ends_at,
+            }),
+            starts_at: mapping.last_starts_at,
+            ends_at: mapping.last_ends_at,
+            intent_hash: [0; 32],
+        };
+        change.intent_hash = schedule_publication_intent_hash(source, &change)
+            .map_err(|_| GoogleSyncServiceError::Internal)?;
+        changes.push(change);
+    }
+    Ok(changes)
+}
+
 #[allow(clippy::too_many_lines)] // Keeps the reviewed provider projection in one auditable function.
 fn prepare_calendar_outbound(
     item: crate::items::Item,
@@ -2666,6 +3818,102 @@ fn outbound_event_result(
     })
 }
 
+fn schedule_publication_event_result(
+    event: &GoogleEvent,
+    dispatch_nonce: Uuid,
+    observation_source: SchedulePublicationObservationSource,
+) -> Result<SchedulePublicationResult, GoogleSyncServiceError> {
+    validate_remote_id(&event.id).map_err(|_| GoogleError::InvalidResponse)?;
+    let remote_etag = bounded_optional(event.etag.as_deref(), 1000)
+        .map_err(|_| GoogleError::InvalidResponse)?
+        .ok_or(GoogleError::InvalidResponse)?;
+    Ok(SchedulePublicationResult {
+        remote_resource_id: event.id.clone(),
+        remote_etag: Some(remote_etag),
+        remote_updated_at: event
+            .updated
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()
+            .map_err(|_| GoogleError::InvalidResponse)?,
+        payload_hash: payload_hash(event).map_err(|_| GoogleError::InvalidResponse)?,
+        dispatch_nonce,
+        observation_source,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Every provider identity fence is explicit.
+fn schedule_create_conflict_result(
+    found: &GoogleEvent,
+    intended: &GoogleEvent,
+    slot_id: Uuid,
+    incarnation: u32,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    dispatch_nonce: Uuid,
+) -> Result<SchedulePublicationResult, GoogleSyncServiceError> {
+    if found.id != intended.id
+        || !schedule_calendar_event_owned_by(
+            found,
+            slot_id,
+            incarnation,
+            account_id,
+            collection_id,
+            cipher,
+            scope,
+        )
+        || !schedule_calendar_event_matches_intent(found, intended)
+    {
+        return Err(GoogleError::PreconditionFailed.into());
+    }
+    schedule_publication_event_result(
+        found,
+        dispatch_nonce,
+        SchedulePublicationObservationSource::ReconciliationRead,
+    )
+}
+
+fn schedule_publication_absent_result(
+    remote_resource_id: &str,
+    dispatch_nonce: Uuid,
+    observation_source: SchedulePublicationObservationSource,
+) -> SchedulePublicationResult {
+    SchedulePublicationResult {
+        remote_resource_id: remote_resource_id.to_owned(),
+        remote_etag: None,
+        remote_updated_at: None,
+        payload_hash: Sha256::digest(b"deleted").into(),
+        dispatch_nonce,
+        observation_source,
+    }
+}
+
+fn schedule_delete_already_absent(error: &GoogleSyncServiceError) -> bool {
+    matches!(
+        error,
+        GoogleSyncServiceError::Google(
+            GoogleError::SyncTokenExpired | GoogleError::Api { status: 410 }
+        )
+    )
+}
+
+fn schedule_calendar_write_access_is_current(
+    calendars: &[DiscoveredCollection],
+    remote_collection_id: &str,
+) -> bool {
+    calendars.iter().any(|calendar| {
+        calendar.kind == GoogleCollectionKind::Calendar
+            && calendar.remote_id == remote_collection_id
+            && !calendar.provider_deleted
+            && matches!(
+                calendar.provider_access_role.as_deref(),
+                Some("owner" | "writer")
+            )
+    })
+}
+
 fn outbound_task_result(
     task: &GoogleTask,
     dispatch_nonce: Uuid,
@@ -2749,6 +3997,347 @@ fn calendar_event_matches_intent(found: &GoogleEvent, intended: &GoogleEvent) ->
     normalize_calendar_provider_metadata(&mut found);
     normalize_calendar_provider_metadata(&mut intended);
     found == intended
+}
+
+fn schedule_calendar_event_matches_intent(found: &GoogleEvent, intended: &GoogleEvent) -> bool {
+    let mut found = found.clone();
+    let mut intended = intended.clone();
+    normalize_schedule_calendar_semantics(&mut found)
+        && normalize_schedule_calendar_semantics(&mut intended)
+        && found == intended
+}
+
+fn normalize_schedule_calendar_semantics(event: &mut GoogleEvent) -> bool {
+    normalize_calendar_provider_metadata(event);
+    for bound in [&mut event.start, &mut event.end] {
+        let Some(bound) = bound.as_mut() else {
+            return false;
+        };
+        if bound.date.is_some() {
+            return false;
+        }
+        let Some(date_time) = bound.date_time.as_deref() else {
+            return false;
+        };
+        let Ok(parsed) = DateTime::parse_from_rfc3339(date_time) else {
+            return false;
+        };
+        bound.date_time = Some(
+            parsed
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+        );
+    }
+
+    let Some(reminders) = event.additional_properties.get_mut("reminders") else {
+        return false;
+    };
+    let Some(reminders_object) = reminders.as_object() else {
+        return false;
+    };
+    if reminders_object.get("useDefault") != Some(&Value::Bool(false))
+        || reminders_object
+            .get("overrides")
+            .is_some_and(|overrides| overrides.as_array().is_none_or(|values| !values.is_empty()))
+        || reminders_object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "useDefault" | "overrides"))
+    {
+        return false;
+    }
+    *reminders = json!({ "useDefault": false, "overrides": [] });
+
+    // Google commonly materializes documented defaults in response bodies.
+    // Remove only exact defaults that cannot alter a private attendee-free
+    // block; non-default or unknown fields remain comparison-significant.
+    for (field, default_value) in [
+        ("endTimeUnspecified", Value::Bool(false)),
+        ("attendeesOmitted", Value::Bool(false)),
+        ("anyoneCanAddSelf", Value::Bool(false)),
+        ("guestsCanInviteOthers", Value::Bool(true)),
+        ("guestsCanModify", Value::Bool(false)),
+        ("guestsCanSeeOtherGuests", Value::Bool(true)),
+        ("privateCopy", Value::Bool(false)),
+        ("locked", Value::Bool(false)),
+    ] {
+        if event.additional_properties.get(field) == Some(&default_value) {
+            event.additional_properties.remove(field);
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)] // Every response identity and ownership fence is explicit.
+fn validate_schedule_write_response(
+    result: &GoogleEvent,
+    intended: &GoogleEvent,
+    expected_remote_id: &str,
+    slot_id: Uuid,
+    incarnation: u32,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<(), GoogleSyncServiceError> {
+    if result.id != expected_remote_id {
+        return Err(GoogleSyncServiceError::ProviderIdentityUnresolved);
+    }
+    if !schedule_calendar_event_owned_by(
+        result,
+        slot_id,
+        incarnation,
+        account_id,
+        collection_id,
+        cipher,
+        scope,
+    ) || !schedule_calendar_event_matches_intent(result, intended)
+    {
+        return Err(GoogleError::InvalidResponse.into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleUpdateRecoveryAction {
+    Adopt,
+    Retry,
+}
+
+#[allow(clippy::too_many_arguments)] // Every ownership and conditional-write fence is explicit.
+fn schedule_update_recovery_action(
+    found: &GoogleEvent,
+    intended: &GoogleEvent,
+    expected_etag: &str,
+    slot_id: Uuid,
+    incarnation: u32,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<ScheduleUpdateRecoveryAction, GoogleSyncServiceError> {
+    if !schedule_calendar_event_owned_by(
+        found,
+        slot_id,
+        incarnation,
+        account_id,
+        collection_id,
+        cipher,
+        scope,
+    ) {
+        return Err(GoogleError::PreconditionFailed.into());
+    }
+    let found_etag = found
+        .etag
+        .as_deref()
+        .filter(|etag| valid_opaque(etag, 1000))
+        .ok_or(GoogleError::InvalidResponse)?;
+    if schedule_calendar_event_matches_intent(found, intended) {
+        return Ok(ScheduleUpdateRecoveryAction::Adopt);
+    }
+    if found_etag == expected_etag {
+        Ok(ScheduleUpdateRecoveryAction::Retry)
+    } else {
+        Err(GoogleError::PreconditionFailed.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleDeleteRecoveryAction {
+    Absent,
+    Retry,
+}
+
+#[allow(clippy::too_many_arguments)] // Every deletion identity and ownership fence is explicit.
+fn schedule_delete_recovery_action(
+    found: &GoogleEvent,
+    expected_remote_id: &str,
+    expected_etag: &str,
+    slot_id: Uuid,
+    incarnation: u32,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<ScheduleDeleteRecoveryAction, GoogleSyncServiceError> {
+    if found.id != expected_remote_id {
+        return Err(GoogleSyncServiceError::ProviderIdentityUnresolved);
+    }
+    // Google events.get deliberately returns cancelled tombstones, and a
+    // deleted non-recurring event may contain only its ID. For our exact
+    // deterministic mapping this is authoritative absence even when the
+    // ownership marker and old ETag have already been stripped.
+    if found.status.as_deref() == Some("cancelled") {
+        return Ok(ScheduleDeleteRecoveryAction::Absent);
+    }
+    if !schedule_calendar_event_owned_by(
+        found,
+        slot_id,
+        incarnation,
+        account_id,
+        collection_id,
+        cipher,
+        scope,
+    ) {
+        return Err(GoogleError::PreconditionFailed.into());
+    }
+    let found_etag = found
+        .etag
+        .as_deref()
+        .filter(|etag| valid_opaque(etag, 1000))
+        .ok_or(GoogleError::InvalidResponse)?;
+    if found_etag == expected_etag {
+        Ok(ScheduleDeleteRecoveryAction::Retry)
+    } else {
+        Err(GoogleError::PreconditionFailed.into())
+    }
+}
+
+fn deterministic_schedule_calendar_event_id(
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    collection: &GoogleSyncCollection,
+    slot_id: Uuid,
+    incarnation: u32,
+) -> Result<String, GoogleSyncServiceError> {
+    let context = serde_json::to_vec(&(
+        scope.workspace_id,
+        scope.user_id,
+        collection.account_id,
+        collection.id,
+        &collection.remote_collection_id,
+        slot_id,
+        incarnation,
+    ))
+    .map_err(|_| GoogleSyncServiceError::Internal)?;
+    let (version, digest) =
+        cipher.identity_digest(b"dayweave.google.schedule-event-id.v1", &context)?;
+    Ok(format!("s{version:x}{}", encode_hex(&digest)))
+}
+
+fn schedule_calendar_ownership_proof(
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    account_id: Uuid,
+    collection_id: Uuid,
+    slot_id: Uuid,
+    incarnation: u32,
+    event_id: &str,
+) -> Result<String, GoogleSyncServiceError> {
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&(1_u8, slot_id, incarnation))
+            .map_err(|_| GoogleSyncServiceError::Internal)?,
+    );
+    let marker = cipher.seal(
+        &plaintext,
+        &schedule_calendar_marker_aad(scope, account_id, collection_id, event_id),
+    )?;
+    Ok(format!(
+        "dwsm1.v{}.{}",
+        marker.key_version,
+        URL_SAFE_NO_PAD.encode(&marker.ciphertext)
+    ))
+}
+
+fn schedule_calendar_marker_for_target(
+    event: &GoogleEvent,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<Option<(Uuid, u32)>, NormalizationError> {
+    let Some(properties) = event.extended_properties.as_ref() else {
+        return Ok(None);
+    };
+    let Some(proof) = properties.private.get("dayweaveScheduleOwnershipProof") else {
+        return Ok(None);
+    };
+    let remainder = proof
+        .strip_prefix("dwsm1.v")
+        .ok_or(NormalizationError::Rejected(
+            "dayweave_schedule_marker_invalid",
+        ))?;
+    let (version, encoded) = remainder
+        .split_once('.')
+        .ok_or(NormalizationError::Rejected(
+            "dayweave_schedule_marker_invalid",
+        ))?;
+    let version = version
+        .parse::<u32>()
+        .map_err(|_| NormalizationError::Rejected("dayweave_schedule_marker_invalid"))?;
+    let envelope = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| NormalizationError::Rejected("dayweave_schedule_marker_invalid"))?;
+    let mut plaintext = cipher
+        .open(
+            version,
+            &envelope,
+            &schedule_calendar_marker_aad(scope, account_id, collection_id, &event.id),
+        )
+        .map_err(|_| NormalizationError::Rejected("dayweave_schedule_marker_invalid"))?;
+    let parsed = serde_json::from_slice::<(u8, Uuid, u32)>(&plaintext)
+        .ok()
+        .filter(|(schema, slot_id, incarnation)| {
+            *schema == 1 && !slot_id.is_nil() && *incarnation > 0
+        })
+        .map(|(_, slot_id, incarnation)| (slot_id, incarnation))
+        .ok_or(NormalizationError::Rejected(
+            "dayweave_schedule_marker_invalid",
+        ));
+    plaintext.zeroize();
+    parsed.map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleCalendarEventDisposition {
+    Generated,
+    Rejected(&'static str),
+    External,
+}
+
+fn classify_schedule_calendar_event(
+    event: &GoogleEvent,
+    known_schedule_remote_ids: &BTreeSet<String>,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> ScheduleCalendarEventDisposition {
+    match schedule_calendar_marker_for_target(event, account_id, collection_id, cipher, scope) {
+        Ok(Some(_)) => ScheduleCalendarEventDisposition::Generated,
+        Err(NormalizationError::Rejected(reason)) => {
+            ScheduleCalendarEventDisposition::Rejected(reason)
+        }
+        Ok(None) if known_schedule_remote_ids.contains(&event.id) => {
+            if event.status.as_deref() == Some("cancelled") {
+                ScheduleCalendarEventDisposition::Generated
+            } else {
+                ScheduleCalendarEventDisposition::Rejected("dayweave_schedule_marker_missing")
+            }
+        }
+        Ok(None) => ScheduleCalendarEventDisposition::External,
+    }
+}
+
+fn schedule_calendar_event_owned_by(
+    event: &GoogleEvent,
+    slot_id: Uuid,
+    incarnation: u32,
+    account_id: Uuid,
+    collection_id: Uuid,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> bool {
+    matches!(
+        schedule_calendar_marker_for_target(
+            event,
+            account_id,
+            collection_id,
+            cipher,
+            scope,
+        ),
+        Ok(Some((parsed_slot, parsed_incarnation)))
+            if parsed_slot == slot_id && parsed_incarnation == incarnation
+    )
 }
 
 fn calendar_reviewed_projection(event: &GoogleEvent) -> Result<Value, serde_json::Error> {
@@ -2917,6 +4506,23 @@ fn calendar_marker_aad(scope: OAuthScope, account_id: Uuid, collection_id: Uuid)
     .expect("UUID marker context serialization cannot fail")
 }
 
+fn schedule_calendar_marker_aad(
+    scope: OAuthScope,
+    account_id: Uuid,
+    collection_id: Uuid,
+    event_id: &str,
+) -> Vec<u8> {
+    serde_json::to_vec(&(
+        "dayweave.google.schedule-calendar-marker.v1",
+        scope.workspace_id,
+        scope.user_id,
+        account_id,
+        collection_id,
+        event_id,
+    ))
+    .expect("UUID marker context serialization cannot fail")
+}
+
 fn parse_event_bound(
     value: &EventDateTime,
     fallback_timezone: &str,
@@ -3071,6 +4677,190 @@ fn payload_hash<T: Serialize>(value: &T) -> Result<[u8; 32], NormalizationError>
     Ok(Sha256::digest(bytes).into())
 }
 
+/// Stable logical identity for one generated work session. The scheduler's
+/// source block UUID includes its start time and therefore cannot identify a
+/// moved Google event. This value intentionally excludes placement bounds.
+#[must_use]
+pub(crate) fn schedule_publication_slot_id(
+    workspace_id: Uuid,
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+    session_index: u16,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"dayweave.google.schedule-slot.v1\0");
+    digest.update(workspace_id.as_bytes());
+    digest.update(item_id.as_bytes());
+    match occurrence_id {
+        Some(occurrence_id) => {
+            digest.update([1]);
+            digest.update(occurrence_id.as_bytes());
+        }
+        None => digest.update([0; 17]),
+    }
+    digest.update(session_index.to_be_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Mark this deterministic UUID as RFC 4122 variant / version 5. The
+    // digest construction above is the canonical namespace operation.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+pub(crate) fn schedule_desired_payload_hash(
+    slot_id: Uuid,
+    incarnation: u32,
+    summary: &str,
+    starts_at: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
+    timezone_name: &str,
+) -> Result<[u8; 32], GoogleSyncServiceError> {
+    let bytes = serde_json::to_vec(&(
+        "dayweave.google.schedule-desired-payload.v1",
+        slot_id,
+        incarnation,
+        summary,
+        starts_at,
+        ends_at,
+        timezone_name,
+        "confirmed",
+        "opaque",
+        "private",
+        "default",
+        "no_attendees",
+        "no_notifications",
+    ))
+    .map_err(|_| GoogleSyncServiceError::Internal)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+#[allow(clippy::too_many_lines)] // The complete external-effect binding is intentionally explicit.
+pub(crate) fn schedule_publication_intent_hash(
+    source: &SchedulePublicationSource,
+    change: &PreparedSchedulePublicationChange,
+) -> Result<[u8; 32], serde_json::Error> {
+    let bytes = serde_json::to_vec(&(
+        "dayweave.google.schedule-publication-intent.v2",
+        (source.workspace_id, source.user_id, source.account_id),
+        (
+            source.collection.id,
+            source.collection.revision,
+            &source.collection.remote_collection_id,
+            GOOGLE_CALENDAR_SCOPE,
+        ),
+        (
+            source.schedule_revision_id,
+            source.schedule_revision_number,
+            source.schedule_publication_hash,
+            &source.timezone_name,
+            source.horizon_start,
+            source.horizon_end,
+        ),
+        (
+            change.ordinal,
+            change.slot_id,
+            change.source_block_id,
+            change.item_id,
+            change.occurrence_id,
+            change.session_index,
+            change.incarnation,
+            change.operation,
+        ),
+        (
+            change.mapping_id,
+            change.remote_resource_id.as_deref(),
+            change.expected_etag.as_deref(),
+            change.desired_payload_hash,
+            change.starts_at,
+            change.ends_at,
+        ),
+        (&change.payload, &change.review_summary),
+    ))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+pub(crate) fn schedule_publication_desired_set_hash(
+    source: &SchedulePublicationSource,
+    changes: &[PreparedSchedulePublicationChange],
+) -> Result<[u8; 32], serde_json::Error> {
+    let desired = changes
+        .iter()
+        .filter(|change| change.source_block_id.is_some())
+        .map(|change| {
+            (
+                change.ordinal,
+                change.slot_id,
+                change.source_block_id,
+                change.item_id,
+                change.occurrence_id,
+                change.session_index,
+                change.incarnation,
+                change.desired_payload_hash,
+                change.starts_at,
+                change.ends_at,
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&(
+        "dayweave.google.schedule-desired-set.v1",
+        source.workspace_id,
+        source.user_id,
+        source.schedule_revision_id,
+        source.schedule_revision_number,
+        source.schedule_publication_hash,
+        &source.timezone_name,
+        source.horizon_start,
+        source.horizon_end,
+        desired,
+    ))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+pub(crate) fn schedule_publication_preview_hash(
+    preview_id: Uuid,
+    source: &SchedulePublicationSource,
+    changes: &[PreparedSchedulePublicationChange],
+    expires_at: DateTime<Utc>,
+) -> Result<[u8; 32], serde_json::Error> {
+    let desired_set_hash = schedule_publication_desired_set_hash(source, changes)?;
+    let intent_hashes = changes
+        .iter()
+        .map(|change| {
+            (
+                change.ordinal,
+                change.intent_hash,
+                change.operation,
+                change.slot_id,
+                change.source_block_id,
+                change.remote_resource_id.as_deref(),
+                change.expected_etag.as_deref(),
+                &change.review_summary,
+                change.starts_at,
+                change.ends_at,
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&(
+        "dayweave.google.schedule-publication-preview.v2",
+        preview_id,
+        source.workspace_id,
+        source.user_id,
+        source.account_id,
+        source.collection.id,
+        source.collection.revision,
+        &source.collection.remote_collection_id,
+        source.schedule_revision_id,
+        source.schedule_revision_number,
+        source.schedule_publication_hash,
+        desired_set_hash,
+        intent_hashes,
+        expires_at,
+    ))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
 #[allow(clippy::too_many_arguments)] // Every reviewed authorization dimension is explicit and hashed.
 pub(crate) fn outbound_intent_hash(
     workspace_id: Uuid,
@@ -3125,14 +4915,28 @@ pub(crate) fn outbound_preview_hash(
 }
 
 fn approval_capability_hash(value: &str) -> Result<[u8; 32], GoogleSyncServiceError> {
+    capability_hash_with_prefix(value, APPROVAL_TOKEN_PREFIX)
+}
+
+fn schedule_approval_capability_hash(value: &str) -> Result<[u8; 32], GoogleSyncServiceError> {
+    capability_hash_with_prefix(value, SCHEDULE_APPROVAL_TOKEN_PREFIX)
+}
+
+fn capability_hash_with_prefix(
+    value: &str,
+    prefix: &str,
+) -> Result<[u8; 32], GoogleSyncServiceError> {
     let payload = value
-        .strip_prefix(APPROVAL_TOKEN_PREFIX)
+        .strip_prefix(prefix)
         .ok_or(GoogleSyncServiceError::InvalidApprovalCapability)?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| GoogleSyncServiceError::InvalidApprovalCapability)?;
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| GoogleSyncServiceError::InvalidApprovalCapability)?,
+    );
+    let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(decoded.as_slice()));
     if decoded.len() != APPROVAL_TOKEN_RANDOM_BYTES
-        || URL_SAFE_NO_PAD.encode(&decoded) != payload
+        || canonical.as_str() != payload
         || value.chars().any(char::is_whitespace)
     {
         return Err(GoogleSyncServiceError::InvalidApprovalCapability);
@@ -3239,6 +5043,16 @@ fn exponential_backoff(attempts: u32) -> Duration {
     Duration::seconds(30_i64.saturating_mul(1_i64 << exponent).min(3_600))
 }
 
+fn schedule_ambiguous_response_code(error: &GoogleSyncServiceError) -> Option<&'static str> {
+    match error {
+        GoogleSyncServiceError::ProviderIdentityUnresolved => Some("provider_identity_unresolved"),
+        GoogleSyncServiceError::Google(GoogleError::ResponseTooLarge) => {
+            Some("provider_response_too_large")
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FailureDisposition {
     kind: SyncFailureKind,
@@ -3268,6 +5082,8 @@ pub(crate) enum GoogleSyncServiceError {
     DeleteRequiresTrash,
     #[error("Google outbound publication is disabled by deployment policy")]
     ExternalPublicationDisabled,
+    #[error("Google schedule-block publication is disabled by deployment policy")]
+    SchedulePublicationDisabled,
     #[error("outbound approval capability is invalid")]
     InvalidApprovalCapability,
     #[error("collection publication policy does not permit this provider representation")]
@@ -3431,6 +5247,26 @@ mod tests {
     const REFRESH_ACCOUNT_ACTIVE: u8 = 0;
     const REFRESH_ACCOUNT_PAUSED: u8 = 1;
     const REFRESH_ACCOUNT_DISCONNECTED: u8 = 2;
+
+    #[test]
+    fn ambiguous_schedule_write_responses_stay_reconcilable() {
+        assert_eq!(
+            schedule_ambiguous_response_code(&GoogleSyncServiceError::ProviderIdentityUnresolved),
+            Some("provider_identity_unresolved")
+        );
+        assert_eq!(
+            schedule_ambiguous_response_code(&GoogleSyncServiceError::Google(
+                GoogleError::ResponseTooLarge,
+            )),
+            Some("provider_response_too_large")
+        );
+        assert_eq!(
+            schedule_ambiguous_response_code(&GoogleSyncServiceError::Google(
+                GoogleError::PreconditionFailed,
+            )),
+            None
+        );
+    }
 
     struct RefreshReplayLifecycle {
         account_state: AtomicU8,
@@ -3632,6 +5468,941 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn schedule_source(
+        blocks: Vec<SchedulePublicationBlock>,
+        mappings: Vec<ScheduleBlockMapping>,
+    ) -> SchedulePublicationSource {
+        let scope = test_oauth_scope();
+        SchedulePublicationSource {
+            workspace_id: scope.workspace_id,
+            user_id: scope.user_id,
+            account_id: Uuid::from_u128(11),
+            collection: collection(GoogleSyncRole::Writable, true),
+            schedule_revision_id: Uuid::from_u128(0x700),
+            schedule_revision_number: 7,
+            schedule_publication_hash: [0x77; 32],
+            timezone_name: "UTC".to_owned(),
+            horizon_start: parse_timestamp("2026-09-03T00:00:00Z").expect("start"),
+            horizon_end: parse_timestamp("2026-09-05T00:00:00Z").expect("end"),
+            blocks,
+            mappings,
+        }
+    }
+
+    #[test]
+    fn schedule_slot_identity_is_stable_across_moves_and_separates_sessions() {
+        let workspace = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        let occurrence = Uuid::from_u128(3);
+        let first = schedule_publication_slot_id(workspace, item, Some(occurrence), 0);
+        assert_eq!(
+            first,
+            schedule_publication_slot_id(workspace, item, Some(occurrence), 0)
+        );
+        assert_ne!(
+            first,
+            schedule_publication_slot_id(workspace, item, Some(occurrence), 1)
+        );
+        assert_ne!(
+            first,
+            schedule_publication_slot_id(workspace, item, None, 0)
+        );
+        assert_ne!(
+            first,
+            schedule_publication_slot_id(Uuid::from_u128(4), item, Some(occurrence), 0)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture verifies privacy, redaction, and target binding together.
+    fn schedule_event_is_private_redacted_and_target_bound() {
+        let collection = collection(GoogleSyncRole::Writable, true);
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let slot_id = schedule_publication_slot_id(
+            scope.workspace_id,
+            Uuid::from_u128(0x901),
+            Some(Uuid::from_u128(0x902)),
+            2,
+        );
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let first = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Never expose this sensitive title",
+            true,
+            starts_at,
+            ends_at,
+            "UTC",
+        )
+        .expect("event");
+        let second = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Never expose this sensitive title",
+            true,
+            starts_at,
+            ends_at,
+            "UTC",
+        )
+        .expect("second event");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.summary.as_deref(), Some("Busy"));
+        assert!(first.description.is_none());
+        assert!(first.location.is_none());
+        assert!(first.attendees.is_empty());
+        assert!(first.attachments.is_empty());
+        assert!(first.conference_data.is_none());
+        assert_eq!(
+            first.additional_properties.get("reminders"),
+            Some(&json!({ "useDefault": false, "overrides": [] }))
+        );
+        assert_eq!(first.visibility.as_deref(), Some("private"));
+        assert_eq!(first.transparency.as_deref(), Some("opaque"));
+        let encoded = serde_json::to_string(&first).expect("serialize");
+        assert!(!encoded.contains("Never expose"));
+        assert!(!encoded.contains(&slot_id.to_string()));
+        assert!(encoded.contains("\"useDefault\":false"));
+        assert_eq!(
+            schedule_calendar_marker_for_target(
+                &first,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Ok(Some((slot_id, 1)))
+        );
+        assert!(matches!(
+            schedule_calendar_marker_for_target(
+                &first,
+                collection.account_id,
+                Uuid::from_u128(0x999),
+                &cipher,
+                scope,
+            ),
+            Err(NormalizationError::Rejected(
+                "dayweave_schedule_marker_invalid"
+            ))
+        ));
+
+        let mut replayed = first.clone();
+        replayed.id.push('0');
+        assert!(matches!(
+            schedule_calendar_marker_for_target(
+                &replayed,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Err(NormalizationError::Rejected(
+                "dayweave_schedule_marker_invalid"
+            ))
+        ));
+
+        let paris = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Canonical response",
+            false,
+            starts_at,
+            ends_at,
+            "Europe/Paris",
+        )
+        .expect("Paris event");
+        let mut provider_response = paris.clone();
+        provider_response.start.as_mut().expect("start").date_time =
+            Some("2026-09-03T11:00:00+02:00".to_owned());
+        provider_response.end.as_mut().expect("end").date_time =
+            Some("2026-09-03T12:00:00.000+02:00".to_owned());
+        provider_response
+            .additional_properties
+            .insert("reminders".to_owned(), json!({ "useDefault": false }));
+        for (field, value) in [
+            ("endTimeUnspecified", json!(false)),
+            ("attendeesOmitted", json!(false)),
+            ("guestsCanInviteOthers", json!(true)),
+            ("guestsCanModify", json!(false)),
+            ("guestsCanSeeOtherGuests", json!(true)),
+        ] {
+            provider_response
+                .additional_properties
+                .insert(field.to_owned(), value);
+        }
+        provider_response.additional_properties.insert(
+            "creator".to_owned(),
+            json!({ "email": "calendar-owner@example.test", "self": true }),
+        );
+        assert!(schedule_calendar_event_matches_intent(
+            &provider_response,
+            &paris
+        ));
+        provider_response.visibility = Some("public".to_owned());
+        assert!(!schedule_calendar_event_matches_intent(
+            &provider_response,
+            &paris
+        ));
+    }
+
+    #[test]
+    fn schedule_create_duplicate_id_adopts_only_the_exact_owned_intent() {
+        let calendar = collection(GoogleSyncRole::Writable, true);
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let slot_id =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0x908), None, 0);
+        let mut intended = prepare_schedule_calendar_event(
+            &calendar,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Deterministic create",
+            false,
+            parse_timestamp("2026-09-03T09:00:00Z").expect("start"),
+            parse_timestamp("2026-09-03T10:00:00Z").expect("end"),
+            "UTC",
+        )
+        .expect("intent");
+        let nonce = Uuid::from_u128(0x909);
+        intended.etag = Some("duplicate-etag".to_owned());
+
+        let adopted = schedule_create_conflict_result(
+            &intended,
+            &intended,
+            slot_id,
+            1,
+            calendar.account_id,
+            calendar.id,
+            &cipher,
+            scope,
+            nonce,
+        )
+        .expect("exact existing deterministic ID is adopted");
+        assert_eq!(adopted.remote_resource_id.as_str(), intended.id.as_str());
+        assert_eq!(adopted.remote_etag.as_deref(), Some("duplicate-etag"));
+        assert_eq!(adopted.dispatch_nonce, nonce);
+        assert_eq!(
+            adopted.observation_source,
+            SchedulePublicationObservationSource::ReconciliationRead
+        );
+
+        let mut missing_etag = intended.clone();
+        missing_etag.etag = None;
+        assert!(matches!(
+            schedule_create_conflict_result(
+                &missing_etag,
+                &intended,
+                slot_id,
+                1,
+                calendar.account_id,
+                calendar.id,
+                &cipher,
+                scope,
+                nonce,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+
+        let mut wrong_intent = intended.clone();
+        wrong_intent.summary = Some("A different event at that ID".to_owned());
+        assert!(matches!(
+            schedule_create_conflict_result(
+                &wrong_intent,
+                &intended,
+                slot_id,
+                1,
+                calendar.account_id,
+                calendar.id,
+                &cipher,
+                scope,
+                nonce,
+            ),
+            Err(GoogleSyncServiceError::Google(
+                GoogleError::PreconditionFailed
+            ))
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercises every generated-event authentication rejection branch.
+    fn schedule_projection_ignores_authenticated_generated_events() {
+        let collection = collection(GoogleSyncRole::Writable, true);
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let slot_id =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0x910), None, 0);
+        let event = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Generated block",
+            false,
+            starts_at,
+            ends_at,
+            "UTC",
+        )
+        .expect("event");
+        let mut changes = Vec::new();
+        let mut rejected = Vec::new();
+        let mut bytes = 0;
+        normalize_calendar_projection_events(
+            &collection,
+            CalendarProjectionWindow {
+                start: starts_at - Duration::hours(1),
+                end: ends_at + Duration::hours(1),
+            },
+            "UTC",
+            vec![event.clone()],
+            &cipher,
+            scope,
+            &BTreeSet::new(),
+            &mut changes,
+            &mut rejected,
+            &mut bytes,
+        )
+        .expect("projection");
+        assert!(changes.is_empty());
+        assert!(rejected.is_empty());
+        assert_eq!(bytes, 0);
+
+        let known_ids = BTreeSet::from([event.id.clone()]);
+        let mut marker_stripped = event.clone();
+        marker_stripped.extended_properties = None;
+        let cancelled: GoogleEvent = serde_json::from_value(json!({
+            "id": event.id,
+            "status": "cancelled"
+        }))
+        .expect("ID-only cancelled event");
+        let mut malformed_marker = event;
+        malformed_marker
+            .extended_properties
+            .as_mut()
+            .expect("marker")
+            .private
+            .get_mut("dayweaveScheduleOwnershipProof")
+            .expect("proof")
+            .push('x');
+        assert_eq!(
+            classify_schedule_calendar_event(
+                &marker_stripped,
+                &known_ids,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            ScheduleCalendarEventDisposition::Rejected("dayweave_schedule_marker_missing")
+        );
+        assert_eq!(
+            classify_schedule_calendar_event(
+                &cancelled,
+                &known_ids,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            ScheduleCalendarEventDisposition::Generated
+        );
+        assert_eq!(
+            classify_schedule_calendar_event(
+                &malformed_marker,
+                &known_ids,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            ScheduleCalendarEventDisposition::Rejected("dayweave_schedule_marker_invalid")
+        );
+
+        let mut changes = Vec::new();
+        let mut rejected = Vec::new();
+        let mut bytes = 0;
+        normalize_calendar_projection_events(
+            &collection,
+            CalendarProjectionWindow {
+                start: starts_at - Duration::hours(1),
+                end: ends_at + Duration::hours(1),
+            },
+            "UTC",
+            vec![marker_stripped, cancelled],
+            &cipher,
+            scope,
+            &known_ids,
+            &mut changes,
+            &mut rejected,
+            &mut bytes,
+        )
+        .expect("known generated projections");
+        assert!(changes.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].reason, "dayweave_schedule_marker_missing");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One table verifies all pre-acceptance update recovery outcomes.
+    fn schedule_update_recovery_retries_crash_or_transport_before_acceptance() {
+        let collection = collection(GoogleSyncRole::Writable, true);
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let slot_id =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0x920), None, 0);
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let mut intended = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "New placement",
+            false,
+            starts_at,
+            ends_at,
+            "UTC",
+        )
+        .expect("intended event");
+        intended.etag = Some("etag-before-update".to_owned());
+
+        let mut untouched = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Old placement",
+            false,
+            starts_at - Duration::hours(1),
+            ends_at - Duration::hours(1),
+            "UTC",
+        )
+        .expect("old event");
+        untouched.etag = Some("etag-before-update".to_owned());
+        assert_eq!(
+            schedule_update_recovery_action(
+                &untouched,
+                &intended,
+                "etag-before-update",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            )
+            .expect("unchanged old ETag is safe to retry"),
+            ScheduleUpdateRecoveryAction::Retry
+        );
+
+        let mut accepted = intended.clone();
+        accepted.etag = Some("etag-after-update".to_owned());
+        assert_eq!(
+            schedule_update_recovery_action(
+                &accepted,
+                &intended,
+                "etag-before-update",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            )
+            .expect("accepted intent is adopted"),
+            ScheduleUpdateRecoveryAction::Adopt
+        );
+
+        let mut missing_etag = accepted.clone();
+        missing_etag.etag = None;
+        assert!(matches!(
+            schedule_update_recovery_action(
+                &missing_etag,
+                &intended,
+                "etag-before-update",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+
+        untouched.etag = Some("etag-from-concurrent-edit".to_owned());
+        assert!(matches!(
+            schedule_update_recovery_action(
+                &untouched,
+                &intended,
+                "etag-before-update",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Err(GoogleSyncServiceError::Google(
+                GoogleError::PreconditionFailed
+            ))
+        ));
+
+        let mut malformed_success = accepted.clone();
+        malformed_success.etag = None;
+        assert!(matches!(
+            schedule_publication_event_result(
+                &malformed_success,
+                Uuid::from_u128(0x921),
+                SchedulePublicationObservationSource::ProviderResponse,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+        malformed_success.etag = Some("etag-after-update".to_owned());
+        malformed_success.updated = Some("not-a-timestamp".to_owned());
+        assert!(matches!(
+            schedule_publication_event_result(
+                &malformed_success,
+                Uuid::from_u128(0x922),
+                SchedulePublicationObservationSource::ProviderResponse,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+
+        let mut semantically_wrong_success = accepted.clone();
+        semantically_wrong_success.summary = Some("Provider returned another state".to_owned());
+        assert!(matches!(
+            validate_schedule_write_response(
+                &semantically_wrong_success,
+                &intended,
+                &intended.id,
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+    }
+
+    #[test]
+    fn schedule_delete_recovery_accepts_google_cancelled_tombstones() {
+        assert!(schedule_delete_already_absent(
+            &GoogleError::Api { status: 410 }.into()
+        ));
+        assert!(!schedule_delete_already_absent(
+            &GoogleError::Api { status: 404 }.into()
+        ));
+        assert!(schedule_delete_already_absent(
+            &GoogleError::SyncTokenExpired.into()
+        ));
+        let collection = collection(GoogleSyncRole::Writable, true);
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let slot_id =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0x930), None, 0);
+        let active = prepare_schedule_calendar_event(
+            &collection,
+            &cipher,
+            scope,
+            slot_id,
+            1,
+            "Published block",
+            false,
+            parse_timestamp("2026-09-03T09:00:00Z").expect("start"),
+            parse_timestamp("2026-09-03T10:00:00Z").expect("end"),
+            "UTC",
+        )
+        .expect("active event");
+        let remote_id = active.id.clone();
+        let tombstone: GoogleEvent = serde_json::from_value(json!({
+            "id": remote_id,
+            "status": "cancelled"
+        }))
+        .expect("ID-only Google tombstone");
+        assert_eq!(
+            schedule_delete_recovery_action(
+                &tombstone,
+                &active.id,
+                "etag-before-delete",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            )
+            .expect("cancelled tombstone proves absence"),
+            ScheduleDeleteRecoveryAction::Absent
+        );
+
+        let mut retained_cancelled = active.clone();
+        retained_cancelled.status = Some("cancelled".to_owned());
+        retained_cancelled.etag = Some("etag-after-delete".to_owned());
+        assert_eq!(
+            schedule_delete_recovery_action(
+                &retained_cancelled,
+                &active.id,
+                "etag-before-delete",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            )
+            .expect("retained cancelled event proves absence"),
+            ScheduleDeleteRecoveryAction::Absent
+        );
+
+        let mut unchanged = active;
+        unchanged.etag = Some("etag-before-delete".to_owned());
+        assert_eq!(
+            schedule_delete_recovery_action(
+                &unchanged,
+                &unchanged.id,
+                "etag-before-delete",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            )
+            .expect("unchanged owned event is safe to delete again"),
+            ScheduleDeleteRecoveryAction::Retry
+        );
+
+        let mut missing_etag = unchanged;
+        missing_etag.etag = None;
+        assert!(matches!(
+            schedule_delete_recovery_action(
+                &missing_etag,
+                &missing_etag.id,
+                "etag-before-delete",
+                slot_id,
+                1,
+                collection.account_id,
+                collection.id,
+                &cipher,
+                scope,
+            ),
+            Err(GoogleSyncServiceError::Google(GoogleError::InvalidResponse))
+        ));
+    }
+
+    #[test]
+    fn schedule_delete_404_requires_current_writable_calendar_proof() {
+        let mut target = DiscoveredCollection {
+            kind: GoogleCollectionKind::Calendar,
+            remote_id: "target@example.test".to_owned(),
+            display_name: "Publication calendar".to_owned(),
+            provider_access_role: Some("owner".to_owned()),
+            provider_primary: false,
+            provider_selected: true,
+            provider_hidden: false,
+            provider_deleted: false,
+        };
+        assert!(schedule_calendar_write_access_is_current(
+            std::slice::from_ref(&target),
+            "target@example.test"
+        ));
+
+        target.provider_access_role = Some("reader".to_owned());
+        assert!(!schedule_calendar_write_access_is_current(
+            std::slice::from_ref(&target),
+            "target@example.test"
+        ));
+        target.provider_access_role = Some("writer".to_owned());
+        target.provider_deleted = true;
+        assert!(!schedule_calendar_write_access_is_current(
+            std::slice::from_ref(&target),
+            "target@example.test"
+        ));
+        target.provider_deleted = false;
+        assert!(!schedule_calendar_write_access_is_current(
+            std::slice::from_ref(&target),
+            "another@example.test"
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One diff fixture makes create/no-op/update/delete identity relationships explicit.
+    fn schedule_diff_emits_create_noop_update_and_future_delete() {
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let calendar = collection(GoogleSyncRole::Writable, true);
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let block = |item: u128, source: u128, title: &str| SchedulePublicationBlock {
+            source_block_id: Uuid::from_u128(source),
+            item_id: Uuid::from_u128(item),
+            occurrence_id: None,
+            session_index: 0,
+            incarnation: 1,
+            title: title.to_owned(),
+            starts_at,
+            ends_at,
+            is_sensitive: false,
+        };
+        let noop_block = block(0xa2, 0xb2, "Unchanged");
+        let noop_slot =
+            schedule_publication_slot_id(scope.workspace_id, noop_block.item_id, None, 0);
+        let noop_hash =
+            schedule_desired_payload_hash(noop_slot, 1, "Unchanged", starts_at, ends_at, "UTC")
+                .expect("desired hash");
+        let update_block = block(0xa3, 0xb3, "Changed");
+        let update_slot =
+            schedule_publication_slot_id(scope.workspace_id, update_block.item_id, None, 0);
+        let future_delete_slot =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0xa4), None, 0);
+        let past_delete_slot =
+            schedule_publication_slot_id(scope.workspace_id, Uuid::from_u128(0xa5), None, 0);
+        let remote_id = |slot_id| {
+            deterministic_schedule_calendar_event_id(&cipher, scope, &calendar, slot_id, 1)
+                .expect("provider id")
+        };
+        let mapping = |mapping_id: u128,
+                       slot_id: Uuid,
+                       item_id: u128,
+                       source_id: u128,
+                       desired_payload_hash: [u8; 32],
+                       map_start: DateTime<Utc>,
+                       map_end: DateTime<Utc>| ScheduleBlockMapping {
+            mapping_id: Uuid::from_u128(mapping_id),
+            slot_id,
+            item_id: Uuid::from_u128(item_id),
+            occurrence_id: None,
+            session_index: 0,
+            incarnation: 1,
+            source_block_id: Uuid::from_u128(source_id),
+            remote_resource_id: remote_id(slot_id),
+            remote_etag: format!("etag-{mapping_id:x}"),
+            desired_payload_hash,
+            last_starts_at: map_start,
+            last_ends_at: map_end,
+        };
+        let source = schedule_source(
+            vec![block(0xa1, 0xb1, "Create"), noop_block, update_block],
+            vec![
+                mapping(0xc2, noop_slot, 0xa2, 0xd2, noop_hash, starts_at, ends_at),
+                mapping(0xc3, update_slot, 0xa3, 0xd3, [0; 32], starts_at, ends_at),
+                mapping(
+                    0xc4,
+                    future_delete_slot,
+                    0xa4,
+                    0xd4,
+                    [4; 32],
+                    starts_at,
+                    ends_at,
+                ),
+                mapping(
+                    0xc5,
+                    past_delete_slot,
+                    0xa5,
+                    0xd5,
+                    [5; 32],
+                    starts_at - Duration::days(2),
+                    ends_at - Duration::days(2),
+                ),
+            ],
+        );
+        let changes = build_schedule_publication_changes(
+            &source,
+            &cipher,
+            scope,
+            starts_at - Duration::hours(1),
+        )
+        .expect("diff");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                ScheduleGooglePublicationOperation::Create,
+                ScheduleGooglePublicationOperation::Noop,
+                ScheduleGooglePublicationOperation::Update,
+                ScheduleGooglePublicationOperation::Delete,
+            ]
+        );
+        assert_eq!(changes[3].source_block_id, None);
+        assert_eq!(
+            changes[3].review_summary["summary"],
+            "Previously published DayWeave block"
+        );
+        assert!(changes.iter().all(|change| change.intent_hash != [0; 32]));
+
+        let expires_at = starts_at + Duration::minutes(10);
+        let original_preview_hash = schedule_publication_preview_hash(
+            Uuid::from_u128(0x6000),
+            &source,
+            &changes,
+            expires_at,
+        )
+        .expect("preview hash");
+        let mut tampered_review = changes.clone();
+        let original_intent = tampered_review[0].intent_hash;
+        tampered_review[0].review_summary["summary"] = json!("Different reviewed text");
+        let recalculated_intent =
+            schedule_publication_intent_hash(&source, &tampered_review[0]).expect("intent hash");
+        assert_ne!(original_intent, recalculated_intent);
+        assert_ne!(
+            original_preview_hash,
+            schedule_publication_preview_hash(
+                Uuid::from_u128(0x6000),
+                &source,
+                &tampered_review,
+                expires_at,
+            )
+            .expect("tampered preview hash")
+        );
+
+        let mut forged_stale_mapping = source.clone();
+        forged_stale_mapping
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.slot_id == future_delete_slot)
+            .expect("future stale mapping")
+            .remote_resource_id = "arbitrary-user-event".to_owned();
+        assert!(matches!(
+            build_schedule_publication_changes(
+                &forged_stale_mapping,
+                &cipher,
+                scope,
+                starts_at - Duration::hours(1),
+            ),
+            Err(GoogleSyncServiceError::ProviderIdentityUnresolved)
+        ));
+    }
+
+    #[test]
+    fn schedule_diff_never_rewrites_an_exact_elapsed_history_instance() {
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let calendar = collection(GoogleSyncRole::Writable, true);
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let item_id = Uuid::from_u128(0xe1);
+        let source_block_id = Uuid::from_u128(0xe2);
+        let slot_id = schedule_publication_slot_id(scope.workspace_id, item_id, None, 0);
+        let block = SchedulePublicationBlock {
+            source_block_id,
+            item_id,
+            occurrence_id: None,
+            session_index: 0,
+            incarnation: 1,
+            title: "Edited after completion".to_owned(),
+            starts_at,
+            ends_at,
+            is_sensitive: true,
+        };
+        let mapping = ScheduleBlockMapping {
+            mapping_id: Uuid::from_u128(0xe3),
+            slot_id,
+            item_id,
+            occurrence_id: None,
+            session_index: 0,
+            incarnation: 1,
+            source_block_id,
+            remote_resource_id: deterministic_schedule_calendar_event_id(
+                &cipher, scope, &calendar, slot_id, 1,
+            )
+            .expect("remote ID"),
+            remote_etag: "elapsed-etag".to_owned(),
+            // Deliberately differs from the edited sensitive title and the
+            // publication timezone below. Neither may rewrite elapsed history.
+            desired_payload_hash: [0; 32],
+            last_starts_at: starts_at,
+            last_ends_at: ends_at,
+        };
+        let mut source = schedule_source(vec![block], vec![mapping]);
+        source.timezone_name = "Europe/Paris".to_owned();
+
+        let changes = build_schedule_publication_changes(
+            &source,
+            &cipher,
+            scope,
+            ends_at + Duration::seconds(1),
+        )
+        .expect("elapsed history diff");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].operation,
+            ScheduleGooglePublicationOperation::Noop
+        );
+        assert_eq!(changes[0].mapping_id, Some(Uuid::from_u128(0xe3)));
+    }
+
+    #[test]
+    fn schedule_diff_caps_combined_blocks_and_future_deletes() {
+        let scope = test_oauth_scope();
+        let cipher = test_marker_cipher();
+        let calendar = collection(GoogleSyncRole::Writable, true);
+        let starts_at = parse_timestamp("2026-09-03T09:00:00Z").expect("start");
+        let ends_at = parse_timestamp("2026-09-03T10:00:00Z").expect("end");
+        let blocks = (0..MAX_CALENDAR_PROJECTION_ITEMS)
+            .map(|index| SchedulePublicationBlock {
+                source_block_id: Uuid::from_u128(0x20_0000 + index as u128),
+                item_id: Uuid::from_u128(0x10_0000 + index as u128),
+                occurrence_id: None,
+                session_index: 0,
+                incarnation: 1,
+                title: "Bounded block".to_owned(),
+                starts_at,
+                ends_at,
+                is_sensitive: false,
+            })
+            .collect::<Vec<_>>();
+        let stale_item_id = Uuid::from_u128(0x30_0000);
+        let stale_slot = schedule_publication_slot_id(scope.workspace_id, stale_item_id, None, 0);
+        let stale_mapping = ScheduleBlockMapping {
+            mapping_id: Uuid::from_u128(0x40_0000),
+            slot_id: stale_slot,
+            item_id: stale_item_id,
+            occurrence_id: None,
+            session_index: 0,
+            incarnation: 1,
+            source_block_id: Uuid::from_u128(0x50_0000),
+            remote_resource_id: deterministic_schedule_calendar_event_id(
+                &cipher, scope, &calendar, stale_slot, 1,
+            )
+            .expect("remote ID"),
+            remote_etag: "etag-stale".to_owned(),
+            desired_payload_hash: [3; 32],
+            last_starts_at: starts_at,
+            last_ends_at: ends_at,
+        };
+        assert!(matches!(
+            build_schedule_publication_changes(
+                &schedule_source(blocks, vec![stale_mapping]),
+                &cipher,
+                scope,
+                starts_at - Duration::hours(1),
+            ),
+            Err(GoogleSyncServiceError::ProviderLimitExceeded)
+        ));
     }
 
     fn event() -> GoogleEvent {
@@ -4805,6 +7576,13 @@ mod tests {
         assert!(approval_capability_hash(&token).is_ok());
         assert!(approval_capability_hash("true").is_err());
         assert!(approval_capability_hash(&format!("{token}x")).is_err());
+        let schedule_token = format!(
+            "{SCHEDULE_APPROVAL_TOKEN_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode([8_u8; 32])
+        );
+        assert!(schedule_approval_capability_hash(&schedule_token).is_ok());
+        assert!(schedule_approval_capability_hash(&token).is_err());
+        assert!(approval_capability_hash(&schedule_token).is_err());
 
         let mut collection = collection(GoogleSyncRole::Writable, true);
         collection.kind = GoogleCollectionKind::TaskList;

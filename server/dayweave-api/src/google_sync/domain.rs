@@ -369,6 +369,280 @@ impl Drop for GoogleOutboundApproval {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleGooglePublicationOperation {
+    Create,
+    Update,
+    Delete,
+    Noop,
+}
+
+impl ScheduleGooglePublicationOperation {
+    pub(crate) const fn as_db(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Noop => "noop",
+        }
+    }
+}
+
+/// Review-safe representation of one desired generated-schedule slot change.
+///
+/// Provider payloads and private ownership markers deliberately stay inside the
+/// durable server-side approval record. Sensitive slots arrive with a generic
+/// summary, so this review surface never needs canonical item content.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ScheduleGooglePublicationChange {
+    pub ordinal: u32,
+    pub slot_id: Uuid,
+    pub source_block_id: Option<Uuid>,
+    pub operation: ScheduleGooglePublicationOperation,
+    pub provider_resource_id: Option<String>,
+    pub provider_etag: Option<String>,
+    pub summary: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+}
+
+/// Exact, immutable review projection for one generated-schedule publication.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ScheduleGooglePublicationPreview {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub collection_display_name: String,
+    pub schedule_revision_id: Uuid,
+    pub schedule_revision_number: u64,
+    pub preview_hash: String,
+    pub create_count: u32,
+    pub update_count: u32,
+    pub delete_count: u32,
+    pub noop_count: u32,
+    pub changes: Vec<ScheduleGooglePublicationChange>,
+    pub expires_at: DateTime<Utc>,
+}
+
+// Deliberately not `Debug`: this value carries the one-time bearer capability
+// returned to the approving device. The server stores only its hash.
+#[derive(Clone, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ScheduleGooglePublicationApproval {
+    pub preview_id: Uuid,
+    pub approval_capability: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl Drop for ScheduleGooglePublicationApproval {
+    fn drop(&mut self) {
+        self.approval_capability.zeroize();
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ScheduleGooglePublicationAccepted {
+    pub publication_id: Uuid,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleGooglePublicationState {
+    Pending,
+    Delivering,
+    Backoff,
+    PartiallyPublished,
+    Published,
+    Conflict,
+    Failed,
+    Superseded,
+}
+
+/// Content-free aggregate delivery state for one generated-schedule
+/// publication. Exact slot content remains available only in its expiring
+/// preview and in server-internal dispatch records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ScheduleGooglePublicationStatus {
+    pub publication_id: Uuid,
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub schedule_revision_id: Uuid,
+    pub state: ScheduleGooglePublicationState,
+    pub total_count: u32,
+    pub pending_count: u32,
+    pub delivering_count: u32,
+    pub published_count: u32,
+    pub conflicted_count: u32,
+    pub failed_count: u32,
+    pub superseded_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error_code: Option<String>,
+}
+
+// Deliberately not `Debug`: this is the only publication model that still
+// carries the canonical title for a block marked sensitive.
+#[derive(Clone)]
+pub(crate) struct SchedulePublicationBlock {
+    pub source_block_id: Uuid,
+    pub item_id: Uuid,
+    pub occurrence_id: Option<Uuid>,
+    pub session_index: u16,
+    pub incarnation: u32,
+    pub title: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub is_sensitive: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduleBlockMapping {
+    pub mapping_id: Uuid,
+    pub slot_id: Uuid,
+    pub item_id: Uuid,
+    pub occurrence_id: Option<Uuid>,
+    pub session_index: u16,
+    pub incarnation: u32,
+    pub source_block_id: Uuid,
+    pub remote_resource_id: String,
+    pub remote_etag: String,
+    pub desired_payload_hash: [u8; 32],
+    pub last_starts_at: DateTime<Utc>,
+    pub last_ends_at: DateTime<Utc>,
+}
+
+// Deliberately not `Debug`: this transitively carries raw block titles.
+#[derive(Clone)]
+pub(crate) struct SchedulePublicationSource {
+    pub workspace_id: Uuid,
+    pub user_id: Uuid,
+    pub account_id: Uuid,
+    pub collection: GoogleSyncCollection,
+    pub schedule_revision_id: Uuid,
+    pub schedule_revision_number: u64,
+    pub schedule_publication_hash: [u8; 32],
+    pub timezone_name: String,
+    pub horizon_start: DateTime<Utc>,
+    pub horizon_end: DateTime<Utc>,
+    pub blocks: Vec<SchedulePublicationBlock>,
+    pub mappings: Vec<ScheduleBlockMapping>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSchedulePublicationChange {
+    pub ordinal: u32,
+    pub slot_id: Uuid,
+    pub source_block_id: Option<Uuid>,
+    pub item_id: Uuid,
+    pub occurrence_id: Option<Uuid>,
+    pub session_index: u16,
+    pub incarnation: u32,
+    pub operation: ScheduleGooglePublicationOperation,
+    pub mapping_id: Option<Uuid>,
+    pub remote_resource_id: Option<String>,
+    pub expected_etag: Option<String>,
+    pub desired_payload_hash: [u8; 32],
+    pub payload: Value,
+    pub review_summary: Value,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub intent_hash: [u8; 32],
+}
+
+// Deliberately not `Debug`: this transitively carries the raw source snapshot.
+#[derive(Clone)]
+pub(crate) struct SchedulePublicationPreviewSpec {
+    pub id: Uuid,
+    pub source: SchedulePublicationSource,
+    pub changes: Vec<PreparedSchedulePublicationChange>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulePublicationApprovalSpec {
+    pub account_id: Uuid,
+    pub preview_id: Uuid,
+    pub expected_preview_hash: [u8; 32],
+    pub capability_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulePublicationEnqueueSpec {
+    pub account_id: Uuid,
+    pub preview_id: Uuid,
+    pub collection_id: Uuid,
+    pub expected_schedule_revision_id: Uuid,
+    pub capability_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulePublicationWork {
+    pub outbox_id: Uuid,
+    pub publication_id: Uuid,
+    pub change_id: Uuid,
+    pub ordinal: u32,
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub collection_remote_id: String,
+    pub schedule_revision_id: Uuid,
+    pub schedule_revision_number: u64,
+    pub schedule_publication_hash: [u8; 32],
+    pub slot_id: Uuid,
+    pub source_block_id: Option<Uuid>,
+    pub item_id: Uuid,
+    pub occurrence_id: Option<Uuid>,
+    pub session_index: u16,
+    pub incarnation: u32,
+    pub operation: ScheduleGooglePublicationOperation,
+    pub mapping_id: Option<Uuid>,
+    pub remote_resource_id: Option<String>,
+    pub expected_etag: Option<String>,
+    pub desired_payload_hash: [u8; 32],
+    pub payload: Value,
+    pub required_scope: String,
+    pub intent_hash: [u8; 32],
+    pub claim_id: Uuid,
+    pub run_claim_id: Uuid,
+    pub run_claim_generation: u64,
+    pub provider_post_may_have_started: bool,
+    pub attempts: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulePublicationDispatchPermit {
+    pub nonce: Uuid,
+    pub intent_hash: [u8; 32],
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulePublicationObservationSource {
+    ProviderResponse,
+    ReconciliationRead,
+}
+
+impl SchedulePublicationObservationSource {
+    pub(crate) const fn as_db(self) -> &'static str {
+        match self {
+            Self::ProviderResponse => "provider_response",
+            Self::ReconciliationRead => "reconciliation_read",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchedulePublicationResult {
+    pub remote_resource_id: String,
+    pub remote_etag: Option<String>,
+    pub remote_updated_at: Option<DateTime<Utc>>,
+    pub payload_hash: [u8; 32],
+    pub dispatch_nonce: Uuid,
+    pub observation_source: SchedulePublicationObservationSource,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OutboundPreviewSpec {
     pub id: Uuid,
@@ -499,4 +773,126 @@ pub struct GoogleSyncRefreshAccepted {
 pub struct GoogleOutboundAccepted {
     pub outbox_id: Uuid,
     pub replayed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schedule_publication_preview_is_review_safe_and_attests_noops() {
+        let starts_at = "2026-09-03T09:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid start");
+        let ends_at = "2026-09-03T10:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid end");
+        let preview = ScheduleGooglePublicationPreview {
+            id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            collection_id: Uuid::new_v4(),
+            collection_revision: 7,
+            collection_display_name: "Published schedule".to_owned(),
+            schedule_revision_id: Uuid::new_v4(),
+            schedule_revision_number: 11,
+            preview_hash: "00".repeat(32),
+            create_count: 0,
+            update_count: 0,
+            delete_count: 0,
+            noop_count: 1,
+            changes: vec![ScheduleGooglePublicationChange {
+                ordinal: 0,
+                slot_id: Uuid::new_v4(),
+                source_block_id: Some(Uuid::new_v4()),
+                operation: ScheduleGooglePublicationOperation::Noop,
+                provider_resource_id: Some("opaque-provider-id".to_owned()),
+                provider_etag: Some("opaque-etag".to_owned()),
+                summary: "Busy".to_owned(),
+                starts_at,
+                ends_at,
+            }],
+            expires_at: ends_at,
+        };
+
+        let serialized = serde_json::to_value(preview).expect("serialize preview");
+        assert_eq!(serialized.as_object().expect("preview object").len(), 14);
+        assert_eq!(serialized["schedule_revision_number"], json!(11));
+        assert_eq!(serialized["noop_count"], json!(1));
+        let change = &serialized["changes"][0];
+        assert_eq!(change.as_object().expect("change object").len(), 9);
+        assert_eq!(change["operation"], json!("noop"));
+        assert_eq!(change["summary"], json!("Busy"));
+        for internal_field in [
+            "item_id",
+            "occurrence_id",
+            "session_index",
+            "incarnation",
+            "payload",
+            "review_summary",
+            "intent_hash",
+            "ownership_marker",
+            "notes",
+            "location",
+        ] {
+            assert!(
+                change.get(internal_field).is_none(),
+                "leaked {internal_field}"
+            );
+        }
+
+        for operation in [
+            ScheduleGooglePublicationOperation::Create,
+            ScheduleGooglePublicationOperation::Update,
+            ScheduleGooglePublicationOperation::Delete,
+            ScheduleGooglePublicationOperation::Noop,
+        ] {
+            assert_eq!(
+                serde_json::to_value(operation).expect("serialize operation"),
+                json!(operation.as_db())
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_publication_status_contains_only_aggregate_delivery_metadata() {
+        let created_at = "2026-09-03T09:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid created time");
+        let serialized = serde_json::to_value(ScheduleGooglePublicationStatus {
+            publication_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            collection_id: Uuid::new_v4(),
+            schedule_revision_id: Uuid::new_v4(),
+            state: ScheduleGooglePublicationState::Delivering,
+            total_count: 4,
+            pending_count: 1,
+            delivering_count: 1,
+            published_count: 1,
+            conflicted_count: 0,
+            failed_count: 0,
+            superseded_count: 1,
+            created_at,
+            completed_at: None,
+            last_error_code: None,
+        })
+        .expect("serialize status");
+
+        assert_eq!(serialized.as_object().expect("status object").len(), 15);
+        assert_eq!(serialized["state"], json!("delivering"));
+        for content_field in [
+            "changes",
+            "summary",
+            "starts_at",
+            "ends_at",
+            "provider_resource_id",
+            "provider_etag",
+            "payload",
+        ] {
+            assert!(
+                serialized.get(content_field).is_none(),
+                "status leaked {content_field}"
+            );
+        }
+    }
 }

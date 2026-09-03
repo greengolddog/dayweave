@@ -14,10 +14,16 @@ use dayweave_google::{
     tasks::{GoogleTask, TaskInsertOptions},
 };
 use serde_json::json;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header, method, path, query_param, query_param_is_missing},
 };
+
+const OVERSIZED_MUTATION_BODY_BYTES: usize = 1024 * 1024 + 1;
 
 fn client(server: &MockServer) -> GoogleClient {
     GoogleClient::with_base_url(
@@ -59,6 +65,48 @@ fn event(attendees: Vec<EventAttendee>) -> GoogleEvent {
         extended_properties: Some(ExtendedProperties::default()),
         additional_properties: BTreeMap::new(),
     }
+}
+
+fn task() -> GoogleTask {
+    GoogleTask {
+        id: String::new(),
+        etag: None,
+        title: "Synthetic task".to_owned(),
+        notes: None,
+        status: Some("needsAction".to_owned()),
+        due: None,
+        completed: None,
+        updated: None,
+        parent: None,
+        position: None,
+        links: None,
+        deleted: false,
+        hidden: false,
+    }
+}
+
+async fn serve_raw_response_once(response: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("request");
+        let mut request = [0_u8; 16 * 1024];
+        let _ = socket.read(&mut request).await.expect("request bytes");
+        let _ = socket.write_all(&response).await;
+    });
+    format!("http://{address}/")
+}
+
+async fn prepared_task_for_raw_server(response: Vec<u8>) -> dayweave_google::PreparedGoogleRequest {
+    let base_url = serve_raw_response_once(response).await;
+    GoogleClient::with_base_url(
+        Arc::new(StaticAccessToken::new("test-access-token")),
+        &base_url,
+    )
+    .expect("raw server URL is a valid API base")
+    .prepare_insert_task("primary", &task())
+    .await
+    .expect("task request preparation remains network quiet")
 }
 
 #[tokio::test]
@@ -146,30 +194,15 @@ async fn malformed_task_create_success_is_an_ambiguous_post_send_error() {
         .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
         .mount(&server)
         .await;
-    let task = GoogleTask {
-        id: String::new(),
-        etag: None,
-        title: "Synthetic task".to_owned(),
-        notes: None,
-        status: Some("needsAction".to_owned()),
-        due: None,
-        completed: None,
-        updated: None,
-        parent: None,
-        position: None,
-        links: None,
-        deleted: false,
-        hidden: false,
-    };
     let prepared = client(&server)
-        .prepare_insert_task("primary", &task)
+        .prepare_insert_task("primary", &task())
         .await
         .expect("task request preparation remains network quiet");
     let error = prepared
         .send_json::<GoogleTask>(None)
         .await
         .expect_err("an unusable 2xx body cannot identify the created task");
-    assert!(matches!(error, GoogleError::Transport(_)));
+    assert!(matches!(error, GoogleError::InvalidResponse));
     assert_eq!(
         server
             .received_requests()
@@ -179,6 +212,45 @@ async fn malformed_task_create_success_is_an_ambiguous_post_send_error() {
         1,
         "the decode error occurs only after the markerless POST was sent"
     );
+}
+
+#[tokio::test]
+async fn prepared_mutation_rejects_a_declared_oversized_success_response() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {OVERSIZED_MUTATION_BODY_BYTES}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let error = prepared_task_for_raw_server(response)
+        .await
+        .send_json::<GoogleTask>(None)
+        .await
+        .expect_err("the declared body length exceeds the mutation limit");
+
+    assert!(matches!(error, GoogleError::ResponseTooLarge));
+}
+
+#[tokio::test]
+async fn prepared_mutation_rejects_a_chunked_oversized_success_response() {
+    let body = format!(
+        "{{\"padding\":\"{}\"}}",
+        "x".repeat(OVERSIZED_MUTATION_BODY_BYTES)
+    );
+    let split_at = body.len() / 2;
+    let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    for chunk in [&body.as_bytes()[..split_at], &body.as_bytes()[split_at..]] {
+        response.extend_from_slice(format!("{:X}\r\n", chunk.len()).as_bytes());
+        response.extend_from_slice(chunk);
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"0\r\n\r\n");
+
+    let error = prepared_task_for_raw_server(response)
+        .await
+        .send_json::<GoogleTask>(None)
+        .await
+        .expect_err("streamed body bytes exceed the mutation limit");
+
+    assert!(matches!(error, GoogleError::ResponseTooLarge));
 }
 
 #[tokio::test]
@@ -317,6 +389,48 @@ async fn maps_expired_sync_token_to_bounded_resync_signal() {
         .expect_err("410 requires a bounded full resync");
 
     assert!(matches!(error, GoogleError::SyncTokenExpired));
+}
+
+#[tokio::test]
+async fn calendar_delete_surfaces_absence_responses_for_contextual_handling() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/calendar/v3/calendars/primary/events/gone-410"))
+        .and(header("if-match", "etag-410"))
+        .respond_with(ResponseTemplate::new(410))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/calendar/v3/calendars/primary/events/gone-404"))
+        .and(header("if-match", "etag-404"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let gone = client
+        .delete_event(
+            "primary",
+            "gone-410",
+            "etag-410",
+            &EventWriteApproval::PrivateAppOwned,
+            SendUpdates::None,
+        )
+        .await
+        .expect_err("Google maps every 410 to its sync-token-expired signal");
+    assert!(matches!(gone, GoogleError::SyncTokenExpired));
+
+    let missing = client
+        .delete_event(
+            "primary",
+            "gone-404",
+            "etag-404",
+            &EventWriteApproval::PrivateAppOwned,
+            SendUpdates::None,
+        )
+        .await
+        .expect_err("Google preserves a not-found response");
+    assert!(matches!(missing, GoogleError::Api { status: 404 }));
 }
 
 #[tokio::test]
