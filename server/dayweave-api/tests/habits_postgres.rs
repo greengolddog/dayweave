@@ -3,16 +3,16 @@ use std::{str::FromStr, sync::Arc};
 use chrono::{DateTime, Duration, Timelike as _, Utc};
 use dayweave_api::{
     habits::{
-        HabitAnalyticsBucket, HabitIdempotencyKey, HabitOutcomeCommand, HabitOutcomeInput,
-        HabitOutcomeStatus, HabitPauseResumeCommand, HabitPauseStartCommand, HabitRepository,
-        HabitRepositoryError, HabitService,
+        HabitAnalyticsBucket, HabitDeltaChange, HabitIdempotency, HabitIdempotencyKey,
+        HabitOutcomeCommand, HabitOutcomeInput, HabitOutcomeStatus, HabitPauseResumeCommand,
+        HabitPauseStartCommand, HabitRepository, HabitRepositoryError, HabitService,
     },
     items::{IdempotencyKey, ItemKind, ItemService, ItemStatus, NewItem, SplitPolicy},
     persistence::{DatabaseScope, MIGRATOR, PostgresHabitRepository, PostgresItemRepository},
     proposals::SystemClock,
     scheduling::{
-        ComposeScheduleRequest, PostgresSchedulingRepository, PublishScheduleSpec, ScheduleAccess,
-        SchedulePublicationError, compose_canonical_schedule,
+        ComposeScheduleError, ComposeScheduleRequest, PostgresSchedulingRepository,
+        PublishScheduleSpec, ScheduleAccess, SchedulePublicationError, compose_canonical_schedule,
     },
 };
 use serde_json::json;
@@ -492,6 +492,54 @@ async fn published_habit_evidence_drives_audited_cas_delta_pause_and_recompositi
             .is_err()
     );
 
+    // A malformed completion outside the requested horizon must never become a trusted rolling
+    // recurrence anchor. Keeping its window outside the request independently exercises the
+    // DISTINCT ON completion-anchor query rather than the active terminal-occurrence query.
+    let active_corrupted_evidence_id = Uuid::new_v4();
+    let active_corrupted_planner_id =
+        Uuid::new_v5(&habit_id, b"active-corrupted-authoritative-evidence");
+    let inserted = sqlx::query(
+        "INSERT INTO habit_occurrence_evidence (id, workspace_id, habit_id, planner_occurrence_id, \
+         source_schedule_revision_id, source_item_revision, policy_fingerprint, recurrence_identity, \
+         nominal_start, nominal_end, window_start, window_end, local_date, timezone_name, \
+         expected_duration_seconds, expected_quantity, expected_unit, is_sensitive, created_at, \
+         last_published_at) SELECT $3, workspace_id, habit_id, $4, source_schedule_revision_id, \
+         source_item_revision, policy_fingerprint, $5, \
+         '2040-01-01T09:00:00Z'::timestamptz, '2040-01-01T09:30:00Z'::timestamptz, \
+         '2040-01-01T08:00:00Z'::timestamptz, '2040-01-01T10:00:00Z'::timestamptz, \
+         '2040-01-01'::date, timezone_name, expected_duration_seconds, expected_quantity, \
+         expected_unit, is_sensitive, created_at, last_published_at \
+         FROM habit_occurrence_evidence WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(evidence_id)
+    .bind(active_corrupted_evidence_id)
+    .bind(active_corrupted_planner_id)
+    .bind(json!({"type":"custom"}))
+    .execute(&database.pool)
+    .await
+    .expect("seed active corrupted evidence row");
+    assert_eq!(inserted.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO habit_occurrence_outcomes (workspace_id, occurrence_evidence_id, revision, \
+         status, progress_basis_points, quantity, unit, actual_seconds, note, occurred_at, updated_at) \
+         VALUES ($1,$2,1,'completed',10000,NULL,NULL,NULL,NULL,$3,$3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(active_corrupted_evidence_id)
+    .bind(postgres_now() + Duration::days(1))
+    .execute(&database.pool)
+    .await
+    .expect("seed active corrupted completion outcome");
+    let corrupted_preview = compose_canonical_schedule(&items, &schedules, request.clone()).await;
+    assert!(
+        matches!(
+            corrupted_preview,
+            Err(ComposeScheduleError::ExecutionEvidenceUnavailable)
+        ),
+        "out-of-horizon corrupted completion must fail anchor hydration: {corrupted_preview:?}"
+    );
+
     items
         .trash(habit_id, 1, item_idempotency("habit-soft-delete", 9))
         .await
@@ -524,6 +572,202 @@ async fn published_habit_evidence_drives_audited_cas_delta_pause_and_recompositi
             .expect("isolated list")
             .0
             .is_empty()
+    );
+
+    // Repository hydration must fail closed even if an operator or older binary bypassed the
+    // current publication admission contract.
+    let valid_occurrence = occurrences[0].clone();
+    let corrupted_evidence_id = Uuid::new_v4();
+    let corrupted_planner_id = Uuid::new_v5(&habit_id, b"corrupted-authoritative-evidence");
+    let inserted = sqlx::query(
+        "INSERT INTO habit_occurrence_evidence (id, workspace_id, habit_id, planner_occurrence_id, \
+         source_schedule_revision_id, source_item_revision, policy_fingerprint, recurrence_identity, \
+         nominal_start, nominal_end, window_start, window_end, local_date, timezone_name, \
+         expected_duration_seconds, expected_quantity, expected_unit, is_sensitive, created_at, \
+         last_published_at) SELECT $3, workspace_id, habit_id, $4, source_schedule_revision_id, \
+         source_item_revision, policy_fingerprint, $5, nominal_start, nominal_end, window_start, \
+         window_end, local_date, timezone_name, expected_duration_seconds, expected_quantity, \
+         expected_unit, is_sensitive, created_at, last_published_at \
+         FROM habit_occurrence_evidence WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(evidence_id)
+    .bind(corrupted_evidence_id)
+    .bind(corrupted_planner_id)
+    .bind(json!({"type":"custom"}))
+    .execute(&database.pool)
+    .await
+    .expect("seed corrupted evidence row");
+    assert_eq!(inserted.rows_affected(), 1);
+    assert!(matches!(
+        repository
+            .list_occurrences(
+                habit_id,
+                "2025-10-26".parse().unwrap(),
+                "2025-10-26".parse().unwrap(),
+                None,
+                100,
+            )
+            .await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let delta_head = repository.delta_head().await.expect("delta head");
+    let mut corrupted_delta = serde_json::to_value(HabitDeltaChange::OccurrenceUpsert {
+        occurrence: valid_occurrence.clone(),
+    })
+    .expect("delta JSON");
+    corrupted_delta["occurrence"]["evidence"]["identity"] = json!({"type":"custom"});
+    sqlx::query(
+        "INSERT INTO habit_changes (workspace_id, change_kind, entity_id, entity_revision, \
+         payload, changed_at) VALUES ($1, 'occurrence_upsert', $2, 1, $3, $4)",
+    )
+    .bind(scope.workspace_id)
+    .bind(evidence_id)
+    .bind(corrupted_delta)
+    .bind(postgres_now())
+    .execute(&database.pool)
+    .await
+    .expect("seed corrupted delta");
+    assert!(matches!(
+        repository.delta(delta_head, 100).await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let receipt_identity = HabitIdempotency {
+        namespace: "habit-corrupted-receipt",
+        key_hash: [91; 32],
+        request_fingerprint: [92; 32],
+        operation_id: Uuid::new_v4(),
+        actor_session_id: None,
+    };
+    let mut corrupted_receipt = json!({
+        "type": "occurrence",
+        "value": valid_occurrence,
+    });
+    corrupted_receipt["value"]["evidence"]["identity"] = json!({"type":"custom"});
+    sqlx::query(
+        "INSERT INTO habit_operation_receipts (workspace_id, namespace, key_hash, operation_id, \
+         request_fingerprint, response_json, completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(receipt_identity.namespace)
+    .bind(receipt_identity.key_hash.as_slice())
+    .bind(receipt_identity.operation_id)
+    .bind(receipt_identity.request_fingerprint.as_slice())
+    .bind(corrupted_receipt)
+    .bind(postgres_now())
+    .execute(&database.pool)
+    .await
+    .expect("seed corrupted receipt");
+    assert!(matches!(
+        repository.replay_outcome(&receipt_identity).await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn matching_republication_rejects_malformed_existing_evidence() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; habit PostgreSQL test skipped");
+        return;
+    };
+    let database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&database.pool, "habit-republication-owner").await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(database.pool.clone(), scope)),
+        Arc::new(SystemClock),
+    ));
+    let habit_id = Uuid::new_v4();
+    items
+        .create(
+            habit(habit_id),
+            item_idempotency("habit-republication-create", 31),
+        )
+        .await
+        .expect("create canonical habit");
+    let schedules = PostgresSchedulingRepository::new(database.pool.clone(), scope);
+    let access = ScheduleAccess {
+        subject: "auth0|habit-republication-owner".to_owned(),
+        include_sensitive: true,
+        workspace_id: Some(scope.workspace_id),
+        user_id: Some(scope.user_id),
+    };
+    let request = compose_request();
+    let first_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("compose first occurrence");
+    let planner_occurrence_id = first_preview.plan.occurrences[0].id.0;
+    schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [32; 32],
+                input_digest: digest_bytes(&first_preview.input_digest),
+                timezone_name: request.timezone_name.clone(),
+                manual_placement_approvals: Vec::new(),
+                result: first_preview,
+                published_at: postgres_now(),
+            },
+        )
+        .await
+        .expect("publish first occurrence");
+    let republish_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("compose matching republication");
+
+    // Simulate legacy or privileged corruption in a field that the old equality-only conflict
+    // path did not compare. No outcome or version points at this fresh evidence row yet.
+    sqlx::query(
+        "ALTER TABLE habit_occurrence_evidence \
+         DISABLE TRIGGER habit_occurrence_evidence_update_guard",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("disable evidence guard in isolated test schema");
+    sqlx::query(
+        "UPDATE habit_occurrence_evidence SET id = planner_occurrence_id \
+         WHERE workspace_id = $1 AND habit_id = $2 AND planner_occurrence_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(habit_id)
+    .bind(planner_occurrence_id)
+    .execute(&database.pool)
+    .await
+    .expect("seed malformed matching evidence");
+    sqlx::query(
+        "ALTER TABLE habit_occurrence_evidence \
+         ENABLE TRIGGER habit_occurrence_evidence_update_guard",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("restore evidence guard");
+
+    let republished = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [33; 32],
+                input_digest: digest_bytes(&republish_preview.input_digest),
+                timezone_name: request.timezone_name,
+                manual_placement_approvals: Vec::new(),
+                result: republish_preview,
+                published_at: postgres_now(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(republished, Err(SchedulePublicationError::InvalidPayload)),
+        "matching content must not promote malformed stored evidence: {republished:?}"
     );
 
     database.destroy().await;

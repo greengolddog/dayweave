@@ -375,6 +375,10 @@ class OkHttpHabitTransportTest {
                 "33333333-3333-4333-8333-333333333333",
             ),
             occurrenceJson().replace(
+                "\"id\":\"$OCCURRENCE_ID\"",
+                "\"id\":\"$PLANNER_OCCURRENCE_ID\"",
+            ),
+            occurrenceJson().replace(
                 "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
                 "{\"type\":\"custom\"}",
             ),
@@ -411,6 +415,176 @@ class OkHttpHabitTransportTest {
                         LocalDate.parse("2026-09-07"),
                     )
                 }
+            }
+        }
+    }
+
+    @Test
+    fun occurrenceEvidenceRequiresRfcUuidVariantBoundedInstantsAndIanaTimezone() {
+        val endpointYearEvidence = occurrenceJson()
+            .replace(
+                "\"window_start\":\"2026-09-01T06:00:00Z\"",
+                "\"window_start\":\"0001-01-01T00:00:00Z\"",
+            )
+            .replace(
+                "\"window_end\":\"2026-09-01T09:00:00Z\"",
+                "\"window_end\":\"9999-12-31T23:59:59.999999Z\"",
+            )
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$endpointYearEvidence],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        val endpointPage = runBlocking {
+            transport.listOccurrences(
+                configuration(),
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-07"),
+            )
+        }
+        assertEquals("0001-01-01T00:00:00Z", endpointPage.occurrences.single().evidence.windowStart)
+
+        val invalidOccurrences = listOf(
+            occurrenceJson().replace(
+                PLANNER_OCCURRENCE_ID,
+                "33333333-3333-5333-0333-333333333333",
+            ),
+            occurrenceJson().replace(
+                "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
+                "{\"type\":\"custom_rule\",\"rule_id\":\"aaaaaaaa-aaaa-5aaa-0aaa-aaaaaaaaaaaa\",\"sequence\":0,\"date\":\"2026-09-01\"}",
+            ),
+            occurrenceJson().replace(
+                "\"window_start\":\"2026-09-01T06:00:00Z\"",
+                "\"window_start\":\"0000-01-01T00:00:00Z\"",
+            ),
+            occurrenceJson().replace(
+                "\"window_end\":\"2026-09-01T09:00:00Z\"",
+                "\"window_end\":\"+10000-01-01T00:00:00Z\"",
+            ),
+            occurrenceJson().replace(
+                "\"timezone_name\":\"Europe/Paris\"",
+                "\"timezone_name\":\"+02:00\"",
+            ),
+            occurrenceJson().replace(
+                "\"timezone_name\":\"Europe/Paris\"",
+                "\"timezone_name\":\"SystemV/EST5\"",
+            ),
+        )
+
+        invalidOccurrences.forEach { occurrence ->
+            server.enqueue(
+                jsonResponse(
+                    """{"occurrences":[$occurrence],"next_cursor":null,"has_more":false}""",
+                ),
+            )
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.listOccurrences(
+                        configuration(),
+                        HABIT_ID,
+                        LocalDate.parse("2026-09-01"),
+                        LocalDate.parse("2026-09-07"),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun rawHabitResponsesRequireCanonicalIntegerLexemesAndIdentityAnchors() {
+        val signedIntegerOccurrence = occurrenceJson(withOutcome = true).replace(
+            "\"quantity\":7",
+            "\"quantity\":-7",
+        )
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$signedIntegerOccurrence],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        val signedIntegerPage = runBlocking {
+            transport.listOccurrences(
+                configuration(),
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-07"),
+            )
+        }
+        assertEquals(-7L, signedIntegerPage.occurrences.single().outcome?.quantity)
+
+        val invalidOccurrences = listOf("-0", "0.0", "0e0").map { token ->
+            occurrenceJson(withOutcome = true).replace(
+                "\"actual_seconds\":600",
+                "\"actual_seconds\":$token",
+            )
+        } + listOf(
+            "2026-09-01T07:00:00.123400Z",
+            "2026-09-01T07:00:00+00:00",
+            "2026-09-01T07:00:00-00:00",
+            "2026-09-01t07:00:00Z",
+            "2026-09-01T07:00:00z",
+        ).map { anchor ->
+            occurrenceJson().replace(
+                "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
+                "{\"type\":\"after_completion\",\"anchor\":\"$anchor\"}",
+            )
+        }
+
+        invalidOccurrences.forEach { occurrence ->
+            server.enqueue(
+                jsonResponse(
+                    """{"occurrences":[$occurrence],"next_cursor":null,"has_more":false}""",
+                ),
+            )
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.listOccurrences(
+                        configuration(),
+                        HABIT_ID,
+                        LocalDate.parse("2026-09-01"),
+                        LocalDate.parse("2026-09-07"),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun deltaHabitEvidenceDateHorizonIsInclusiveAndRejectsOutsideYears() {
+        listOf(1900, 2200).forEach { year ->
+            server.enqueue(
+                jsonResponse(
+                    """{
+                      "changes":[
+                        {"type":"occurrence_upsert","occurrence":${occurrenceJsonForYear(year)}}
+                      ],
+                      "next_cursor":"42",
+                      "has_more":false
+                    }""".trimIndent(),
+                ),
+            )
+
+            val page = runBlocking { transport.delta(configuration()) }
+
+            val change = page.changes.single() as RemoteHabitDeltaChange.OccurrenceUpsert
+            assertEquals("$year-09-01", change.occurrence.evidence.localDate)
+        }
+
+        listOf(1899, 2201).forEach { year ->
+            server.enqueue(
+                jsonResponse(
+                    """{
+                      "changes":[
+                        {"type":"occurrence_upsert","occurrence":${occurrenceJsonForYear(year)}}
+                      ],
+                      "next_cursor":"42",
+                      "has_more":false
+                    }""".trimIndent(),
+                ),
+            )
+
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking { transport.delta(configuration()) }
             }
         }
     }
@@ -665,6 +839,9 @@ class OkHttpHabitTransportTest {
           "outcome":${if (withOutcome) outcomeJson() else "null"}
         }
     """.trimIndent()
+
+    private fun occurrenceJsonForYear(year: Int): String =
+        occurrenceJson().replace("2026-09-01", "$year-09-01")
 
     private fun outcomeJson(): String = """
         {

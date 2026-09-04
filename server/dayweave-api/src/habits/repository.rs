@@ -212,6 +212,9 @@ impl InMemoryHabitRepository {
         &self,
         evidence: HabitOccurrenceEvidence,
     ) -> Result<(), HabitRepositoryError> {
+        evidence
+            .validate()
+            .map_err(|_| HabitRepositoryError::Internal)?;
         let mut state = self.state.lock().await;
         if let Some(existing) = state.occurrences.get(&evidence.id) {
             if existing.evidence != evidence {

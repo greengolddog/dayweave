@@ -2385,7 +2385,7 @@ struct CanonicalSyncStoreTests {
         #expect(planner.publishedScheduleProof?.hasCurrentImmutablePlanSeal == true)
     }
 
-    @Test("recurrence evidence accepts descendants and rejects unrelated items")
+    @Test("recurrence evidence requires both series ancestry and recurrence-family compatibility")
     func recurringHierarchyEvidenceUsesCanonicalParentGraph() async throws {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
         let rootID = UUID(uuidString: "27420000-2222-4333-8444-200000000000")!
@@ -2402,12 +2402,24 @@ struct CanonicalSyncStoreTests {
         )
         let root = try Self.decodeItem(rootObject)
 
-        for isDescendant in [true, false] {
-            let token = "canonical-recurring-hierarchy-\(isDescendant)"
+        let scenarios: [(
+            label: String,
+            isDescendant: Bool,
+            mismatchedIdentity: Bool,
+            bucketOrdinal: Int,
+            shouldAccept: Bool
+        )] = [
+            ("descendant", true, false, 0, true),
+            ("unrelated", false, false, 0, false),
+            ("wrong-family", true, true, 0, false),
+            ("out-of-range-selector", true, false, 1, false),
+        ]
+        for scenario in scenarios {
+            let token = "canonical-recurring-hierarchy-\(scenario.label)"
             let leaf = try Self.decodeItem(Self.itemObject(
                 id: leafID,
                 revision: 1,
-                parentID: isDescendant ? rootID : nil
+                parentID: scenario.isDescendant ? rootID : nil
             ))
             let planner = PlannerStore(
                 canonicalItems: [root, leaf],
@@ -2434,20 +2446,27 @@ struct CanonicalSyncStoreTests {
             let blockStart = try #require(blocks[0]["start"] as? String)
             let blockEnd = try #require(blocks[0]["end"] as? String)
             let localDate = String(blockStart.prefix(10))
+            let identity: [String: Any] = scenario.mismatchedIdentity
+                ? [
+                    "type": "rolling_minutes",
+                    "index": 0,
+                    "anchor": "2026-08-29T08:00:00Z",
+                ]
+                : [
+                    "type": "calendar_day",
+                    "date": localDate,
+                    "bucket_ordinal": scenario.bucketOrdinal,
+                ]
             plan["occurrences"] = [[
                 "id": occurrenceID.uuidString.lowercased(),
                 "series_item_id": rootID.uuidString.lowercased(),
-                "identity": [
-                    "type": "calendar_day",
-                    "date": localDate,
-                    "bucket_ordinal": 0,
-                ],
+                "identity": identity,
                 "nominal_start": blockStart,
                 "nominal_end": blockEnd,
                 "window_start": blockStart,
                 "window_end": blockEnd,
-                "local_date": localDate,
-                "ordinal": 0,
+                "local_date": scenario.mismatchedIdentity ? NSNull() : localDate,
+                "ordinal": scenario.bucketOrdinal,
                 "state": "generated",
             ]]
             plan["unscheduled"] = [[
@@ -2492,7 +2511,7 @@ struct CanonicalSyncStoreTests {
 
             await sync.sync()
 
-            if isDescendant {
+            if scenario.shouldAccept {
                 if case .online = sync.status {} else {
                     Issue.record("A recurring descendant must retain the root occurrence")
                 }

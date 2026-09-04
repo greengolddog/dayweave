@@ -10,7 +10,7 @@ import com.greengolddog.dayweave.network.RemoteHabitSupportiveFactCode
 import com.greengolddog.dayweave.network.RemoteHabitTrendBucket
 import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -187,25 +187,22 @@ data class HabitOccurrenceEvidenceSnapshot(
     fun requireValid() {
         listOf(id, habitId, plannerOccurrenceId, sourceScheduleRevisionId)
             .forEach(::requireHabitUuid)
-        require(UUID.fromString(plannerOccurrenceId).version() == 5)
+        require(UUID.fromString(plannerOccurrenceId).isRfc4122Version5())
+        require(id != plannerOccurrenceId)
         require(sourceItemRevision > 0)
         require(policyFingerprint.matches(HABIT_FINGERPRINT_PATTERN))
         require(identity.isNotEmpty() && identity.size <= MAX_HABIT_IDENTITY_FIELDS)
         require(identity.toString().length <= MAX_HABIT_IDENTITY_CHARS)
-        val nominalStartInstant = requireHabitInstant(nominalStart)
-        val nominalEndInstant = requireHabitInstant(nominalEnd)
-        val windowStartInstant = requireHabitInstant(windowStart)
-        val windowEndInstant = requireHabitInstant(windowEnd)
+        val nominalStartInstant = requireHabitEvidenceInstant(nominalStart)
+        val nominalEndInstant = requireHabitEvidenceInstant(nominalEnd)
+        val windowStartInstant = requireHabitEvidenceInstant(windowStart)
+        val windowEndInstant = requireHabitEvidenceInstant(windowEnd)
         require(nominalStartInstant < nominalEndInstant)
         require(windowStartInstant < windowEndInstant)
         require(nominalStartInstant >= windowStartInstant && nominalEndInstant <= windowEndInstant)
         val occurrenceDate = requireHabitDate(localDate)
-        require(
-            timezoneName.length in 1..MAX_HABIT_TIMEZONE_CHARS &&
-                timezoneName.none(Char::isISOControl),
-        )
-        val timezone = runCatching { ZoneId.of(timezoneName) }.getOrNull()
-        require(timezone != null)
+        require(occurrenceDate.year in MIN_HABIT_EVIDENCE_YEAR..MAX_HABIT_EVIDENCE_YEAR)
+        val timezone = requireCanonicalTimezoneName(timezoneName)
         require(
             identity.matchesHabitEvidenceContext(
                 occurrenceDate,
@@ -894,6 +891,14 @@ private fun requireHabitInstant(value: String): Instant {
     return parsed
 }
 
+private fun requireHabitEvidenceInstant(value: String): Instant =
+    requireHabitInstant(value).also { instant ->
+        require(
+            instant.atOffset(ZoneOffset.UTC).year in
+                MIN_HABIT_EVIDENCE_INSTANT_YEAR..MAX_HABIT_EVIDENCE_INSTANT_YEAR,
+        )
+    }
+
 private fun requireHabitDate(value: String): LocalDate {
     val parsed = LocalDate.parse(value)
     require(parsed.toString() == value)
@@ -920,9 +925,12 @@ private val HABIT_COMMAND_JSON = Json {
 }
 private const val MAX_HABIT_NOTE_CHARS = 10_000
 private const val MAX_HABIT_UNIT_CHARS = 200
-private const val MAX_HABIT_TIMEZONE_CHARS = 100
 private const val MAX_HABIT_IDENTITY_FIELDS = 32
 private const val MAX_HABIT_IDENTITY_CHARS = 16 * 1024
+private const val MIN_HABIT_EVIDENCE_YEAR = 1_900
+private const val MAX_HABIT_EVIDENCE_YEAR = 2_200
+private const val MIN_HABIT_EVIDENCE_INSTANT_YEAR = 1
+private const val MAX_HABIT_EVIDENCE_INSTANT_YEAR = 9_999
 private const val MAX_HABIT_QUANTITY = 1_000_000_000_000L
 private const val MAX_HABIT_SECONDS = 366L * 24 * 60 * 60
 private const val MAX_HABIT_ANALYTICS_OCCURRENCES = 50_000L

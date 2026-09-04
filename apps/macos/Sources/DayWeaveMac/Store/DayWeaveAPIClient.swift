@@ -3257,7 +3257,9 @@ struct DayWeaveAPIClient: Sendable {
               isStrictJSONMediaType(contentType),
               cacheControl?.lowercased() == "no-store, max-age=0",
               pragma?.lowercased() == "no-cache",
-              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body) else { return false }
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: body) else {
+            return false
+        }
 
         let isMutation = method == "PUT"
             || (method == "POST" && pathComponents.contains("pauses"))
@@ -3628,6 +3630,7 @@ struct DayWeaveAPIClient: Sendable {
     private static func strictUnsignedJSONInteger(_ value: Any?) -> UInt64? {
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number),
               let parsed = UInt64(number.stringValue),
               parsed <= UInt64(Int64.max),
               number.stringValue == String(parsed) else { return nil }
@@ -4674,14 +4677,24 @@ struct StrictJSONObjectKeyScanner {
     private static let maximumDepth = 64
 
     private let bytes: [UInt8]
+    private let requiresCanonicalIntegers: Bool
     private var index = 0
 
-    private init(_ data: Data) {
+    private init(_ data: Data, requiresCanonicalIntegers: Bool) {
         bytes = Array(data)
+        self.requiresCanonicalIntegers = requiresCanonicalIntegers
     }
 
     static func hasUniqueKeys(in data: Data) -> Bool {
-        var scanner = Self(data)
+        scan(data, requiresCanonicalIntegers: false)
+    }
+
+    static func hasUniqueKeysAndCanonicalIntegers(in data: Data) -> Bool {
+        scan(data, requiresCanonicalIntegers: true)
+    }
+
+    private static func scan(_ data: Data, requiresCanonicalIntegers: Bool) -> Bool {
+        var scanner = Self(data, requiresCanonicalIntegers: requiresCanonicalIntegers)
         scanner.skipWhitespace()
         guard scanner.parseValue(depth: 0) else { return false }
         scanner.skipWhitespace()
@@ -4777,13 +4790,23 @@ struct StrictJSONObjectKeyScanner {
     }
 
     private mutating func parseNumber() -> Bool {
-        _ = consume(0x2D)
+        let isNegative = consume(0x2D)
         guard index < bytes.count else { return false }
+        let isZero: Bool
         if consume(0x30) {
+            isZero = true
             if index < bytes.count, Self.isDigit(bytes[index]) { return false }
         } else {
+            isZero = false
             guard index < bytes.count, (0x31...0x39).contains(bytes[index]) else { return false }
             repeat { index += 1 } while index < bytes.count && Self.isDigit(bytes[index])
+        }
+        if requiresCanonicalIntegers {
+            guard !(isNegative && isZero),
+                  index >= bytes.count
+                    || (bytes[index] != 0x2E && bytes[index] != 0x65 && bytes[index] != 0x45)
+            else { return false }
+            return true
         }
         if consume(0x2E) {
             guard index < bytes.count, Self.isDigit(bytes[index]) else { return false }

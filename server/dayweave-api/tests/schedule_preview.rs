@@ -308,6 +308,121 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One HTTP matrix keeps accepted and rejected anchor spellings together.
+async fn habit_preview_rejects_nonportable_rolling_anchors_at_the_http_boundary() {
+    let app = test_app();
+    for (index, anchor) in ["0000-09-01T00:00:00Z", "2026-09-01T00:00:00+18:01"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut poisoned = task(Uuid::new_v4(), &json!({"energy": "deep"}));
+        poisoned["kind"] = json!("habit");
+        poisoned["deadline_at"] = Value::Null;
+        poisoned["recurrence"] = json!({
+            "type": "frequency",
+            "target": 1,
+            "period": "day",
+            "semantics": "rolling",
+            "weekdays": [],
+            "minimum_spacing": 0,
+            "anchor": anchor
+        });
+        let idempotency_key = format!("nonportable-inline-habit-anchor-{index}");
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/items",
+                Some(poisoned),
+                true,
+                Some(&idempotency_key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "nonportable inline recurrence anchor was admitted: {anchor}"
+        );
+    }
+
+    let habit_id = Uuid::new_v4();
+    let mut habit = task(habit_id, &json!({"energy": "deep"}));
+    habit["kind"] = json!("habit");
+    habit["deadline_at"] = Value::Null;
+    habit["recurrence"] = json!({
+        "type": "frequency",
+        "target": 1,
+        "period": "day",
+        "semantics": "rolling",
+        "weekdays": [],
+        "minimum_spacing": 0,
+        "anchor": "2026-09-01T00:00:00+18:00"
+    });
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(habit),
+            true,
+            Some("portable-habit-anchor"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let habit_key = habit_id.to_string();
+    let request_with_anchor = |anchor: &str| {
+        let mut body = preview(habit_id, 1);
+        body["recurrence_context"] = json!({"rolling_anchors": {}});
+        body["recurrence_context"]["rolling_anchors"][habit_key.as_str()] = json!(anchor);
+        body
+    };
+    let boundary = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(request_with_anchor("2026-09-01T00:00:00+18:00")),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    let boundary_status = boundary.status();
+    let boundary = body_json(boundary).await;
+    assert_eq!(
+        boundary_status,
+        StatusCode::OK,
+        "18-hour boundary preview response: {boundary}"
+    );
+
+    for anchor in [
+        "0000-09-01T00:00:00Z",
+        "2026-09-01T00:00:00+18:01",
+        "2026-09-01T00:00:00.000000001Z",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/schedule/preview",
+                Some(request_with_anchor(anchor)),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "nonportable habit anchor was admitted: {anchor}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sensitive_ancestor_marks_child_preview_blocks_without_moving_them() {
     let app = test_app();
     let parent_id = Uuid::new_v4();

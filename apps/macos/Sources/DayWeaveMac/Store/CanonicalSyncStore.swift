@@ -2322,9 +2322,10 @@ final class CanonicalSyncStore: ObservableObject {
                 localDate: occurrence.localDate,
                 ordinal: occurrence.ordinal
             )
+            let seriesRecurrence = itemByID[occurrence.seriesItemID]?.recurrence
             guard occurrenceByID.updateValue(occurrence, forKey: occurrence.id) == nil,
-                  (occurrence.id.uuid.6 >> 4) == 5,
-                  itemByID[occurrence.seriesItemID]?.recurrence != nil,
+                  dayWeaveIsRFC4122VersionFiveUUID(occurrence.id),
+                  occurrence.identity.isCompatible(with: seriesRecurrence),
                   source.hasValidShape,
                   Self.validOccurrenceWindow(occurrence),
                   ["generated", "completed", "paused", "skipped"].contains(occurrence.state) else {
@@ -3320,13 +3321,18 @@ final class CanonicalSyncStore: ObservableObject {
         let activeItemIDs = Set(activeItems.map(\.id))
         let activeHabitIDs = Set(activeItems.filter { $0.kind == .habit }.map(\.id))
         let authoritativeHabitIDs = habitCheckpoint == nil ? Set<UUID>() : activeHabitIDs
+        let currentItemByID = Dictionary(
+            uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0) }
+        )
         let currentRevisionByItem = Dictionary(
             uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
         )
         let storedMoves = planner.recurrenceOccurrenceMoves
         guard storedMoves.allSatisfy({ move in
             move.hasValidShape
-                && currentRevisionByItem[move.itemID] == move.source?.itemRevision
+                && currentItemByID[move.itemID].map {
+                    move.source?.canAuthorizeOccurrenceMove(for: $0) == true
+                } == true
         }) else {
             throw CanonicalSyncError.staleOccurrenceMove
         }
@@ -3701,6 +3707,9 @@ final class CanonicalSyncStore: ObservableObject {
                             blockItemID,
                             belongsToSeries: occurrence.seriesItemID,
                             itemByID: itemByID
+                          ),
+                          occurrence.identity.isCompatible(
+                            with: itemByID[occurrence.seriesItemID]?.recurrence
                           ) else { return nil }
                     let source = RecurrenceMoveSource(
                         itemRevision: revision,

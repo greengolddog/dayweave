@@ -476,7 +476,7 @@ struct EncryptedHabitPersistence: Sendable {
         guard plaintext.count <= Self.maximumPlaintextBytes else {
             throw HabitPersistenceError.snapshotTooLarge
         }
-        guard StrictJSONObjectKeyScanner.hasUniqueKeys(in: plaintext),
+        guard StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: plaintext),
               let root = try? JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
               Set([
                   "schemaVersion", "savedAt", "occurrences", "pauses", "analytics",

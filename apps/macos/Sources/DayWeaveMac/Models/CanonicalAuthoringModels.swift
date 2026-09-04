@@ -1260,6 +1260,24 @@ struct CanonicalRFC3339Instant: Comparable {
         fractionalDigits.dropFirst(6).allSatisfy { $0 == 0 }
     }
 
+    /// Matches the spelling emitted by `time::format_description::well_known::Rfc3339`.
+    /// The formatter omits a zero fraction, trims fractional trailing zeroes, and uses
+    /// `Z` rather than a signed zero offset.
+    static func hasCanonicalTimeRFC3339Spelling(_ value: String) -> Bool {
+        guard Self(value) != nil,
+              !value.hasSuffix("+00:00"),
+              !value.hasSuffix("-00:00") else { return false }
+        let bytes = Array(value.utf8)
+        if bytes.count > 19, bytes[19] == Character.asciiPeriod {
+            var cursor = 20
+            while cursor < bytes.count, Self.isDigit(bytes[cursor]) {
+                cursor += 1
+            }
+            guard cursor > 20, bytes[cursor - 1] != Character.asciiZero else { return false }
+        }
+        return true
+    }
+
     var dateAtWholeSecond: Date {
         Date(timeIntervalSince1970: TimeInterval(
             wholeSeconds - Self.secondsFromYearOneToUnixEpoch

@@ -529,6 +529,210 @@ struct DayWeaveHabitOutcome: Codable, Equatable, Sendable {
     }
 }
 
+/// Exact scheduler-issued recurrence identity accepted for authoritative habit evidence.
+/// The legacy `custom` placeholder remains decodable by planner move models only; it cannot
+/// authenticate a habit occurrence.
+private enum DayWeaveHabitRecurrenceIdentity: Decodable, Sendable {
+    case calendarDay(date: DayWeaveLocalDate)
+    case calendarWeek(weekKey: Int32)
+    case calendarMonth(year: Int32, month: UInt8)
+    case rollingMinutes
+    case afterCompletion
+    case rollingMonth
+    case customRule(date: DayWeaveLocalDate)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, date, year, month, index, anchor, cycle, sequence
+        case bucketOrdinal = "bucket_ordinal"
+        case weekKey = "week_key"
+        case ruleID = "rule_id"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let dynamic = try decoder.container(keyedBy: DayWeaveAnyCodingKey.self)
+        let typeKey = DayWeaveAnyCodingKey(stringValue: CodingKeys.type.rawValue)!
+        guard dynamic.contains(typeKey) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.type,
+                .init(codingPath: decoder.codingPath, debugDescription: "Missing identity type")
+            )
+        }
+        let type = try dynamic.decode(String.self, forKey: typeKey)
+        let keys = Set(dynamic.allKeys.map(\.stringValue))
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        switch type {
+        case "calendar_day":
+            try Self.requireExactKeys(keys, ["type", "date", "bucket_ordinal"], decoder)
+            let bucketOrdinal = try container.decode(UInt16.self, forKey: .bucketOrdinal)
+            guard bucketOrdinal <= Self.maximumBucketOrdinal else { throw Self.invalid(decoder) }
+            self = .calendarDay(
+                date: try container.decode(DayWeaveLocalDate.self, forKey: .date)
+            )
+        case "calendar_week":
+            try Self.requireExactKeys(keys, ["type", "week_key", "bucket_ordinal"], decoder)
+            let bucketOrdinal = try container.decode(UInt16.self, forKey: .bucketOrdinal)
+            guard bucketOrdinal <= Self.maximumBucketOrdinal else { throw Self.invalid(decoder) }
+            self = .calendarWeek(
+                weekKey: try container.decode(Int32.self, forKey: .weekKey)
+            )
+        case "calendar_month":
+            try Self.requireExactKeys(
+                keys,
+                ["type", "year", "month", "bucket_ordinal"],
+                decoder
+            )
+            let month = try container.decode(UInt8.self, forKey: .month)
+            let bucketOrdinal = try container.decode(UInt16.self, forKey: .bucketOrdinal)
+            guard (1...12).contains(month),
+                  bucketOrdinal <= Self.maximumBucketOrdinal else { throw Self.invalid(decoder) }
+            self = .calendarMonth(
+                year: try container.decode(Int32.self, forKey: .year),
+                month: month
+            )
+        case "rolling_minutes":
+            try Self.requireExactKeys(keys, ["type", "index", "anchor"], decoder)
+            _ = try container.decode(UInt32.self, forKey: .index)
+            try Self.requireValidAnchor(try container.decode(String.self, forKey: .anchor), decoder)
+            self = .rollingMinutes
+        case "after_completion":
+            try Self.requireExactKeys(keys, ["type", "anchor"], decoder)
+            try Self.requireValidAnchor(try container.decode(String.self, forKey: .anchor), decoder)
+            self = .afterCompletion
+        case "rolling_month":
+            try Self.requireExactKeys(keys, ["type", "cycle", "index", "anchor"], decoder)
+            let cycle = try container.decode(Int64.self, forKey: .cycle)
+            let index = try container.decode(UInt16.self, forKey: .index)
+            guard (0...Int64(Int32.max)).contains(cycle) else { throw Self.invalid(decoder) }
+            guard index <= Self.maximumBucketOrdinal else { throw Self.invalid(decoder) }
+            try Self.requireValidAnchor(try container.decode(String.self, forKey: .anchor), decoder)
+            self = .rollingMonth
+        case "custom_rule":
+            try Self.requireExactKeys(
+                keys,
+                ["type", "rule_id", "sequence", "date"],
+                decoder
+            )
+            let rawRuleID = try container.decode(String.self, forKey: .ruleID)
+            guard let ruleID = UUID(uuidString: rawRuleID),
+                  ruleID != Self.nilID,
+                  dayWeaveIsRFC4122VersionFiveUUID(ruleID),
+                  ruleID.uuidString.lowercased() == rawRuleID else {
+                throw Self.invalid(decoder)
+            }
+            let sequence = try container.decode(UInt32.self, forKey: .sequence)
+            guard sequence <= Self.maximumCustomRuleSequence else { throw Self.invalid(decoder) }
+            self = .customRule(
+                date: try container.decode(DayWeaveLocalDate.self, forKey: .date)
+            )
+        default:
+            // This deliberately rejects both unknown variants and the legacy `custom` identity.
+            throw Self.invalid(decoder)
+        }
+    }
+
+    func matchesEvidenceContext(
+        localDate: DayWeaveLocalDate,
+        timezoneName: String,
+        nominalStart: Date,
+        nominalEnd: Date
+    ) -> Bool {
+        guard DayWeaveLocalDate.containing(nominalStart, timezoneName: timezoneName) == localDate
+        else { return false }
+
+        switch self {
+        case let .calendarDay(date):
+            return date == localDate
+                && Self.calendarEnd(nominalEnd, remainsIn: localDate, timezoneName: timezoneName)
+        case let .calendarWeek(weekKey):
+            guard Self.calendarEnd(
+                nominalEnd,
+                remainsIn: localDate,
+                timezoneName: timezoneName
+            ), let julianDay = Self.julianDay(for: localDate) else { return false }
+            return julianDay >= Int64(weekKey) && julianDay <= Int64(weekKey) + 6
+        case let .calendarMonth(year, month):
+            let components = localDate.rawValue.split(separator: "-").compactMap { Int($0) }
+            return components.count == 3
+                && components[0] == Int(year)
+                && components[1] == Int(month)
+                && Self.calendarEnd(
+                    nominalEnd,
+                    remainsIn: localDate,
+                    timezoneName: timezoneName
+                )
+        case let .customRule(date):
+            return date == localDate
+                && Self.calendarEnd(nominalEnd, remainsIn: localDate, timezoneName: timezoneName)
+        case .rollingMinutes, .afterCompletion, .rollingMonth:
+            return true
+        }
+    }
+
+    private static let nilID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
+    private static let maximumBucketOrdinal: UInt16 = UInt16.max - 1
+    private static let maximumCustomRuleSequence: UInt32 = 9_999
+
+    private static func requireExactKeys(
+        _ actual: Set<String>,
+        _ expected: Set<String>,
+        _ decoder: any Decoder
+    ) throws {
+        guard actual == expected else { throw invalid(decoder) }
+    }
+
+    private static func requireValidAnchor(_ value: String, _ decoder: any Decoder) throws {
+        guard CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(value),
+              let instant = CanonicalRFC3339Instant(value),
+              instant.hasPostgresPrecision else {
+            throw invalid(decoder)
+        }
+    }
+
+    private static func invalid(_ decoder: any Decoder) -> DecodingError {
+        .dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Malformed authoritative recurrence identity"
+            )
+        )
+    }
+
+    private static func calendarEnd(
+        _ nominalEnd: Date,
+        remainsIn localDate: DayWeaveLocalDate,
+        timezoneName: String
+    ) -> Bool {
+        guard let endMicroseconds = dayWeavePostgresEpochMicroseconds(nominalEnd),
+              endMicroseconds > Int64.min else { return false }
+        let lastIncludedInstant = Date(
+            timeIntervalSince1970: TimeInterval(endMicroseconds - 1) / 1_000_000
+        )
+        return DayWeaveLocalDate.containing(
+            lastIncludedInstant,
+            timezoneName: timezoneName
+        ) == localDate
+    }
+
+    private static func julianDay(for localDate: DayWeaveLocalDate) -> Int64? {
+        guard let date = localDate.date(in: "UTC") else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let epoch = calendar.date(from: DateComponents(
+            timeZone: calendar.timeZone,
+            year: 1970,
+            month: 1,
+            day: 1
+        )), let days = calendar.dateComponents([.day], from: epoch, to: date).day else {
+            return nil
+        }
+        return Int64(days) + 2_440_588
+    }
+}
+
 struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
     let id: UUID
     let habitID: UUID
@@ -580,6 +784,10 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
         sourceScheduleRevisionID = try container.decode(UUID.self, forKey: .sourceScheduleRevisionID)
         sourceItemRevision = try container.decode(UInt64.self, forKey: .sourceItemRevision)
         policyFingerprint = try container.decode(String.self, forKey: .policyFingerprint)
+        let recurrenceIdentity = try container.decode(
+            DayWeaveHabitRecurrenceIdentity.self,
+            forKey: .identity
+        )
         identity = try container.decode(JSONValue.self, forKey: .identity)
         nominalStart = try container.decode(Date.self, forKey: .nominalStart)
         nominalEnd = try container.decode(Date.self, forKey: .nominalEnd)
@@ -593,7 +801,7 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
         )
         expectedQuantity = try container.decodeIfPresent(Int64.self, forKey: .expectedQuantity)
         expectedUnit = try container.decodeIfPresent(String.self, forKey: .expectedUnit)
-        guard hasValidShape else {
+        guard hasValidShape(using: recurrenceIdentity) else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
@@ -663,24 +871,42 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
     }
 
     var hasValidShape: Bool {
+        guard let recurrenceIdentity = Self.recurrenceIdentity(from: identity) else { return false }
+        return hasValidShape(using: recurrenceIdentity)
+    }
+
+    private func hasValidShape(using recurrenceIdentity: DayWeaveHabitRecurrenceIdentity) -> Bool {
         guard id != Self.nilID,
               habitID != Self.nilID,
               plannerOccurrenceID != Self.nilID,
+              id != plannerOccurrenceID,
+              dayWeaveIsRFC4122VersionFiveUUID(plannerOccurrenceID),
               sourceScheduleRevisionID != Self.nilID,
               sourceItemRevision > 0,
               Self.isSHA256(policyFingerprint),
               case .object = identity,
               (try? JSONEncoder().encode(identity).count).map({ $0 <= 64 * 1_024 }) == true,
-              nominalStart.timeIntervalSinceReferenceDate.isFinite,
-              nominalEnd.timeIntervalSinceReferenceDate.isFinite,
-              windowStart.timeIntervalSinceReferenceDate.isFinite,
-              windowEnd.timeIntervalSinceReferenceDate.isFinite,
+              Self.isValidEvidenceDate(nominalStart),
+              Self.isValidEvidenceDate(nominalEnd),
+              Self.isValidEvidenceDate(windowStart),
+              Self.isValidEvidenceDate(windowEnd),
               windowStart < windowEnd,
               nominalStart < nominalEnd,
               nominalStart >= windowStart,
               nominalEnd <= windowEnd,
-              TimeZone(identifier: timezoneName) != nil,
-              expectedDurationSeconds.map({ $0 > 0 }) ?? true,
+              !timezoneName.isEmpty,
+              timezoneName.unicodeScalars.count <= 100,
+              timezoneName.unicodeScalars.allSatisfy({
+                  $0.properties.generalCategory != .control
+              }),
+              DayWeaveCanonicalItemDraft.supportedTimeZone(identifier: timezoneName) != nil,
+              recurrenceIdentity.matchesEvidenceContext(
+                  localDate: localDate,
+                  timezoneName: timezoneName,
+                  nominalStart: nominalStart,
+                  nominalEnd: nominalEnd
+              ),
+              expectedDurationSeconds.map({ $0 > 0 && $0 <= 31_622_400 }) ?? true,
               (expectedQuantity == nil) == (expectedUnit == nil),
               expectedQuantity.map({ $0 > 0 && $0 <= DayWeaveHabitOutcomeInput.maximumQuantity })
                 ?? true,
@@ -688,7 +914,20 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
         return true
     }
 
+    private static func recurrenceIdentity(
+        from value: JSONValue
+    ) -> DayWeaveHabitRecurrenceIdentity? {
+        guard case .object = value,
+              let data = try? JSONEncoder().encode(value) else { return nil }
+        return try? JSONDecoder().decode(DayWeaveHabitRecurrenceIdentity.self, from: data)
+    }
+
     private static let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    static func isValidEvidenceDate(_ value: Date) -> Bool {
+        dayWeavePostgresEpochMicroseconds(value) != nil
+            && CanonicalRFC3339Instant(date: value) != nil
+    }
 
     private static func isSHA256(_ value: String) -> Bool {
         guard value.utf8.count == 71, value.hasPrefix("sha256:") else { return false }

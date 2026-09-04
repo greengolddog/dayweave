@@ -16,8 +16,8 @@ use crate::{
 use super::{
     HabitAnalytics, HabitAnalyticsBucket, HabitDeltaChange, HabitDomainError, HabitIdempotency,
     HabitMutation, HabitOccurrence, HabitOutcomeCommand, HabitPause, HabitPauseResumeCommand,
-    HabitPauseStartCommand, HabitRepository, HabitRepositoryError, OutcomeWrite, PauseCreate,
-    PauseResume, calculate_analytics,
+    HabitPauseStartCommand, HabitRepository, HabitRepositoryError, MAX_HABIT_DATE_YEAR,
+    MIN_HABIT_DATE_YEAR, OutcomeWrite, PauseCreate, PauseResume, calculate_analytics,
     invalidation::{HabitInvalidationHub, HabitInvalidationOpenError, HabitInvalidationStream},
     repository::OccurrencePageCursor,
 };
@@ -31,8 +31,6 @@ const MAX_ANALYTICS_OCCURRENCES: usize = 50_000;
 pub const DEFAULT_HABIT_PAGE_LIMIT: usize = 100;
 pub const MAX_HABIT_PAGE_LIMIT: usize = 200;
 pub const MAX_HABIT_RANGE_DAYS: i64 = 366;
-pub const MIN_HABIT_DATE_YEAR: i32 = 1900;
-pub const MAX_HABIT_DATE_YEAR: i32 = 2200;
 
 #[derive(Clone, Debug)]
 pub struct HabitIdempotencyKey {

@@ -213,6 +213,68 @@ data class CanonicalRecurrenceDraft(
     }
 }
 
+internal data class CanonicalRecurrenceIdentitySelector(
+    val identityType: String,
+    val ordinalUpperBoundExclusive: Long? = null,
+)
+
+/** Exact identity discriminator and selector range the current recurrence rule can issue. */
+internal fun expectedRecurrenceIdentitySelector(
+    recurrenceJson: String?,
+): CanonicalRecurrenceIdentitySelector? = runCatching {
+    val recurrence = decodeCanonicalRecurrence(requireNotNull(recurrenceJson))
+    when (recurrence.kind) {
+        CanonicalRecurrenceKind.DAILY -> CanonicalRecurrenceIdentitySelector(
+            "calendar_day",
+            requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+        )
+        CanonicalRecurrenceKind.WEEKLY -> CanonicalRecurrenceIdentitySelector(
+            "calendar_week",
+            requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+        )
+        CanonicalRecurrenceKind.MONTHLY -> CanonicalRecurrenceIdentitySelector(
+            "calendar_month",
+            requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+        )
+        CanonicalRecurrenceKind.EVERY_INTERVAL -> CanonicalRecurrenceIdentitySelector(
+            "rolling_minutes",
+            Int.MAX_VALUE.toLong() + 1,
+        )
+        CanonicalRecurrenceKind.AFTER_COMPLETION ->
+            CanonicalRecurrenceIdentitySelector("after_completion")
+        CanonicalRecurrenceKind.CUSTOM ->
+            CanonicalRecurrenceIdentitySelector("custom_rule")
+        CanonicalRecurrenceKind.FREQUENCY -> when (
+            requireNotNull(recurrence.semantics) to requireNotNull(recurrence.period)
+        ) {
+            CanonicalRecurrenceSemantics.CALENDAR to CanonicalRecurrencePeriod.DAY ->
+                CanonicalRecurrenceIdentitySelector(
+                    "calendar_day",
+                    requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+                )
+            CanonicalRecurrenceSemantics.CALENDAR to CanonicalRecurrencePeriod.WEEK ->
+                CanonicalRecurrenceIdentitySelector(
+                    "calendar_week",
+                    requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+                )
+            CanonicalRecurrenceSemantics.CALENDAR to CanonicalRecurrencePeriod.MONTH ->
+                CanonicalRecurrenceIdentitySelector(
+                    "calendar_month",
+                    requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+                )
+            CanonicalRecurrenceSemantics.ROLLING to CanonicalRecurrencePeriod.DAY,
+            CanonicalRecurrenceSemantics.ROLLING to CanonicalRecurrencePeriod.WEEK,
+            -> CanonicalRecurrenceIdentitySelector("rolling_minutes")
+            CanonicalRecurrenceSemantics.ROLLING to CanonicalRecurrencePeriod.MONTH ->
+                CanonicalRecurrenceIdentitySelector(
+                    "rolling_month",
+                    requireNotNull(recurrence.occurrencesPerPeriod).toLong(),
+                )
+            else -> error("Unsupported recurrence identity mapping")
+        }
+    }
+}.getOrNull()
+
 /**
  * Mirrors the finite custom-RRULE subset in `dayweave-core/custom_recurrence.rs`.
  *

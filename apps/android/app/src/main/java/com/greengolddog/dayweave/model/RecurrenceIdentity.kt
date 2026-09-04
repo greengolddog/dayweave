@@ -6,11 +6,11 @@ import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.longOrNull
 
 /**
  * Validates and canonicalizes the server-issued, rule-specific occurrence identity.
@@ -33,6 +33,8 @@ internal fun recurrenceIdentityObject(raw: String?): JsonObject? {
 internal fun recurrenceIdentityType(raw: String?): String? =
     recurrenceIdentityObject(raw)?.exactString("type")
 
+internal fun UUID.isRfc4122Version5(): Boolean = version() == 5 && variant() == 2
+
 /** Validates the complete persisted source envelope against its current canonical series. */
 internal fun RecurrenceOccurrenceSourceSnapshot.hasValidRecurrenceSourceFor(
     item: CanonicalItemSnapshot,
@@ -40,11 +42,16 @@ internal fun RecurrenceOccurrenceSourceSnapshot.hasValidRecurrenceSourceFor(
     require(itemId == item.id && itemRevision == item.revision && itemRevision > 0)
     require(ordinal in 0..UInt.MAX_VALUE.toLong())
     val identity = requireNotNull(recurrenceIdentityObject(identityJson))
+    val type = identity.exactString("type")
+    val selector = requireNotNull(expectedRecurrenceIdentitySelector(item.recurrenceJson))
+    val matchesCurrentSeries = selector.identityType == type ||
+        type == "custom" && selector.identityType == "custom_rule"
+    require(matchesCurrentSeries)
     val parsedNominalStart = requireNotNull(parseValidRfc3339(nominalStart))
     val parsedNominalEnd = requireNotNull(parseValidRfc3339(nominalEnd))
     require(parsedNominalStart < parsedNominalEnd)
     require(stableOrdinal(identity) == ordinal)
-    val type = identity.exactString("type")
+    selector.ordinalUpperBoundExclusive?.let { require(ordinal < it) }
     val isCalendarIdentity = type in CALENDAR_IDENTITY_TYPES
     require((localDate != null) == isCalendarIdentity)
     localDate?.let { rawDate ->
@@ -64,7 +71,10 @@ internal fun RecurrenceOccurrenceSourceSnapshot.hasValidRecurrenceSourceFor(
                 identity.exactLong("year") == date.year.toLong() &&
                     identity.exactLong("month") == date.monthValue.toLong(),
             )
-            "custom_rule" -> require(identity.exactString("date") == rawDate)
+            "custom_rule" -> {
+                require(identity.exactString("date") == rawDate)
+                require(parsedNominalEnd.minusNanos(1).toLocalDate() == date)
+            }
         }
     }
 }.isSuccess
@@ -75,18 +85,18 @@ internal fun JsonObject.hasValidRecurrenceIdentityShape(): Boolean = runCatching
             require(keys == setOf("type", "date", "bucket_ordinal"))
             val date = LocalDate.parse(exactString("date"))
             require(date.toString() == exactString("date"))
-            require(exactLong("bucket_ordinal") in 0..UShort.MAX_VALUE.toLong())
+            require(exactLong("bucket_ordinal") in 0..MAX_GENERATED_BUCKET_ORDINAL)
         }
         "calendar_week" -> {
             require(keys == setOf("type", "week_key", "bucket_ordinal"))
             require(exactLong("week_key") in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong())
-            require(exactLong("bucket_ordinal") in 0..UShort.MAX_VALUE.toLong())
+            require(exactLong("bucket_ordinal") in 0..MAX_GENERATED_BUCKET_ORDINAL)
         }
         "calendar_month" -> {
             require(keys == setOf("type", "year", "month", "bucket_ordinal"))
             require(exactLong("year") in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong())
             require(exactLong("month") in 1..12)
-            require(exactLong("bucket_ordinal") in 0..UShort.MAX_VALUE.toLong())
+            require(exactLong("bucket_ordinal") in 0..MAX_GENERATED_BUCKET_ORDINAL)
         }
         "rolling_minutes" -> {
             require(keys == setOf("type", "index", "anchor"))
@@ -100,19 +110,19 @@ internal fun JsonObject.hasValidRecurrenceIdentityShape(): Boolean = runCatching
         "rolling_month" -> {
             require(keys == setOf("type", "cycle", "index", "anchor"))
             require(exactLong("cycle") in 0..Int.MAX_VALUE.toLong())
-            require(exactLong("index") in 0..UShort.MAX_VALUE.toLong())
+            require(exactLong("index") in 0..MAX_GENERATED_BUCKET_ORDINAL)
             requireValidRfc3339(exactString("anchor"))
         }
         "custom" -> require(keys == setOf("type"))
         "custom_rule" -> {
             require(keys == setOf("type", "rule_id", "sequence", "date"))
-            val ruleId = java.util.UUID.fromString(exactString("rule_id"))
+            val ruleId = UUID.fromString(exactString("rule_id"))
             require(
-                ruleId != java.util.UUID(0L, 0L) &&
-                    ruleId.version() == 5 &&
+                ruleId != UUID(0L, 0L) &&
+                    ruleId.isRfc4122Version5() &&
                     ruleId.toString() == exactString("rule_id"),
             )
-            require(exactLong("sequence") in 0..UInt.MAX_VALUE.toLong())
+            require(exactLong("sequence") in 0..MAX_GENERATED_CUSTOM_RULE_SEQUENCE)
             val date = LocalDate.parse(exactString("date"))
             require(date.toString() == exactString("date"))
         }
@@ -165,11 +175,14 @@ private fun JsonObject.exactString(key: String): String =
         ?.contentOrNull
         ?: error("$key must be a string")
 
-private fun JsonObject.exactLong(key: String): Long =
-    (this[key] as? JsonPrimitive)
-        ?.takeUnless { it.isString }
-        ?.longOrNull
+private fun JsonObject.exactLong(key: String): Long {
+    val primitive = (this[key] as? JsonPrimitive)?.takeUnless { it.isString }
         ?: error("$key must be an integer")
+    require(CANONICAL_JSON_INTEGER_PATTERN.matches(primitive.content)) {
+        "$key must use canonical base-10 integer syntax"
+    }
+    return primitive.content.toLongOrNull() ?: error("$key must fit in a signed 64-bit integer")
+}
 
 private fun requireValidRfc3339(raw: String) {
     requireNotNull(parseValidRfc3339(raw))
@@ -182,7 +195,11 @@ private fun parseValidRfc3339(raw: String): OffsetDateTime? {
     } catch (error: DateTimeException) {
         return null
     }
-    return parsed.takeIf { it.nano % 1_000 == 0 }
+    return parsed.takeIf {
+        it.year in MIN_RFC3339_IDENTITY_YEAR..MAX_RFC3339_IDENTITY_YEAR &&
+            it.nano % 1_000 == 0 &&
+            DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(it) == raw
+    }
 }
 
 private fun stableOrdinal(identity: JsonObject): Long? = when (identity.exactString("type")) {
@@ -198,6 +215,13 @@ private val RECURRENCE_IDENTITY_JSON = Json { ignoreUnknownKeys = false }
 private val CALENDAR_IDENTITY_TYPES =
     setOf("calendar_day", "calendar_week", "calendar_month", "custom_rule")
 private const val JULIAN_DAY_AT_UNIX_EPOCH = 2_440_588L
+// A u16 recurrence target can contain at most ordinals 0..<65_535.
+private const val MAX_GENERATED_BUCKET_ORDINAL = 65_534L
+// Custom recurrence expansion admits at most 10,000 zero-based occurrences.
+private const val MAX_GENERATED_CUSTOM_RULE_SEQUENCE = 9_999L
+private const val MIN_RFC3339_IDENTITY_YEAR = 1
+private const val MAX_RFC3339_IDENTITY_YEAR = 9_999
+private val CANONICAL_JSON_INTEGER_PATTERN = Regex("(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
 private val RFC3339_PATTERN = Regex(
     """^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$""",
 )

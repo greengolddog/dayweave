@@ -4612,7 +4612,7 @@ class CanonicalSyncManagerTest {
             kind = "habit",
             recurrence = buildJsonObject {
                 put("type", "custom")
-                put("rrule", "FREQ=DAILY")
+                put("rrule", "FREQ=DAILY;COUNT=10")
             },
         )
         val occurrence = RemotePlanOccurrence(

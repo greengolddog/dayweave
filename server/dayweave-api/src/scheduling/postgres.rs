@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike as _, Duration, Utc};
 use dayweave_core::{
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
     ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, PlanRequest, ScheduleBlockKind,
@@ -22,6 +22,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
+    habits::{MAX_HABIT_DATE_YEAR, MIN_HABIT_DATE_YEAR, valid_habit_recurrence_anchor},
     persistence::{
         AuthoritativeHabitRecurrence, DatabaseScope, PublishedHabitEvidenceError,
         authoritative_habit_recurrence_tx, fetch_item_batch_tx, insert_proposal_tx,
@@ -3258,6 +3259,61 @@ pub(super) fn validate_composed_result_for_schema(
         .map_err(|_| SchedulePublicationError::InvalidPayload)?;
     if expected_plan != *result.plan {
         return Err(SchedulePublicationError::InvalidPayload);
+    }
+    validate_habit_occurrence_portability(timezone_name, result)?;
+    Ok(())
+}
+
+fn validate_habit_occurrence_portability(
+    timezone_name: &str,
+    result: &ComposeScheduleResult,
+) -> Result<(), SchedulePublicationError> {
+    let habit_ids = result
+        .planning_request
+        .items
+        .iter()
+        .filter_map(|item| {
+            matches!(&item.kind, dayweave_core::ItemKind::Habit(_)).then_some(item.id)
+        })
+        .collect::<BTreeSet<_>>();
+    if habit_ids.is_empty() {
+        return Ok(());
+    }
+    // Canonical preparation requires every recurring item's timezone to equal the planning
+    // timezone, so this is the same local-date derivation publication uses for rolling evidence.
+    let timezone = timezone_name
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| SchedulePublicationError::InvalidPayload)?;
+    for occurrence in result
+        .plan
+        .occurrences
+        .iter()
+        .filter(|occurrence| habit_ids.contains(&occurrence.series_item_id))
+    {
+        let local_year = occurrence.local_date.map_or_else(
+            || {
+                offset_to_chrono(occurrence.nominal_start)
+                    .map(|value| value.with_timezone(&timezone).year())
+            },
+            |date| Ok(date.year()),
+        )?;
+        let anchor = match occurrence.identity {
+            dayweave_core::RecurrenceOccurrenceIdentity::RollingMinutes { anchor, .. }
+            | dayweave_core::RecurrenceOccurrenceIdentity::AfterCompletion { anchor }
+            | dayweave_core::RecurrenceOccurrenceIdentity::RollingMonth { anchor, .. } => {
+                Some(anchor)
+            }
+            dayweave_core::RecurrenceOccurrenceIdentity::CalendarDay { .. }
+            | dayweave_core::RecurrenceOccurrenceIdentity::CalendarWeek { .. }
+            | dayweave_core::RecurrenceOccurrenceIdentity::CalendarMonth { .. }
+            | dayweave_core::RecurrenceOccurrenceIdentity::Custom
+            | dayweave_core::RecurrenceOccurrenceIdentity::CustomRule { .. } => None,
+        };
+        if !(MIN_HABIT_DATE_YEAR..=MAX_HABIT_DATE_YEAR).contains(&local_year)
+            || anchor.is_some_and(|value| !valid_habit_recurrence_anchor(value))
+        {
+            return Err(SchedulePublicationError::InvalidPayload);
+        }
     }
     Ok(())
 }

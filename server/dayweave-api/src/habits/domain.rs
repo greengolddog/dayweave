@@ -1,17 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike as _, Duration, NaiveDate, Utc};
-use dayweave_core::is_valid_habit_quantity_unit;
+use dayweave_core::{RecurrenceOccurrenceIdentity, is_valid_habit_quantity_unit};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use utoipa::ToSchema;
-use uuid::Uuid;
+use uuid::{Uuid, Variant};
 
 pub const MAX_HABIT_NOTE_CHARS: usize = 10_000;
 pub const MAX_HABIT_UNIT_CHARS: usize = dayweave_core::MAX_HABIT_QUANTITY_UNIT_CHARS;
 pub const MAX_HABIT_QUANTITY: i64 = dayweave_core::MAX_HABIT_QUANTITY;
 pub const MAX_HABIT_ACTUAL_SECONDS: u64 = 366 * 24 * 60 * 60;
+pub const MIN_HABIT_DATE_YEAR: i32 = 1900;
+pub const MAX_HABIT_DATE_YEAR: i32 = 2200;
+const MAX_HABIT_TIMEZONE_CHARS: usize = 100;
+const MAX_RFC3339_OFFSET_SECONDS: u32 = 18 * 60 * 60;
+const MAX_RECURRENCE_BUCKET_ORDINAL: u16 = u16::MAX - 1;
+const MAX_CUSTOM_RECURRENCE_SEQUENCE: u32 = 9_999;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +201,182 @@ pub struct HabitOccurrenceEvidence {
     pub expected_duration_seconds: Option<u64>,
     pub expected_quantity: Option<i64>,
     pub expected_unit: Option<String>,
+}
+
+impl HabitOccurrenceEvidence {
+    /// Validates immutable evidence before it can enter or leave a repository.
+    ///
+    /// Historical evidence is checked without consulting the habit's current recurrence because
+    /// that recurrence may have been edited since publication. The exact core identity union,
+    /// deterministic UUID version, and self-contained temporal context remain independently
+    /// verifiable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HabitDomainError::InvalidOccurrenceEvidence`] when the evidence cannot have been
+    /// emitted by the supported recurrence engine or cannot be decoded by native clients.
+    pub fn validate(&self) -> Result<(), HabitDomainError> {
+        if self.id.is_nil()
+            || self.habit_id.is_nil()
+            || self.id == self.planner_occurrence_id
+            || self.planner_occurrence_id.get_version_num() != 5
+            || self.planner_occurrence_id.get_variant() != Variant::RFC4122
+            || self.source_schedule_revision_id.is_nil()
+            || self.source_item_revision == 0
+            || !(MIN_HABIT_DATE_YEAR..=MAX_HABIT_DATE_YEAR).contains(&self.local_date.year())
+            || !valid_policy_fingerprint(&self.policy_fingerprint)
+            || !valid_api_datetime(self.nominal_start)
+            || !valid_api_datetime(self.nominal_end)
+            || !valid_api_datetime(self.window_start)
+            || !valid_api_datetime(self.window_end)
+            || self.nominal_start >= self.nominal_end
+            || self.window_start >= self.window_end
+            || self.nominal_start < self.window_start
+            || self.nominal_end > self.window_end
+            || self
+                .expected_duration_seconds
+                .is_some_and(|value| value == 0 || value > MAX_HABIT_ACTUAL_SECONDS)
+            || self
+                .expected_quantity
+                .is_some_and(|value| !(1..=MAX_HABIT_QUANTITY).contains(&value))
+            || self.expected_quantity.is_some() != self.expected_unit.is_some()
+            || self
+                .expected_unit
+                .as_deref()
+                .is_some_and(|unit| !is_valid_habit_quantity_unit(unit))
+        {
+            return Err(HabitDomainError::InvalidOccurrenceEvidence);
+        }
+
+        let timezone = self
+            .timezone_name
+            .parse::<chrono_tz::Tz>()
+            .ok()
+            .filter(|_| {
+                !self.timezone_name.is_empty()
+                    && self.timezone_name.chars().count() <= MAX_HABIT_TIMEZONE_CHARS
+                    && !self.timezone_name.chars().any(char::is_control)
+            })
+            .ok_or(HabitDomainError::InvalidOccurrenceEvidence)?;
+        if self.nominal_start.with_timezone(&timezone).date_naive() != self.local_date {
+            return Err(HabitDomainError::InvalidOccurrenceEvidence);
+        }
+        let identity: RecurrenceOccurrenceIdentity = serde_json::from_value(self.identity.clone())
+            .map_err(|_| HabitDomainError::InvalidOccurrenceEvidence)?;
+        let canonical_identity = serde_json::to_value(identity)
+            .map_err(|_| HabitDomainError::InvalidOccurrenceEvidence)?;
+        if canonical_identity != self.identity {
+            return Err(HabitDomainError::InvalidOccurrenceEvidence);
+        }
+        let nominal_last_date = self
+            .nominal_end
+            .checked_sub_signed(Duration::nanoseconds(1))
+            .map(|value| value.with_timezone(&timezone).date_naive())
+            .ok_or(HabitDomainError::InvalidOccurrenceEvidence)?;
+        if !identity_matches_evidence_context(&identity, self.local_date, nominal_last_date) {
+            return Err(HabitDomainError::InvalidOccurrenceEvidence);
+        }
+        Ok(())
+    }
+}
+
+fn valid_policy_fingerprint(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_api_datetime(value: DateTime<Utc>) -> bool {
+    (1..=9_999).contains(&value.year()) && value.timestamp_subsec_nanos().is_multiple_of(1_000)
+}
+
+fn identity_matches_evidence_context(
+    identity: &RecurrenceOccurrenceIdentity,
+    local_date: NaiveDate,
+    nominal_last_date: NaiveDate,
+) -> bool {
+    let calendar_interval_is_local = nominal_last_date == local_date;
+    match *identity {
+        RecurrenceOccurrenceIdentity::CalendarDay {
+            date,
+            bucket_ordinal,
+        } => {
+            bucket_ordinal <= MAX_RECURRENCE_BUCKET_ORDINAL
+                && calendar_interval_is_local
+                && time_date_to_naive(date) == Some(local_date)
+        }
+        RecurrenceOccurrenceIdentity::CalendarWeek {
+            week_key,
+            bucket_ordinal,
+        } => naive_to_time_date(local_date).is_some_and(|date| {
+            bucket_ordinal <= MAX_RECURRENCE_BUCKET_ORDINAL
+                && calendar_interval_is_local
+                && week_key
+                    .checked_add(6)
+                    .is_some_and(|end| (week_key..=end).contains(&date.to_julian_day()))
+        }),
+        RecurrenceOccurrenceIdentity::CalendarMonth {
+            year,
+            month,
+            bucket_ordinal,
+        } => {
+            bucket_ordinal <= MAX_RECURRENCE_BUCKET_ORDINAL
+                && calendar_interval_is_local
+                && local_date.year() == year
+                && u8::try_from(local_date.month()) == Ok(month)
+        }
+        RecurrenceOccurrenceIdentity::RollingMinutes { index, anchor } => {
+            u32::try_from(index).is_ok() && valid_habit_recurrence_anchor(anchor)
+        }
+        RecurrenceOccurrenceIdentity::AfterCompletion { anchor } => {
+            valid_habit_recurrence_anchor(anchor)
+        }
+        RecurrenceOccurrenceIdentity::RollingMonth {
+            cycle,
+            index,
+            anchor,
+        } => {
+            (0..=i64::from(i32::MAX)).contains(&cycle)
+                && index <= MAX_RECURRENCE_BUCKET_ORDINAL
+                && valid_habit_recurrence_anchor(anchor)
+        }
+        RecurrenceOccurrenceIdentity::Custom => false,
+        RecurrenceOccurrenceIdentity::CustomRule {
+            rule_id,
+            sequence,
+            date,
+        } => {
+            sequence <= MAX_CUSTOM_RECURRENCE_SEQUENCE
+                && calendar_interval_is_local
+                && rule_id.get_version_num() == 5
+                && rule_id.get_variant() == Variant::RFC4122
+                && time_date_to_naive(date) == Some(local_date)
+        }
+    }
+}
+
+pub(crate) fn valid_habit_recurrence_anchor(value: time::OffsetDateTime) -> bool {
+    value.nanosecond().is_multiple_of(1_000)
+        && (1..=9_999).contains(&value.year())
+        && value.offset().whole_seconds().unsigned_abs() <= MAX_RFC3339_OFFSET_SECONDS
+}
+
+fn time_date_to_naive(value: time::Date) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(
+        value.year(),
+        u32::from(u8::from(value.month())),
+        u32::from(value.day()),
+    )
+}
+
+fn naive_to_time_date(value: NaiveDate) -> Option<time::Date> {
+    let month = u8::try_from(value.month())
+        .ok()
+        .and_then(|month| time::Month::try_from(month).ok())?;
+    time::Date::from_calendar_date(value.year(), month, u8::try_from(value.day()).ok()?).ok()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -545,6 +727,8 @@ pub enum HabitDomainError {
     InvalidNote,
     #[error("occurred_at is outside the supported precision or time range")]
     InvalidOccurredAt,
+    #[error("habit occurrence evidence has invalid recurrence identity or temporal context")]
+    InvalidOccurrenceEvidence,
 }
 
 #[cfg(test)]
@@ -553,15 +737,23 @@ mod tests {
 
     fn occurrence(date: NaiveDate, status: Option<HabitOutcomeStatus>) -> HabitOccurrence {
         let start = date.and_hms_opt(8, 0, 0).unwrap().and_utc();
+        let habit_id = Uuid::from_u128(1);
         HabitOccurrence {
             evidence: HabitOccurrenceEvidence {
                 id: Uuid::new_v4(),
-                habit_id: Uuid::from_u128(1),
-                planner_occurrence_id: Uuid::new_v4(),
+                habit_id,
+                planner_occurrence_id: Uuid::new_v5(
+                    &habit_id,
+                    format!("daily:{date}:0").as_bytes(),
+                ),
                 source_schedule_revision_id: Uuid::new_v4(),
                 source_item_revision: 1,
                 policy_fingerprint: format!("sha256:{}", "0".repeat(64)),
-                identity: serde_json::json!({"type":"daily","date":date}),
+                identity: serde_json::json!({
+                    "type": "calendar_day",
+                    "date": date,
+                    "bucket_ordinal": 0
+                }),
                 nominal_start: start,
                 nominal_end: start + Duration::hours(1),
                 window_start: start,
@@ -588,6 +780,156 @@ mod tests {
                 updated_at: start,
             }),
         }
+    }
+
+    #[test]
+    fn recurrence_evidence_enforces_native_identity_and_date_bounds() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let evidence = occurrence(date, None).evidence;
+        assert!(evidence.validate().is_ok());
+
+        let validates_identity = |identity: Value| {
+            let mut candidate = evidence.clone();
+            candidate.identity = identity;
+            candidate.validate().is_ok()
+        };
+        assert!(validates_identity(serde_json::json!({
+            "type": "calendar_day",
+            "date": date,
+            "bucket_ordinal": 65_534
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "calendar_day",
+            "date": date,
+            "bucket_ordinal": 65_535
+        })));
+        assert!(validates_identity(serde_json::json!({
+            "type": "rolling_month",
+            "cycle": 2_147_483_647_i64,
+            "index": 65_534,
+            "anchor": "0001-01-01T00:00:00Z"
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "rolling_month",
+            "cycle": 0,
+            "index": 65_535,
+            "anchor": "0001-01-01T00:00:00Z"
+        })));
+        assert!(validates_identity(serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 4_294_967_295_u64,
+            "anchor": "9999-12-31T23:59:59.999999Z"
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 0,
+            "anchor": "0000-01-01T00:00:00Z"
+        })));
+        assert!(validates_identity(serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 0,
+            "anchor": "2026-09-04T08:00:00+18:00"
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 0,
+            "anchor": "2026-09-04T08:00:00+18:01"
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 0,
+            "anchor": "2026-09-04T08:00:00.000000001Z"
+        })));
+
+        let rule_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"bounded-custom-rule");
+        assert!(validates_identity(serde_json::json!({
+            "type": "custom_rule",
+            "rule_id": rule_id,
+            "sequence": 9_999,
+            "date": date
+        })));
+        assert!(!validates_identity(serde_json::json!({
+            "type": "custom_rule",
+            "rule_id": rule_id,
+            "sequence": 10_000,
+            "date": date
+        })));
+
+        for year in [MIN_HABIT_DATE_YEAR, MAX_HABIT_DATE_YEAR] {
+            assert!(
+                occurrence(NaiveDate::from_ymd_opt(year, 6, 1).unwrap(), None)
+                    .evidence
+                    .validate()
+                    .is_ok()
+            );
+        }
+        for year in [MIN_HABIT_DATE_YEAR - 1, MAX_HABIT_DATE_YEAR + 1] {
+            assert!(
+                occurrence(NaiveDate::from_ymd_opt(year, 6, 1).unwrap(), None)
+                    .evidence
+                    .validate()
+                    .is_err()
+            );
+        }
+
+        let mut expanded_window_year = evidence;
+        expanded_window_year.window_start = NaiveDate::from_ymd_opt(0, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert!(expanded_window_year.validate().is_err());
+    }
+
+    #[test]
+    fn recurrence_evidence_requires_rfc4122_v5_ids_and_canonical_identity_json() {
+        fn with_ncs_variant(value: Uuid) -> Uuid {
+            let mut bytes = *value.as_bytes();
+            bytes[8] &= 0x3f;
+            Uuid::from_bytes(bytes)
+        }
+
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        let evidence = occurrence(date, None).evidence;
+
+        let mut wrong_planner_variant = evidence.clone();
+        wrong_planner_variant.planner_occurrence_id =
+            with_ncs_variant(wrong_planner_variant.planner_occurrence_id);
+        assert_eq!(
+            wrong_planner_variant
+                .planner_occurrence_id
+                .get_version_num(),
+            5
+        );
+        assert_ne!(
+            wrong_planner_variant.planner_occurrence_id.get_variant(),
+            Variant::RFC4122
+        );
+        assert!(wrong_planner_variant.validate().is_err());
+
+        let rule_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"variant-bound-custom-rule");
+        let mut wrong_rule_variant = evidence.clone();
+        wrong_rule_variant.identity = serde_json::json!({
+            "type": "custom_rule",
+            "rule_id": with_ncs_variant(rule_id),
+            "sequence": 0,
+            "date": date
+        });
+        assert!(wrong_rule_variant.validate().is_err());
+
+        let noncanonical_anchor = serde_json::json!({
+            "type": "rolling_minutes",
+            "index": 0,
+            "anchor": "2026-09-04 08:00:00.1234560000z"
+        });
+        assert!(
+            serde_json::from_value::<RecurrenceOccurrenceIdentity>(noncanonical_anchor.clone())
+                .is_ok(),
+            "the typed decoder remains permissive, so evidence must enforce its canonical encoding"
+        );
+        let mut noncanonical = evidence;
+        noncanonical.identity = noncanonical_anchor;
+        assert!(noncanonical.validate().is_err());
     }
 
     #[test]

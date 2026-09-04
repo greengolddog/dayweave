@@ -10,6 +10,9 @@ struct RecurrenceMoveTests {
     nonisolated private static let childOneID = UUID(uuidString: "81000000-0000-4000-8000-000000000011")!
     nonisolated private static let childTwoID = UUID(uuidString: "81000000-0000-4000-8000-000000000012")!
     nonisolated private static let occurrenceID = UUID(uuidString: "5432cf9b-22b0-56ff-ba43-2d71e23eb904")!
+    nonisolated private static let customOccurrenceID = UUID(
+        uuidString: "a8267a41-d93a-5d17-b66b-1378ca77c192"
+    )!
     nonisolated private static let configuration = "https://api.example.test"
     nonisolated private static let now = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -383,7 +386,8 @@ struct RecurrenceMoveTests {
             #"{"type":"calendar_month","year":2027,"month":1,"bucket_ordinal":4}"#,
             #"{"type":"rolling_minutes","index":19,"anchor":"2027-01-15T08:00:00.123456789Z"}"#,
             #"{"type":"after_completion","anchor":"2027-01-15T08:00:00.123456789+01:00"}"#,
-            #"{"type":"rolling_month","cycle":7,"index":5,"anchor":"2027-01-15T08:00:00.123456789Z"}"#,
+            #"{"type":"rolling_month","cycle":7,"index":5,"anchor":"2027-01-15T08:00:00.123456789+18:00"}"#,
+            #"{"type":"custom_rule","rule_id":"123e4567-e89b-52d3-a456-426614174000","sequence":9999,"date":"2027-01-15"}"#,
             #"{"type":"custom"}"#,
         ]
         let decoder = JSONDecoder()
@@ -399,7 +403,106 @@ struct RecurrenceMoveTests {
                 from: encoder.encode(identity)
             )
             #expect(emitted == expected)
+            #expect(identity.jsonValue == expected)
         }
+    }
+
+    @Test("canonical recurrence families accept only their generated selector identities")
+    func recurrenceIdentityCompatibilityTable() throws {
+        let anchor = "2027-01-15T08:00:00Z"
+        let mappings: [(String, RecurrenceOccurrenceIdentity)] = [
+            (#"{"type":"daily","times_per_day":2}"#,
+             .calendarDay(date: "2027-01-15", bucketOrdinal: 1)),
+            (#"{"type":"weekly","times_per_week":2,"weekdays":[]}"#,
+             .calendarWeek(weekKey: 2_461_421, bucketOrdinal: 1)),
+            (#"{"type":"monthly","times_per_month":2}"#,
+             .calendarMonth(year: 2027, month: 1, bucketOrdinal: 1)),
+            (#"{"type":"every_interval","interval":60}"#,
+             .rollingMinutes(index: 19, anchor: anchor)),
+            (#"{"type":"after_completion","interval":60}"#,
+             .afterCompletion(anchor: anchor)),
+            (#"{"type":"frequency","target":2,"period":"day","semantics":"calendar"}"#,
+             .calendarDay(date: "2027-01-15", bucketOrdinal: 1)),
+            (#"{"type":"frequency","target":2,"period":"week","semantics":"calendar"}"#,
+             .calendarWeek(weekKey: 2_461_421, bucketOrdinal: 1)),
+            (#"{"type":"frequency","target":2,"period":"month","semantics":"calendar"}"#,
+             .calendarMonth(year: 2027, month: 1, bucketOrdinal: 1)),
+            (#"{"type":"frequency","target":2,"period":"day","semantics":"rolling"}"#,
+             .rollingMinutes(index: 19, anchor: anchor)),
+            (#"{"type":"frequency","target":2,"period":"week","semantics":"rolling"}"#,
+             .rollingMinutes(index: 19, anchor: anchor)),
+            (#"{"type":"frequency","target":2,"period":"month","semantics":"rolling"}"#,
+             .rollingMonth(cycle: 7, index: 1, anchor: anchor)),
+            (#"{"type":"custom","rrule":"FREQ=DAILY;INTERVAL=1;COUNT=30"}"#,
+             .customRule(
+                ruleID: "48308843-a333-57a5-b648-34fffedb700f",
+                sequence: 0,
+                date: "2027-01-15"
+             )),
+        ]
+
+        for (recurrence, identity) in mappings {
+            #expect(identity.isCompatible(with: try Self.recurrence(recurrence)))
+        }
+
+        #expect(RecurrenceOccurrenceIdentity.calendarDay(
+            date: "2027-01-15",
+            bucketOrdinal: 0
+        ).isCompatible(with: try Self.recurrence(#"{"type":"daily"}"#)))
+        #expect(!RecurrenceOccurrenceIdentity.calendarDay(
+            date: "2027-01-15",
+            bucketOrdinal: 1
+        ).isCompatible(with: try Self.recurrence(#"{"type":"daily"}"#)))
+        #expect(RecurrenceOccurrenceIdentity.calendarWeek(
+            weekKey: 2_461_421,
+            bucketOrdinal: 2
+        ).isCompatible(with: try Self.recurrence(
+            #"{"type":"weekly","weekdays":["monday","wednesday","friday"]}"#
+        )))
+        #expect(!RecurrenceOccurrenceIdentity.calendarWeek(
+            weekKey: 2_461_421,
+            bucketOrdinal: 3
+        ).isCompatible(with: try Self.recurrence(
+            #"{"type":"weekly","weekdays":["monday","wednesday","friday"]}"#
+        )))
+        #expect(!RecurrenceOccurrenceIdentity.calendarMonth(
+            year: 2027,
+            month: 1,
+            bucketOrdinal: 2
+        ).isCompatible(with: try Self.recurrence(
+            #"{"type":"monthly","times_per_month":2}"#
+        )))
+        #expect(!RecurrenceOccurrenceIdentity.calendarDay(
+            date: "2027-01-15",
+            bucketOrdinal: 2
+        ).isCompatible(with: try Self.recurrence(
+            #"{"type":"frequency","target":2,"period":"day","semantics":"calendar"}"#
+        )))
+        #expect(!RecurrenceOccurrenceIdentity.rollingMonth(
+            cycle: 7,
+            index: 2,
+            anchor: anchor
+        ).isCompatible(with: try Self.recurrence(
+            #"{"type":"frequency","target":2,"period":"month","semantics":"rolling"}"#
+        )))
+        let longRollingIndex = RecurrenceOccurrenceIdentity.rollingMinutes(
+            index: Int64(Int32.max) + 1,
+            anchor: anchor
+        )
+        #expect(!longRollingIndex.isCompatible(with: try Self.recurrence(
+            #"{"type":"every_interval","interval":60}"#
+        )))
+        #expect(longRollingIndex.isCompatible(with: try Self.recurrence(
+            #"{"type":"frequency","target":2,"period":"day","semantics":"rolling"}"#
+        )))
+        #expect(!RecurrenceOccurrenceIdentity.calendarMonth(
+            year: 2027,
+            month: 1,
+            bucketOrdinal: 0
+        ).isCompatible(with: try Self.recurrence(#"{"type":"daily"}"#)))
+        #expect(RecurrenceOccurrenceIdentity.custom.isCompatible(with: try Self.recurrence(
+            #"{"type":"custom","rrule":"FREQ=DAILY;COUNT=30"}"#
+        )))
     }
 
     @Test("preview occurrence identities reject missing, unknown, extra, and malformed fields")
@@ -408,10 +511,21 @@ struct RecurrenceMoveTests {
             #"{"type":"not_a_rule"}"#,
             #"{"type":"calendar_day","date":"2027-01-15"}"#,
             #"{"type":"calendar_day","date":"2027-02-30","bucket_ordinal":0}"#,
+            #"{"type":"calendar_day","date":"2027-01-15","bucket_ordinal":65535}"#,
             #"{"type":"calendar_week","week_key":2461421,"bucket_ordinal":0,"extra":true}"#,
             #"{"type":"calendar_month","year":2027,"month":13,"bucket_ordinal":0}"#,
             #"{"type":"rolling_minutes","index":-1,"anchor":"2027-01-15T08:00:00Z"}"#,
             #"{"type":"after_completion","anchor":"2027-01-15T08:00:00.1234567890Z"}"#,
+            #"{"type":"rolling_minutes","index":0,"anchor":"2027-01-15T08:00:00.123456780Z"}"#,
+            #"{"type":"after_completion","anchor":"2027-01-15T08:00:00.000Z"}"#,
+            #"{"type":"rolling_minutes","index":0,"anchor":"2027-01-15T08:00:00+00:00"}"#,
+            #"{"type":"rolling_minutes","index":0,"anchor":"2027-01-15T08:00:00-00:00"}"#,
+            #"{"type":"rolling_month","cycle":7,"index":65535,"anchor":"2027-01-15T08:00:00Z"}"#,
+            #"{"type":"custom_rule","rule_id":"123e4567-e89b-42d3-a456-426614174000","sequence":0,"date":"2027-01-15"}"#,
+            #"{"type":"custom_rule","rule_id":"123e4567-e89b-52d3-2456-426614174000","sequence":0,"date":"2027-01-15"}"#,
+            #"{"type":"custom_rule","rule_id":"123E4567-E89B-52D3-A456-426614174000","sequence":0,"date":"2027-01-15"}"#,
+            #"{"type":"custom_rule","rule_id":"123e4567-e89b-52d3-a456-426614174000","sequence":10000,"date":"2027-01-15"}"#,
+            #"{"type":"custom_rule","rule_id":"123e4567-e89b-52d3-a456-426614174000","sequence":0,"date":"2027-02-30"}"#,
             #"{"type":"custom","bucket_ordinal":0}"#,
         ]
         let decoder = JSONDecoder()
@@ -441,6 +555,16 @@ struct RecurrenceMoveTests {
                 from: Data(occurrenceWithoutIdentity.utf8)
             )
         }
+
+        let nonRFC4122Move = RecurrenceOccurrenceMove(
+            itemID: Self.itemID,
+            occurrenceID: UUID(uuidString: "5432cf9b-22b0-56ff-3a43-2d71e23eb904")!,
+            startAt: Self.now.addingTimeInterval(3_600),
+            endAt: Self.now.addingTimeInterval(5_400),
+            movedAt: Self.now,
+            source: Self.source
+        )
+        #expect(!nonRFC4122Move.hasValidShape)
     }
 
     @Test("custom recurrence identities remain visible but cannot authorize a move")
@@ -493,7 +617,184 @@ struct RecurrenceMoveTests {
         #expect(store.recurrenceOccurrenceMoves.isEmpty)
     }
 
-    private static func block(id: UUID, sessionIndex: UInt16, start: Date) -> ScheduleBlock {
+    @Test("a selector from another recurrence family cannot enqueue a move")
+    func mismatchedRecurrenceFamilyCannotEnqueueMove() throws {
+        let context = try Self.persistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let profile = PlannerStore(restoreFromPersistence: false).scheduleProfile
+        let horizon = try profile.expanded(asOf: Self.now)
+        let item = try Self.recurringItem(
+            recurrence: #"{"type":"weekly","times_per_week":1,"weekdays":[]}"#
+        )
+        #expect(Self.source.canAuthorizeOccurrenceMove)
+        #expect(!Self.source.canAuthorizeOccurrenceMove(for: item))
+        let block = Self.block(
+            id: UUID(uuidString: "89000000-0000-4000-8000-000000000009")!,
+            sessionIndex: 0,
+            start: Self.now.addingTimeInterval(3_600)
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: Self.configuration,
+            schedulePreviewProvenance: .init(
+                configurationIdentifier: Self.configuration,
+                generatedAt: Self.now,
+                asOf: Self.now,
+                horizonStart: horizon.horizonStart,
+                horizonEnd: horizon.horizonEnd,
+                timezoneName: profile.timezoneName
+            ),
+            scheduleProfile: profile,
+            previewValidatedForCurrentLaunch: true,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Self.now }
+        )
+
+        #expect(throws: PlannerRecurrenceMoveError.invalidOccurrence) {
+            try store.enqueueCanonicalOccurrenceMove(
+                blockID: block.id,
+                moveStart: block.start.addingTimeInterval(3_600)
+            )
+        }
+        #expect(store.recurrenceOccurrenceMoves.isEmpty)
+    }
+
+    @Test("a persisted same-revision selector mismatch is pruned and rewritten")
+    func mismatchedPersistedMoveIsDurablyPruned() throws {
+        let context = try Self.persistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let profile = PlannerStore(restoreFromPersistence: false).scheduleProfile
+        let item = try Self.recurringItem(
+            recurrence: #"{"type":"weekly","times_per_week":1,"weekdays":[]}"#
+        )
+        let move = RecurrenceOccurrenceMove(
+            itemID: Self.itemID,
+            occurrenceID: Self.occurrenceID,
+            startAt: Self.now.addingTimeInterval(3_600),
+            endAt: Self.now.addingTimeInterval(5_400),
+            movedAt: Self.now,
+            source: Self.source
+        )
+        #expect(move.hasValidShape)
+        #expect(!move.source!.canAuthorizeOccurrenceMove(for: item))
+        let snapshot = PlannerSnapshot(
+            savedAt: Self.now,
+            destination: .today,
+            selectedBlockID: nil,
+            blocks: [],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "",
+            protectedFreeMinutes: profile.protectedFreeMinutes,
+            scheduleProfile: profile,
+            freezeHours: 2,
+            showCompleted: true,
+            canonicalItems: [item],
+            canonicalTombstoneRevisions: [:],
+            completedOccurrenceIDs: [],
+            pendingCanonicalMutations: [],
+            pendingCanonicalSensitivityMutations: [],
+            recurrenceSessionOutcomes: [],
+            recurrenceOccurrenceMoves: [move],
+            canonicalConfigurationIdentifier: Self.configuration
+        )
+        try context.persistence.save(snapshot)
+
+        let restored = PlannerStore(persistence: context.persistence, now: { Self.now })
+        #expect(restored.persistenceError == nil)
+        #expect(restored.recurrenceOccurrenceMoves.isEmpty)
+        #expect(restored.lastScheduleMessage.contains("obsolete recurring move"))
+        let loaded = try context.persistence.load()
+        let rewritten = try #require(loaded)
+        #expect(rewritten.recurrenceOccurrenceMoves == [])
+    }
+
+    @Test("generated custom-rule identities retain exact proof and authorize a move")
+    func customRuleIdentityAuthorizesMove() throws {
+        let context = try Self.persistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let profile = PlannerStore(restoreFromPersistence: false).scheduleProfile
+        let horizon = try profile.expanded(asOf: Self.now)
+        let customRuleSource = RecurrenceMoveSource(
+            itemRevision: 1,
+            identity: .customRule(
+                ruleID: "48308843-a333-57a5-b648-34fffedb700f",
+                sequence: 0,
+                date: "2027-01-15"
+            ),
+            nominalStart: "2027-01-15T08:00:00Z",
+            nominalEnd: "2027-01-16T00:00:00Z",
+            localDate: "2027-01-15",
+            ordinal: 0
+        )
+        #expect(customRuleSource.hasValidShape)
+        #expect(customRuleSource.canAuthorizeOccurrenceMove)
+        let mismatchedDateSource = RecurrenceMoveSource(
+            itemRevision: 1,
+            identity: customRuleSource.identity,
+            nominalStart: "2027-01-16T08:00:00Z",
+            nominalEnd: "2027-01-17T00:00:00Z",
+            localDate: "2027-01-16",
+            ordinal: 0
+        )
+        #expect(!mismatchedDateSource.hasValidShape)
+        #expect(!mismatchedDateSource.canAuthorizeOccurrenceMove)
+        let boundaryOverflowSource = RecurrenceMoveSource(
+            itemRevision: 1,
+            identity: customRuleSource.identity,
+            nominalStart: customRuleSource.nominalStart,
+            nominalEnd: "2027-01-16T00:00:00.000000001Z",
+            localDate: customRuleSource.localDate,
+            ordinal: customRuleSource.ordinal
+        )
+        #expect(!boundaryOverflowSource.hasValidShape)
+        #expect(!boundaryOverflowSource.canAuthorizeOccurrenceMove)
+        let block = Self.block(
+            id: UUID(uuidString: "88000000-0000-4000-8000-000000000008")!,
+            sessionIndex: 0,
+            start: Self.now.addingTimeInterval(3_600),
+            occurrenceID: Self.customOccurrenceID,
+            source: customRuleSource
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [try Self.recurringItem(
+                recurrence: #"{"type":"custom","rrule":"FREQ=DAILY;INTERVAL=1;COUNT=30"}"#
+            )],
+            canonicalConfigurationIdentifier: Self.configuration,
+            schedulePreviewProvenance: .init(
+                configurationIdentifier: Self.configuration,
+                generatedAt: Self.now,
+                asOf: Self.now,
+                horizonStart: horizon.horizonStart,
+                horizonEnd: horizon.horizonEnd,
+                timezoneName: profile.timezoneName
+            ),
+            scheduleProfile: profile,
+            previewValidatedForCurrentLaunch: true,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Self.now }
+        )
+
+        let move = try store.enqueueCanonicalOccurrenceMove(
+            blockID: block.id,
+            moveStart: block.start.addingTimeInterval(3_600)
+        )
+        #expect(move.source == customRuleSource)
+        #expect(move.hasValidShape)
+        #expect(store.recurrenceOccurrenceMoves == [move])
+    }
+
+    private static func block(
+        id: UUID,
+        sessionIndex: UInt16,
+        start: Date,
+        occurrenceID: UUID = Self.occurrenceID,
+        source: RecurrenceMoveSource = Self.source
+    ) -> ScheduleBlock {
         ScheduleBlock(
             id: id, title: "Split routine", kind: .habit,
             start: start, end: start.addingTimeInterval(900), status: .scheduled,
@@ -515,13 +816,16 @@ struct RecurrenceMoveTests {
         ordinal: 0
     )
 
-    private static func recurringItem(revision: UInt64 = 1) throws -> DayWeaveCanonicalItem {
+    private static func recurringItem(
+        revision: UInt64 = 1,
+        recurrence: String = #"{"type":"daily","times_per_day":1}"#
+    ) throws -> DayWeaveCanonicalItem {
         let data = Data(#"""
         {
           "id":"\#(itemID.uuidString.lowercased())","is_sensitive":false,
           "kind":"habit","status":"scheduled","title":"Split routine","notes":null,
           "timezone_name":"UTC","duration_seconds":1800,"deadline_at":null,
-          "earliest_start_at":null,"recurrence":{"type":"daily","times_per_day":1},
+          "earliest_start_at":null,"recurrence":\#(recurrence),
           "flexible_constraints":{},"split_policy":{"type":"splittable",
           "minimum_chunk_seconds":900,"maximum_chunk_seconds":900},
           "importance":50,"urgency":50,"parent_id":null,"sibling_order":0,
@@ -574,6 +878,10 @@ struct RecurrenceMoveTests {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(DayWeaveCanonicalItem.self, from: data)
+    }
+
+    private static func recurrence(_ value: String) throws -> JSONValue {
+        try JSONDecoder().decode(JSONValue.self, from: Data(value.utf8))
     }
 
     private static func format(_ date: Date) -> String {

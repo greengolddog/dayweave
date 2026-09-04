@@ -18,6 +18,28 @@ Migration `0026_habit_occurrence_ledger.sql` stores each admitted occurrence wit
   occurrences;
 - scheduled duration and optional quantity target/unit.
 
+Authoritative evidence uses the scheduler core's exact tagged recurrence
+identity union: `calendar_day`, `calendar_week`, `calendar_month`,
+`rolling_minutes`, `after_completion`, `rolling_month`, or `custom_rule`.
+The legacy `custom` placeholder is readable only inside old move envelopes and
+is never valid as newly admitted habit evidence. The planner occurrence ID and
+custom-rule ID must use UUID-v5 with the RFC 4122 variant. Identity JSON must
+equal the core's canonical typed serialization, including canonical base-10
+integers and RFC 3339 anchors; value-equivalent alternate wire spellings are
+not accepted. Every evidence envelope binds its nominal start to the recorded
+local date and canonical server-supported IANA timezone; calendar and
+custom-rule identities additionally bind their embedded period/date to the
+exclusive nominal interval. Rolling identity fields retain the core's exact
+shape and globally provable bounds; full policy-aware identity and UUID-v5
+proof happens when the core creates the published schedule.
+Calendar bucket ordinals and rolling-month indexes are limited to `0...65534`,
+custom-rule sequences to `0...9999`, rolling indexes to the unsigned 32-bit
+range, and rolling-month cycles to `0...2147483647`. Identity anchors must be
+RFC 3339 instants in years `0001...9999` with no precision beyond PostgreSQL's
+microseconds and offsets no larger than `±18:00`. The four evidence envelope
+instants use the same year and precision bounds. Evidence local dates remain
+inside the supported `1900...2200` habit horizon.
+
 Schedule publication writes this evidence in the same transaction as schedule blocks and the
 private result snapshot. Reusing a planner identity with different policy, identity, time window,
 duration, or target rejects the entire publication. An exact re-publication is a no-op for existing
@@ -79,10 +101,11 @@ Outcome constraints are:
 - `completed`: exactly 10000 basis points;
 - `skipped`: 0–9999 basis points and may retain partial quantity/time/note evidence.
 
-Quantity and unit are paired. Quantity is signed and bounded to ±1,000,000,000,000; unit is at
-most 200 safe characters and must match the scheduled target unit when one exists. Actual time is
-bounded to 31,622,400 seconds and notes to 10,000 safe characters. Corrections may increase,
-decrease, replace, or remove evidence subject to the status shape.
+Quantity and unit are paired. Quantity is signed and bounded to ±1,000,000,000,000; unit is
+non-blank, limited to 200 Unicode scalar values, excludes Unicode control (`Cc`) scalars, and must
+match the scheduled target unit when one exists. Actual time is bounded to 31,622,400 seconds and
+notes to 10,000 Unicode scalar values. Corrections may increase, decrease, replace, or remove
+evidence subject to the status shape.
 
 Pause creation uses `{operation_id, pause_id, expected_revision: 0, started_at}`. Resume uses
 `{operation_id, expected_revision, ended_at}` with a positive exact revision. A habit has at most

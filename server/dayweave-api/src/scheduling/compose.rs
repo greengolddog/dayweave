@@ -27,6 +27,7 @@ use time::format_description::well_known::Rfc3339;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::habits::valid_habit_recurrence_anchor;
 use crate::items::{
     BlockedReasonKind, DeadlineKind, DeadlineStrength, DurationKind, DurationSource, Item,
     ItemKind, ItemQuery, ItemService, ItemServiceError, ItemStatus, SplitPolicy,
@@ -1327,6 +1328,7 @@ fn compose_items_with_projection_for_schema(
                 .to_owned(),
         ));
     }
+    validate_habit_recurrence_anchor_inputs(&request, &source_items)?;
     let source_items = source_items.into_iter().map(into_canonical_item).collect();
     let prepared = prepare_canonical_schedule(source_items, request).map_err(map_prepare_error)?;
     compose_prepared_for_schema(
@@ -1337,6 +1339,31 @@ fn compose_items_with_projection_for_schema(
         habit_change_head,
         untrusted_assignments,
     )
+}
+
+fn validate_habit_recurrence_anchor_inputs(
+    request: &ComposeScheduleRequest,
+    source_items: &[Item],
+) -> Result<(), ComposeScheduleError> {
+    let habit_ids = source_items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Habit && item.recurrence.is_some())
+        .map(|item| ItemId(item.id))
+        .collect::<BTreeSet<_>>();
+    let anchors_are_portable = request
+        .recurrence_context
+        .rolling_anchors
+        .iter()
+        .chain(request.recurrence_context.completion_anchors.iter())
+        .filter(|(item_id, _)| habit_ids.contains(item_id))
+        .all(|(_, anchor)| valid_habit_recurrence_anchor(*anchor));
+    if !anchors_are_portable {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "habit recurrence anchors must use years 1 through 9999, PostgreSQL microsecond precision, and an offset no larger than 18 hours"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn compose_prepared_for_schema(
@@ -2053,6 +2080,62 @@ mod tests {
         assert!(matches!(
             result.expect("preflight result"),
             Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn habit_preview_rejects_nonportable_dates_without_narrowing_recurring_tasks() {
+        for (marker, year) in [(501, 1899), (503, 2201)] {
+            let mut recurring = canonical_item(Uuid::from_u128(marker));
+            recurring.timezone_name = "UTC".to_owned();
+            recurring.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+            clear_deadline(&mut recurring);
+            recurring.created_at = Utc.with_ymd_and_hms(year - 1, 8, 29, 8, 0, 0).unwrap();
+            recurring.updated_at = recurring.created_at;
+            let mut request = preview_request();
+            request.timezone_name = "UTC".to_owned();
+            request.as_of = Utc.with_ymd_and_hms(year, 9, 1, 7, 0, 0).unwrap();
+            request.horizon_start = Utc.with_ymd_and_hms(year, 9, 1, 0, 0, 0).unwrap();
+            request.horizon_end = Utc.with_ymd_and_hms(year, 9, 2, 0, 0, 0).unwrap();
+            request.availability[0].start = Utc.with_ymd_and_hms(year, 9, 1, 7, 0, 0).unwrap();
+            request.availability[0].end = Utc.with_ymd_and_hms(year, 9, 1, 16, 0, 0).unwrap();
+
+            let task_result = compose_items(vec![recurring.clone()], request.clone());
+            assert!(
+                task_result.is_ok(),
+                "non-habit scheduling retains the core date range in {year}: {task_result:?}"
+            );
+            recurring.kind = ItemKind::Habit;
+            assert!(
+                matches!(
+                    compose_items(vec![recurring], request),
+                    Err(ComposeScheduleError::InvalidRequest(_))
+                ),
+                "habit occurrence evidence must reject local year {year}"
+            );
+        }
+    }
+
+    #[test]
+    fn habit_anchor_admission_enforces_native_offset_bounds_only_for_habits() {
+        let item_id = Uuid::from_u128(502);
+        let mut recurring = canonical_item(item_id);
+        recurring.recurrence = Some(json!({"type":"every_interval","interval":60}));
+        clear_deadline(&mut recurring);
+        let mut request = preview_request();
+        request.recurrence_context.rolling_anchors.insert(
+            ItemId(item_id),
+            OffsetDateTime::parse("2026-09-01T00:00:00+18:01", &Rfc3339).unwrap(),
+        );
+
+        assert!(
+            compose_items(vec![recurring.clone()], request.clone()).is_ok(),
+            "non-habit recurrence identities are not persisted in the habit ledger"
+        );
+        recurring.kind = ItemKind::Habit;
+        assert!(matches!(
+            compose_items(vec![recurring], request),
+            Err(ComposeScheduleError::InvalidRequest(_))
         ));
     }
 

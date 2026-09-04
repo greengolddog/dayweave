@@ -1070,7 +1070,7 @@ struct HabitSyncStoreTests {
     nonisolated fileprivate static let now = date("2026-09-04T12:30:00.123456Z")
     nonisolated fileprivate static let habitID = UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!
     nonisolated fileprivate static let ledgerOccurrenceID = UUID(uuidString: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")!
-    nonisolated fileprivate static let plannerOccurrenceID = UUID(uuidString: "cccccccc-3333-4333-8333-cccccccccccc")!
+    nonisolated fileprivate static let plannerOccurrenceID = UUID(uuidString: "cccccccc-3333-5333-8333-cccccccccccc")!
 
     nonisolated fileprivate static func occurrence(
         note: String? = nil,
@@ -1113,16 +1113,23 @@ struct HabitSyncStoreTests {
             evidence: .init(
                 id: ledgerID,
                 habitID: occurrenceHabitID,
-                plannerOccurrenceID: plannerID,
+                plannerOccurrenceID: versionFiveUUID(plannerID),
                 sourceScheduleRevisionID: UUID(uuidString: "dddddddd-4444-4444-8444-dddddddddddd")!,
                 sourceItemRevision: sourceItemRevision,
                 policyFingerprint: "sha256:\(String(repeating: "a", count: 64))",
-                identity: .object([:]),
+                identity: .object([
+                    "type": .string("rolling_minutes"),
+                    "index": .number(JSONNumber(UInt64(0))),
+                    "anchor": .string("2026-09-04T12:00:00Z"),
+                ]),
                 nominalStart: nominalStart,
                 nominalEnd: nominalStart.addingTimeInterval(3_600),
                 windowStart: nominalStart.addingTimeInterval(-3_600),
                 windowEnd: nominalStart.addingTimeInterval(7_200),
-                localDate: DayWeaveLocalDate("2026-09-04")!,
+                localDate: DayWeaveLocalDate.containing(
+                    nominalStart,
+                    timezoneName: "Europe/Paris"
+                )!,
                 timezoneName: "Europe/Paris",
                 expectedDurationSeconds: 3_600,
                 expectedQuantity: 20,
@@ -1130,6 +1137,13 @@ struct HabitSyncStoreTests {
             ),
             outcome: outcome
         )
+    }
+
+    nonisolated private static func versionFiveUUID(_ value: UUID) -> UUID {
+        var bytes = value.uuid
+        bytes.6 = (bytes.6 & 0x0f) | 0x50
+        bytes.8 = (bytes.8 & 0x3f) | 0x80
+        return UUID(uuid: bytes)
     }
 
     nonisolated fileprivate static func pause(

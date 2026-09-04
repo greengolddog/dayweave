@@ -58,6 +58,28 @@ enum StoredReceipt {
     Pause(HabitPause),
 }
 
+impl StoredReceipt {
+    fn validate(&self) -> Result<(), HabitRepositoryError> {
+        if let Self::Occurrence(occurrence) = self {
+            occurrence
+                .evidence
+                .validate()
+                .map_err(|_| HabitRepositoryError::Internal)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_change(change: &HabitDeltaChange) -> Result<(), HabitRepositoryError> {
+    if let HabitDeltaChange::OccurrenceUpsert { occurrence } = change {
+        occurrence
+            .evidence
+            .validate()
+            .map_err(|_| HabitRepositoryError::Internal)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)] // Each mutation intentionally keeps its atomic audit/version/change transaction visible.
 impl HabitRepository for PostgresHabitRepository {
@@ -585,7 +607,7 @@ impl HabitRepository for PostgresHabitRepository {
         let fetch_limit =
             i64::try_from(limit.saturating_add(1)).map_err(|_| HabitRepositoryError::Internal)?;
         let rows = sqlx::query(AssertSqlSafe(format!(
-            "{OCCURRENCE_SELECT} WHERE evidence.workspace_id = $1 AND evidence.habit_id = $2 \
+            "SELECT {EVIDENCE_COLUMNS}{OCCURRENCE_OUTCOME_SELECT} WHERE evidence.workspace_id = $1 AND evidence.habit_id = $2 \
              AND evidence.local_date BETWEEN $3 AND $4 \
              AND ($5::date IS NULL OR (evidence.local_date, evidence.nominal_start, evidence.id) > ($5, $6, $7)) \
              ORDER BY evidence.local_date, evidence.nominal_start, evidence.id LIMIT $8"
@@ -668,8 +690,10 @@ impl HabitRepository for PostgresHabitRepository {
         for row in selected {
             watermark = from_i64(row.try_get("sequence").map_err(storage)?)?;
             let payload: Value = row.try_get("payload").map_err(storage)?;
-            changes
-                .push(serde_json::from_value(payload).map_err(|_| HabitRepositoryError::Internal)?);
+            let change =
+                serde_json::from_value(payload).map_err(|_| HabitRepositoryError::Internal)?;
+            validate_change(&change)?;
+            changes.push(change);
         }
         Ok(HabitDeltaPage {
             changes,
@@ -679,12 +703,14 @@ impl HabitRepository for PostgresHabitRepository {
     }
 }
 
-const OCCURRENCE_SELECT: &str = "SELECT evidence.id, evidence.habit_id, evidence.planner_occurrence_id, \
+const EVIDENCE_COLUMNS: &str = "evidence.id, evidence.habit_id, evidence.planner_occurrence_id, \
      evidence.source_schedule_revision_id, evidence.source_item_revision, \
      evidence.policy_fingerprint, evidence.recurrence_identity, evidence.nominal_start, \
      evidence.nominal_end, evidence.window_start, evidence.window_end, evidence.local_date, \
      evidence.timezone_name, evidence.expected_duration_seconds, evidence.expected_quantity, \
-     evidence.expected_unit, outcome.revision AS outcome_revision, outcome.status AS outcome_status, \
+     evidence.expected_unit";
+
+const OCCURRENCE_OUTCOME_SELECT: &str = ", outcome.revision AS outcome_revision, outcome.status AS outcome_status, \
      outcome.progress_basis_points, outcome.quantity, outcome.unit, outcome.actual_seconds, \
      outcome.note, outcome.occurred_at, outcome.updated_at \
      FROM habit_occurrence_evidence evidence LEFT JOIN habit_occurrence_outcomes outcome \
@@ -698,7 +724,7 @@ async fn occurrence_row_for_update(
     occurrence_id: Uuid,
 ) -> Result<Option<sqlx::postgres::PgRow>, HabitRepositoryError> {
     sqlx::query(AssertSqlSafe(format!(
-        "{OCCURRENCE_SELECT} WHERE evidence.workspace_id = $1 AND evidence.habit_id = $2 AND evidence.id = $3 FOR UPDATE OF evidence"
+        "SELECT {EVIDENCE_COLUMNS}{OCCURRENCE_OUTCOME_SELECT} WHERE evidence.workspace_id = $1 AND evidence.habit_id = $2 AND evidence.id = $3 FOR UPDATE OF evidence"
     )))
     .bind(workspace_id)
     .bind(habit_id)
@@ -711,34 +737,8 @@ async fn occurrence_row_for_update(
 fn occurrence_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<HabitOccurrence, HabitRepositoryError> {
-    let fingerprint: Vec<u8> = row.try_get("policy_fingerprint").map_err(storage)?;
-    if fingerprint.len() != 32 {
-        return Err(HabitRepositoryError::Internal);
-    }
-    let source_revision: i64 = row.try_get("source_item_revision").map_err(storage)?;
-    let expected_duration: Option<i64> =
-        row.try_get("expected_duration_seconds").map_err(storage)?;
+    let evidence = evidence_from_row(row)?;
     let outcome_revision: Option<i64> = row.try_get("outcome_revision").map_err(storage)?;
-    let evidence = HabitOccurrenceEvidence {
-        id: row.try_get("id").map_err(storage)?,
-        habit_id: row.try_get("habit_id").map_err(storage)?,
-        planner_occurrence_id: row.try_get("planner_occurrence_id").map_err(storage)?,
-        source_schedule_revision_id: row
-            .try_get("source_schedule_revision_id")
-            .map_err(storage)?,
-        source_item_revision: from_i64(source_revision)?,
-        policy_fingerprint: prefixed_hex(&fingerprint),
-        identity: row.try_get("recurrence_identity").map_err(storage)?,
-        nominal_start: row.try_get("nominal_start").map_err(storage)?,
-        nominal_end: row.try_get("nominal_end").map_err(storage)?,
-        window_start: row.try_get("window_start").map_err(storage)?,
-        window_end: row.try_get("window_end").map_err(storage)?,
-        local_date: row.try_get("local_date").map_err(storage)?,
-        timezone_name: row.try_get("timezone_name").map_err(storage)?,
-        expected_duration_seconds: expected_duration.map(from_i64).transpose()?,
-        expected_quantity: row.try_get("expected_quantity").map_err(storage)?,
-        expected_unit: row.try_get("expected_unit").map_err(storage)?,
-    };
     let outcome = outcome_revision
         .map(|revision| {
             let status: String = row.try_get("outcome_status").map_err(storage)?;
@@ -762,6 +762,42 @@ fn occurrence_from_row(
         })
         .transpose()?;
     Ok(HabitOccurrence { evidence, outcome })
+}
+
+fn evidence_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<HabitOccurrenceEvidence, HabitRepositoryError> {
+    let fingerprint: Vec<u8> = row.try_get("policy_fingerprint").map_err(storage)?;
+    if fingerprint.len() != 32 {
+        return Err(HabitRepositoryError::Internal);
+    }
+    let source_revision: i64 = row.try_get("source_item_revision").map_err(storage)?;
+    let expected_duration: Option<i64> =
+        row.try_get("expected_duration_seconds").map_err(storage)?;
+    let evidence = HabitOccurrenceEvidence {
+        id: row.try_get("id").map_err(storage)?,
+        habit_id: row.try_get("habit_id").map_err(storage)?,
+        planner_occurrence_id: row.try_get("planner_occurrence_id").map_err(storage)?,
+        source_schedule_revision_id: row
+            .try_get("source_schedule_revision_id")
+            .map_err(storage)?,
+        source_item_revision: from_i64(source_revision)?,
+        policy_fingerprint: prefixed_hex(&fingerprint),
+        identity: row.try_get("recurrence_identity").map_err(storage)?,
+        nominal_start: row.try_get("nominal_start").map_err(storage)?,
+        nominal_end: row.try_get("nominal_end").map_err(storage)?,
+        window_start: row.try_get("window_start").map_err(storage)?,
+        window_end: row.try_get("window_end").map_err(storage)?,
+        local_date: row.try_get("local_date").map_err(storage)?,
+        timezone_name: row.try_get("timezone_name").map_err(storage)?,
+        expected_duration_seconds: expected_duration.map(from_i64).transpose()?,
+        expected_quantity: row.try_get("expected_quantity").map_err(storage)?,
+        expected_unit: row.try_get("expected_unit").map_err(storage)?,
+    };
+    evidence
+        .validate()
+        .map_err(|_| HabitRepositoryError::Internal)?;
+    Ok(evidence)
 }
 
 fn pause_from_row(row: &sqlx::postgres::PgRow) -> Result<HabitPause, HabitRepositoryError> {
@@ -851,9 +887,9 @@ async fn replay_receipt(
         return Err(HabitRepositoryError::IdempotencyConflict);
     }
     let response: Value = row.try_get("response_json").map_err(storage)?;
-    serde_json::from_value(response)
-        .map(Some)
-        .map_err(|_| HabitRepositoryError::Internal)
+    let receipt = serde_json::from_value(response).map_err(|_| HabitRepositoryError::Internal)?;
+    StoredReceipt::validate(&receipt)?;
+    Ok(Some(receipt))
 }
 
 async fn insert_receipt(
@@ -863,6 +899,7 @@ async fn insert_receipt(
     response: &StoredReceipt,
     now: DateTime<Utc>,
 ) -> Result<(), HabitRepositoryError> {
+    response.validate()?;
     let response = serde_json::to_value(response).map_err(|_| HabitRepositoryError::Internal)?;
     sqlx::query(
         "INSERT INTO habit_operation_receipts (workspace_id, namespace, key_hash, operation_id, \
@@ -899,6 +936,7 @@ async fn insert_change(
     change: &HabitDeltaChange,
     changed_at: DateTime<Utc>,
 ) -> Result<u64, HabitRepositoryError> {
+    validate_change(change)?;
     let payload = serde_json::to_value(change).map_err(|_| HabitRepositoryError::Internal)?;
     let sequence: i64 = sqlx::query_scalar(
         "INSERT INTO habit_changes (workspace_id, change_kind, entity_id, entity_revision, payload, changed_at) \
@@ -991,6 +1029,12 @@ pub(crate) enum PublishedHabitEvidenceError {
     Unavailable,
 }
 
+fn authoritative_evidence_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<HabitOccurrenceEvidence, PublishedHabitEvidenceError> {
+    evidence_from_row(row).map_err(|_| PublishedHabitEvidenceError::Invalid)
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthoritativeHabitRecurrence {
     pub(crate) change_head: u64,
@@ -1018,9 +1062,8 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
     .await
     .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
     let change_head = u64::try_from(head).map_err(|_| PublishedHabitEvidenceError::Invalid)?;
-    let rows = sqlx::query(
-        "SELECT evidence.habit_id, evidence.planner_occurrence_id, \
-                evidence.expected_duration_seconds, outcome.status, outcome.progress_basis_points \
+    let rows = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {EVIDENCE_COLUMNS}, outcome.status, outcome.progress_basis_points \
          FROM habit_occurrence_evidence evidence JOIN habit_occurrence_outcomes outcome \
            ON outcome.workspace_id = evidence.workspace_id \
           AND outcome.occurrence_evidence_id = evidence.id \
@@ -1029,8 +1072,8 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
            AND outcome.status IN ('partial', 'completed', 'skipped') \
            AND ((evidence.window_start < $3 AND evidence.window_end > $2) \
                 OR evidence.planner_occurrence_id = ANY($4)) \
-         ORDER BY evidence.habit_id, evidence.planner_occurrence_id",
-    )
+         ORDER BY evidence.habit_id, evidence.planner_occurrence_id"
+    )))
     .bind(workspace_id)
     .bind(horizon_start)
     .bind(horizon_end)
@@ -1040,12 +1083,9 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
     .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
     let mut context = RecurrenceContext::default();
     for row in rows {
-        let habit_id: Uuid = row
-            .try_get("habit_id")
-            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
-        let occurrence_id: Uuid = row
-            .try_get("planner_occurrence_id")
-            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let evidence = authoritative_evidence_from_row(&row)?;
+        let habit_id = evidence.habit_id;
+        let occurrence_id = evidence.planner_occurrence_id;
         let status: String = row
             .try_get("status")
             .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
@@ -1063,12 +1103,8 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
                 // timed habit, use the exact immutable estimate admitted with
                 // this occurrence and let core derive the positive,
                 // ceiling-rounded remainder from normalized progress.
-                let expected_seconds: Option<i64> = row
-                    .try_get("expected_duration_seconds")
-                    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+                let expected_seconds = evidence.expected_duration_seconds;
                 if let Some(expected_seconds) = expected_seconds {
-                    let expected_seconds = u64::try_from(expected_seconds)
-                        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
                     let expected_minutes = expected_seconds
                         .checked_add(59)
                         .ok_or(PublishedHabitEvidenceError::Invalid)?
@@ -1108,29 +1144,27 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
             _ => return Err(PublishedHabitEvidenceError::Invalid),
         }
     }
-    let anchors = sqlx::query(
-        "SELECT DISTINCT ON (evidence.habit_id) evidence.habit_id, outcome.occurred_at \
+    let anchors = sqlx::query(AssertSqlSafe(format!(
+        "SELECT DISTINCT ON (evidence.habit_id) {EVIDENCE_COLUMNS}, outcome.occurred_at \
          FROM habit_occurrence_evidence evidence JOIN habit_occurrence_outcomes outcome \
            ON outcome.workspace_id = evidence.workspace_id \
           AND outcome.occurrence_evidence_id = evidence.id \
          JOIN items item ON item.workspace_id = evidence.workspace_id AND item.id = evidence.habit_id \
          WHERE evidence.workspace_id = $1 AND item.kind = 'habit' AND item.trashed_at IS NULL \
            AND outcome.status = 'completed' \
-         ORDER BY evidence.habit_id, outcome.occurred_at DESC, evidence.id DESC",
-    )
+         ORDER BY evidence.habit_id, outcome.occurred_at DESC, evidence.id DESC"
+    )))
     .bind(workspace_id)
     .fetch_all(&mut **tx)
     .await
     .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
     for row in anchors {
-        let habit_id: Uuid = row
-            .try_get("habit_id")
-            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let evidence = authoritative_evidence_from_row(&row)?;
         let occurred_at: DateTime<Utc> = row
             .try_get("occurred_at")
             .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
         context.completion_anchors.insert(
-            ItemId(habit_id),
+            ItemId(evidence.habit_id),
             chrono_to_offset(occurred_at).map_err(|_| PublishedHabitEvidenceError::Invalid)?,
         );
     }
@@ -1359,6 +1393,27 @@ async fn insert_published_occurrence(
         return Err(PublishedHabitEvidenceError::Invalid);
     }
     let evidence_id = Uuid::new_v4();
+    let evidence = HabitOccurrenceEvidence {
+        id: evidence_id,
+        habit_id: occurrence.series_item_id.0,
+        planner_occurrence_id: occurrence.id.0,
+        source_schedule_revision_id: schedule_revision_id,
+        source_item_revision: policy.source_revision,
+        policy_fingerprint: prefixed_hex(&policy.fingerprint),
+        identity: identity.clone(),
+        nominal_start,
+        nominal_end,
+        window_start,
+        window_end,
+        local_date,
+        timezone_name: policy.timezone_name.clone(),
+        expected_duration_seconds: policy.expected_duration_seconds,
+        expected_quantity: policy.expected_quantity,
+        expected_unit: policy.expected_unit.clone(),
+    };
+    evidence
+        .validate()
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
     let inserted = sqlx::query(
         "INSERT INTO habit_occurrence_evidence (id, workspace_id, habit_id, planner_occurrence_id, \
          source_schedule_revision_id, source_item_revision, policy_fingerprint, recurrence_identity, \
@@ -1390,24 +1445,6 @@ async fn insert_published_occurrence(
     .await
     .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
     if inserted.rows_affected() == 1 {
-        let evidence = HabitOccurrenceEvidence {
-            id: evidence_id,
-            habit_id: occurrence.series_item_id.0,
-            planner_occurrence_id: occurrence.id.0,
-            source_schedule_revision_id: schedule_revision_id,
-            source_item_revision: policy.source_revision,
-            policy_fingerprint: prefixed_hex(&policy.fingerprint),
-            identity,
-            nominal_start,
-            nominal_end,
-            window_start,
-            window_end,
-            local_date,
-            timezone_name: policy.timezone_name.clone(),
-            expected_duration_seconds: policy.expected_duration_seconds,
-            expected_quantity: policy.expected_quantity,
-            expected_unit: policy.expected_unit.clone(),
-        };
         let change = HabitDeltaChange::OccurrenceUpsert {
             occurrence: HabitOccurrence {
                 evidence,
@@ -1427,13 +1464,16 @@ async fn insert_published_occurrence(
         .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
         return Ok(());
     }
-    let matches: bool = sqlx::query_scalar(
-        "SELECT policy_fingerprint = $4 AND recurrence_identity = $5 AND nominal_start = $6 \
+    let existing = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {EVIDENCE_COLUMNS}, (policy_fingerprint = $4 \
+         AND recurrence_identity = $5 AND nominal_start = $6 \
          AND nominal_end = $7 AND window_start = $8 AND window_end = $9 AND local_date = $10 \
          AND timezone_name = $11 AND expected_duration_seconds IS NOT DISTINCT FROM $12 \
-         AND expected_quantity IS NOT DISTINCT FROM $13 AND expected_unit IS NOT DISTINCT FROM $14 \
-         FROM habit_occurrence_evidence WHERE workspace_id = $1 AND habit_id = $2 AND planner_occurrence_id = $3",
-    )
+         AND expected_quantity IS NOT DISTINCT FROM $13 \
+         AND expected_unit IS NOT DISTINCT FROM $14) AS content_matches \
+         FROM habit_occurrence_evidence evidence \
+         WHERE workspace_id = $1 AND habit_id = $2 AND planner_occurrence_id = $3"
+    )))
     .bind(workspace_id)
     .bind(occurrence.series_item_id.0)
     .bind(occurrence.id.0)
@@ -1445,12 +1485,25 @@ async fn insert_published_occurrence(
     .bind(window_end)
     .bind(local_date)
     .bind(&policy.timezone_name)
-    .bind(policy.expected_duration_seconds.map(i64::try_from).transpose().map_err(|_| PublishedHabitEvidenceError::Invalid)?)
+    .bind(
+        policy
+            .expected_duration_seconds
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| PublishedHabitEvidenceError::Invalid)?,
+    )
     .bind(policy.expected_quantity)
     .bind(&policy.expected_unit)
     .fetch_one(&mut **tx)
     .await
     .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    // A matching unique key may have been written by an older binary or a
+    // privileged operator. Equality alone cannot promote malformed stored
+    // evidence into trusted history, so hydrate the complete row first.
+    let _ = authoritative_evidence_from_row(&existing)?;
+    let matches: bool = existing
+        .try_get("content_matches")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
     if !matches {
         return Err(PublishedHabitEvidenceError::Conflict);
     }

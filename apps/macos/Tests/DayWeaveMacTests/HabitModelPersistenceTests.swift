@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 #if canImport(Testing)
 import Testing
@@ -105,6 +106,301 @@ struct HabitModelPersistenceTests {
         #expect(!DayWeaveHabitQuantityTotal(unit: oversizedUnit, amount: 1).hasValidShape)
         #expect(Self.occurrence(note: nil, unit: maximumUnit).evidence.hasValidShape)
         #expect(!Self.occurrence(note: nil, unit: oversizedUnit).evidence.hasValidShape)
+    }
+
+    @Test("authoritative recurrence identity accepts every exact core variant")
+    func recurrenceIdentityVariants() {
+        let identities: [JSONValue] = [
+            .object([
+                "type": .string("calendar_day"),
+                "date": .string("2026-09-04"),
+                "bucket_ordinal": .number(JSONNumber(UInt64(UInt16.max - 1))),
+            ]),
+            .object([
+                "type": .string("calendar_week"),
+                "week_key": .number(JSONNumber(integerLiteral: 2_461_288)),
+                "bucket_ordinal": .number(JSONNumber(UInt64(UInt16.max - 1))),
+            ]),
+            .object([
+                "type": .string("calendar_month"),
+                "year": .number(JSONNumber(integerLiteral: 2_026)),
+                "month": .number(JSONNumber(UInt64(9))),
+                "bucket_ordinal": .number(JSONNumber(UInt64(UInt16.max - 1))),
+            ]),
+            .object([
+                "type": .string("rolling_minutes"),
+                "index": .number(JSONNumber(UInt64(UInt32.max))),
+                "anchor": .string("2026-09-01T08:00:00.123456+02:00"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00.123456Z"),
+            ]),
+            .object([
+                "type": .string("rolling_month"),
+                "cycle": .number(JSONNumber(integerLiteral: Int64(Int32.max))),
+                "index": .number(JSONNumber(UInt64(UInt16.max - 1))),
+                "anchor": .string("2026-09-01T08:00:00+18:00"),
+            ]),
+            .object([
+                "type": .string("custom_rule"),
+                "rule_id": .string("123e4567-e89b-52d3-a456-426614174000"),
+                "sequence": .number(JSONNumber(UInt64(9_999))),
+                "date": .string("2026-09-04"),
+            ]),
+        ]
+
+        for identity in identities {
+            #expect(Self.evidence(identity: identity).hasValidShape)
+        }
+    }
+
+    @Test("malformed or context-free recurrence evidence fails closed")
+    func recurrenceIdentityAndContextRejection() {
+        let malformed: [JSONValue] = [
+            .object([:]),
+            .object(["type": .string("custom")]),
+            .object([
+                "type": .string("calendar_day"),
+                "date": .string("2026-09-04"),
+                "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+                "future": .bool(true),
+            ]),
+            .object([
+                "type": .string("calendar_month"),
+                "year": .number(JSONNumber(integerLiteral: 2_026)),
+                "month": .number(JSONNumber(UInt64(13))),
+                "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+            ]),
+            .object([
+                "type": .string("calendar_day"),
+                "date": .string("2026-09-04"),
+                "bucket_ordinal": .number(JSONNumber(UInt64(UInt16.max))),
+            ]),
+            .object([
+                "type": .string("rolling_minutes"),
+                "index": .number(JSONNumber(integerLiteral: -1)),
+                "anchor": .string("2026-09-01T08:00:00Z"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00.1234567Z"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00.123456000Z"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00.120Z"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00.000Z"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00+00:00"),
+            ]),
+            .object([
+                "type": .string("after_completion"),
+                "anchor": .string("2026-09-01T08:00:00-00:00"),
+            ]),
+            .object([
+                "type": .string("rolling_month"),
+                "cycle": .number(JSONNumber(integerLiteral: Int64(Int32.max) + 1)),
+                "index": .number(JSONNumber(UInt64(0))),
+                "anchor": .string("2026-09-01T08:00:00Z"),
+            ]),
+            .object([
+                "type": .string("rolling_month"),
+                "cycle": .number(JSONNumber(integerLiteral: 0)),
+                "index": .number(JSONNumber(UInt64(UInt16.max))),
+                "anchor": .string("2026-09-01T08:00:00Z"),
+            ]),
+            .object([
+                "type": .string("custom_rule"),
+                "rule_id": .string("123e4567-e89b-42d3-a456-426614174000"),
+                "sequence": .number(JSONNumber(UInt64(0))),
+                "date": .string("2026-09-04"),
+            ]),
+            .object([
+                "type": .string("custom_rule"),
+                "rule_id": .string("123e4567-e89b-52d3-2456-426614174000"),
+                "sequence": .number(JSONNumber(UInt64(0))),
+                "date": .string("2026-09-04"),
+            ]),
+            .object([
+                "type": .string("custom_rule"),
+                "rule_id": .string("123e4567-e89b-52d3-a456-426614174000"),
+                "sequence": .number(JSONNumber(UInt64(10_000))),
+                "date": .string("2026-09-04"),
+            ]),
+        ]
+        for identity in malformed {
+            #expect(!Self.evidence(identity: identity).hasValidShape)
+        }
+
+        let calendarDay = JSONValue.object([
+            "type": .string("calendar_day"),
+            "date": .string("2026-09-04"),
+            "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+        ])
+        let wrongWeek = JSONValue.object([
+            "type": .string("calendar_week"),
+            "week_key": .number(JSONNumber(integerLiteral: 2_461_200)),
+            "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+        ])
+        let wrongMonth = JSONValue.object([
+            "type": .string("calendar_month"),
+            "year": .number(JSONNumber(integerLiteral: 2_026)),
+            "month": .number(JSONNumber(UInt64(8))),
+            "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+        ])
+        let wrongCustomDate = JSONValue.object([
+            "type": .string("custom_rule"),
+            "rule_id": .string("123e4567-e89b-52d3-a456-426614174000"),
+            "sequence": .number(JSONNumber(UInt64(0))),
+            "date": .string("2026-09-03"),
+        ])
+        let rolling = JSONValue.object([
+            "type": .string("rolling_minutes"),
+            "index": .number(JSONNumber(UInt64(0))),
+            "anchor": .string("2026-09-01T08:00:00Z"),
+        ])
+
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            plannerOccurrenceID: UUID(uuidString: "cccccccc-3333-4333-8333-cccccccccccc")!
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            plannerOccurrenceID: UUID(uuidString: "cccccccc-3333-5333-0333-cccccccccccc")!
+        ).hasValidShape)
+        let plannerOccurrenceID = UUID(
+            uuidString: "cccccccc-3333-5333-8333-cccccccccccc"
+        )!
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            id: plannerOccurrenceID,
+            plannerOccurrenceID: plannerOccurrenceID
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            localDate: DayWeaveLocalDate("2026-09-03")!
+        ).hasValidShape)
+        #expect(!Self.evidence(identity: wrongWeek).hasValidShape)
+        #expect(!Self.evidence(identity: wrongMonth).hasValidShape)
+        #expect(!Self.evidence(identity: wrongCustomDate).hasValidShape)
+        #expect(!Self.evidence(identity: calendarDay, timezoneName: "Mars/Olympus").hasValidShape)
+        #expect(!Self.evidence(identity: calendarDay, timezoneName: "PST").hasValidShape)
+        #expect(!Self.evidence(identity: calendarDay, timezoneName: "GMT+2").hasValidShape)
+        #expect(!Self.evidence(identity: calendarDay, timezoneName: "GMT+01:00").hasValidShape)
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            timezoneName: "UTC\u{0}"
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            timezoneName: String(repeating: "A", count: 101)
+        ).hasValidShape)
+        #expect(Self.evidence(
+            identity: calendarDay,
+            expectedDurationSeconds: 31_622_400
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            expectedDurationSeconds: 31_622_401
+        ).hasValidShape)
+
+        let crossingStart = Self.date("2026-09-04T21:30:00.000000Z")
+        let crossingEnd = Self.date("2026-09-04T22:30:00.000000Z")
+        #expect(!Self.evidence(
+            identity: calendarDay,
+            nominalStart: crossingStart,
+            nominalEnd: crossingEnd
+        ).hasValidShape)
+        #expect(Self.evidence(
+            identity: rolling,
+            nominalStart: crossingStart,
+            nominalEnd: crossingEnd
+        ).hasValidShape)
+
+        let submicrosecond = Date(timeIntervalSince1970: 1_788_527_800.123_456_5)
+        #expect(!Self.evidence(identity: rolling, nominalStart: submicrosecond).hasValidShape)
+    }
+
+    @Test("all evidence instants stay within RFC 3339's four-digit year domain")
+    func recurrenceEvidenceDateYearBounds() {
+        let yearOne = Date(timeIntervalSince1970: -62_135_596_800)
+        let beforeYearOne = yearOne.addingTimeInterval(-1)
+        let yearTenThousand = Date(timeIntervalSince1970: 253_402_300_800)
+        let lastYear9999Second = yearTenThousand.addingTimeInterval(-1)
+        #expect(DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(yearOne))
+        #expect(DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(lastYear9999Second))
+        #expect(!DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(beforeYearOne))
+        #expect(!DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(yearTenThousand))
+
+        let rolling = JSONValue.object([
+            "type": .string("rolling_minutes"),
+            "index": .number(JSONNumber(UInt64(0))),
+            "anchor": .string("2026-09-01T08:00:00Z"),
+        ])
+        let ordinaryStart = Self.date("2026-09-04T12:00:00Z")
+        let ordinaryEnd = Self.date("2026-09-04T13:00:00Z")
+
+        #expect(!Self.evidence(
+            identity: rolling,
+            nominalStart: beforeYearOne,
+            nominalEnd: ordinaryEnd,
+            windowStart: beforeYearOne.addingTimeInterval(-3_600),
+            windowEnd: ordinaryEnd.addingTimeInterval(3_600)
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: rolling,
+            nominalStart: ordinaryStart,
+            nominalEnd: yearTenThousand,
+            windowStart: ordinaryStart.addingTimeInterval(-3_600),
+            windowEnd: yearTenThousand.addingTimeInterval(3_600)
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: rolling,
+            nominalStart: ordinaryStart,
+            nominalEnd: ordinaryEnd,
+            windowStart: beforeYearOne,
+            windowEnd: ordinaryEnd.addingTimeInterval(3_600)
+        ).hasValidShape)
+        #expect(!Self.evidence(
+            identity: rolling,
+            nominalStart: ordinaryStart,
+            nominalEnd: ordinaryEnd,
+            windowStart: ordinaryStart.addingTimeInterval(-3_600),
+            windowEnd: yearTenThousand
+        ).hasValidShape)
+    }
+
+    @Test("calendar evidence accepts 23-hour and 25-hour IANA local days")
+    func recurrenceEvidenceAcrossDSTTransitions() {
+        func calendarDay(_ value: String) -> JSONValue {
+            .object([
+                "type": .string("calendar_day"),
+                "date": .string(value),
+                "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+            ])
+        }
+
+        #expect(Self.evidence(
+            identity: calendarDay("2026-03-29"),
+            nominalStart: Self.date("2026-03-28T23:00:00.000000Z"),
+            nominalEnd: Self.date("2026-03-29T22:00:00.000000Z"),
+            localDate: DayWeaveLocalDate("2026-03-29")!
+        ).hasValidShape)
+        #expect(Self.evidence(
+            identity: calendarDay("2026-10-25"),
+            nominalStart: Self.date("2026-10-24T22:00:00.000000Z"),
+            nominalEnd: Self.date("2026-10-25T23:00:00.000000Z"),
+            localDate: DayWeaveLocalDate("2026-10-25")!
+        ).hasValidShape)
     }
 
     @Test("strict outcome decoding rejects unknown and omitted nullable keys")
@@ -250,6 +546,43 @@ struct HabitModelPersistenceTests {
         #expect(!String(decoding: raw, as: UTF8.self).contains("private reflection"))
         let permissions = try FileManager.default.attributesOfItem(atPath: context.fileURL.path)[.posixPermissions] as? NSNumber
         #expect(permissions?.intValue == 0o600)
+    }
+
+    @Test("authenticated snapshots reject non-canonical integer spellings")
+    func encryptedSnapshotRejectsIntegralFloatIdentity() throws {
+        let context = try Context()
+        defer { context.remove() }
+        let persistence = context.persistence()
+        let snapshot = Self.snapshot(binding: "origin-a|auth=device-a", note: nil)
+        _ = try persistence.save(snapshot, expectedRevision: .missing)
+
+        let canonicalPlaintext = try Self.encoder().encode(snapshot)
+        let canonicalText = try #require(String(data: canonicalPlaintext, encoding: .utf8))
+        let alteredText = canonicalText.replacingOccurrences(
+            of: "\"bucket_ordinal\":0",
+            with: "\"bucket_ordinal\":0.0"
+        )
+        #expect(alteredText != canonicalText)
+        let sealed = try AES.GCM.seal(
+            Data(alteredText.utf8),
+            using: SymmetricKey(data: Data(repeating: 7, count: 32)),
+            authenticating: Data("DayWeave.HabitSnapshot|1|AES.GCM.256".utf8)
+        )
+        let combined = try #require(sealed.combined)
+        let envelope = try JSONSerialization.data(
+            withJSONObject: [
+                "cipher": "AES.GCM.256",
+                "magic": "DAYWEAVE-ENCRYPTED-HABITS",
+                "payload": combined.base64EncodedString(),
+                "version": 1,
+            ],
+            options: [.sortedKeys]
+        )
+        try envelope.write(to: context.fileURL)
+
+        #expect(throws: HabitPersistenceError.invalidSnapshot) {
+            try persistence.loadRevisioned()
+        }
     }
 
     @Test("a different key cannot authenticate the private habit cache")
@@ -471,22 +804,12 @@ struct HabitModelPersistenceTests {
     ) -> DayWeaveHabitOccurrence {
         let occurredAt = date("2026-09-04T12:30:00.123456Z")
         return .init(
-            evidence: .init(
-                id: UUID(uuidString: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")!,
-                habitID: UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!,
-                plannerOccurrenceID: UUID(uuidString: "cccccccc-3333-4333-8333-cccccccccccc")!,
-                sourceScheduleRevisionID: UUID(uuidString: "dddddddd-4444-4444-8444-dddddddddddd")!,
-                sourceItemRevision: 3,
-                policyFingerprint: "sha256:\(String(repeating: "a", count: 64))",
-                identity: .object([:]),
-                nominalStart: date("2026-09-04T12:00:00.123456Z"),
-                nominalEnd: date("2026-09-04T13:00:00.123456Z"),
-                windowStart: date("2026-09-04T11:00:00.123456Z"),
-                windowEnd: date("2026-09-04T14:00:00.123456Z"),
-                localDate: DayWeaveLocalDate("2026-09-04")!,
-                timezoneName: "Europe/Paris",
-                expectedDurationSeconds: 3_600,
-                expectedQuantity: 20,
+            evidence: evidence(
+                identity: .object([
+                    "type": .string("calendar_day"),
+                    "date": .string("2026-09-04"),
+                    "bucket_ordinal": .number(JSONNumber(UInt64(0))),
+                ]),
                 expectedUnit: unit
             ),
             outcome: .init(
@@ -500,6 +823,44 @@ struct HabitModelPersistenceTests {
                 occurredAt: occurredAt,
                 updatedAt: date("2026-09-04T12:31:00.123456Z")
             )
+        )
+    }
+
+    private static func evidence(
+        identity: JSONValue,
+        id: UUID = UUID(uuidString: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")!,
+        plannerOccurrenceID: UUID = UUID(
+            uuidString: "cccccccc-3333-5333-8333-cccccccccccc"
+        )!,
+        nominalStart: Date = date("2026-09-04T12:00:00.123456Z"),
+        nominalEnd: Date? = nil,
+        windowStart: Date? = nil,
+        windowEnd: Date? = nil,
+        localDate: DayWeaveLocalDate = DayWeaveLocalDate("2026-09-04")!,
+        timezoneName: String = "Europe/Paris",
+        expectedUnit: String = "pages",
+        expectedDurationSeconds: UInt64 = 3_600
+    ) -> DayWeaveHabitOccurrenceEvidence {
+        let resolvedEnd = nominalEnd ?? nominalStart.addingTimeInterval(3_600)
+        return .init(
+            id: id,
+            habitID: UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!,
+            plannerOccurrenceID: plannerOccurrenceID,
+            sourceScheduleRevisionID: UUID(
+                uuidString: "dddddddd-4444-4444-8444-dddddddddddd"
+            )!,
+            sourceItemRevision: 3,
+            policyFingerprint: "sha256:\(String(repeating: "a", count: 64))",
+            identity: identity,
+            nominalStart: nominalStart,
+            nominalEnd: resolvedEnd,
+            windowStart: windowStart ?? nominalStart.addingTimeInterval(-3_600),
+            windowEnd: windowEnd ?? resolvedEnd.addingTimeInterval(3_600),
+            localDate: localDate,
+            timezoneName: timezoneName,
+            expectedDurationSeconds: expectedDurationSeconds,
+            expectedQuantity: 20,
+            expectedUnit: expectedUnit
         )
     }
 

@@ -11,7 +11,7 @@ struct HabitAPIClientTests {
     private static let token = "habit-api-test-token"
     private static let habitID = UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!
     private static let occurrenceID = UUID(uuidString: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")!
-    private static let plannerOccurrenceID = UUID(uuidString: "cccccccc-3333-4333-8333-cccccccccccc")!
+    private static let plannerOccurrenceID = UUID(uuidString: "cccccccc-3333-5333-8333-cccccccccccc")!
     private static let scheduleID = UUID(uuidString: "dddddddd-4444-4444-8444-dddddddddddd")!
 
     init() {
@@ -47,6 +47,71 @@ struct HabitAPIClientTests {
         ]))
         #expect(request.headers["Cache-Control"] == "no-store")
         #expect(request.headers["Authorization"] == "Bearer \(Self.token)")
+    }
+
+    @Test("authoritative occurrence identity and context fail closed at API ingestion")
+    func invalidOccurrenceEvidence() async {
+        let invalidEvidence = [
+            Self.evidence.replacingOccurrences(
+                of: "\"bucket_ordinal\":0",
+                with: "\"bucket_ordinal\":0.0"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: "\"bucket_ordinal\":0",
+                with: "\"bucket_ordinal\":0e0"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: "\"bucket_ordinal\":0",
+                with: "\"bucket_ordinal\":-0"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: "\"identity\":{\"type\":\"calendar_day\",\"date\":\"2026-09-04\",\"bucket_ordinal\":0}",
+                with: "\"identity\":{\"type\":\"custom\"}"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: Self.plannerOccurrenceID.uuidString.lowercased(),
+                with: "cccccccc-3333-4333-8333-cccccccccccc"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: Self.plannerOccurrenceID.uuidString.lowercased(),
+                with: "cccccccc-3333-5333-0333-cccccccccccc"
+            ),
+            Self.evidence.replacingOccurrences(
+                of: "\"local_date\":\"2026-09-04\"",
+                with: "\"local_date\":\"2026-09-03\""
+            ),
+        ]
+
+        for evidence in invalidEvidence {
+            URLProtocolStub.storage.enqueue(
+                key: Self.token,
+                Self.response(Data(
+                    "{\"occurrences\":[{\"evidence\":\(evidence),\"outcome\":null}],\"next_cursor\":null,\"has_more\":false}"
+                        .utf8
+                ))
+            )
+            await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+                try await makeClient().habitOccurrences(
+                    habitID: Self.habitID,
+                    startDate: DayWeaveLocalDate("2026-09-01")!,
+                    endDate: DayWeaveLocalDate("2026-09-07")!,
+                    cursor: nil,
+                    limit: 200
+                )
+            }
+        }
+    }
+
+    @Test("canonical integer scanning retains signed integers and rejects alternate spellings")
+    func canonicalIntegerScanning() {
+        #expect(StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(
+            in: Data(#"{"positive":12,"negative":-12,"zero":0}"#.utf8)
+        ))
+        for token in ["-0", "0.0", "1e0", "1E+0"] {
+            #expect(!StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(
+                in: Data("{\"value\":\(token)}".utf8)
+            ))
+        }
     }
 
     @Test("skipped outcomes preserve partial evidence and send one idempotency key")
@@ -323,7 +388,7 @@ struct HabitAPIClientTests {
     }
 
     private static let evidence = """
-    {"id":"\(occurrenceID.uuidString.lowercased())","habit_id":"\(habitID.uuidString.lowercased())","planner_occurrence_id":"\(plannerOccurrenceID.uuidString.lowercased())","source_schedule_revision_id":"\(scheduleID.uuidString.lowercased())","source_item_revision":3,"policy_fingerprint":"sha256:\(String(repeating: "a", count: 64))","identity":{},"nominal_start":"2026-09-04T12:00:00.000000Z","nominal_end":"2026-09-04T13:00:00.000000Z","window_start":"2026-09-04T11:00:00.000000Z","window_end":"2026-09-04T14:00:00.000000Z","local_date":"2026-09-04","timezone_name":"Europe/Paris","expected_duration_seconds":3600,"expected_quantity":20,"expected_unit":"pages"}
+    {"id":"\(occurrenceID.uuidString.lowercased())","habit_id":"\(habitID.uuidString.lowercased())","planner_occurrence_id":"\(plannerOccurrenceID.uuidString.lowercased())","source_schedule_revision_id":"\(scheduleID.uuidString.lowercased())","source_item_revision":3,"policy_fingerprint":"sha256:\(String(repeating: "a", count: 64))","identity":{"type":"calendar_day","date":"2026-09-04","bucket_ordinal":0},"nominal_start":"2026-09-04T12:00:00.000000Z","nominal_end":"2026-09-04T13:00:00.000000Z","window_start":"2026-09-04T11:00:00.000000Z","window_end":"2026-09-04T14:00:00.000000Z","local_date":"2026-09-04","timezone_name":"Europe/Paris","expected_duration_seconds":3600,"expected_quantity":20,"expected_unit":"pages"}
     """
 
     private static let skippedOutcome = """

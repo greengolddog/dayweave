@@ -9,12 +9,14 @@ import java.nio.charset.StandardCharsets
 import java.time.DateTimeException
 import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.Locale
 import java.util.UUID
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
 import com.greengolddog.dayweave.model.hasAtMostUnicodeScalars
+import com.greengolddog.dayweave.model.isRfc4122Version5
 import com.greengolddog.dayweave.model.matchesHabitEvidenceContext
+import com.greengolddog.dayweave.model.requireCanonicalTimezoneName
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -735,23 +737,23 @@ private fun RemoteHabitOccurrenceEvidence.requireValid(expectedHabitId: String) 
     habitId.requireCanonicalUuid()
     require(habitId == expectedHabitId)
     plannerOccurrenceId.requireCanonicalUuid()
-    require(UUID.fromString(plannerOccurrenceId).version() == 5)
+    require(UUID.fromString(plannerOccurrenceId).isRfc4122Version5())
+    require(id != plannerOccurrenceId)
     sourceScheduleRevisionId.requireCanonicalUuid()
     require(sourceItemRevision > 0)
     require(policyFingerprint.matches(Regex("sha256:[0-9a-f]{64}")))
     require(identity.size in 1..32)
-    val nominalStartInstant = requireInstant(nominalStart)
-    val nominalEndInstant = requireInstant(nominalEnd)
-    val windowStartInstant = requireInstant(windowStart)
-    val windowEndInstant = requireInstant(windowEnd)
+    val nominalStartInstant = requireEvidenceInstant(nominalStart)
+    val nominalEndInstant = requireEvidenceInstant(nominalEnd)
+    val windowStartInstant = requireEvidenceInstant(windowStart)
+    val windowEndInstant = requireEvidenceInstant(windowEnd)
     require(nominalStartInstant < nominalEndInstant)
     require(windowStartInstant < windowEndInstant)
     require(nominalStartInstant >= windowStartInstant && nominalEndInstant <= windowEndInstant)
     val occurrenceDate = LocalDate.parse(localDate)
     require(occurrenceDate.toString() == localDate)
-    require(timezoneName.length in 1..100 && timezoneName.none(Char::isISOControl))
-    val timezone = runCatching { ZoneId.of(timezoneName) }.getOrNull()
-    require(timezone != null)
+    require(occurrenceDate.year in MIN_HABIT_DATE_YEAR..MAX_HABIT_DATE_YEAR)
+    val timezone = requireCanonicalTimezoneName(timezoneName)
     require(
         identity.matchesHabitEvidenceContext(
             occurrenceDate,
@@ -932,6 +934,14 @@ private fun requireInstant(value: String): Instant {
     return parsed
 }
 
+private fun requireEvidenceInstant(value: String): Instant =
+    requireInstant(value).also { instant ->
+        require(
+            instant.atOffset(ZoneOffset.UTC).year in
+                MIN_HABIT_EVIDENCE_INSTANT_YEAR..MAX_HABIT_EVIDENCE_INSTANT_YEAR,
+        )
+    }
+
 private fun requireUnit(value: String) = requireText(value, 200, multiline = false)
 
 private fun requireSignedQuantity(value: Long, maximum: Long = MAX_QUANTITY) {
@@ -946,6 +956,8 @@ private fun requireText(value: String, maxChars: Int, multiline: Boolean) {
 private const val MAX_NOTE_CHARS = 10_000
 private const val MIN_HABIT_DATE_YEAR = 1900
 private const val MAX_HABIT_DATE_YEAR = 2200
+private const val MIN_HABIT_EVIDENCE_INSTANT_YEAR = 1
+private const val MAX_HABIT_EVIDENCE_INSTANT_YEAR = 9_999
 private const val MAX_HABIT_CURSOR_CHARS = 256
 private const val MAX_ERROR_MESSAGE_CHARS = 16_384
 private const val MAX_QUANTITY = 1_000_000_000_000L
@@ -957,7 +969,7 @@ private const val MAX_TREND_BUCKETS = 366
 private const val MAX_STREAK_DAYS = 366
 private const val MAX_QUANTITY_TOTALS = 200
 
-/** Detects duplicate object keys, including equivalent escaped spellings, before decoding. */
+/** Rejects duplicate keys and noncanonical number tokens before typed decoding. */
 private class StrictHabitJsonKeyScanner(
     private val source: String,
     private val json: Json,
@@ -1052,6 +1064,10 @@ private class StrictHabitJsonKeyScanner(
         val start = index
         while (index < source.length && source[index] !in PRIMITIVE_DELIMITERS) index += 1
         require(index > start)
+        val token = source.substring(start, index)
+        require(token in JSON_LITERAL_TOKENS || CANONICAL_JSON_INTEGER_PATTERN.matches(token)) {
+            "JSON numbers must use canonical base-10 integer syntax"
+        }
     }
 
     private fun skipWhitespace() {
@@ -1071,5 +1087,7 @@ private class StrictHabitJsonKeyScanner(
         const val MAX_DEPTH = 32
         val JSON_WHITESPACE = setOf(' ', '\t', '\r', '\n')
         val PRIMITIVE_DELIMITERS = JSON_WHITESPACE + setOf(',', ']', '}')
+        val JSON_LITERAL_TOKENS = setOf("false", "null", "true")
+        val CANONICAL_JSON_INTEGER_PATTERN = Regex("(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
     }
 }

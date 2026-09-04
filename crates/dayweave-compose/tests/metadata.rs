@@ -185,3 +185,56 @@ fn bounded_custom_rrules_are_authorable_but_unbounded_rules_are_not() {
             .contains("exactly one finite COUNT or UNTIL")
     );
 }
+
+#[test]
+fn canonical_frequency_anchors_use_the_portable_identity_range() {
+    let mut fields = FixtureFields {
+        item_id: Uuid::from_u128(901),
+        kind: CanonicalItemKind::Habit,
+        status: CanonicalItemStatus::Planned,
+        timezone_name: "Europe/Paris".to_owned(),
+        duration_seconds: Some(1_800),
+        deadline_at: None,
+        earliest_start_at: None,
+        recurrence: None,
+        flexible_constraints: serde_json::json!({}),
+        split_policy: CanonicalSplitPolicy::Indivisible,
+        parent_id: None,
+    };
+    let recurrence = |anchor: &str| {
+        serde_json::json!({
+            "type": "frequency",
+            "target": 1,
+            "period": "day",
+            "semantics": "rolling",
+            "weekdays": [],
+            "minimum_spacing": 0,
+            "anchor": anchor
+        })
+    };
+
+    for anchor in [
+        "0001-01-01T00:00:00Z",
+        "2026-09-04T08:00:00+18:00",
+        "9999-12-31T23:59:59.999999Z",
+    ] {
+        fields.recurrence = Some(recurrence(anchor));
+        validate_scheduling_metadata(fields.input())
+            .unwrap_or_else(|error| panic!("portable anchor {anchor} failed: {error}"));
+    }
+
+    for (anchor, expected) in [
+        ("0000-01-01T00:00:00Z", "must use canonical RFC 3339 syntax"),
+        (
+            "2026-09-04T08:00:00+18:01",
+            "must use canonical RFC 3339 syntax",
+        ),
+    ] {
+        fields.recurrence = Some(recurrence(anchor));
+        let error = validate_scheduling_metadata(fields.input()).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} for {anchor}, got {error}"
+        );
+    }
+}

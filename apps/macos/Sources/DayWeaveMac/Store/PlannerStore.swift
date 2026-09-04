@@ -2179,11 +2179,9 @@ final class PlannerStore: ObservableObject {
               let seriesItemID = focused.recurrenceSeriesItemID ?? focused.sourceItemID,
               let source = focused.recurrenceMoveSource,
               let seriesItem = canonicalItem(id: seriesItemID),
-              seriesItem.revision == source.itemRevision,
-              source.canAuthorizeOccurrenceMove,
+              source.canAuthorizeOccurrenceMove(for: seriesItem),
               let item = canonicalItem(id: itemID),
               item.revision == itemRevision,
-              seriesItem.recurrence != nil,
               canonicalItem(itemID, belongsToSeries: seriesItemID),
               canonicalAuthoringMutation(itemID: seriesItemID) == nil,
               canMutate(focused),
@@ -5718,7 +5716,9 @@ final class PlannerStore: ObservableObject {
                 (retainingItemIDs?.contains(move.itemID) ?? true)
                     && !terminalOccurrenceIDs.contains(move.occurrenceID)
                     && move.hasValidShape
-                    && canonicalItem(id: move.itemID)?.revision == move.source?.itemRevision
+                    && canonicalItem(id: move.itemID).map {
+                        move.source?.canAuthorizeOccurrenceMove(for: $0) == true
+                    } == true
                     && currentHorizonStart.map({ move.endAt > $0 }) ?? true
             }
             .sorted {

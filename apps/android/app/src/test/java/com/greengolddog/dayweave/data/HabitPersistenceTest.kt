@@ -176,6 +176,83 @@ class HabitPersistenceTest {
             }
         }
 
+    @Test
+    fun persistedHabitEvidenceDateHorizonIsInclusiveAndRejectsOutsideYears() {
+        val evidence = ledger().occurrences.values.single().evidence
+
+        listOf(1900, 2200).forEach { year -> evidence.withLocalYear(year).requireValid() }
+        listOf(1899, 2201).forEach { year ->
+            assertThrows(IllegalArgumentException::class.java) {
+                evidence.withLocalYear(year).requireValid()
+            }
+        }
+    }
+
+    @Test
+    fun persistedHabitEvidenceRejectsLedgerIdEqualToPlannerOccurrenceId() {
+        val evidence = ledger().occurrences.values.single().evidence
+
+        assertThrows(IllegalArgumentException::class.java) {
+            evidence.copy(id = evidence.plannerOccurrenceId).requireValid()
+        }
+    }
+
+    @Test
+    fun persistedHabitEvidenceRequiresRfcUuidVariantBoundedInstantsAndIanaTimezone() {
+        val evidence = ledger().occurrences.values.single().evidence
+
+        assertThrows(IllegalArgumentException::class.java) {
+            evidence.copy(plannerOccurrenceId = NON_RFC_VARIANT_PLANNER_OCCURRENCE_ID)
+                .requireValid()
+        }
+
+        evidence.copy(
+            windowStart = "0001-01-01T00:00:00Z",
+            windowEnd = "9999-12-31T23:59:59.999999Z",
+        ).requireValid()
+
+        listOf(
+            evidence.copy(windowStart = "0000-01-01T00:00:00Z"),
+            evidence.copy(windowEnd = "+10000-01-01T00:00:00Z"),
+            evidence.copy(timezoneName = "+02:00"),
+            evidence.copy(timezoneName = "SystemV/EST5"),
+        ).forEach { invalidEvidence ->
+            assertThrows(IllegalArgumentException::class.java) {
+                invalidEvidence.requireValid()
+            }
+        }
+    }
+
+    @Test
+    fun persistedHabitIdentityRejectsNoncanonicalNumbersAndAnchors() {
+        val evidence = ledger().occurrences.values.single().evidence
+        val invalidIdentities = listOf(
+            """{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":-0}""",
+            """{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":0.0}""",
+            """{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":0e0}""",
+            """{"type":"after_completion","anchor":"2026-09-01T07:00:00.123400Z"}""",
+            """{"type":"after_completion","anchor":"2026-09-01T07:00:00+00:00"}""",
+            """{"type":"after_completion","anchor":"2026-09-01T07:00:00-00:00"}""",
+        ).map { raw -> Json.parseToJsonElement(raw).jsonObject }
+
+        invalidIdentities.forEach { identity ->
+            assertThrows(IllegalArgumentException::class.java) {
+                evidence.copy(identity = identity).requireValid()
+            }
+        }
+    }
+
+    private fun HabitOccurrenceEvidenceSnapshot.withLocalYear(
+        year: Int,
+    ): HabitOccurrenceEvidenceSnapshot = copy(
+        identity = JsonObject(identity + ("date" to JsonPrimitive("$year-09-01"))),
+        nominalStart = nominalStart.replace("2026", year.toString()),
+        nominalEnd = nominalEnd.replace("2026", year.toString()),
+        windowStart = windowStart.replace("2026", year.toString()),
+        windowEnd = windowEnd.replace("2026", year.toString()),
+        localDate = "$year-09-01",
+    )
+
     private fun ledger(): HabitLedgerSnapshot {
         val occurrence = HabitOccurrenceSnapshot(
             evidence = HabitOccurrenceEvidenceSnapshot(
@@ -255,6 +332,8 @@ class HabitPersistenceTest {
         const val HABIT_ID = "11111111-1111-4111-8111-111111111111"
         const val OCCURRENCE_ID = "22222222-2222-4222-8222-222222222222"
         const val PLANNER_OCCURRENCE_ID = "33333333-3333-5333-8333-333333333333"
+        const val NON_RFC_VARIANT_PLANNER_OCCURRENCE_ID =
+            "33333333-3333-5333-0333-333333333333"
         const val SCHEDULE_REVISION_ID = "44444444-4444-4444-8444-444444444444"
         const val OPERATION_ID = "55555555-5555-4555-8555-555555555555"
         const val DIFFERENT_OPERATION_ID = "66666666-6666-4666-8666-666666666666"

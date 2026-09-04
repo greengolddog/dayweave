@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Timelike as _, Utc
 use dayweave_api::{
     AppState,
     auth::StaticTokenAuthenticator,
-    habits::{HabitOccurrenceEvidence, InMemoryHabitRepository},
+    habits::{HabitOccurrenceEvidence, HabitRepositoryError, InMemoryHabitRepository},
     http::router,
     items::{InMemoryItemRepository, ItemService},
     proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock},
@@ -136,7 +136,6 @@ async fn habit_api_is_authoritative_retryable_revisioned_private_and_analytics_s
     let (app, repository) = test_app();
     let habit_id = Uuid::new_v4();
     let evidence_id = Uuid::new_v4();
-    let planner_occurrence_id = Uuid::new_v4();
     let create = app
         .clone()
         .oneshot(request(
@@ -155,6 +154,7 @@ async fn habit_api_is_authoritative_retryable_revisioned_private_and_analytics_s
     );
 
     let local_date = Utc::now().date_naive();
+    let planner_occurrence_id = Uuid::new_v5(&habit_id, format!("daily:{local_date}:0").as_bytes());
     let nominal_start = local_date.and_hms_opt(8, 0, 0).expect("time").and_utc();
     repository
         .insert_authoritative_occurrence(HabitOccurrenceEvidence {
@@ -164,7 +164,11 @@ async fn habit_api_is_authoritative_retryable_revisioned_private_and_analytics_s
             source_schedule_revision_id: Uuid::new_v4(),
             source_item_revision: 1,
             policy_fingerprint: format!("sha256:{}", "a".repeat(64)),
-            identity: json!({"type":"daily","date":local_date,"ordinal":0}),
+            identity: json!({
+                "type": "calendar_day",
+                "date": local_date,
+                "bucket_ordinal": 0
+            }),
             nominal_start,
             nominal_end: nominal_start + ChronoDuration::minutes(30),
             window_start: nominal_start - ChronoDuration::hours(1),
@@ -584,14 +588,16 @@ async fn habit_pause_is_single_open_revisioned_and_validated() {
 #[test]
 fn evidence_identity_contract_is_distinct_and_strict() {
     let local_date = NaiveDate::from_ymd_opt(2026, 10, 25).expect("DST date");
+    let habit_id = Uuid::new_v4();
+    let planner_occurrence_id = Uuid::new_v5(&habit_id, format!("daily:{local_date}:0").as_bytes());
     let value = json!({
         "id": Uuid::new_v4(),
-        "habit_id": Uuid::new_v4(),
-        "planner_occurrence_id": Uuid::new_v4(),
+        "habit_id": habit_id,
+        "planner_occurrence_id": planner_occurrence_id,
         "source_schedule_revision_id": Uuid::new_v4(),
         "source_item_revision": 7,
         "policy_fingerprint": format!("sha256:{}", "0".repeat(64)),
-        "identity": {"type":"daily","date":local_date,"ordinal":0},
+        "identity": {"type":"calendar_day","date":local_date,"bucket_ordinal":0},
         "nominal_start": "2026-10-25T07:00:00Z",
         "nominal_end": "2026-10-25T07:30:00Z",
         "window_start": "2026-10-25T06:00:00Z",
@@ -604,7 +610,94 @@ fn evidence_identity_contract_is_distinct_and_strict() {
     });
     let parsed: HabitOccurrenceEvidence = serde_json::from_value(value.clone()).expect("evidence");
     assert_ne!(parsed.id, parsed.planner_occurrence_id);
+    parsed.validate().expect("valid recurrence evidence");
     let mut unknown = value;
     unknown["invented"] = json!(true);
     assert!(serde_json::from_value::<HabitOccurrenceEvidence>(unknown).is_err());
+}
+
+#[tokio::test]
+async fn authoritative_insertion_rejects_malformed_and_legacy_recurrence_evidence() {
+    let repository = InMemoryHabitRepository::default();
+    let local_date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("date");
+    let nominal_start = local_date.and_hms_opt(8, 0, 0).expect("time").and_utc();
+    let habit_id = Uuid::new_v4();
+    let planner_occurrence_id = Uuid::new_v5(&habit_id, format!("daily:{local_date}:0").as_bytes());
+    let valid = HabitOccurrenceEvidence {
+        id: Uuid::new_v4(),
+        habit_id,
+        planner_occurrence_id,
+        source_schedule_revision_id: Uuid::new_v4(),
+        source_item_revision: 1,
+        policy_fingerprint: format!("sha256:{}", "a".repeat(64)),
+        identity: json!({
+            "type": "calendar_day",
+            "date": local_date,
+            "bucket_ordinal": 0
+        }),
+        nominal_start,
+        nominal_end: nominal_start + ChronoDuration::minutes(30),
+        window_start: nominal_start - ChronoDuration::hours(1),
+        window_end: nominal_start + ChronoDuration::hours(1),
+        local_date,
+        timezone_name: "Europe/Paris".to_owned(),
+        expected_duration_seconds: Some(1_800),
+        expected_quantity: Some(20),
+        expected_unit: Some("pages".to_owned()),
+    };
+    valid.validate().expect("valid control evidence");
+
+    let mut malformed = valid.clone();
+    malformed.id = Uuid::new_v4();
+    malformed.identity = json!({"type":"calendar_day","date":local_date});
+    assert!(matches!(
+        repository.insert_authoritative_occurrence(malformed).await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let mut legacy_daily = valid.clone();
+    legacy_daily.id = Uuid::new_v4();
+    legacy_daily.identity = json!({"type":"daily","date":local_date,"ordinal":0});
+    assert!(matches!(
+        repository
+            .insert_authoritative_occurrence(legacy_daily)
+            .await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let mut legacy_custom = valid.clone();
+    legacy_custom.id = Uuid::new_v4();
+    legacy_custom.identity = json!({"type":"custom"});
+    assert!(matches!(
+        repository
+            .insert_authoritative_occurrence(legacy_custom)
+            .await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let mut noncanonical_custom_rule = valid.clone();
+    noncanonical_custom_rule.id = Uuid::new_v4();
+    let rule_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"habit-api-custom-rule");
+    noncanonical_custom_rule.identity = json!({
+        "type": "custom_rule",
+        "rule_id": rule_id.to_string().to_uppercase(),
+        "sequence": 0,
+        "date": local_date
+    });
+    assert!(matches!(
+        repository
+            .insert_authoritative_occurrence(noncanonical_custom_rule)
+            .await,
+        Err(HabitRepositoryError::Internal)
+    ));
+
+    let mut non_deterministic_id = valid;
+    non_deterministic_id.id = Uuid::new_v4();
+    non_deterministic_id.planner_occurrence_id = Uuid::new_v4();
+    assert!(matches!(
+        repository
+            .insert_authoritative_occurrence(non_deterministic_id)
+            .await,
+        Err(HabitRepositoryError::Internal)
+    ));
 }

@@ -1491,7 +1491,7 @@ class PlannerStoreTest {
     fun malformedOrCustomRestoredIdentityCannotAuthorizeARecurrenceMove() {
         val occurrenceId = "66666666-6666-5666-8666-666666666666"
         val item = canonicalItem("planned", 7).copy(
-            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+            recurrenceJson = "{\"type\":\"custom\",\"rrule\":\"FREQ=DAILY;COUNT=10\"}",
         )
         val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
         val validSource = occurrenceSource()

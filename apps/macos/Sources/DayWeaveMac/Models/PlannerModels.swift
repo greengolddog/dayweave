@@ -1,6 +1,11 @@
 import Foundation
 import SwiftUI
 
+func dayWeaveIsRFC4122VersionFiveUUID(_ value: UUID) -> Bool {
+    let bytes = value.uuid
+    return (bytes.6 >> 4) == 5 && (bytes.8 & 0xC0) == 0x80
+}
+
 enum PlannerTimeZone {
     private static let utc = TimeZone(secondsFromGMT: 0)!
 
@@ -334,12 +339,14 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
     case rollingMinutes(index: Int64, anchor: String)
     case afterCompletion(anchor: String)
     case rollingMonth(cycle: Int64, index: UInt16, anchor: String)
+    case customRule(ruleID: String, sequence: UInt32, date: String)
     case custom
 
     private enum CodingKeys: String, CodingKey {
-        case type, date, year, month, index, anchor, cycle
+        case type, date, year, month, index, anchor, cycle, sequence
         case bucketOrdinal = "bucket_ordinal"
         case weekKey = "week_key"
+        case ruleID = "rule_id"
     }
 
     private enum Kind: String {
@@ -349,6 +356,7 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
         case rollingMinutes = "rolling_minutes"
         case afterCompletion = "after_completion"
         case rollingMonth = "rolling_month"
+        case customRule = "custom_rule"
         case custom
     }
 
@@ -434,6 +442,17 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
                 index: try container.decode(UInt16.self, forKey: .index),
                 anchor: try container.decode(String.self, forKey: .anchor)
             )
+        case .customRule:
+            try Self.requireExactKeys(
+                keys,
+                ["type", "rule_id", "sequence", "date"],
+                decoder: decoder
+            )
+            decoded = .customRule(
+                ruleID: try container.decode(String.self, forKey: .ruleID),
+                sequence: try container.decode(UInt32.self, forKey: .sequence),
+                date: try container.decode(String.self, forKey: .date)
+            )
         case .custom:
             try Self.requireExactKeys(keys, ["type"], decoder: decoder)
             decoded = .custom
@@ -477,6 +496,11 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
             try container.encode(cycle, forKey: .cycle)
             try container.encode(index, forKey: .index)
             try container.encode(anchor, forKey: .anchor)
+        case let .customRule(ruleID, sequence, date):
+            try container.encode(Kind.customRule.rawValue, forKey: .type)
+            try container.encode(ruleID, forKey: .ruleID)
+            try container.encode(sequence, forKey: .sequence)
+            try container.encode(date, forKey: .date)
         case .custom:
             try container.encode(Kind.custom.rawValue, forKey: .type)
         }
@@ -484,26 +508,121 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
 
     var hasValidShape: Bool {
         switch self {
-        case let .calendarDay(date, _):
-            RecurrenceMoveSource.isValidLocalDate(date)
-        case .calendarWeek:
-            true
-        case let .calendarMonth(year, month, _):
-            (1...9_999).contains(year) && (1...12).contains(month)
+        case let .calendarDay(date, bucketOrdinal):
+            return RecurrenceMoveSource.isValidLocalDate(date)
+                && bucketOrdinal <= Self.maximumBucketOrdinal
+        case let .calendarWeek(_, bucketOrdinal):
+            return bucketOrdinal <= Self.maximumBucketOrdinal
+        case let .calendarMonth(year, month, bucketOrdinal):
+            return (1...9_999).contains(year)
+                && (1...12).contains(month)
+                && bucketOrdinal <= Self.maximumBucketOrdinal
         case let .rollingMinutes(index, anchor):
-            index >= 0
+            return index >= 0
                 && UInt32(exactly: index) != nil
                 && anchor.utf8.count <= 64
-                && RecurrenceMoveSource.parseRFC3339(anchor) != nil
+                && CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(anchor)
         case let .afterCompletion(anchor):
-            anchor.utf8.count <= 64 && RecurrenceMoveSource.parseRFC3339(anchor) != nil
-        case let .rollingMonth(cycle, _, anchor):
-            cycle >= 0
+            return anchor.utf8.count <= 64
+                && CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(anchor)
+        case let .rollingMonth(cycle, index, anchor):
+            return cycle >= 0
                 && cycle <= Int64(Int32.max)
+                && index <= Self.maximumBucketOrdinal
                 && anchor.utf8.count <= 64
-                && RecurrenceMoveSource.parseRFC3339(anchor) != nil
+                && CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(anchor)
+        case let .customRule(ruleID, sequence, date):
+            guard let parsedRuleID = UUID(uuidString: ruleID) else { return false }
+            return parsedRuleID.uuidString.lowercased() == ruleID
+                && dayWeaveIsRFC4122VersionFiveUUID(parsedRuleID)
+                && sequence <= Self.maximumCustomRuleSequence
+                && RecurrenceMoveSource.isValidLocalDate(date)
         case .custom:
-            true
+            return true
+        }
+    }
+
+    /// Whether this identity family can have been generated by the retained
+    /// canonical series recurrence. Legacy `custom` remains compatible for
+    /// display, but `RecurrenceMoveSource` keeps it non-authorizing.
+    func isCompatible(with recurrence: JSONValue?) -> Bool {
+        guard hasValidShape,
+              case let .object(object)? = recurrence,
+              case let .string(type)? = object["type"] else { return false }
+        if type != "custom", recurrence?.supportsCanonicalAuthoringRecurrence != true {
+            return false
+        }
+
+        func count(_ key: String, default defaultValue: UInt32) -> UInt32? {
+            guard let value = object[key] else { return defaultValue }
+            guard case let .number(number) = value else { return nil }
+            return number.exactUInt32
+        }
+
+        switch type {
+        case "daily":
+            guard case let .calendarDay(_, bucketOrdinal) = self,
+                  let limit = count("times_per_day", default: 1) else { return false }
+            return UInt32(bucketOrdinal) < limit
+        case "weekly":
+            guard case let .calendarWeek(_, bucketOrdinal) = self else { return false }
+            let defaultCount: UInt32
+            if case let .array(weekdays)? = object["weekdays"] {
+                defaultCount = UInt32(max(weekdays.count, 1))
+            } else {
+                defaultCount = 1
+            }
+            guard let limit = count("times_per_week", default: defaultCount) else {
+                return false
+            }
+            return UInt32(bucketOrdinal) < limit
+        case "monthly":
+            guard case let .calendarMonth(_, _, bucketOrdinal) = self,
+                  let limit = count("times_per_month", default: 1) else { return false }
+            return UInt32(bucketOrdinal) < limit
+        case "every_interval":
+            guard case let .rollingMinutes(index, _) = self else { return false }
+            return Int32(exactly: index) != nil
+        case "after_completion":
+            if case .afterCompletion = self { return true }
+            return false
+        case "frequency":
+            guard case let .string(period)? = object["period"],
+                  case let .string(semantics)? = object["semantics"],
+                  let target = count("target", default: 0) else { return false }
+            switch (semantics, period) {
+            case ("calendar", "day"):
+                guard case let .calendarDay(_, bucketOrdinal) = self else { return false }
+                return UInt32(bucketOrdinal) < target
+            case ("calendar", "week"):
+                guard case let .calendarWeek(_, bucketOrdinal) = self else { return false }
+                return UInt32(bucketOrdinal) < target
+            case ("calendar", "month"):
+                guard case let .calendarMonth(_, _, bucketOrdinal) = self else { return false }
+                return UInt32(bucketOrdinal) < target
+            case ("rolling", "day"), ("rolling", "week"):
+                if case .rollingMinutes = self { return true }
+                return false
+            case ("rolling", "month"):
+                guard case let .rollingMonth(_, index, _) = self else { return false }
+                return UInt32(index) < target
+            default:
+                return false
+            }
+        case "custom":
+            guard Set(object.keys) == ["type", "rrule"],
+                  case let .string(rrule)? = object["rrule"],
+                  !rrule.isEmpty,
+                  rrule.utf8.count <= 1_024,
+                  rrule.utf8.allSatisfy({ (33...126).contains($0) }) else { return false }
+            switch self {
+            case .customRule, .custom:
+                return true
+            default:
+                return false
+            }
+        default:
+            return false
         }
     }
 
@@ -519,12 +638,14 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
             0
         case let .rollingMonth(_, index, _):
             UInt32(index)
+        case let .customRule(_, sequence, _):
+            sequence
         }
     }
 
     var expectsLocalDate: Bool {
         switch self {
-        case .calendarDay, .calendarWeek, .calendarMonth:
+        case .calendarDay, .calendarWeek, .calendarMonth, .customRule:
             true
         case .rollingMinutes, .afterCompletion, .rollingMonth, .custom:
             false
@@ -570,6 +691,13 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
                 "index": .number(.init(UInt64(index))),
                 "anchor": .string(anchor),
             ])
+        case let .customRule(ruleID, sequence, date):
+            .object([
+                "type": .string(Kind.customRule.rawValue),
+                "rule_id": .string(ruleID),
+                "sequence": .number(.init(UInt64(sequence))),
+                "date": .string(date),
+            ])
         case .custom:
             .object(["type": .string(Kind.custom.rawValue)])
         }
@@ -589,6 +717,9 @@ enum RecurrenceOccurrenceIdentity: Hashable, Codable, Sendable {
             )
         }
     }
+
+    private static let maximumBucketOrdinal = UInt16.max - 1
+    private static let maximumCustomRuleSequence: UInt32 = 9_999
 }
 
 private struct RecurrenceIdentityCodingKey: CodingKey {
@@ -621,23 +752,37 @@ struct RecurrenceMoveSource: Hashable, Codable, Sendable {
               identity.stableOrdinal == ordinal,
               nominalStart.utf8.count <= 64,
               nominalEnd.utf8.count <= 64,
-              let start = Self.parseRFC3339(nominalStart),
-              let end = Self.parseRFC3339(nominalEnd),
+              CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(nominalStart),
+              CanonicalRFC3339Instant.hasCanonicalTimeRFC3339Spelling(nominalEnd),
+              let start = CanonicalRFC3339Instant(nominalStart),
+              let end = CanonicalRFC3339Instant(nominalEnd),
               start < end else { return false }
         guard identity.expectsLocalDate else { return localDate == nil }
         guard let localDate else { return false }
-        if case let .calendarDay(date, _) = identity, localDate != date {
-            return false
+        switch identity {
+        case let .calendarDay(date, _):
+            guard localDate == date else { return false }
+        case let .customRule(_, _, date):
+            guard localDate == date,
+                  Self.localDateImmediatelyBefore(nominalEnd) == date else { return false }
+        default:
+            break
         }
         return Self.isValidLocalDate(localDate) && nominalStart.hasPrefix(localDate + "T")
     }
 
-    /// Custom RFC 5545 occurrences currently share a placeholder identity, so
-    /// it is safe to display them but not to authorize a per-instance move.
+    /// Legacy custom occurrences lack a generated rule identity, so they are
+    /// safe to display but cannot authorize a per-instance move.
     var canAuthorizeOccurrenceMove: Bool {
         guard hasValidShape else { return false }
         if case .custom = identity { return false }
         return true
+    }
+
+    func canAuthorizeOccurrenceMove(for item: DayWeaveCanonicalItem) -> Bool {
+        canAuthorizeOccurrenceMove
+            && itemRevision == item.revision
+            && identity.isCompatible(with: item.recurrence)
     }
 
     static func parseRFC3339(_ value: String) -> Date? {
@@ -685,6 +830,55 @@ struct RecurrenceMoveSource: Hashable, Codable, Sendable {
         let whole = ISO8601DateFormatter()
         whole.formatOptions = [.withInternetDateTime]
         return whole.date(from: value)
+    }
+
+    private static func localDateImmediatelyBefore(_ value: String) -> String? {
+        guard CanonicalRFC3339Instant(value) != nil else { return nil }
+        let bytes = Array(value.utf8)
+        guard let year = decimal(bytes, 0..<4),
+              let month = decimal(bytes, 5..<7),
+              let day = decimal(bytes, 8..<10),
+              let hour = decimal(bytes, 11..<13),
+              let minute = decimal(bytes, 14..<16),
+              let second = decimal(bytes, 17..<19) else { return nil }
+        var cursor = 19
+        var hasNonzeroFraction = false
+        if cursor < bytes.count, bytes[cursor] == 46 {
+            cursor += 1
+            while cursor < bytes.count, (48...57).contains(bytes[cursor]) {
+                hasNonzeroFraction = hasNonzeroFraction || bytes[cursor] != 48
+                cursor += 1
+            }
+        }
+        if hour != 0 || minute != 0 || second != 0 || hasNonzeroFraction {
+            return String(format: "%04d-%02d-%02d", year, month, day)
+        }
+        if day > 1 {
+            return String(format: "%04d-%02d-%02d", year, month, day - 1)
+        }
+        if month > 1 {
+            let priorMonth = month - 1
+            return String(
+                format: "%04d-%02d-%02d",
+                year,
+                priorMonth,
+                daysInMonth(priorMonth, year: year)
+            )
+        }
+        guard year > 1 else { return nil }
+        return String(format: "%04d-12-31", year - 1)
+    }
+
+    private static func daysInMonth(_ month: Int, year: Int) -> Int {
+        switch month {
+        case 2:
+            return (year.isMultiple(of: 400)
+                || (year.isMultiple(of: 4) && !year.isMultiple(of: 100))) ? 29 : 28
+        case 4, 6, 9, 11:
+            return 30
+        default:
+            return 31
+        }
     }
 
     private static func decimal(_ bytes: [UInt8], _ range: Range<Int>) -> Int? {
@@ -964,7 +1158,7 @@ struct RecurrenceOccurrenceMove: Hashable, Codable, Sendable {
         let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         return itemID != nilID
             && occurrenceID != nilID
-            && (occurrenceID.uuid.6 >> 4) == 5
+            && dayWeaveIsRFC4122VersionFiveUUID(occurrenceID)
             && startAt.timeIntervalSinceReferenceDate.isFinite
             && endAt.timeIntervalSinceReferenceDate.isFinite
             && movedAt.timeIntervalSinceReferenceDate.isFinite

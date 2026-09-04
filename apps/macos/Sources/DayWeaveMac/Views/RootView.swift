@@ -1830,9 +1830,9 @@ struct WillDoLaterButton: View {
             return item.revision == block.sourceItemRevision
                 && (block.occurrenceID == nil
                     ? item.supportsCanonicalAuthoringReplacement
-                    : seriesItem?.recurrence != nil
-                        && block.recurrenceMoveSource?.itemRevision == seriesItem?.revision
-                        && block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true
+                    : seriesItem.map {
+                        block.recurrenceMoveSource?.canAuthorizeOccurrenceMove(for: $0) == true
+                    } == true
                         && WillDoLaterTiming.proposedWindow(
                             for: block,
                             moveStart: preset(hours: 1),
