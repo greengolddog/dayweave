@@ -18,8 +18,11 @@ pub(crate) use google_sync_repository::PostgresGoogleSyncRepository;
 pub use idempotency::{IdempotencyDecision, IdempotencyError, PostgresIdempotencyRepository};
 pub use item_repository::PostgresItemRepository;
 pub(crate) use item_repository::{
-    TransactionalItemCommand, TransactionalItemEffect, apply_item_command_tx, fetch_item_batch_tx,
-    list_item_batch_tx, lock_execution_item_batch_tx, lock_item_batch_tx,
+    TransactionalGraphMode, TransactionalItemCommand, TransactionalItemEffect,
+    apply_item_command_tx, clear_dependency_edges_tx, fetch_item_batch_tx, list_item_batch_tx,
+    lock_execution_item_batch_tx, lock_item_batch_tx, stage_item_create_tx, staged_item_shell,
+    start_item_change_group_tx, validate_dependency_graph_batch_tx, validate_item_change_group_tx,
+    validate_preview_item_change_group_tx,
 };
 pub use outbox::{NewOutboxMessage, OutboxError, OutboxMessage, PostgresOutboxRepository};
 pub use proposal_application_repository::{

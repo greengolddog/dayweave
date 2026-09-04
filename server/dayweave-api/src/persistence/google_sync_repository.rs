@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use dayweave_core::Dependency;
 use dayweave_google::calendar::GoogleEvent;
 use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction, postgres::PgRow};
@@ -7954,6 +7955,7 @@ async fn apply_calendar_occurrence_change(
             "item.google_calendar_occurrence_created",
             None,
             now,
+            [],
         )
         .await?;
         update_calendar_occurrence_mapping(
@@ -8043,6 +8045,11 @@ async fn apply_calendar_occurrence_change(
     reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
         .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
+    if restored {
+        super::item_repository::validate_dependency_graph_batch_tx(transaction, scope.workspace_id)
+            .await
+            .map_err(|error| map_google_item_validation_error(&error))?;
+    }
     let updated = fetch_import_item(transaction, scope.workspace_id, updated.id).await?;
     record_import_mutation(
         transaction,
@@ -8058,11 +8065,9 @@ async fn apply_calendar_occurrence_change(
         },
         Some(base_revision),
         now,
+        restored.then_some(updated.parent_id),
     )
     .await?;
-    if restored {
-        refresh_google_parents(transaction, scope, [updated.parent_id], now).await?;
-    }
     update_calendar_occurrence_mapping(
         transaction,
         mapping_id,
@@ -8103,6 +8108,7 @@ async fn insert_calendar_occurrence(
             "item.google_calendar_occurrence_created",
             None,
             now,
+            [],
         )
         .await?;
     }
@@ -8470,9 +8476,9 @@ async fn trash_projected_item(
         event,
         Some(expected),
         now,
+        [deleted.parent_id],
     )
     .await?;
-    refresh_google_parents(transaction, scope, [deleted.parent_id], now).await?;
     Ok(ImportOutcome::Deleted)
 }
 
@@ -9082,9 +9088,9 @@ async fn apply_remote_delete(
             "item.google_import_deleted",
             Some(actual),
             now,
+            [parent_id],
         )
         .await?;
-        refresh_google_parents(transaction, scope, [parent_id], now).await?;
         next
     };
     update_mapping_remote(
@@ -9151,6 +9157,7 @@ async fn apply_remote_upsert(
             "item.google_import_created",
             None,
             now,
+            [],
         )
         .await?;
         insert_mapping(
@@ -9297,6 +9304,7 @@ async fn apply_remote_upsert(
             "item.google_import_created",
             None,
             now,
+            [],
         )
         .await?;
         sqlx::query(
@@ -9412,6 +9420,11 @@ async fn apply_remote_upsert(
     reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
         .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
+    if restored {
+        super::item_repository::validate_dependency_graph_batch_tx(transaction, scope.workspace_id)
+            .await
+            .map_err(|error| map_google_item_validation_error(&error))?;
+    }
     let updated = fetch_import_item(transaction, scope.workspace_id, updated.id).await?;
     record_import_mutation(
         transaction,
@@ -9427,11 +9440,9 @@ async fn apply_remote_upsert(
         },
         Some(expected),
         now,
+        restored.then_some(updated.parent_id),
     )
     .await?;
-    if restored {
-        refresh_google_parents(transaction, scope, [updated.parent_id], now).await?;
-    }
     update_mapping_remote(
         transaction,
         mapping_id,
@@ -9789,6 +9800,7 @@ async fn insert_imported_item(
     item: &Item,
 ) -> Result<(), GoogleSyncRepositoryError> {
     let (split, minimum, maximum) = split_columns(&item.split_policy);
+    let stored_constraints = item.constraints_without_dependencies().map_err(internal)?;
     sqlx::query(
         "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
          timezone_name, duration_kind, duration_seconds, duration_min_seconds, duration_max_seconds, \
@@ -9821,7 +9833,7 @@ async fn insert_imported_item(
     .bind(item.deadline_soft_weight.map(u32_to_i32).transpose()?)
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
-    .bind(&item.flexible_constraints)
+    .bind(stored_constraints)
     .bind(item.has_own_effort)
     .bind(split)
     .bind(minimum)
@@ -9849,6 +9861,7 @@ async fn update_imported_item(
     item: &Item,
 ) -> Result<(), GoogleSyncRepositoryError> {
     let (split, minimum, maximum) = split_columns(&item.split_policy);
+    let stored_constraints = item.constraints_without_dependencies().map_err(internal)?;
     sqlx::query(
         "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
          duration_kind = $9, duration_seconds = $10, duration_min_seconds = $11, \
@@ -9881,7 +9894,7 @@ async fn update_imported_item(
     .bind(item.deadline_soft_weight.map(u32_to_i32).transpose()?)
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
-    .bind(&item.flexible_constraints)
+    .bind(stored_constraints)
     .bind(item.has_own_effort)
     .bind(split)
     .bind(minimum)
@@ -9912,10 +9925,18 @@ async fn record_import_mutation(
     event: &'static str,
     base_revision: Option<i64>,
     now: DateTime<Utc>,
+    parent_ids_to_refresh: impl IntoIterator<Item = Option<Uuid>>,
 ) -> Result<(), GoogleSyncRepositoryError> {
+    // A provider page can contain many independent items, so each canonical
+    // item mutation owns a separate bounded delta group. Any derived parent
+    // refreshes join that item's group; the next imported item starts a new
+    // group and remains independently drainable.
+    let change_group_id = super::item_repository::start_item_change_group_tx(transaction)
+        .await
+        .map_err(|_| GoogleSyncRepositoryError::Internal)?;
     sqlx::query(
-        "INSERT INTO item_changes (workspace_id, item_id, item_revision, change_kind, payload, changed_at) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO item_changes (workspace_id, item_id, item_revision, change_kind, payload, \
+         changed_at, change_group_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(scope.workspace_id)
     .bind(item_id)
@@ -9923,6 +9944,7 @@ async fn record_import_mutation(
     .bind(change_kind)
     .bind(payload)
     .bind(now)
+    .bind(change_group_id)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -9958,6 +9980,14 @@ async fn record_import_mutation(
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
+    refresh_google_parents(transaction, scope, parent_ids_to_refresh, now).await?;
+    super::item_repository::validate_item_change_group_tx(
+        transaction,
+        scope.workspace_id,
+        change_group_id,
+    )
+    .await
+    .map_err(|_| GoogleSyncRepositoryError::Internal)?;
     Ok(())
 }
 
@@ -9984,14 +10014,18 @@ async fn validate_google_parent_for_restored_child(
 ) -> Result<(), GoogleSyncRepositoryError> {
     super::item_repository::validate_parent(transaction, workspace_id, child_id, parent_id)
         .await
-        .map_err(|error| match error {
-            ItemRepositoryError::Internal => GoogleSyncRepositoryError::Internal,
-            _ => GoogleSyncRepositoryError::CursorConflict,
-        })?;
+        .map_err(|error| map_google_item_validation_error(&error))?;
     if let Some(parent_id) = parent_id {
         reject_google_item_for_active_execution(transaction, workspace_id, parent_id).await?;
     }
     Ok(())
+}
+
+fn map_google_item_validation_error(error: &ItemRepositoryError) -> GoogleSyncRepositoryError {
+    match error {
+        ItemRepositoryError::Internal => GoogleSyncRepositoryError::Internal,
+        _ => GoogleSyncRepositoryError::CursorConflict,
+    }
 }
 
 async fn refresh_google_parents(
@@ -10082,7 +10116,18 @@ async fn fetch_import_item_optional(
                  AND child.id = child_edge.child_item_id \
              WHERE child_edge.workspace_id = item.workspace_id \
                  AND child_edge.parent_item_id = item.id \
-                 AND child.trashed_at IS NULL) AS has_children \
+                 AND child.trashed_at IS NULL) AS has_children, \
+         COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+                 'item_id', dependency.predecessor_item_id, \
+                 'relation', dependency.dependency_kind, \
+                 'minimum_lag', dependency.lag_seconds / 60, \
+                 'strength', CASE WHEN dependency.dependency_strength = 'hard' \
+                     THEN jsonb_build_object('level', 'hard') \
+                     ELSE jsonb_build_object('level', 'soft', 'weight', dependency.dependency_soft_weight) END \
+             ) ORDER BY dependency.projection_ordinal, dependency.predecessor_item_id) \
+             FROM item_dependencies AS dependency \
+             WHERE dependency.workspace_id = item.workspace_id \
+               AND dependency.successor_item_id = item.id), '[]'::jsonb) AS authoritative_dependencies \
          FROM items item LEFT JOIN item_hierarchy hierarchy ON hierarchy.workspace_id = item.workspace_id \
            AND hierarchy.child_item_id = item.id \
          WHERE item.workspace_id = $1 AND item.id = $2 FOR UPDATE OF item",
@@ -10112,7 +10157,12 @@ fn item_from_row(row: &PgRow) -> Result<Item, GoogleSyncRepositoryError> {
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
     let kind = parse_item_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?;
     let has_own_effort: bool = row.try_get("has_own_effort").map_err(internal)?;
-    Ok(Item {
+    let authoritative_dependencies: Vec<Dependency> = serde_json::from_value(
+        row.try_get::<Value, _>("authoritative_dependencies")
+            .map_err(internal)?,
+    )
+    .map_err(internal)?;
+    let mut item = Item {
         id: row.try_get("id").map_err(internal)?,
         is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
         kind,
@@ -10187,7 +10237,10 @@ fn item_from_row(row: &PgRow) -> Result<Item, GoogleSyncRepositoryError> {
             .transpose()?,
         blocked_by_item_id: row.try_get("blocked_by_item_id").map_err(internal)?,
         blocked_reason: row.try_get("blocked_reason").map_err(internal)?,
-    })
+    };
+    item.project_dependencies(&authoritative_dependencies)
+        .map_err(internal)?;
+    Ok(item)
 }
 
 fn collection_from_row(row: &PgRow) -> Result<GoogleSyncCollection, GoogleSyncRepositoryError> {
@@ -13979,41 +14032,137 @@ mod tests {
     }
 
     fn local_task(id: Uuid, title: &str, now: DateTime<Utc>) -> Item {
-        Item::new(
-            NewItem {
-                id,
-                is_sensitive: false,
-                kind: ItemKind::Task,
-                status: ItemStatus::Planned,
-                title: title.to_owned(),
-                notes: None,
-                timezone_name: "UTC".to_owned(),
-                duration_kind: None,
-                duration_seconds: Some(1_800),
-                duration_min_seconds: None,
-                duration_max_seconds: None,
-                duration_source: None,
-                deadline_kind: None,
-                deadline_date: None,
-                deadline_at: None,
-                deadline_strength: None,
-                deadline_soft_weight: None,
-                earliest_start_at: Some(now),
-                recurrence: None,
-                flexible_constraints: json!({}),
-                has_own_effort: None,
-                split_policy: SplitPolicy::Indivisible,
-                importance: 0,
-                urgency: 0,
-                parent_id: None,
-                sibling_order: 0,
-                blocked_reason_kind: None,
-                blocked_by_item_id: None,
-                blocked_reason: None,
-            },
-            now,
+        Item::new(local_task_input(id, title, now), now).expect("local task")
+    }
+
+    fn local_task_input(id: Uuid, title: &str, now: DateTime<Utc>) -> NewItem {
+        NewItem {
+            id,
+            is_sensitive: false,
+            kind: ItemKind::Task,
+            status: ItemStatus::Planned,
+            title: title.to_owned(),
+            notes: None,
+            timezone_name: "UTC".to_owned(),
+            duration_kind: None,
+            duration_seconds: Some(1_800),
+            duration_min_seconds: None,
+            duration_max_seconds: None,
+            duration_source: None,
+            deadline_kind: None,
+            deadline_date: None,
+            deadline_at: None,
+            deadline_strength: None,
+            deadline_soft_weight: None,
+            earliest_start_at: Some(now),
+            recurrence: None,
+            flexible_constraints: json!({}),
+            has_own_effort: None,
+            split_policy: SplitPolicy::Indivisible,
+            importance: 0,
+            urgency: 0,
+            parent_id: None,
+            sibling_order: 0,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
+        }
+    }
+
+    async fn seed_provider_restore_combined_cycle(
+        fixture: &SyncFixture,
+        collection_id: Uuid,
+        restored_item_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> i64 {
+        let routine = local_task(Uuid::new_v4(), "Ordered provider-restore routine", now);
+        let later_sibling = local_task(Uuid::new_v4(), "Later ordered sibling", now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("begin latent combined-cycle fixture");
+        insert_imported_item(&mut transaction, fixture.scope, &routine)
+            .await
+            .expect("insert ordered routine fixture");
+        sqlx::query(
+            "UPDATE items SET kind='routine', scheduling_constraints=$3 \
+             WHERE workspace_id=$1 AND id=$2",
         )
-        .expect("local task")
+        .bind(fixture.scope.workspace_id)
+        .bind(routine.id)
+        .bind(json!({"routine_ordered": true}))
+        .execute(&mut *transaction)
+        .await
+        .expect("promote ordered routine fixture");
+        insert_imported_item(&mut transaction, fixture.scope, &later_sibling)
+            .await
+            .expect("insert ordered sibling fixture");
+        sqlx::query(
+            "INSERT INTO item_hierarchy (workspace_id,parent_item_id,child_item_id,position) \
+             VALUES ($1,$2,$3,0),($1,$2,$4,1)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(routine.id)
+        .bind(restored_item_id)
+        .bind(later_sibling.id)
+        .execute(&mut *transaction)
+        .await
+        .expect("attach provider item and ordered sibling");
+        let _: String = sqlx::query_scalar(
+            "SELECT set_config('dayweave.item_dependency_write', 'aggregate-v1', true)",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("authorize dependency fixture");
+        sqlx::query(
+            "INSERT INTO item_dependencies (workspace_id,predecessor_item_id,successor_item_id, \
+             dependency_kind,lag_seconds,dependency_strength,dependency_soft_weight,projection_ordinal) \
+             VALUES ($1,$2,$3,'finish_to_start',0,'hard',NULL,0)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(later_sibling.id)
+        .bind(restored_item_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert explicit reverse edge fixture");
+        let trashed_revision: i64 = sqlx::query_scalar(
+            "UPDATE items SET revision=revision+1,updated_at=$3,trashed_at=$3 \
+             WHERE workspace_id=$1 AND id=$2 RETURNING revision",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(restored_item_id)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("trash provider item before latent cycle");
+        let mappings = sqlx::query(
+            "UPDATE provider_sync_mappings SET local_revision=$4,sync_state='deleted_remote', \
+             conflict_metadata=NULL,updated_at=$5 WHERE workspace_id=$1 AND collection_id=$2 \
+             AND local_entity_id=$3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(collection_id)
+        .bind(restored_item_id)
+        .bind(trashed_revision)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .expect("align provider mapping with trashed fixture")
+        .rows_affected();
+        assert_eq!(mappings, 1);
+        super::super::item_repository::validate_dependency_graph_batch_tx(
+            &mut transaction,
+            fixture.scope.workspace_id,
+        )
+        .await
+        .expect("trashed child keeps the combined graph acyclic");
+        transaction
+            .commit()
+            .await
+            .expect("commit latent combined-cycle fixture");
+        trashed_revision
     }
 
     fn projected_occurrence(
@@ -14095,6 +14244,229 @@ mod tests {
                 end: fixture.now + Duration::days(120),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_calendar_restore_rejects_a_combined_ordered_routine_dependency_cycle() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar restore-cycle test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "calendar-restore-combined-cycle";
+        let initial = projected_occurrence(&fixture, remote_id, "Cycle event", false, 210);
+        let item_id = initial.item.as_ref().expect("initial occurrence").id;
+        let created = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![initial]),
+                fixture.now,
+            )
+            .await
+            .expect("initial occurrence projection");
+        assert!(created.complete);
+        assert_eq!(created.counts.imported, 1);
+
+        let trashed_at = fixture.now + Duration::seconds(1);
+        let trashed_revision = seed_provider_restore_combined_cycle(
+            &fixture,
+            fixture.collection.id,
+            item_id,
+            trashed_at,
+        )
+        .await;
+        let changes_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("changes before rejected calendar restore");
+
+        let rejected = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(
+                        &fixture,
+                        remote_id,
+                        "Restored cycle event",
+                        false,
+                        211,
+                    )],
+                ),
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("combined cycle becomes a durable projection conflict");
+        assert!(!rejected.complete);
+        assert_eq!(rejected.counts.conflicts, 1);
+        let state: (i64, Option<DateTime<Utc>>, Option<i64>, String) = sqlx::query_as(
+            "SELECT item.revision, item.trashed_at, mapping.local_revision, mapping.sync_state \
+             FROM items AS item JOIN provider_sync_mappings AS mapping \
+               ON mapping.workspace_id = item.workspace_id \
+              AND mapping.local_entity_id = item.id \
+             WHERE item.workspace_id = $1 AND item.id = $2 AND mapping.collection_id = $3 \
+               AND mapping.entity_kind = 'calendar_occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("calendar restore rollback state");
+        assert_eq!(
+            state,
+            (
+                trashed_revision,
+                Some(trashed_at),
+                Some(trashed_revision),
+                "deleted_remote".to_owned(),
+            )
+        );
+        let changes_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("changes after rejected calendar restore");
+        assert_eq!(changes_after, changes_before);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_task_restore_rejects_a_combined_ordered_routine_dependency_cycle() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; task restore-cycle test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let discovered = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                None,
+                GoogleCollectionKind::TaskList,
+                vec![DiscoveredCollection {
+                    kind: GoogleCollectionKind::TaskList,
+                    remote_id: "restore-cycle-tasks".to_owned(),
+                    display_name: "Restore cycle tasks".to_owned(),
+                    provider_access_role: None,
+                    provider_primary: false,
+                    provider_selected: true,
+                    provider_hidden: false,
+                    provider_deleted: false,
+                }],
+                fixture.now,
+            )
+            .await
+            .expect("task-list discovery");
+        let discovered = discovered
+            .iter()
+            .find(|collection| collection.kind == GoogleCollectionKind::TaskList)
+            .expect("task list");
+        let task_list = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                discovered.id,
+                discovered.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .expect("configured task list");
+        let remote_id = "remote-restore-combined-cycle";
+        let initial = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            remote_id,
+            "Cycle task",
+            ItemStatus::Planned,
+            [212; 32],
+        );
+        let item_id = initial.item.as_ref().expect("initial task").id;
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(&fixture.claim, initial, fixture.now)
+                .await
+                .expect("initial task import"),
+            ImportOutcome::Created
+        );
+
+        let trashed_at = fixture.now + Duration::seconds(1);
+        let trashed_revision =
+            seed_provider_restore_combined_cycle(&fixture, task_list.id, item_id, trashed_at).await;
+        let changes_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("changes before rejected task restore");
+
+        let restored = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            remote_id,
+            "Restored cycle task",
+            ItemStatus::Planned,
+            [213; 32],
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(&fixture.claim, restored, fixture.now + Duration::seconds(2),)
+                .await,
+            Err(GoogleSyncRepositoryError::CursorConflict)
+        );
+        let state: (i64, Option<DateTime<Utc>>, Option<i64>, String) = sqlx::query_as(
+            "SELECT item.revision, item.trashed_at, mapping.local_revision, mapping.sync_state \
+             FROM items AS item JOIN provider_sync_mappings AS mapping \
+               ON mapping.workspace_id = item.workspace_id \
+              AND mapping.local_entity_id = item.id \
+             WHERE item.workspace_id = $1 AND item.id = $2 AND mapping.collection_id = $3 \
+               AND mapping.entity_kind = 'item'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .bind(task_list.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("task restore rollback state");
+        assert_eq!(
+            state,
+            (
+                trashed_revision,
+                Some(trashed_at),
+                Some(trashed_revision),
+                "deleted_remote".to_owned(),
+            )
+        );
+        let changes_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("changes after rejected task restore");
+        assert_eq!(changes_after, changes_before);
+        fixture.database.destroy().await;
     }
 
     #[test]
@@ -15918,6 +16290,7 @@ mod tests {
             "item.created",
             None,
             fixture.now,
+            [],
         )
         .await
         .expect("record calendar parent fixture");
@@ -16027,6 +16400,22 @@ mod tests {
         .await
         .expect("parent refresh after calendar absence");
         assert_eq!(parent_after_absence, (2, true));
+        let absence_group: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT item_id, change_group_id FROM item_changes \
+             WHERE workspace_id = $1 AND changed_at = $2 \
+               AND item_id = ANY($3) ORDER BY sequence",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.now + Duration::seconds(1))
+        .bind([item_id, parent_id])
+        .fetch_all(&fixture.database.pool)
+        .await
+        .expect("calendar absence atomic delta group");
+        assert_eq!(absence_group.len(), 2);
+        assert_eq!(absence_group[0].0, item_id);
+        assert_eq!(absence_group[1].0, parent_id);
+        assert!(absence_group[0].1.is_some());
+        assert_eq!(absence_group[0].1, absence_group[1].1);
 
         for offset in 2..=4 {
             let quiescent = fixture
@@ -16138,6 +16527,22 @@ mod tests {
         .await
         .expect("parent refresh after calendar reappearance");
         assert_eq!(parent_after_reappearance, (3, false));
+        let reappearance_group: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT item_id, change_group_id FROM item_changes \
+             WHERE workspace_id = $1 AND changed_at = $2 \
+               AND item_id = ANY($3) ORDER BY sequence",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.now + Duration::seconds(5))
+        .bind([item_id, parent_id])
+        .fetch_all(&fixture.database.pool)
+        .await
+        .expect("calendar reappearance atomic delta group");
+        assert_eq!(reappearance_group.len(), 2);
+        assert_eq!(reappearance_group[0].0, item_id);
+        assert_eq!(reappearance_group[1].0, parent_id);
+        assert!(reappearance_group[0].1.is_some());
+        assert_eq!(reappearance_group[0].1, reappearance_group[1].1);
 
         let second_absence = fixture
             .repository
@@ -18488,6 +18893,7 @@ mod tests {
             "item.created",
             None,
             fixture.now + Duration::seconds(8),
+            [],
         )
         .await
         .expect("record local parent fixture");

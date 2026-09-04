@@ -2241,6 +2241,7 @@ async fn run_legacy_clock_upgrade(pool: PgPool) {
         include_str!("../migrations/0022_google_schedule_publication.sql"),
         include_str!("../migrations/0023_google_task_provider_metadata.sql"),
         include_str!("../migrations/0024_structural_item_fields.sql"),
+        include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
     ] {
         pool.execute(migration)
             .await

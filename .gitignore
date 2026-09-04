@@ -7,8 +7,13 @@
 target/
 DerivedData/
 .build/
+.swiftpm/
 build/
 *.xcuserstate
+xcuserdata/
+*.apk
+*.aab
+*.log
 *.jks
 *.keystore
 *.key

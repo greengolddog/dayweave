@@ -36,6 +36,40 @@ fn item(value: u128, title: &str, minutes: u32) -> WorkItem {
     }
 }
 
+fn calendar_event(
+    value: u128,
+    title: &str,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> WorkItem {
+    WorkItem {
+        id: id(value),
+        is_sensitive: false,
+        revision: 1,
+        title: title.to_owned(),
+        kind: ItemKind::CalendarEvent(CalendarEventSpec {
+            start,
+            end,
+            immutable: true,
+            all_day: false,
+            source_calendar_id: Some("work".to_owned()),
+        }),
+        status: WorkStatus::Scheduled,
+        parent_id: None,
+        sibling_order: None,
+        has_own_effort: false,
+        goal_ids: BTreeSet::new(),
+        priority: Priority::NONE,
+        duration: None,
+        constraints: SchedulingConstraints::default(),
+        split_policy: SplitPolicy::Indivisible,
+        energy: None,
+        tags: BTreeSet::new(),
+        created_at: DAY,
+        updated_at: DAY,
+    }
+}
+
 fn availability(start_hour: i64, end_hour: i64) -> AvailabilityWindow {
     AvailabilityWindow {
         start: DAY + Duration::hours(start_hour),
@@ -464,6 +498,60 @@ fn blocked_predecessor_makes_hard_dependency_unavailable() {
 }
 
 #[test]
+fn partial_predecessor_readiness_uses_the_relation_predecessor_boundary() {
+    for (relation, successor_can_be_scheduled) in [
+        (DependencyRelation::FinishToStart, false),
+        (DependencyRelation::StartToStart, true),
+        (DependencyRelation::FinishToFinish, false),
+        (DependencyRelation::StartToFinish, true),
+    ] {
+        let mut predecessor = item(49_001, "Partly scheduled predecessor", 120);
+        predecessor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(60),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        let mut successor = item(49_002, "Dependent work", 30);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes(120),
+            strength: ConstraintStrength::Hard,
+        });
+        let successor_window = AvailabilityWindow {
+            end: DAY + Duration::hours(10) + Duration::minutes(30),
+            ..availability(10, 11)
+        };
+        let mut input = request(vec![predecessor.clone(), successor.clone()]);
+        input.availability = vec![availability(8, 9), successor_window];
+
+        let plan = Scheduler.plan(&input).unwrap();
+
+        assert_eq!(planned(&plan, &predecessor).len(), 1, "{relation:?}");
+        assert!(
+            plan.unscheduled
+                .iter()
+                .any(|work| { work.item_id == predecessor.id && work.remaining == Minutes(60) })
+        );
+        assert_eq!(
+            !planned(&plan, &successor).is_empty(),
+            successor_can_be_scheduled,
+            "{relation:?}"
+        );
+        assert_eq!(
+            plan.unscheduled.iter().any(|work| {
+                work.item_id == successor.id
+                    && work.reason == UnscheduledReason::DependencyUnavailable
+            }),
+            !successor_can_be_scheduled,
+            "{relation:?}"
+        );
+    }
+}
+
+#[test]
 fn blocked_semantic_container_without_own_effort_has_no_phantom_demand() {
     let mut project = item(48_001, "Blocked project container", 180);
     project.kind = ItemKind::Project;
@@ -616,6 +704,504 @@ fn fixed_calendar_event_remains_a_valid_hard_dependency_predecessor() {
         panic!("the dependent work must be scheduled once");
     };
     assert!(block.start >= DAY + Duration::hours(11));
+}
+
+#[test]
+fn finish_relations_constrain_only_the_aggregate_finish_of_a_split_successor() {
+    for (relation, lag) in [
+        (DependencyRelation::FinishToFinish, Minutes::ZERO),
+        (DependencyRelation::StartToFinish, Minutes(60)),
+    ] {
+        let predecessor = calendar_event(
+            51_001,
+            "Fixed predecessor",
+            DAY + Duration::hours(10),
+            DAY + Duration::hours(11),
+        );
+        let mut successor = item(51_002, "Split dependent work", 120);
+        successor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(60),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: lag,
+            strength: ConstraintStrength::Hard,
+        });
+        let mut input = request(vec![predecessor, successor.clone()]);
+        input.availability = vec![availability(8, 12)];
+
+        let plan = Scheduler.plan(&input).unwrap();
+        let blocks = planned(&plan, &successor);
+
+        assert_eq!(blocks.len(), 2, "{relation:?}");
+        assert_eq!(blocks[0].start, DAY + Duration::hours(8), "{relation:?}");
+        assert_eq!(blocks[0].end, DAY + Duration::hours(9), "{relation:?}");
+        assert_eq!(blocks[1].start, DAY + Duration::hours(11), "{relation:?}");
+        assert_eq!(blocks[1].end, DAY + Duration::hours(12), "{relation:?}");
+        assert!(
+            plan.unscheduled
+                .iter()
+                .all(|work| work.item_id != successor.id),
+            "{relation:?}"
+        );
+    }
+}
+
+#[test]
+fn soft_finish_dependency_penalty_is_assessed_only_on_the_aggregate_finish() {
+    let predecessor = calendar_event(
+        51_003,
+        "Fixed predecessor",
+        DAY + Duration::hours(10),
+        DAY + Duration::hours(11),
+    );
+    let mut successor = item(51_004, "Split dependent work", 120);
+    successor.split_policy = SplitPolicy::Splittable {
+        minimum_session: Minutes(60),
+        maximum_session: Minutes(60),
+        maximum_sessions: 2,
+        minimum_gap: Minutes::ZERO,
+        maximum_days: Some(1),
+    };
+    successor.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToFinish,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Soft { weight: 7 },
+    });
+    let mut input = request(vec![predecessor, successor.clone()]);
+    input.availability = vec![availability(8, 12)];
+
+    let plan = Scheduler.plan(&input).unwrap();
+    let blocks = planned(&plan, &successor);
+
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].end, DAY + Duration::hours(9));
+    assert_eq!(blocks[1].end, DAY + Duration::hours(12));
+    assert_eq!(plan.score.soft_penalty, 0);
+    assert!(
+        plan.violations
+            .iter()
+            .all(|violation| violation.kind != ViolationKind::Dependency)
+    );
+}
+
+#[test]
+fn higher_priority_successor_does_not_retain_a_provisional_soft_dependency_penalty() {
+    let mut predecessor = item(51_005, "Lower-priority predecessor", 60);
+    predecessor.priority = Priority {
+        importance: 1,
+        urgency: 1,
+    };
+    let mut successor = item(51_006, "Higher-priority successor", 60);
+    successor.priority = Priority {
+        importance: 10,
+        urgency: 10,
+    };
+    successor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(9)));
+    successor.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Soft { weight: 7 },
+    });
+    let mut input = request(vec![successor.clone(), predecessor.clone()]);
+    input.availability = vec![availability(8, 10)];
+
+    let plan = Scheduler.plan(&input).unwrap();
+
+    assert_eq!(
+        planned(&plan, &predecessor)[0].start,
+        DAY + Duration::hours(8)
+    );
+    assert_eq!(
+        planned(&plan, &predecessor)[0].end,
+        DAY + Duration::hours(9)
+    );
+    assert_eq!(
+        planned(&plan, &successor)[0].start,
+        DAY + Duration::hours(9)
+    );
+    assert_eq!(plan.score.soft_penalty, 0);
+    assert!(
+        plan.violations
+            .iter()
+            .all(|violation| violation.kind != ViolationKind::Dependency)
+    );
+    assert!(
+        planned(&plan, &successor)[0]
+            .explanations
+            .iter()
+            .any(|value| value.code == ExplanationCode::Dependency)
+    );
+}
+
+#[test]
+fn soft_dependency_cycles_remain_schedulable_and_use_final_split_boundaries() {
+    for (relation, expected_penalty) in [
+        (DependencyRelation::FinishToStart, 540),
+        (DependencyRelation::StartToStart, 360),
+        (DependencyRelation::FinishToFinish, 180),
+        (DependencyRelation::StartToFinish, 0),
+    ] {
+        let mut split_successor = item(51_007, "First soft-cycle member", 120);
+        split_successor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(60),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        let mut other = item(51_008, "Second soft-cycle member", 60);
+        split_successor.constraints.dependencies.push(Dependency {
+            item_id: other.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Soft { weight: 3 },
+        });
+        other.constraints.dependencies.push(Dependency {
+            item_id: split_successor.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Soft { weight: 3 },
+        });
+        let mut input = request(vec![split_successor.clone(), other.clone()]);
+        input.availability = vec![availability(8, 11)];
+
+        let plan = Scheduler.plan(&input).unwrap();
+
+        assert!(plan.unscheduled.is_empty(), "{relation:?}");
+        let split_blocks = planned(&plan, &split_successor);
+        assert_eq!(split_blocks.len(), 2, "{relation:?}");
+        assert_eq!(
+            split_blocks[0].start,
+            DAY + Duration::hours(8),
+            "{relation:?}"
+        );
+        assert_eq!(
+            split_blocks[1].end,
+            DAY + Duration::hours(10),
+            "{relation:?}"
+        );
+        assert_eq!(
+            planned(&plan, &other)[0].start,
+            DAY + Duration::hours(10),
+            "{relation:?}"
+        );
+        assert_eq!(plan.score.soft_penalty, expected_penalty, "{relation:?}");
+        let dependency_violations = plan
+            .violations
+            .iter()
+            .filter(|violation| violation.kind == ViolationKind::Dependency)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dependency_violations.len(),
+            usize::from(expected_penalty > 0),
+            "{relation:?}"
+        );
+        if let Some(violation) = dependency_violations.first() {
+            assert_eq!(violation.item_ids, vec![split_successor.id], "{relation:?}");
+            assert_eq!(violation.penalty, expected_penalty, "{relation:?}");
+        }
+    }
+}
+
+#[test]
+fn retained_split_pins_surface_hard_dependency_conflicts_for_every_relation() {
+    for relation in [
+        DependencyRelation::FinishToStart,
+        DependencyRelation::StartToStart,
+        DependencyRelation::FinishToFinish,
+        DependencyRelation::StartToFinish,
+    ] {
+        let mut predecessor = item(51_009, "Predecessor after retained work", 60);
+        predecessor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(10)));
+        let mut successor = item(51_010, "Retained split successor", 120);
+        successor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(60),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes(15),
+            strength: ConstraintStrength::Hard,
+        });
+        let mut input = request(vec![successor.clone(), predecessor.clone()]);
+        input.availability = vec![availability(8, 11)];
+        input.previous_assignments = vec![PreviousAssignment {
+            item_id: successor.id,
+            occurrence_id: None,
+            blocks: vec![
+                PreviousBlock {
+                    start: DAY + Duration::hours(8),
+                    end: DAY + Duration::hours(9),
+                    session_index: 0,
+                },
+                PreviousBlock {
+                    start: DAY + Duration::hours(9),
+                    end: DAY + Duration::hours(10),
+                    session_index: 1,
+                },
+            ],
+            pinned: true,
+            manual_placement_id: None,
+        }];
+
+        let plan = Scheduler.plan(&input).unwrap();
+
+        assert!(plan.unscheduled.is_empty(), "{relation:?}");
+        assert_eq!(
+            plan.blocks_for(successor.id)
+                .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+                .count(),
+            2,
+            "{relation:?}"
+        );
+        let violations = plan
+            .violations
+            .iter()
+            .filter(|violation| violation.kind == ViolationKind::Dependency)
+            .collect::<Vec<_>>();
+        assert_eq!(violations.len(), 1, "{relation:?}");
+        assert_eq!(
+            violations[0].severity,
+            ViolationSeverity::Error,
+            "{relation:?}"
+        );
+        assert_eq!(violations[0].penalty, 0, "{relation:?}");
+        assert!(
+            violations[0].item_ids.contains(&predecessor.id),
+            "{relation:?}"
+        );
+        assert!(
+            violations[0].item_ids.contains(&successor.id),
+            "{relation:?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_execution_reservation_surfaces_a_hard_start_dependency_conflict() {
+    let mut predecessor = item(51_011, "Execution predecessor", 60);
+    predecessor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(9)));
+    let mut successor = item(51_012, "Reserved execution successor", 60);
+    successor.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::StartToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+    let mut input = request(vec![successor.clone(), predecessor.clone()]);
+    input.availability = vec![availability(9, 10)];
+
+    let plan = Scheduler
+        .plan_with_execution(
+            &input,
+            &execution_context(vec![in_flight_defer_work(successor.id, 60)]),
+        )
+        .unwrap();
+
+    let violation = plan
+        .violations
+        .iter()
+        .find(|violation| violation.kind == ViolationKind::Dependency)
+        .expect("the retained execution block must expose its hard conflict");
+    assert_eq!(violation.severity, ViolationSeverity::Error);
+    assert_eq!(violation.penalty, 0);
+    assert!(violation.item_ids.contains(&predecessor.id));
+    assert!(violation.item_ids.contains(&successor.id));
+}
+
+#[test]
+fn deferred_replacement_checks_a_new_aggregate_start_for_hard_fs_and_ss() {
+    for relation in [
+        DependencyRelation::FinishToStart,
+        DependencyRelation::StartToStart,
+    ] {
+        let mut predecessor = item(51_013, "Predecessor before deferred work", 60);
+        predecessor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(10)));
+        let mut successor = item(51_014, "Partly deferred successor", 120);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+        let mut input = request(vec![successor.clone(), predecessor.clone()]);
+        input.availability = vec![availability(8, 13)];
+        let execution = execution_context(vec![in_flight_defer_work(successor.id, 60)]);
+        let mut candidate = defer_candidate(successor.id);
+        candidate.move_start = DAY + Duration::hours(12);
+        candidate.move_end = candidate.move_start + Duration::minutes(49);
+
+        let result = Scheduler
+            .assess_defer_candidate(&input, &execution, &candidate)
+            .unwrap();
+
+        let planned_blocks = planned(&result.plan, &successor);
+        let [planned_block] = planned_blocks.as_slice() else {
+            panic!("the residual work must use one planned block: {relation:?}");
+        };
+        assert_eq!(
+            planned_block.start,
+            DAY + Duration::hours(11),
+            "{relation:?}"
+        );
+        assert_eq!(planned_block.end, candidate.move_start, "{relation:?}");
+        assert!(
+            planned_block.start < candidate.move_start,
+            "the planned block must become the aggregate first block: {relation:?}"
+        );
+        assert!(
+            result
+                .plan
+                .violations
+                .iter()
+                .all(|violation| violation.kind != ViolationKind::Dependency),
+            "{relation:?}"
+        );
+        assert!(
+            result
+                .assessment
+                .violations
+                .iter()
+                .all(|violation| violation.code != ManualPlacementViolationCode::Dependency),
+            "{relation:?}"
+        );
+    }
+}
+
+#[test]
+fn deferred_item_does_not_hide_a_nonmanual_retained_start_conflict() {
+    for relation in [
+        DependencyRelation::FinishToStart,
+        DependencyRelation::StartToStart,
+    ] {
+        let mut predecessor = item(51_017, "Predecessor after an ordinary pin", 60);
+        predecessor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(10)));
+        let mut successor = item(51_018, "Deferred item with an ordinary pin", 180);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+        let mut input = request(vec![successor.clone(), predecessor.clone()]);
+        input.availability = vec![availability(8, 14)];
+        input.previous_assignments = vec![PreviousAssignment {
+            item_id: successor.id,
+            occurrence_id: None,
+            blocks: vec![PreviousBlock {
+                start: DAY + Duration::hours(8),
+                end: DAY + Duration::hours(9),
+                session_index: 2,
+            }],
+            pinned: true,
+            manual_placement_id: None,
+        }];
+        let execution = execution_context(vec![in_flight_defer_work(successor.id, 60)]);
+        let mut candidate = defer_candidate(successor.id);
+        candidate.replacement_session_index = 3;
+        candidate.move_start = DAY + Duration::hours(12);
+        candidate.move_end = candidate.move_start + Duration::minutes(49);
+
+        let result = Scheduler
+            .assess_defer_candidate(&input, &execution, &candidate)
+            .unwrap();
+
+        let dependency_violations = result
+            .plan
+            .violations
+            .iter()
+            .filter(|violation| violation.kind == ViolationKind::Dependency)
+            .collect::<Vec<_>>();
+        assert_eq!(dependency_violations.len(), 1, "{relation:?}");
+        assert_eq!(
+            dependency_violations[0].severity,
+            ViolationSeverity::Error,
+            "{relation:?}"
+        );
+        assert!(
+            dependency_violations[0].item_ids.contains(&predecessor.id),
+            "{relation:?}"
+        );
+        assert!(
+            dependency_violations[0].item_ids.contains(&successor.id),
+            "{relation:?}"
+        );
+        assert!(
+            result
+                .assessment
+                .violations
+                .iter()
+                .all(|violation| violation.code != ManualPlacementViolationCode::Dependency),
+            "the non-boundary defer target must not duplicate the plan-level conflict: {relation:?}"
+        );
+    }
+}
+
+#[test]
+fn deferred_replacement_uses_its_retained_aggregate_finish_for_hard_ff_and_sf() {
+    for relation in [
+        DependencyRelation::FinishToFinish,
+        DependencyRelation::StartToFinish,
+    ] {
+        let mut predecessor = item(51_015, "Predecessor before retained finish", 60);
+        predecessor.constraints.earliest_start = Some(Qualified::hard(DAY + Duration::hours(10)));
+        let mut successor = item(51_016, "Deferred final boundary", 120);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+        let mut input = request(vec![successor.clone(), predecessor.clone()]);
+        input.availability = vec![availability(8, 13)];
+        let execution = execution_context(vec![in_flight_defer_work(successor.id, 60)]);
+        let mut candidate = defer_candidate(successor.id);
+        candidate.move_start = DAY + Duration::hours(12);
+        candidate.move_end = candidate.move_start + Duration::minutes(49);
+
+        let result = Scheduler
+            .assess_defer_candidate(&input, &execution, &candidate)
+            .unwrap();
+
+        let planned_blocks = planned(&result.plan, &successor);
+        let [planned_block] = planned_blocks.as_slice() else {
+            panic!("the residual work must use one planned block: {relation:?}");
+        };
+        assert_eq!(
+            planned_block.start,
+            DAY + Duration::hours(8),
+            "the later retained block already establishes the aggregate finish: {relation:?}"
+        );
+        assert!(planned_block.end < candidate.move_start, "{relation:?}");
+        assert!(
+            result
+                .plan
+                .violations
+                .iter()
+                .all(|violation| violation.kind != ViolationKind::Dependency),
+            "{relation:?}"
+        );
+        assert!(
+            result
+                .assessment
+                .violations
+                .iter()
+                .all(|violation| violation.code != ManualPlacementViolationCode::Dependency),
+            "{relation:?}"
+        );
+    }
 }
 
 #[test]
@@ -1179,52 +1765,133 @@ fn manual_placement_requires_one_availability_window_with_all_capabilities() {
 }
 
 #[test]
-fn manual_successor_reports_dependency_when_predecessor_is_only_partly_scheduled() {
-    let mut predecessor = item(91, "Partly scheduled predecessor", 120);
-    predecessor.split_policy = SplitPolicy::Splittable {
-        minimum_session: Minutes(30),
-        maximum_session: Minutes(60),
-        maximum_sessions: 2,
-        minimum_gap: Minutes::ZERO,
-        maximum_days: Some(1),
-    };
-    let mut successor = item(92, "Manually placed successor", 30);
-    successor.constraints.dependencies = vec![Dependency {
-        item_id: predecessor.id,
-        relation: DependencyRelation::FinishToStart,
-        minimum_lag: Minutes::ZERO,
-        strength: ConstraintStrength::Hard,
-    }];
-    let placement_id = Uuid::from_u128(93);
-    let mut input = request(vec![predecessor.clone(), successor.clone()]);
-    input.availability = vec![availability(8, 9)];
-    input.previous_assignments = vec![PreviousAssignment {
-        item_id: successor.id,
-        occurrence_id: None,
-        blocks: vec![PreviousBlock {
-            start: DAY + Duration::hours(9),
-            end: DAY + Duration::hours(9) + Duration::minutes(30),
-            session_index: 0,
-        }],
-        pinned: true,
-        manual_placement_id: Some(placement_id),
-    }];
+fn manual_partial_predecessor_readiness_uses_the_relation_predecessor_boundary() {
+    for (relation, reports_dependency_violation) in [
+        (DependencyRelation::FinishToStart, true),
+        (DependencyRelation::StartToStart, false),
+        (DependencyRelation::FinishToFinish, true),
+        (DependencyRelation::StartToFinish, false),
+    ] {
+        let mut predecessor = item(91, "Partly scheduled predecessor", 120);
+        predecessor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(30),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        let mut successor = item(92, "Manually placed successor", 30);
+        successor.constraints.dependencies = vec![Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        }];
+        let successor_id = successor.id;
+        let placement_id = Uuid::from_u128(93);
+        let mut input = request(vec![predecessor.clone(), successor]);
+        input.availability = vec![availability(8, 9)];
+        input.previous_assignments = vec![PreviousAssignment {
+            item_id: successor_id,
+            occurrence_id: None,
+            blocks: vec![PreviousBlock {
+                start: DAY + Duration::hours(9),
+                end: DAY + Duration::hours(9) + Duration::minutes(30),
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id: Some(placement_id),
+        }];
 
-    let plan = Scheduler.plan(&input).unwrap();
-    assert!(
-        plan.unscheduled
+        let plan = Scheduler.plan(&input).unwrap();
+        assert!(
+            plan.unscheduled
+                .iter()
+                .any(|work| { work.item_id == predecessor.id && work.remaining == Minutes(60) })
+        );
+        let assessment = plan
+            .manual_placement_assessments
             .iter()
-            .any(|work| { work.item_id == predecessor.id && work.remaining == Minutes(60) })
-    );
-    let assessment = plan
-        .manual_placement_assessments
-        .iter()
-        .find(|assessment| assessment.placement_id == placement_id)
-        .expect("manual placement assessment");
-    assert!(assessment.violations.iter().any(|violation| {
-        violation.code == ManualPlacementViolationCode::Dependency
-            && !violation.conflicting_blocks.is_empty()
-    }));
+            .find(|assessment| assessment.placement_id == placement_id)
+            .expect("manual placement assessment");
+        let dependency_violation = assessment
+            .violations
+            .iter()
+            .find(|violation| violation.code == ManualPlacementViolationCode::Dependency);
+        assert_eq!(
+            dependency_violation.is_some(),
+            reports_dependency_violation,
+            "{relation:?}"
+        );
+        if let Some(violation) = dependency_violation {
+            assert!(!violation.conflicting_blocks.is_empty(), "{relation:?}");
+        }
+    }
+}
+
+#[test]
+fn manual_finish_relations_assess_the_aggregate_successor_finish() {
+    for (relation, lag) in [
+        (DependencyRelation::FinishToFinish, Minutes::ZERO),
+        (DependencyRelation::StartToFinish, Minutes(60)),
+    ] {
+        let predecessor = calendar_event(
+            93_001,
+            "Fixed predecessor",
+            DAY + Duration::hours(10),
+            DAY + Duration::hours(11),
+        );
+        let mut successor = item(93_002, "Manually split successor", 120);
+        successor.split_policy = SplitPolicy::Splittable {
+            minimum_session: Minutes(60),
+            maximum_session: Minutes(60),
+            maximum_sessions: 2,
+            minimum_gap: Minutes::ZERO,
+            maximum_days: Some(1),
+        };
+        successor.constraints.dependencies = vec![Dependency {
+            item_id: predecessor.id,
+            relation,
+            minimum_lag: lag,
+            strength: ConstraintStrength::Hard,
+        }];
+        let placement_id = Uuid::from_u128(93_003);
+        let mut input = request(vec![predecessor, successor.clone()]);
+        input.availability = vec![availability(8, 12)];
+        input.previous_assignments = vec![PreviousAssignment {
+            item_id: successor.id,
+            occurrence_id: None,
+            blocks: vec![
+                PreviousBlock {
+                    start: DAY + Duration::hours(8),
+                    end: DAY + Duration::hours(9),
+                    session_index: 0,
+                },
+                PreviousBlock {
+                    start: DAY + Duration::hours(11),
+                    end: DAY + Duration::hours(12),
+                    session_index: 1,
+                },
+            ],
+            pinned: true,
+            manual_placement_id: Some(placement_id),
+        }];
+
+        let plan = Scheduler.plan(&input).unwrap();
+        let assessment = plan
+            .manual_placement_assessments
+            .iter()
+            .find(|assessment| assessment.placement_id == placement_id)
+            .expect("manual placement assessment");
+
+        assert!(
+            assessment
+                .violations
+                .iter()
+                .all(|violation| violation.code != ManualPlacementViolationCode::Dependency),
+            "{relation:?}"
+        );
+    }
 }
 
 #[test]
@@ -1475,12 +2142,16 @@ fn defer_candidate_rounds_credit_once_and_replaces_only_the_source_session() {
     let remaining_session = first
         .plan
         .blocks_for(task.id)
-        .find(|block| block.session_index == 4)
-        .expect("the other split-session demand remains scheduled");
+        .find(|block| block.session_index == 2)
+        .expect("the unrelated retained split session remains exact");
+    assert_eq!(remaining_session.kind, ScheduleBlockKind::Pinned);
+    assert_eq!(remaining_session.start, DAY + Duration::hours(12));
+    assert_eq!(remaining_session.end, DAY + Duration::hours(13));
     assert_eq!(
         (remaining_session.end - remaining_session.start).whole_minutes(),
         60
     );
+    assert!(planned(&first.plan, &task).is_empty());
     assert!(first.plan.unscheduled.is_empty());
 
     // 601 seconds normalizes once to 11 credited minutes. The exact source
@@ -1676,31 +2347,86 @@ fn partially_covered_execution_reservation_is_rejected() {
 }
 
 #[test]
-fn caller_blocks_at_or_below_execution_high_water_are_removed() {
+fn only_exact_execution_indices_remove_caller_blocks_below_the_high_water() {
     let task = item(207, "Do not resurrect old blocks", 60);
     let mut input = request(vec![task.clone()]);
     input.previous_assignments.push(PreviousAssignment {
         item_id: task.id,
         occurrence_id: None,
-        blocks: vec![PreviousBlock {
-            start: DAY + Duration::hours(9),
-            end: DAY + Duration::hours(9) + Duration::minutes(30),
-            session_index: 1,
-        }],
+        blocks: vec![
+            PreviousBlock {
+                start: DAY + Duration::hours(9),
+                end: DAY + Duration::hours(9) + Duration::minutes(30),
+                session_index: 1,
+            },
+            PreviousBlock {
+                start: DAY + Duration::hours(10),
+                end: DAY + Duration::hours(10) + Duration::minutes(30),
+                session_index: 2,
+            },
+        ],
         pinned: true,
         manual_placement_id: None,
     });
     let execution = execution_context(vec![execution_work(task.id, 0, vec![0, 2])]);
 
     let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
-    assert!(
-        plan.blocks_for(task.id)
-            .all(|block| block.kind != ScheduleBlockKind::Pinned)
-    );
+    let pinned = plan
+        .blocks_for(task.id)
+        .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+        .collect::<Vec<_>>();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].session_index, 1);
     let planned = planned(&plan, &task);
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0].session_index, 3);
-    assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 60);
+    assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 30);
+}
+
+#[test]
+fn manual_split_keeps_unclaimed_sessions_on_both_sides_of_execution_history() {
+    let mut task = item(207_001, "Move the unconsumed split sessions", 90);
+    task.split_policy = SplitPolicy::Splittable {
+        minimum_session: Minutes(30),
+        maximum_session: Minutes(30),
+        maximum_sessions: 3,
+        minimum_gap: Minutes::ZERO,
+        maximum_days: None,
+    };
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments.push(PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![
+            PreviousBlock {
+                start: DAY + Duration::hours(9),
+                end: DAY + Duration::hours(9) + Duration::minutes(30),
+                session_index: 0,
+            },
+            PreviousBlock {
+                start: DAY + Duration::hours(10),
+                end: DAY + Duration::hours(10) + Duration::minutes(30),
+                session_index: 1,
+            },
+            PreviousBlock {
+                start: DAY + Duration::hours(11),
+                end: DAY + Duration::hours(11) + Duration::minutes(30),
+                session_index: 2,
+            },
+        ],
+        pinned: true,
+        manual_placement_id: Some(Uuid::from_u128(207_002)),
+    });
+    let execution = execution_context(vec![execution_work(task.id, 1_800, vec![1])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    assert_eq!(
+        plan.blocks_for(task.id)
+            .map(|block| block.session_index)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert!(planned(&plan, &task).is_empty());
 }
 
 #[test]

@@ -61,16 +61,18 @@ current item-revision assignments with exact occurrence, session, start, and
 end identities. Moving published work must preserve every source session index
 and duration while that published assignment still describes the same
 canonical revision. When execution has consumed part of an ordinary published
-split assignment, the server removes every session at or below the
-authoritative execution high-water mark before comparing and scheduling the
-remaining move. An ordinary non-manual assignment superseded by a canonical
-duration/split edit may instead use the complete new shape; a retained manual
-pin still requires its explicit release. The core also requires the complete
-remaining duration, whole-minute target endpoints aligned to the configured
-slot grid, chronological fresh indices, and the item's indivisible or split
-session, gap, and day limits. One request supports at most 64 placement groups,
-128 assignments, 256 exact blocks, and 64 release commands. Invalid proposals
-are rejected instead of becoming stability hints.
+split assignment, the server removes exactly the claimed historical session
+indices before comparing and scheduling the remaining move; the maximum index
+is used only to allocate a fresh suffix and never implies that lower unclaimed
+sessions were consumed. An ordinary non-manual assignment superseded by a
+canonical duration/split edit may instead use the complete new shape; a
+retained manual pin still requires its explicit release. The core also requires
+the complete remaining duration, whole-minute target endpoints aligned to the
+configured slot grid, chronologically increasing unclaimed indices, a
+consecutive fresh suffix, and the item's indivisible or split session, gap, and
+day limits. One request supports at most 64 placement groups, 128 assignments,
+256 exact blocks, and 64 release commands. Invalid proposals are rejected
+instead of becoming stability hints.
 
 Preview retains every accepted manual block as `pinned` and returns one
 `manual_placement_assessments` entry. Its content-free descriptors bind the
@@ -721,6 +723,30 @@ days). Recurrence is bounded to 16 KiB and scheduling metadata to 32 KiB.
 Set-shaped arrays reject duplicates after semantic parsing: alternate textual
 spellings of the same UUID are duplicates, as are multiple dependency edges to
 the same item.
+
+Dependency entries support `finish_to_start`, `start_to_start`,
+`finish_to_finish`, and `start_to_finish`, a nonnegative whole-minute
+`minimum_lag`, and hard or weighted-soft strength. Start relations constrain
+the successor's first scheduled start; finish relations constrain its aggregate
+final finish. Likewise, a start relation can use the first block of a partially
+scheduled splittable predecessor, while a finish relation requires that
+predecessor's final finish. The same semantics apply to automatic and manually
+placed work.
+
+Recurrence materialization preserves a dependency whose predecessor belongs to
+a recurring subtree only when the successor belongs to that same subtree; both
+IDs are then rewritten to the same generated occurrence. External and
+cross-series references into a recurring subtree are rejected because no
+single predecessor occurrence is authoritative. A recurring subtree may still
+depend on an ordinary, non-recurring predecessor.
+
+PostgreSQL stores these edges only in the normalized `item_dependencies` graph.
+Item reads, deltas, proposal snapshots, and scheduling inputs project the graph
+back into the portable `constraints.dependencies` shape; embedded JSON is
+never a second writable authority. Every aggregate write verifies that the
+predecessor identity exists in the same workspace and rejects explicit or
+ordered-routine-derived cycles. Dependency array order has no scheduling
+meaning; new writes use deterministic predecessor order.
 
 ```json
 {

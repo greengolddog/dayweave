@@ -582,7 +582,7 @@ fn validate_manual_placement_sources(
             else {
                 continue;
             };
-            let high_water = execution_high_water_for_identity(
+            let claimed_indices = execution_claimed_indices_for_identity(
                 &evidence.execution,
                 assignment.item_id,
                 assignment.occurrence_id,
@@ -590,7 +590,7 @@ fn validate_manual_placement_sources(
             let source_shape: BTreeMap<_, _> = source
                 .blocks
                 .iter()
-                .filter(|block| high_water.is_none_or(|high| block.session_index > high))
+                .filter(|block| !claimed_indices.contains(&block.session_index))
                 .map(|block| {
                     (
                         block.session_index,
@@ -611,7 +611,7 @@ fn validate_manual_placement_sources(
             let remaining_source_count = source
                 .blocks
                 .iter()
-                .filter(|block| high_water.is_none_or(|high| block.session_index > high))
+                .filter(|block| !claimed_indices.contains(&block.session_index))
                 .count();
             let source_is_unique = source_shape.len() == remaining_source_count;
             let request_is_unique = requested_shape.len() == assignment.blocks.len();
@@ -656,13 +656,13 @@ fn execution_credit_changes_source_shape(
     }) else {
         return false;
     };
-    let Some(high_water) = execution_unit_high_water(unit) else {
+    if unit.used_session_indices.is_empty() {
         return false;
-    };
+    }
     let consumed_source_minutes = source
         .blocks
         .iter()
-        .filter(|block| block.session_index <= high_water)
+        .filter(|block| unit.used_session_indices.contains(&block.session_index))
         .try_fold(0_u64, |total, block| {
             let seconds = block.end.signed_duration_since(block.start).num_seconds();
             u64::try_from(seconds)
@@ -701,10 +701,10 @@ fn normalize_manual_placements_for_execution(
                 format!("item {} is no longer actionable", assignment.item_id),
             ));
         }
-        if let Some(high_water) = execution_unit_high_water(unit) {
+        if !unit.used_session_indices.is_empty() {
             assignment
                 .blocks
-                .retain(|block| block.session_index > high_water);
+                .retain(|block| !unit.used_session_indices.contains(&block.session_index));
             if assignment.blocks.is_empty() {
                 return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
                     format!(
@@ -718,11 +718,11 @@ fn normalize_manual_placements_for_execution(
     Ok(())
 }
 
-fn execution_high_water_for_identity(
+fn execution_claimed_indices_for_identity(
     execution: &ExecutionPlanningContext,
     item_id: Uuid,
     occurrence_id: Option<Uuid>,
-) -> Option<u16> {
+) -> BTreeSet<u16> {
     execution
         .work_units
         .iter()
@@ -730,19 +730,18 @@ fn execution_high_water_for_identity(
             unit.item_id.0 == item_id
                 && unit.occurrence_id.map(|occurrence| occurrence.0) == occurrence_id
         })
-        .and_then(execution_unit_high_water)
-}
-
-fn execution_unit_high_water(unit: &dayweave_core::ExecutionWorkUnit) -> Option<u16> {
-    unit.used_session_indices
-        .iter()
-        .copied()
-        .chain(
-            unit.reservations
+        .map(|unit| {
+            unit.used_session_indices
                 .iter()
-                .map(|reservation| reservation.session_index),
-        )
-        .max()
+                .copied()
+                .chain(
+                    unit.reservations
+                        .iter()
+                        .map(|reservation| reservation.session_index),
+                )
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_manual_placement_item_revisions(
@@ -1032,16 +1031,10 @@ fn retained_placement_has_new_execution_claim(
             .is_some_and(|unit| {
                 !unit.reservations.is_empty()
                     || unit.disposition.is_some()
-                    || unit
-                        .used_session_indices
+                    || assignment
+                        .blocks
                         .iter()
-                        .max()
-                        .is_some_and(|high_water| {
-                            assignment
-                                .blocks
-                                .iter()
-                                .any(|block| block.session_index <= *high_water)
-                        })
+                        .any(|block| unit.used_session_indices.contains(&block.session_index))
             })
     })
 }
@@ -2303,6 +2296,76 @@ mod tests {
             .map(|block| (block.end - block.start).whole_minutes())
             .sum::<i64>();
         assert_eq!(over_credit_minutes, 30);
+    }
+
+    #[test]
+    fn manual_execution_normalization_uses_exact_claimed_indices() {
+        let item_id = Uuid::from_u128(5501);
+        let blocks = vec![
+            PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 8, 30, 0).unwrap(),
+                session_index: 0,
+            },
+            PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap(),
+                session_index: 1,
+            },
+            PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 30, 0).unwrap(),
+                session_index: 2,
+            },
+        ];
+        let execution = ExecutionPlanningContext {
+            snapshot_revision: 1,
+            work_units: vec![dayweave_core::ExecutionWorkUnit {
+                item_id: ItemId(item_id),
+                occurrence_id: None,
+                progress_epoch: 1,
+                credited_seconds: 1_800,
+                disposition: None,
+                used_session_indices: vec![1],
+                reservations: Vec::new(),
+            }],
+        };
+        let mut request = preview_request();
+        request.manual_placements = vec![ManualPlacementInput {
+            id: Uuid::from_u128(5502),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id,
+                item_revision: 1,
+                occurrence_id: None,
+                blocks: blocks.clone(),
+            }],
+        }];
+
+        normalize_manual_placements_for_execution(&mut request, &execution).unwrap();
+        assert_eq!(
+            request.manual_placements[0].assignments[0]
+                .blocks
+                .iter()
+                .map(|block| block.session_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(
+            !retained_placement_has_new_execution_claim(&request.manual_placements[0], &execution,),
+            "a lower unclaimed session does not become consumed by implication"
+        );
+        let source = PreviousAssignmentInput {
+            item_id,
+            item_revision: 1,
+            occurrence_id: None,
+            blocks,
+            pinned: false,
+        };
+        assert!(
+            !execution_credit_changes_source_shape(&execution, &source),
+            "the exact claimed half-hour session accounts for all credited work"
+        );
     }
 
     #[test]

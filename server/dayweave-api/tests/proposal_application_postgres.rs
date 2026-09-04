@@ -11,7 +11,8 @@ use dayweave_api::{
         StartExecution,
     },
     items::{
-        IdempotencyKey, Item, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
+        DeltaChange, IdempotencyKey, Item, ItemKind, ItemRepository, ItemService, ItemStatus,
+        NewItem, ReplaceItem, SplitPolicy,
     },
     persistence::{
         DatabaseScope, MIGRATOR, PostgresExecutionRepository, PostgresItemRepository,
@@ -22,7 +23,8 @@ use dayweave_api::{
         Clock, NewProposal, Proposal, ProposalApplicationStatus, ProposalApplyRequest,
         ProposalChangeSet, ProposalCommand, ProposalConflictCode, ProposalImplicitChangeReason,
         ProposalItemField, ProposalKind, ProposalPreviewMember, ProposalPreviewRequest,
-        ProposalRepository, ProposalSource, ProposalStatus, ProposalUndoRequest, SystemClock,
+        ProposalRepository, ProposalRiskCode, ProposalSource, ProposalStatus, ProposalUndoRequest,
+        SystemClock,
     },
 };
 use serde_json::{Value, json};
@@ -51,10 +53,19 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
 
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
+    let dependent_child_id = Uuid::new_v4();
+    let mut dependent_child = item(
+        dependent_child_id,
+        ItemKind::Task,
+        "Review launch notes",
+        true,
+        Some(parent_id),
+    );
+    dependent_child.flexible_constraints = dependency_metadata(child_id);
     let commands = vec![
         ProposalCommand::CreateItem {
             command_id: Uuid::new_v4(),
-            item: item(parent_id, ItemKind::Goal, "Private launch", true, None),
+            item: dependent_child,
         },
         ProposalCommand::CreateItem {
             command_id: Uuid::new_v4(),
@@ -65,6 +76,13 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
                 true,
                 Some(parent_id),
             ),
+        },
+        // The parent intentionally appears last. Batch execution must stage all
+        // identities, finalize parents before children, and retain submitted
+        // order in review while persisting actual execution order for undo.
+        ProposalCommand::CreateItem {
+            command_id: Uuid::new_v4(),
+            item: item(parent_id, ItemKind::Goal, "Private launch", true, None),
         },
     ];
     let payload = serde_json::to_value(ProposalChangeSet::new(commands.clone()).unwrap()).unwrap();
@@ -95,8 +113,8 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
         .await
         .expect("typed proposal previews");
     assert!(preview.can_apply);
-    assert_eq!(preview.command_ids.len(), 2);
-    assert_eq!(preview.diffs.len(), 2);
+    assert_eq!(preview.command_ids.len(), 3);
+    assert_eq!(preview.diffs.len(), 3);
     assert!(preview.requires_explicit_approval);
     let parent_preview = preview
         .diffs
@@ -104,7 +122,7 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
         .find(|diff| diff.item_id == parent_id)
         .and_then(|diff| diff.after.as_ref())
         .expect("parent has a final preview snapshot");
-    assert_eq!(parent_preview.revision, 2);
+    assert_eq!(parent_preview.revision, 3);
     assert!(!parent_preview.is_executable);
 
     let apply_request = ProposalApplyRequest {
@@ -122,8 +140,16 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
     assert!(!first.replayed);
     assert_eq!(first.application.status, ProposalApplicationStatus::Applied);
     assert_eq!(first.application.proposals[0].applied_revision, 2);
-    assert_eq!(first.application.affected_item_ids.len(), 2);
-    assert_eq!(first.application.command_ids.len(), 2);
+    assert_eq!(first.application.affected_item_ids.len(), 3);
+    assert_eq!(first.application.command_ids.len(), 3);
+    assert_eq!(
+        first.application.command_ids,
+        commands
+            .iter()
+            .map(ProposalCommand::command_id)
+            .collect::<Vec<_>>(),
+        "receipts preserve the reviewed order even when execution is reordered"
+    );
     assert_eq!(
         applications
             .get_for_proposal(proposal.id)
@@ -131,6 +157,28 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
             .expect("application is discoverable after a lost response"),
         first.application
     );
+    let item_repository = PostgresItemRepository::new(test_database.pool.clone(), scope);
+    let apply_delta = item_repository
+        .delta(0, 1)
+        .await
+        .expect("application delta is readable atomically");
+    assert_eq!(
+        apply_delta.changes.len(),
+        5,
+        "three direct creates and two parent refreshes stay in one expanded page"
+    );
+    assert!(!apply_delta.has_more);
+    let apply_group_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT change_group_id FROM item_changes \
+         WHERE workspace_id=$1 AND sequence <= $2 ORDER BY sequence",
+    )
+    .bind(scope.workspace_id)
+    .bind(i64::try_from(apply_delta.watermark).unwrap())
+    .fetch_all(&test_database.pool)
+    .await
+    .unwrap();
+    let apply_group_id = apply_group_ids[0].expect("application changes are grouped");
+    assert_eq!(apply_group_ids, vec![Some(apply_group_id); 5]);
 
     let replay = applications
         .apply(
@@ -193,8 +241,8 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
     .await
     .unwrap();
     assert_eq!(
-        parent_revision, 2,
-        "child creation refreshes its parent fence"
+        parent_revision, 3,
+        "both child creations refresh their parent fence"
     );
 
     let undone = applications
@@ -211,11 +259,33 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
     assert!(!undone.replayed);
     assert_eq!(undone.application.status, ProposalApplicationStatus::Undone);
     assert_eq!(undone.application.application_revision, 2);
+    let undo_delta = item_repository
+        .delta(apply_delta.watermark, 1)
+        .await
+        .expect("undo delta is readable atomically");
+    assert_eq!(
+        undo_delta.changes.len(),
+        5,
+        "inverse commands and their parent refreshes stay in one expanded page"
+    );
+    assert!(!undo_delta.has_more);
+    let undo_group_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT change_group_id FROM item_changes \
+         WHERE workspace_id=$1 AND sequence > $2 ORDER BY sequence",
+    )
+    .bind(scope.workspace_id)
+    .bind(i64::try_from(apply_delta.watermark).unwrap())
+    .fetch_all(&test_database.pool)
+    .await
+    .unwrap();
+    let undo_group_id = undo_group_ids[0].expect("undo changes are grouped");
+    assert_ne!(undo_group_id, apply_group_id);
+    assert_eq!(undo_group_ids, vec![Some(undo_group_id); 5]);
     let active_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM items WHERE workspace_id=$1 AND id = ANY($2) AND trashed_at IS NULL",
     )
     .bind(scope.workspace_id)
-    .bind(vec![parent_id, child_id])
+    .bind(vec![parent_id, child_id, dependent_child_id])
     .fetch_one(&test_database.pool)
     .await
     .unwrap();
@@ -254,6 +324,493 @@ async fn grouped_application_is_atomic_idempotent_and_revision_fenced_for_undo()
     assert!(!audit_canary && !outbox_canary);
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn preview_rejects_an_atomic_delta_group_too_large_for_native_delivery() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; proposal payload bound test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let large_notes = "x".repeat(100_000);
+    let commands = (0..90)
+        .map(|index| {
+            let mut proposed = item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                &format!("Large payload item {index}"),
+                false,
+                None,
+            );
+            proposed.notes = Some(large_notes.clone());
+            ProposalCommand::CreateItem {
+                command_id: Uuid::new_v4(),
+                item: proposed,
+            }
+        })
+        .collect();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::GoalBreakdown,
+        "Reject an undeliverable atomic payload",
+        commands,
+    )
+    .await;
+
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("oversized delivery remains a reviewable conflict");
+    assert!(!preview.can_apply);
+    assert!(preview.conflicts.iter().any(|conflict| {
+        conflict.code == ProposalConflictCode::InvalidItem
+            && conflict.summary.contains("Split this proposal")
+            && conflict.summary.contains("safe device-delivery limit")
+    }));
+    let leaked_changes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM item_changes WHERE workspace_id=$1")
+            .bind(fixture.scope.workspace_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        leaked_changes, 0,
+        "preview payload measurement is rolled back with the simulation"
+    );
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Tunes a real PostgreSQL JSONB group exactly across the delivery boundary.
+async fn preview_reserves_space_for_later_timestamp_serialization_growth() {
+    const COMMAND_COUNT: usize = 84;
+    const MAX_GROUP_PAYLOAD_BYTES: i64 = 8 * 1024 * 1024;
+    const MAX_NOTES_CHARS: usize = 100_000;
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; proposal payload reserve test skipped");
+        return;
+    };
+    let preview_now = "2026-09-04T12:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("fixed whole-second preview time");
+    let later_now = "2026-09-04T12:00:00.123456Z"
+        .parse::<DateTime<Utc>>()
+        .expect("fixed microsecond apply time");
+    let clock = Arc::new(MutableClock::new(preview_now));
+    let fixture = ApplicationFixture::create_with_clock(&database_url, clock.clone()).await;
+    let mut proposed_items = (0..COMMAND_COUNT)
+        .map(|index| {
+            let mut proposed = item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                &format!("Near-limit payload item {index}"),
+                false,
+                None,
+            );
+            proposed.notes = Some("x".repeat(96_000));
+            proposed
+        })
+        .collect::<Vec<_>>();
+
+    let base_payload_bytes =
+        serialized_create_delta_payload_bytes(&fixture.database.pool, &proposed_items, preview_now)
+            .await;
+    let target_payload_bytes = MAX_GROUP_PAYLOAD_BYTES - 1;
+    assert!(
+        base_payload_bytes <= target_payload_bytes,
+        "base fixture must start below the exact group limit: {base_payload_bytes}"
+    );
+    let mut remaining = usize::try_from(target_payload_bytes - base_payload_bytes)
+        .expect("positive payload adjustment fits usize");
+    for proposed in &mut proposed_items {
+        let notes = proposed.notes.as_mut().expect("near-limit notes");
+        let addition = remaining.min(MAX_NOTES_CHARS - notes.len());
+        notes.push_str(&"x".repeat(addition));
+        remaining -= addition;
+    }
+    assert_eq!(remaining, 0, "fixture has enough bounded note capacity");
+
+    let preview_payload_bytes =
+        serialized_create_delta_payload_bytes(&fixture.database.pool, &proposed_items, preview_now)
+            .await;
+    assert_eq!(preview_payload_bytes, target_payload_bytes);
+    let later_payload_bytes =
+        serialized_create_delta_payload_bytes(&fixture.database.pool, &proposed_items, later_now)
+            .await;
+    assert!(
+        later_payload_bytes > MAX_GROUP_PAYLOAD_BYTES,
+        "a wider microsecond timestamp would exceed the exact later bound: {later_payload_bytes}"
+    );
+
+    let commands = proposed_items
+        .into_iter()
+        .map(|item| ProposalCommand::CreateItem {
+            command_id: Uuid::new_v4(),
+            item,
+        })
+        .collect();
+    let proposal = insert_change_set_proposal_at(
+        &fixture.proposals,
+        ProposalKind::GoalBreakdown,
+        "Reserve later timestamp growth",
+        commands,
+        preview_now,
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("near-limit delivery remains a reviewable conflict");
+    assert!(!preview.can_apply);
+    assert!(preview.conflicts.iter().any(|conflict| {
+        conflict.code == ProposalConflictCode::InvalidItem
+            && conflict.summary.contains("safe device-delivery limit")
+    }));
+
+    clock.set(later_now);
+    assert!(matches!(
+        fixture
+            .applications
+            .apply(
+                preview.preview_id,
+                ProposalApplyRequest {
+                    expected_review_hash: preview.review_hash,
+                },
+                "proposal-payload-reserve-apply",
+                None,
+            )
+            .await,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::PreviewNotApplicable
+        ))
+    ));
+    let leaked_changes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM item_changes WHERE workspace_id=$1")
+            .bind(fixture.scope.workspace_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("inspect near-limit preview rollback");
+    assert_eq!(leaked_changes, 0);
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn dependency_change_is_reviewed_applied_and_restored_by_undo() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; dependency proposal test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let predecessor = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Finish the prerequisite",
+                false,
+                None,
+            ),
+            item_key("dependency-proposal-predecessor", 91),
+        )
+        .await
+        .expect("predecessor created")
+        .item;
+    let successor = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Start after the prerequisite",
+                false,
+                None,
+            ),
+            item_key("dependency-proposal-successor", 92),
+        )
+        .await
+        .expect("successor created")
+        .item;
+    let mut proposed = replacement(&successor, successor.status);
+    proposed.flexible_constraints = dependency_metadata(predecessor.id);
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::ConstraintChange,
+        "Add a scheduling dependency",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: successor.id,
+            expected_revision: successor.revision,
+            item: proposed,
+        }],
+    )
+    .await;
+
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("dependency change previews");
+    assert!(preview.can_apply);
+    let diff = preview.diffs.first().expect("one dependency diff");
+    assert!(
+        diff.changed_fields
+            .contains(&ProposalItemField::Dependencies)
+    );
+    assert!(diff.changed_fields.contains(&ProposalItemField::Revision));
+    assert!(
+        !diff
+            .changed_fields
+            .contains(&ProposalItemField::FlexibleConstraints),
+        "dependency edges must not be hidden inside the generic metadata diff"
+    );
+    let risk = preview
+        .risks
+        .iter()
+        .find(|risk| risk.code == ProposalRiskCode::ChangesDependencies)
+        .expect("dependency change has a dedicated risk");
+    assert!(risk.requires_explicit_approval);
+    assert_eq!(risk.item_id, Some(successor.id));
+
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "dependency-proposal-apply",
+            None,
+        )
+        .await
+        .expect("dependency change applies");
+    let current = fixture
+        .items
+        .get(successor.id)
+        .await
+        .expect("successor reads");
+    assert_eq!(
+        current.flexible_constraints,
+        dependency_metadata(predecessor.id)
+    );
+    let stored_edge: (String, i32, String, Option<i32>) = sqlx::query_as(
+        "SELECT dependency_kind, lag_seconds, dependency_strength, dependency_soft_weight \
+         FROM item_dependencies WHERE workspace_id = $1 AND predecessor_item_id = $2 \
+         AND successor_item_id = $3",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(predecessor.id)
+    .bind(successor.id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .expect("normalized dependency edge exists");
+    assert_eq!(
+        stored_edge,
+        ("finish_to_start".to_owned(), 900, "hard".to_owned(), None)
+    );
+
+    let undone = fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "dependency-proposal-undo",
+            None,
+        )
+        .await
+        .expect("dependency change undo restores the prior graph");
+    assert_eq!(undone.application.status, ProposalApplicationStatus::Undone);
+    let restored = fixture
+        .items
+        .get(successor.id)
+        .await
+        .expect("restored successor reads");
+    assert_eq!(restored.flexible_constraints, json!({}));
+    assert!(restored.revision > current.revision);
+    let remaining_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_dependencies WHERE workspace_id = $1 \
+         AND successor_item_id = $2",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(successor.id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .expect("dependency graph inspected after undo");
+    assert_eq!(remaining_edges, 0);
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn dependency_rewire_uses_final_batch_graph_for_apply_and_undo() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; dependency rewire test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let first = fixture
+        .items
+        .create(
+            item(Uuid::new_v4(), ItemKind::Task, "First task", false, None),
+            item_key("dependency-rewire-first", 93),
+        )
+        .await
+        .expect("first item created")
+        .item;
+    let second = fixture
+        .items
+        .create(
+            item(Uuid::new_v4(), ItemKind::Task, "Second task", false, None),
+            item_key("dependency-rewire-second", 94),
+        )
+        .await
+        .expect("second item created")
+        .item;
+    let mut second_with_dependency = replacement(&second, second.status);
+    second_with_dependency.flexible_constraints = dependency_metadata(first.id);
+    let second = fixture
+        .items
+        .replace(
+            second.id,
+            second.revision,
+            second_with_dependency,
+            item_key("dependency-rewire-seed", 95),
+        )
+        .await
+        .expect("initial first-to-second edge created")
+        .item;
+    let baseline_delta = fixture
+        .items
+        .delta(None, 200)
+        .await
+        .expect("baseline item delta");
+    assert!(!baseline_delta.has_more);
+
+    let mut first_replacement = replacement(&first, first.status);
+    first_replacement.flexible_constraints = dependency_metadata(second.id);
+    let mut second_replacement = replacement(&second, second.status);
+    second_replacement.flexible_constraints = json!({});
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::ConstraintChange,
+        "Reverse a dependency without a transient cycle",
+        vec![
+            // This addition deliberately precedes removal of the reverse edge.
+            // A per-command graph validator would reject it even though the
+            // reviewed final graph is acyclic.
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: first.id,
+                expected_revision: first.revision,
+                item: first_replacement,
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: second.id,
+                expected_revision: second.revision,
+                item: second_replacement,
+            },
+        ],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("final acyclic rewire previews");
+    assert!(preview.can_apply);
+    assert_eq!(
+        preview
+            .risks
+            .iter()
+            .filter(|risk| risk.code == ProposalRiskCode::ChangesDependencies)
+            .count(),
+        2
+    );
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "dependency-rewire-apply",
+            None,
+        )
+        .await
+        .expect("final acyclic rewire applies");
+    let applied_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT predecessor_item_id, successor_item_id FROM item_dependencies \
+         WHERE workspace_id = $1 ORDER BY predecessor_item_id, successor_item_id",
+    )
+    .bind(fixture.scope.workspace_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("rewired graph reads");
+    assert_eq!(applied_edges, vec![(second.id, first.id)]);
+
+    let first_rewire_page = fixture
+        .items
+        .delta(Some(&baseline_delta.next_cursor), 1)
+        .await
+        .expect("atomic rewire delta page");
+    assert_eq!(first_rewire_page.changes.len(), 2);
+    assert!(!first_rewire_page.has_more);
+    let changed_items = first_rewire_page
+        .changes
+        .iter()
+        .map(|change| match change {
+            DeltaChange::Upsert { item } => item.as_ref(),
+            DeltaChange::Tombstone { .. } => panic!("rewire changes must be item upserts"),
+        })
+        .collect::<Vec<_>>();
+    let removed_edge_item = changed_items
+        .iter()
+        .find(|item| item.id == second.id)
+        .expect("rewire removal is delivered in the atomic group");
+    assert_eq!(removed_edge_item.flexible_constraints, json!({}));
+    let added_edge_item = changed_items
+        .iter()
+        .find(|item| item.id == first.id)
+        .expect("rewire addition is delivered in the atomic group");
+    assert_eq!(
+        added_edge_item.flexible_constraints,
+        dependency_metadata(second.id),
+        "one atomic page moves the client directly between acyclic graphs"
+    );
+
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "dependency-rewire-undo",
+            None,
+        )
+        .await
+        .expect("rewire undo uses its final graph");
+    let restored_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT predecessor_item_id, successor_item_id FROM item_dependencies \
+         WHERE workspace_id = $1 ORDER BY predecessor_item_id, successor_item_id",
+    )
+    .bind(fixture.scope.workspace_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("restored graph reads");
+    assert_eq!(restored_edges, vec![(first.id, second.id)]);
+
+    fixture.database.destroy().await;
 }
 
 #[tokio::test]
@@ -1987,6 +2544,713 @@ async fn apply_rechecks_time_after_lock_wait_and_rejects_exact_preview_expiry() 
     fixture.database.destroy().await;
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+async fn hierarchy_batch_detaches_child_before_closing_parent_and_adapts_revision() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; hierarchy close test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Close after detaching",
+                false,
+                None,
+            ),
+            item_key("hierarchy-close-parent", 111),
+        )
+        .await
+        .expect("parent created")
+        .item;
+    let child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Detach before close",
+                false,
+                Some(parent.id),
+            ),
+            item_key("hierarchy-close-child", 112),
+        )
+        .await
+        .expect("child created")
+        .item;
+    let parent = fixture
+        .items
+        .get(parent.id)
+        .await
+        .expect("parent refresh reads");
+
+    let mut detached_child = replacement(&child, child.status);
+    detached_child.parent_id = None;
+    let parent_command_id = Uuid::new_v4();
+    let child_command_id = Uuid::new_v4();
+    let commands = vec![
+        ProposalCommand::ReplaceItem {
+            command_id: parent_command_id,
+            item_id: parent.id,
+            expected_revision: parent.revision,
+            item: replacement(&parent, ItemStatus::Completed),
+        },
+        ProposalCommand::ReplaceItem {
+            command_id: child_command_id,
+            item_id: child.id,
+            expected_revision: child.revision,
+            item: detached_child,
+        },
+    ];
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Detach a child and close its parent",
+        commands,
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("inter-target hierarchy batch previews");
+    assert!(preview.can_apply);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "hierarchy-close-apply",
+            None,
+        )
+        .await
+        .expect("child is detached before the parent closes");
+
+    let closed_parent = fixture.items.get(parent.id).await.expect("closed parent");
+    let detached_child = fixture.items.get(child.id).await.expect("detached child");
+    assert_eq!(closed_parent.status, ItemStatus::Completed);
+    assert_eq!(closed_parent.revision, parent.revision + 2);
+    assert_eq!(detached_child.parent_id, None);
+    let evidence: Vec<(Uuid, i16, i16, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT action_id,ordinal,review_ordinal,expected_revision,before_revision,after_revision \
+         FROM proposal_application_effects WHERE workspace_id=$1 AND user_id=$2 \
+         AND application_id=$3 ORDER BY review_ordinal",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(fixture.scope.user_id)
+    .bind(applied.application.application_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("effect ordering evidence");
+    assert_eq!(
+        evidence,
+        vec![
+            (
+                parent_command_id,
+                1,
+                0,
+                Some(i64::try_from(parent.revision).unwrap()),
+                Some(i64::try_from(parent.revision).unwrap()),
+                i64::try_from(parent.revision + 2).unwrap(),
+            ),
+            (
+                child_command_id,
+                0,
+                1,
+                Some(i64::try_from(child.revision).unwrap()),
+                Some(i64::try_from(child.revision).unwrap()),
+                i64::try_from(child.revision + 1).unwrap(),
+            ),
+        ]
+    );
+    let parent_audit_chain: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT operation_type,base_revision,result_revision FROM audit_operations \
+         WHERE workspace_id=$1 AND entity_type='item' AND entity_id=$2 \
+         AND base_revision >= $3 ORDER BY base_revision",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(parent.id)
+    .bind(i64::try_from(parent.revision).unwrap())
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("parent audit chain");
+    assert_eq!(
+        parent_audit_chain,
+        vec![
+            (
+                "item.hierarchy_changed".to_owned(),
+                Some(i64::try_from(parent.revision).unwrap()),
+                Some(i64::try_from(parent.revision + 1).unwrap()),
+            ),
+            (
+                "item.updated".to_owned(),
+                Some(i64::try_from(parent.revision + 1).unwrap()),
+                Some(i64::try_from(parent.revision + 2).unwrap()),
+            ),
+        ]
+    );
+
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "hierarchy-close-undo",
+            None,
+        )
+        .await
+        .expect("undo reopens the parent before restoring its child");
+    let restored_parent = fixture.items.get(parent.id).await.expect("restored parent");
+    let restored_child = fixture.items.get(child.id).await.expect("restored child");
+    assert_eq!(restored_parent.status, parent.status);
+    assert_eq!(restored_child.parent_id, Some(parent.id));
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hierarchy_batch_trashes_child_before_parent_and_undo_restores_parent_first() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; hierarchy trash test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Trash after child",
+                false,
+                None,
+            ),
+            item_key("hierarchy-trash-parent", 113),
+        )
+        .await
+        .expect("parent created")
+        .item;
+    let child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Trash before parent",
+                false,
+                Some(parent.id),
+            ),
+            item_key("hierarchy-trash-child", 114),
+        )
+        .await
+        .expect("child created")
+        .item;
+    let parent = fixture
+        .items
+        .get(parent.id)
+        .await
+        .expect("refreshed parent");
+    let parent_command_id = Uuid::new_v4();
+    let child_command_id = Uuid::new_v4();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Trash a hierarchy atomically",
+        vec![
+            ProposalCommand::TrashItem {
+                command_id: parent_command_id,
+                item_id: parent.id,
+                expected_revision: parent.revision,
+            },
+            ProposalCommand::TrashItem {
+                command_id: child_command_id,
+                item_id: child.id,
+                expected_revision: child.revision,
+            },
+        ],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("parent-first review finds a safe execution order");
+    assert!(preview.can_apply);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "hierarchy-trash-apply",
+            None,
+        )
+        .await
+        .expect("child and parent trash atomically");
+    assert!(
+        item_timestamps(&fixture.database.pool, fixture.scope, child.id)
+            .await
+            .2
+            .is_some()
+    );
+    assert!(
+        item_timestamps(&fixture.database.pool, fixture.scope, parent.id)
+            .await
+            .2
+            .is_some()
+    );
+    let ordinals: Vec<(Uuid, i16, i16)> = sqlx::query_as(
+        "SELECT action_id,ordinal,review_ordinal FROM proposal_application_effects \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY review_ordinal",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(fixture.scope.user_id)
+    .bind(applied.application.application_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("trash execution evidence");
+    assert_eq!(
+        ordinals,
+        vec![(parent_command_id, 1, 0), (child_command_id, 0, 1)]
+    );
+
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "hierarchy-trash-undo",
+            None,
+        )
+        .await
+        .expect("parent restores before child");
+    assert_eq!(
+        fixture
+            .items
+            .get(child.id)
+            .await
+            .expect("child restored")
+            .parent_id,
+        Some(parent.id)
+    );
+    assert!(fixture.items.get(parent.id).await.is_ok());
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hierarchy_batch_reverses_parentage_without_a_transient_cycle() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; hierarchy reversal test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let old_parent = fixture
+        .items
+        .create(
+            item(Uuid::new_v4(), ItemKind::Goal, "Old parent", false, None),
+            item_key("hierarchy-reverse-parent", 115),
+        )
+        .await
+        .expect("old parent created")
+        .item;
+    let old_child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Old child",
+                false,
+                Some(old_parent.id),
+            ),
+            item_key("hierarchy-reverse-child", 116),
+        )
+        .await
+        .expect("old child created")
+        .item;
+    let old_parent = fixture
+        .items
+        .get(old_parent.id)
+        .await
+        .expect("refreshed old parent");
+    let mut parent_under_child = replacement(&old_parent, old_parent.status);
+    parent_under_child.parent_id = Some(old_child.id);
+    let mut child_at_root = replacement(&old_child, old_child.status);
+    child_at_root.parent_id = None;
+    let parent_command_id = Uuid::new_v4();
+    let child_command_id = Uuid::new_v4();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Reverse a hierarchy",
+        vec![
+            ProposalCommand::ReplaceItem {
+                command_id: parent_command_id,
+                item_id: old_parent.id,
+                expected_revision: old_parent.revision,
+                item: parent_under_child,
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: child_command_id,
+                item_id: old_child.id,
+                expected_revision: old_child.revision,
+                item: child_at_root,
+            },
+        ],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("hierarchy reversal previews");
+    assert!(preview.can_apply);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "hierarchy-reverse-apply",
+            None,
+        )
+        .await
+        .expect("hierarchy reversal applies");
+    assert_eq!(
+        fixture
+            .items
+            .get(old_parent.id)
+            .await
+            .expect("new child")
+            .parent_id,
+        Some(old_child.id)
+    );
+    assert_eq!(
+        fixture
+            .items
+            .get(old_child.id)
+            .await
+            .expect("new parent")
+            .parent_id,
+        None
+    );
+    let ordinals: Vec<(Uuid, i16)> = sqlx::query_as(
+        "SELECT action_id,ordinal FROM proposal_application_effects \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY review_ordinal",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(fixture.scope.user_id)
+    .bind(applied.application.application_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("reversal execution evidence");
+    assert_eq!(
+        ordinals,
+        vec![(parent_command_id, 1), (child_command_id, 0)]
+    );
+
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "hierarchy-reverse-undo",
+            None,
+        )
+        .await
+        .expect("hierarchy reversal undoes");
+    assert_eq!(
+        fixture
+            .items
+            .get(old_child.id)
+            .await
+            .expect("original child restored")
+            .parent_id,
+        Some(old_parent.id)
+    );
+    assert_eq!(
+        fixture
+            .items
+            .get(old_parent.id)
+            .await
+            .expect("original root restored")
+            .parent_id,
+        None
+    );
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn created_parent_can_depend_on_its_new_child() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; staged identity test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let mut parent = item(parent_id, ItemKind::Goal, "Dependent parent", false, None);
+    parent.flexible_constraints = dependency_metadata(child_id);
+    let child_command_id = Uuid::new_v4();
+    let parent_command_id = Uuid::new_v4();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::GoalBreakdown,
+        "Create mutually referenced hierarchy identities",
+        vec![
+            ProposalCommand::CreateItem {
+                command_id: child_command_id,
+                item: item(
+                    child_id,
+                    ItemKind::Task,
+                    "New dependency child",
+                    false,
+                    Some(parent_id),
+                ),
+            },
+            ProposalCommand::CreateItem {
+                command_id: parent_command_id,
+                item: parent,
+            },
+        ],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("neutral staged identities make the graph previewable");
+    assert!(preview.can_apply);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "staged-hierarchy-apply",
+            None,
+        )
+        .await
+        .expect("parent dependency and child hierarchy apply together");
+    assert_eq!(
+        fixture
+            .items
+            .get(child_id)
+            .await
+            .expect("child created")
+            .parent_id,
+        Some(parent_id)
+    );
+    assert_eq!(
+        fixture
+            .items
+            .get(parent_id)
+            .await
+            .expect("parent created")
+            .flexible_constraints,
+        dependency_metadata(child_id)
+    );
+    let edge: (Uuid, Uuid) = sqlx::query_as(
+        "SELECT predecessor_item_id,successor_item_id FROM item_dependencies \
+         WHERE workspace_id=$1 AND predecessor_item_id=$2 AND successor_item_id=$3",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(child_id)
+    .bind(parent_id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .expect("parent dependency edge exists");
+    assert_eq!(edge, (child_id, parent_id));
+    let ordinals: Vec<(Uuid, i16)> = sqlx::query_as(
+        "SELECT action_id,ordinal FROM proposal_application_effects \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY review_ordinal",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(fixture.scope.user_id)
+    .bind(applied.application.application_id)
+    .fetch_all(&fixture.database.pool)
+    .await
+    .expect("staged create execution evidence");
+    assert_eq!(
+        ordinals,
+        vec![(child_command_id, 1), (parent_command_id, 0)]
+    );
+
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: applied.application.application_revision,
+            },
+            "staged-hierarchy-undo",
+            None,
+        )
+        .await
+        .expect("created child trashes before its parent");
+    assert!(
+        item_timestamps(&fixture.database.pool, fixture.scope, child_id)
+            .await
+            .2
+            .is_some()
+    );
+    assert!(
+        item_timestamps(&fixture.database.pool, fixture.scope, parent_id)
+            .await
+            .2
+            .is_some()
+    );
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hierarchy_batch_rejects_initial_parent_revision_before_child_refresh() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; hierarchy pre-fence test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Revision-fenced parent",
+                false,
+                None,
+            ),
+            item_key("hierarchy-fence-parent", 117),
+        )
+        .await
+        .expect("parent created")
+        .item;
+    let child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Would refresh parent",
+                false,
+                Some(parent.id),
+            ),
+            item_key("hierarchy-fence-child", 118),
+        )
+        .await
+        .expect("child created")
+        .item;
+    let parent = fixture
+        .items
+        .get(parent.id)
+        .await
+        .expect("refreshed parent");
+    let mut detached_child = replacement(&child, child.status);
+    detached_child.parent_id = None;
+    let parent_command_id = Uuid::new_v4();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Reject a revision that only a batch side effect could create",
+        vec![
+            ProposalCommand::ReplaceItem {
+                command_id: parent_command_id,
+                item_id: parent.id,
+                // Detaching the child would advance the parent to this revision.
+                // It must not make an initially invalid optimistic fence valid.
+                expected_revision: parent.revision + 1,
+                item: replacement(&parent, ItemStatus::Completed),
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: child.id,
+                expected_revision: child.revision,
+                item: detached_child,
+            },
+        ],
+    )
+    .await;
+    let side_effects_before =
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .expect("revision mismatch is a blocked preview");
+    assert!(!preview.can_apply);
+    let conflict = preview
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.command_id == Some(parent_command_id))
+        .expect("parent command owns the initial fence conflict");
+    assert_eq!(conflict.code, ProposalConflictCode::ItemRevisionMismatch);
+    assert_eq!(conflict.expected_revision, Some(parent.revision + 1));
+    assert_eq!(conflict.actual_revision, Some(parent.revision));
+    assert!(matches!(
+        fixture
+            .applications
+            .apply(
+                preview.preview_id,
+                ProposalApplyRequest {
+                    expected_review_hash: preview.review_hash,
+                },
+                "hierarchy-fence-apply",
+                None,
+            )
+            .await,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::PreviewNotApplicable
+        ))
+    ));
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        side_effects_before,
+        "pre-fence rejection leaks no item delta, audit, outbox, receipt, or request"
+    );
+    assert_eq!(
+        fixture
+            .items
+            .get(parent.id)
+            .await
+            .expect("parent unchanged")
+            .revision,
+        parent.revision
+    );
+    assert_eq!(
+        fixture
+            .items
+            .get(child.id)
+            .await
+            .expect("child unchanged")
+            .parent_id,
+        Some(parent.id)
+    );
+
+    fixture.database.destroy().await;
+}
+
 struct ApplicationFixture {
     database: TestDatabase,
     scope: DatabaseScope,
@@ -2368,6 +3632,42 @@ fn item(
         blocked_by_item_id: None,
         blocked_reason: None,
     }
+}
+
+async fn serialized_create_delta_payload_bytes(
+    pool: &PgPool,
+    items: &[NewItem],
+    now: DateTime<Utc>,
+) -> i64 {
+    let payloads = items
+        .iter()
+        .cloned()
+        .map(|item| {
+            serde_json::to_value(Item::new(item, now).expect("valid near-limit item"))
+                .expect("serialize near-limit item")
+        })
+        .collect();
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(octet_length(element::text)), 0)::bigint \
+         FROM jsonb_array_elements($1::jsonb) AS elements(element)",
+    )
+    .bind(Value::Array(payloads))
+    .fetch_one(pool)
+    .await
+    .expect("measure PostgreSQL delta payload bytes")
+}
+
+fn dependency_metadata(predecessor_id: Uuid) -> Value {
+    json!({
+        "constraints": {
+            "dependencies": [{
+                "item_id": predecessor_id,
+                "relation": "finish_to_start",
+                "minimum_lag": 15,
+                "strength": { "level": "hard" }
+            }]
+        }
+    })
 }
 
 async fn seed_scope(pool: &PgPool) -> DatabaseScope {

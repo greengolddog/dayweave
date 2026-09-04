@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use dayweave_core::{ConstraintStrength, Dependency, DependencyRelation};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction, postgres::PgRow};
@@ -8,7 +11,9 @@ use uuid::Uuid;
 use crate::items::{
     BlockedReasonKind, DeadlineKind, DeadlineStrength, DeltaChange, DurationKind, DurationSource,
     IdempotencyContext, Item, ItemDeltaPage, ItemKind, ItemMutation, ItemQuery, ItemRepository,
-    ItemRepositoryError, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy,
+    ItemRepositoryError, ItemStatus, ItemTombstone, MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES,
+    MAX_ITEM_CHANGE_GROUP_SIZE, NewItem, ReplaceItem, SplitPolicy,
+    delivery_bounded_delta_prefix_len, max_expanded_delta_page_size,
 };
 
 use super::{DatabaseScope, database::lock_canonical_item_space};
@@ -28,9 +33,29 @@ const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.st
          JOIN items AS child ON child.workspace_id = child_edge.workspace_id \
              AND child.id = child_edge.child_item_id \
          WHERE child_edge.workspace_id = item.workspace_id \
-             AND child_edge.parent_item_id = item.id AND child.trashed_at IS NULL) AS has_children \
+             AND child_edge.parent_item_id = item.id AND child.trashed_at IS NULL) AS has_children, \
+     COALESCE((SELECT jsonb_agg(jsonb_build_object( \
+             'item_id', dependency.predecessor_item_id, \
+             'relation', dependency.dependency_kind, \
+             'minimum_lag', dependency.lag_seconds / 60, \
+             'strength', CASE WHEN dependency.dependency_strength = 'hard' \
+                 THEN jsonb_build_object('level', 'hard') \
+                 ELSE jsonb_build_object('level', 'soft', 'weight', dependency.dependency_soft_weight) END \
+         ) ORDER BY dependency.projection_ordinal, dependency.predecessor_item_id) \
+         FROM item_dependencies AS dependency \
+         WHERE dependency.workspace_id = item.workspace_id \
+           AND dependency.successor_item_id = item.id), '[]'::jsonb) AS authoritative_dependencies \
      FROM items AS item LEFT JOIN item_hierarchy AS hierarchy \
        ON hierarchy.workspace_id = item.workspace_id AND hierarchy.child_item_id = item.id";
+
+const ITEM_CHANGE_GROUP_SETTING: &str = "dayweave.item_change_group_id";
+// Preview/apply state, command content, UUIDs, revisions, row count, and row
+// order are hash- or fence-bound. Only generated mutation timestamps can differ
+// at a later apply/undo. Deadline, earliest-start, and recurrence times are
+// command-bound; the four mutation-owned RFC 3339 fields can each gain at most
+// seven bytes from a canonical microsecond fraction. One KiB per emitted row
+// therefore leaves more than 36x the maximum dynamic growth.
+const PREVIEW_ITEM_CHANGE_ROW_RESERVE_BYTES: i64 = 1024;
 
 #[derive(Clone, Debug)]
 pub struct PostgresItemRepository {
@@ -72,6 +97,27 @@ pub(crate) enum TransactionalItemCommand {
 pub(crate) struct TransactionalItemEffect {
     pub before: Option<Item>,
     pub after: Item,
+    /// Zero-based order in which this command actually mutated the batch.
+    /// Proposal review remains in submitted order, while undo reverses this
+    /// execution order so parent/child staging is always unwound safely.
+    pub execution_ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionalGraphMode {
+    Immediate,
+    Deferred,
+    DeferredWithStagedCreates,
+}
+
+impl TransactionalGraphMode {
+    const fn validates_immediately(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    const fn uses_staged_creates(self) -> bool {
+        matches!(self, Self::DeferredWithStagedCreates)
+    }
 }
 
 impl PostgresItemRepository {
@@ -87,6 +133,7 @@ impl ItemRepository for PostgresItemRepository {
         self.scope.workspace_id
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps the full locked create, grouped delta, and idempotency envelope visible.
     async fn create(
         &self,
         item: Item,
@@ -134,6 +181,7 @@ impl ItemRepository for PostgresItemRepository {
         )
         .await?;
         insert_item(&mut transaction, self.scope, &item).await?;
+        persist_item_dependency_edges(&mut transaction, self.scope.workspace_id, &item).await?;
         replace_hierarchy_edge(
             &mut transaction,
             self.scope.workspace_id,
@@ -142,9 +190,11 @@ impl ItemRepository for PostgresItemRepository {
             item.sibling_order,
         )
         .await?;
+        validate_dependency_graph_tx(&mut transaction, self.scope.workspace_id).await?;
         let item =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, item.id, false)
                 .await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction).await?;
         record_mutation(
             &mut transaction,
             self.scope,
@@ -161,6 +211,8 @@ impl ItemRepository for PostgresItemRepository {
             item.updated_at,
         )
         .await?;
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -216,6 +268,7 @@ impl ItemRepository for PostgresItemRepository {
             .collect()
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps the locked replace, hierarchy refreshes, and grouped delta envelope visible.
     async fn replace(
         &self,
         id: Uuid,
@@ -292,6 +345,7 @@ impl ItemRepository for PostgresItemRepository {
             return Err(ItemRepositoryError::NonLeafExecutable);
         }
         update_item(&mut transaction, self.scope.workspace_id, &item).await?;
+        persist_item_dependency_edges(&mut transaction, self.scope.workspace_id, &item).await?;
         replace_hierarchy_edge(
             &mut transaction,
             self.scope.workspace_id,
@@ -300,8 +354,10 @@ impl ItemRepository for PostgresItemRepository {
             item.sibling_order,
         )
         .await?;
+        validate_dependency_graph_tx(&mut transaction, self.scope.workspace_id).await?;
         let item =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction).await?;
         record_mutation(
             &mut transaction,
             self.scope,
@@ -320,6 +376,8 @@ impl ItemRepository for PostgresItemRepository {
             )
             .await?;
         }
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -366,6 +424,7 @@ impl ItemRepository for PostgresItemRepository {
         update_item(&mut transaction, self.scope.workspace_id, &item).await?;
         let item =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, true).await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction).await?;
         record_mutation(
             &mut transaction,
             self.scope,
@@ -382,6 +441,8 @@ impl ItemRepository for PostgresItemRepository {
             item.updated_at,
         )
         .await?;
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -443,8 +504,10 @@ impl ItemRepository for PostgresItemRepository {
             return Err(ItemRepositoryError::NonLeafExecutable);
         }
         update_item(&mut transaction, self.scope.workspace_id, &item).await?;
+        validate_dependency_graph_tx(&mut transaction, self.scope.workspace_id).await?;
         let item =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction).await?;
         record_mutation(
             &mut transaction,
             self.scope,
@@ -461,6 +524,8 @@ impl ItemRepository for PostgresItemRepository {
             item.updated_at,
         )
         .await?;
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -480,6 +545,7 @@ impl ItemRepository for PostgresItemRepository {
         u64::try_from(maximum).map_err(|_| ItemRepositoryError::Internal)
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps cursor validation, atomic expansion, and payload decoding in one ordered read.
     async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError> {
         let after = i64::try_from(after).map_err(|_| ItemRepositoryError::Internal)?;
         let maximum =
@@ -487,10 +553,14 @@ impl ItemRepository for PostgresItemRepository {
         if after > maximum {
             return Err(ItemRepositoryError::InvalidCursor);
         }
-        let fetch_limit = i64::try_from(limit.checked_add(1).ok_or(ItemRepositoryError::Internal)?)
-            .map_err(|_| ItemRepositoryError::Internal)?;
+        let fetch_limit = i64::try_from(
+            max_expanded_delta_page_size(limit)?
+                .checked_add(1)
+                .ok_or(ItemRepositoryError::Internal)?,
+        )
+        .map_err(|_| ItemRepositoryError::Internal)?;
         let rows = sqlx::query(
-            "SELECT sequence, change_kind, payload FROM item_changes \
+            "SELECT sequence, change_kind, payload, change_group_id FROM item_changes \
              WHERE workspace_id = $1 AND sequence > $2 ORDER BY sequence LIMIT $3",
         )
         .bind(self.scope.workspace_id)
@@ -499,10 +569,53 @@ impl ItemRepository for PostgresItemRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(internal)?;
-        let has_more = rows.len() > limit;
+        if let Some(first_group_id) = rows
+            .first()
+            .map(|row| row.try_get::<Option<Uuid>, _>("change_group_id"))
+            .transpose()
+            .map_err(internal)?
+            .flatten()
+        {
+            let preceding_group_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT change_group_id FROM item_changes \
+                 WHERE workspace_id = $1 AND sequence <= $2 \
+                 ORDER BY sequence DESC LIMIT 1",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(after)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(internal)?
+            .flatten();
+            if preceding_group_id == Some(first_group_id) {
+                return Err(ItemRepositoryError::InvalidCursor);
+            }
+        }
+        let group_ids = rows
+            .iter()
+            .map(|row| row.try_get::<Option<Uuid>, _>("change_group_id"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        let payload_sizes = rows
+            .iter()
+            .map(|row| {
+                let payload: Value = row.try_get("payload").map_err(internal)?;
+                serde_json::to_vec(&payload)
+                    .map(|serialized| serialized.len())
+                    .map_err(|_| ItemRepositoryError::Internal)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected_count = delivery_bounded_delta_prefix_len(&group_ids, &payload_sizes, limit)?;
+        validate_persisted_delta_groups(
+            &self.pool,
+            self.scope.workspace_id,
+            &rows[..selected_count],
+        )
+        .await?;
+        let has_more = rows.len() > selected_count;
         let mut watermark = u64::try_from(after).map_err(|_| ItemRepositoryError::Internal)?;
-        let mut changes = Vec::with_capacity(rows.len().min(limit));
-        for row in rows.iter().take(limit) {
+        let mut changes = Vec::with_capacity(selected_count);
+        for row in rows.iter().take(selected_count) {
             let sequence: i64 = row.try_get("sequence").map_err(internal)?;
             watermark = u64::try_from(sequence).map_err(|_| ItemRepositoryError::Internal)?;
             let kind: String = row.try_get("change_kind").map_err(internal)?;
@@ -534,6 +647,166 @@ pub(crate) async fn lock_item_batch_tx(
     workspace_id: Uuid,
 ) -> Result<(), ItemRepositoryError> {
     lock_workspace_items(transaction, workspace_id).await
+}
+
+/// Starts one bounded transaction-local delta group. `record_mutation` reads
+/// this local setting, so direct item effects and every implicit parent refresh
+/// produced by the same transaction receive the same identifier. The setting
+/// disappears automatically at commit or rollback.
+pub(crate) async fn start_item_change_group_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Uuid, ItemRepositoryError> {
+    let group_id = Uuid::new_v4();
+    let configured: String = sqlx::query_scalar("SELECT set_config($1, $2, true)")
+        .bind(ITEM_CHANGE_GROUP_SETTING)
+        .bind(group_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    if configured == group_id.to_string() {
+        Ok(group_id)
+    } else {
+        Err(ItemRepositoryError::Internal)
+    }
+}
+
+/// Verifies the write-side bound before a transaction can publish its group,
+/// then closes the transaction-local group context.
+/// Readers independently enforce the same bound and therefore fail closed if
+/// data was inserted outside this repository contract.
+pub(crate) async fn validate_item_change_group_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    group_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    validate_item_change_group_with_reserve_tx(transaction, workspace_id, group_id, 0).await
+}
+
+/// Applies the ordinary group bounds plus conservative headroom for fields that
+/// can be regenerated between preview and a later apply or undo.
+pub(crate) async fn validate_preview_item_change_group_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    group_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    validate_item_change_group_with_reserve_tx(
+        transaction,
+        workspace_id,
+        group_id,
+        PREVIEW_ITEM_CHANGE_ROW_RESERVE_BYTES,
+    )
+    .await
+}
+
+async fn validate_item_change_group_with_reserve_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    group_id: Uuid,
+    reserved_bytes_per_row: i64,
+) -> Result<(), ItemRepositoryError> {
+    let (count, payload_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(sum(octet_length(payload::text)), 0)::bigint \
+         FROM item_changes \
+         WHERE workspace_id = $1 AND change_group_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(group_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let bounded_payload_bytes = count
+        .checked_mul(reserved_bytes_per_row)
+        .and_then(|reserved| payload_bytes.checked_add(reserved));
+    let validation = if count <= 0 || payload_bytes < 0 || reserved_bytes_per_row < 0 {
+        Err(ItemRepositoryError::Internal)
+    } else if count > i64::try_from(MAX_ITEM_CHANGE_GROUP_SIZE).expect("group bound fits i64")
+        || bounded_payload_bytes.is_some_and(|bytes| {
+            bytes
+                > i64::try_from(MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES)
+                    .expect("payload bound fits i64")
+        })
+    {
+        Err(ItemRepositoryError::DeltaGroupTooLarge)
+    } else if bounded_payload_bytes.is_none() {
+        Err(ItemRepositoryError::Internal)
+    } else {
+        Ok(())
+    };
+    // Provider import transactions can process another independent item after
+    // this check. Resetting prevents any later writer from extending a group
+    // whose delivery bounds were already validated. `record_mutation` maps the
+    // empty setting to NULL, which the post-cutover database guard rejects.
+    let cleared: String = sqlx::query_scalar("SELECT set_config($1, '', true)")
+        .bind(ITEM_CHANGE_GROUP_SETTING)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    if !cleared.is_empty() {
+        return Err(ItemRepositoryError::Internal);
+    }
+    validation
+}
+
+async fn validate_persisted_delta_groups(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    selected_rows: &[PgRow],
+) -> Result<(), ItemRepositoryError> {
+    let mut local_counts = HashMap::<Uuid, usize>::new();
+    for row in selected_rows {
+        if let Some(group_id) = row
+            .try_get::<Option<Uuid>, _>("change_group_id")
+            .map_err(internal)?
+        {
+            *local_counts.entry(group_id).or_default() += 1;
+        }
+    }
+    if local_counts.is_empty() {
+        return Ok(());
+    }
+    let group_ids = local_counts.keys().copied().collect::<Vec<_>>();
+    let stats = sqlx::query(
+        "WITH group_stats AS ( \
+             SELECT change_group_id, count(*)::bigint AS row_count, \
+                    min(sequence) AS minimum_sequence, max(sequence) AS maximum_sequence, \
+                    COALESCE(sum(octet_length(payload::text)), 0)::bigint AS payload_bytes \
+             FROM item_changes \
+             WHERE workspace_id = $1 AND change_group_id = ANY($2) \
+             GROUP BY change_group_id \
+         ) \
+         SELECT stats.change_group_id, stats.row_count, stats.payload_bytes, \
+                (SELECT count(*)::bigint FROM item_changes AS spanned \
+                 WHERE spanned.workspace_id = $1 \
+                   AND spanned.sequence BETWEEN stats.minimum_sequence AND stats.maximum_sequence) \
+                    AS span_row_count \
+         FROM group_stats AS stats",
+    )
+    .bind(workspace_id)
+    .bind(&group_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(internal)?;
+    if stats.len() != group_ids.len() {
+        return Err(ItemRepositoryError::Internal);
+    }
+    for row in stats {
+        let group_id: Uuid = row.try_get("change_group_id").map_err(internal)?;
+        let row_count: i64 = row.try_get("row_count").map_err(internal)?;
+        let payload_bytes: i64 = row.try_get("payload_bytes").map_err(internal)?;
+        let span_row_count: i64 = row.try_get("span_row_count").map_err(internal)?;
+        let count = usize::try_from(row_count).map_err(|_| ItemRepositoryError::Internal)?;
+        if count > MAX_ITEM_CHANGE_GROUP_SIZE
+            || payload_bytes
+                > i64::try_from(MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES)
+                    .expect("payload bound fits i64")
+        {
+            return Err(ItemRepositoryError::DeltaGroupTooLarge);
+        }
+        if local_counts.get(&group_id) != Some(&count) || span_row_count != row_count {
+            return Err(ItemRepositoryError::Internal);
+        }
+    }
+    Ok(())
 }
 
 /// Locks execution state before the canonical item space. Proposal preview,
@@ -575,6 +848,73 @@ pub(crate) async fn list_item_batch_tx(
         .collect()
 }
 
+/// Constructs the exact neutral identity persisted for a staged create.
+/// Projection and SQL staging share this normalization so neither can observe
+/// hierarchy, dependency, completion, or blocker state before finalization.
+pub(crate) fn staged_item_shell(
+    input: &NewItem,
+    now: DateTime<Utc>,
+) -> Result<Item, ItemRepositoryError> {
+    let mut shell = Item::new(input.clone(), now)?;
+    shell.status = ItemStatus::Planned;
+    shell.completed_at = None;
+    shell.parent_id = None;
+    shell.blocked_reason_kind = None;
+    shell.blocked_by_item_id = None;
+    shell.blocked_reason = None;
+    shell.project_dependencies(&[])?;
+    shell.is_executable = shell.execution_is_allowed(false);
+    Ok(shell)
+}
+
+/// Inserts a transaction-local shell before proposal batch execution. The row
+/// makes its UUID available to foreign keys without publishing a revision,
+/// audit record, or delta, and is finalized in the same transaction.
+pub(crate) async fn stage_item_create_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    input: &NewItem,
+    now: DateTime<Utc>,
+) -> Result<(), ItemRepositoryError> {
+    let shell = staged_item_shell(input, now)?;
+    insert_item(transaction, scope, &shell).await
+}
+
+/// Removes the old incoming edge sets for every successor that a transactional
+/// batch will replace. The final edge sets can then be inserted in any command
+/// order without transient cycles; the caller must validate the complete graph
+/// before committing.
+pub(crate) async fn clear_dependency_edges_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    successor_item_ids: &[Uuid],
+) -> Result<(), ItemRepositoryError> {
+    let mut successor_item_ids = successor_item_ids.to_vec();
+    successor_item_ids.sort_unstable();
+    successor_item_ids.dedup();
+    if successor_item_ids.is_empty() {
+        return Ok(());
+    }
+    authorize_dependency_writes(transaction).await?;
+    sqlx::query(
+        "DELETE FROM item_dependencies WHERE workspace_id = $1 \
+         AND successor_item_id = ANY($2)",
+    )
+    .bind(workspace_id)
+    .bind(&successor_item_ids)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+pub(crate) async fn validate_dependency_graph_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    validate_dependency_graph_tx(transaction, workspace_id).await
+}
+
 /// Executes one item command inside a transaction that already owns execution
 /// state followed by the canonical workspace item lock. `record` is false for
 /// rolled-back previews and true for committed application/undo transactions.
@@ -585,6 +925,7 @@ pub(crate) async fn apply_item_command_tx(
     command: TransactionalItemCommand,
     now: DateTime<Utc>,
     record: bool,
+    graph_mode: TransactionalGraphMode,
 ) -> Result<TransactionalItemEffect, ItemRepositoryError> {
     match command {
         TransactionalItemCommand::Create(input) => {
@@ -593,7 +934,12 @@ pub(crate) async fn apply_item_command_tx(
             reject_parent_for_active_execution(transaction, scope.workspace_id, item.parent_id)
                 .await?;
             validate_blocked_by(transaction, scope.workspace_id, item.blocked_by_item_id).await?;
-            insert_item(transaction, scope, &item).await?;
+            if graph_mode.uses_staged_creates() {
+                update_item(transaction, scope.workspace_id, &item).await?;
+            } else {
+                insert_item(transaction, scope, &item).await?;
+            }
+            persist_item_dependency_edges(transaction, scope.workspace_id, &item).await?;
             replace_hierarchy_edge(
                 transaction,
                 scope.workspace_id,
@@ -602,6 +948,9 @@ pub(crate) async fn apply_item_command_tx(
                 item.sibling_order,
             )
             .await?;
+            if graph_mode.validates_immediately() {
+                validate_dependency_graph_tx(transaction, scope.workspace_id).await?;
+            }
             let item =
                 fetch_item_transaction(transaction, scope.workspace_id, item.id, false).await?;
             if record {
@@ -626,6 +975,7 @@ pub(crate) async fn apply_item_command_tx(
             Ok(TransactionalItemEffect {
                 before: None,
                 after: item,
+                execution_ordinal: 0,
             })
         }
         TransactionalItemCommand::Replace {
@@ -658,6 +1008,7 @@ pub(crate) async fn apply_item_command_tx(
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
             update_item(transaction, scope.workspace_id, &item).await?;
+            persist_item_dependency_edges(transaction, scope.workspace_id, &item).await?;
             replace_hierarchy_edge(
                 transaction,
                 scope.workspace_id,
@@ -666,6 +1017,9 @@ pub(crate) async fn apply_item_command_tx(
                 item.sibling_order,
             )
             .await?;
+            if graph_mode.validates_immediately() {
+                validate_dependency_graph_tx(transaction, scope.workspace_id).await?;
+            }
             let item =
                 fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
             if record {
@@ -693,6 +1047,7 @@ pub(crate) async fn apply_item_command_tx(
             Ok(TransactionalItemEffect {
                 before: Some(current),
                 after: item,
+                execution_ordinal: 0,
             })
         }
         TransactionalItemCommand::Trash {
@@ -738,6 +1093,7 @@ pub(crate) async fn apply_item_command_tx(
             Ok(TransactionalItemEffect {
                 before: Some(current),
                 after: item,
+                execution_ordinal: 0,
             })
         }
         TransactionalItemCommand::Restore {
@@ -765,6 +1121,9 @@ pub(crate) async fn apply_item_command_tx(
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
             update_item(transaction, scope.workspace_id, &item).await?;
+            if graph_mode.validates_immediately() {
+                validate_dependency_graph_tx(transaction, scope.workspace_id).await?;
+            }
             let item =
                 fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
             if record {
@@ -789,6 +1148,7 @@ pub(crate) async fn apply_item_command_tx(
             Ok(TransactionalItemEffect {
                 before: Some(current),
                 after: item,
+                execution_ordinal: 0,
             })
         }
         TransactionalItemCommand::RestoreSnapshot {
@@ -804,6 +1164,7 @@ pub(crate) async fn apply_item_command_tx(
                 *snapshot,
                 now,
                 record,
+                graph_mode,
             )
             .await
         }
@@ -819,6 +1180,7 @@ async fn restore_item_snapshot_tx(
     mut snapshot: Item,
     now: DateTime<Utc>,
     record: bool,
+    graph_mode: TransactionalGraphMode,
 ) -> Result<TransactionalItemEffect, ItemRepositoryError> {
     let current = fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
     ensure_revision(&current, expected_revision)?;
@@ -852,6 +1214,7 @@ async fn restore_item_snapshot_tx(
         .ok_or(ItemRepositoryError::Internal)?;
     snapshot.updated_at = now;
     update_item(transaction, scope.workspace_id, &snapshot).await?;
+    persist_item_dependency_edges(transaction, scope.workspace_id, &snapshot).await?;
     replace_hierarchy_edge(
         transaction,
         scope.workspace_id,
@@ -860,6 +1223,9 @@ async fn restore_item_snapshot_tx(
         snapshot.sibling_order,
     )
     .await?;
+    if graph_mode.validates_immediately() {
+        validate_dependency_graph_tx(transaction, scope.workspace_id).await?;
+    }
     let restored = fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
     if record {
         let (operation, change_kind) =
@@ -894,6 +1260,7 @@ async fn restore_item_snapshot_tx(
     Ok(TransactionalItemEffect {
         before: Some(current),
         after: restored,
+        execution_ordinal: 0,
     })
 }
 
@@ -903,6 +1270,7 @@ async fn insert_item(
     item: &Item,
 ) -> Result<(), ItemRepositoryError> {
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
+    let stored_constraints = item.constraints_without_dependencies()?;
     let result = sqlx::query(
         "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
          timezone_name, duration_kind, duration_seconds, duration_min_seconds, duration_max_seconds, \
@@ -948,7 +1316,7 @@ async fn insert_item(
     )
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
-    .bind(&item.flexible_constraints)
+    .bind(&stored_constraints)
     .bind(item.has_own_effort)
     .bind(split_allowed)
     .bind(minimum_chunk)
@@ -979,6 +1347,7 @@ async fn update_item(
     item: &Item,
 ) -> Result<(), ItemRepositoryError> {
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
+    let stored_constraints = item.constraints_without_dependencies()?;
     sqlx::query(
         "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
          duration_kind = $9, duration_seconds = $10, duration_min_seconds = $11, \
@@ -1023,7 +1392,7 @@ async fn update_item(
     )
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
-    .bind(&item.flexible_constraints)
+    .bind(&stored_constraints)
     .bind(item.has_own_effort)
     .bind(split_allowed)
     .bind(minimum_chunk)
@@ -1264,6 +1633,115 @@ async fn validate_blocked_by(
     }
 }
 
+async fn persist_item_dependency_edges(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item: &Item,
+) -> Result<(), ItemRepositoryError> {
+    let dependencies = item.dependencies()?;
+    replace_dependency_edges(transaction, workspace_id, item.id, &dependencies).await
+}
+
+async fn replace_dependency_edges(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    successor_item_id: Uuid,
+    dependencies: &[Dependency],
+) -> Result<(), ItemRepositoryError> {
+    authorize_dependency_writes(transaction).await?;
+    let mut dependencies = dependencies.to_vec();
+    dependencies.sort_by_key(|dependency| dependency.item_id);
+    for dependency in &dependencies {
+        let predecessor_item_id = dependency.item_id.0;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = $1 AND id = $2)",
+        )
+        .bind(workspace_id)
+        .bind(predecessor_item_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        if !exists {
+            return Err(ItemRepositoryError::DependencyNotFound(predecessor_item_id));
+        }
+    }
+
+    sqlx::query("DELETE FROM item_dependencies WHERE workspace_id = $1 AND successor_item_id = $2")
+        .bind(workspace_id)
+        .bind(successor_item_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+
+    for (projection_ordinal, dependency) in dependencies.into_iter().enumerate() {
+        let (strength, weight) = match dependency.strength {
+            ConstraintStrength::Hard => ("hard", None),
+            ConstraintStrength::Soft { weight } => (
+                "soft",
+                Some(i32::try_from(weight).map_err(|_| ItemRepositoryError::Internal)?),
+            ),
+        };
+        let lag_seconds = dependency
+            .minimum_lag
+            .get()
+            .checked_mul(60)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or(ItemRepositoryError::Internal)?;
+        sqlx::query(
+            "INSERT INTO item_dependencies (workspace_id, predecessor_item_id, \
+             successor_item_id, dependency_kind, lag_seconds, dependency_strength, \
+             dependency_soft_weight, projection_ordinal) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(workspace_id)
+        .bind(dependency.item_id.0)
+        .bind(successor_item_id)
+        .bind(dependency_relation_name(dependency.relation))
+        .bind(lag_seconds)
+        .bind(strength)
+        .bind(weight)
+        .bind(i32::try_from(projection_ordinal).map_err(|_| ItemRepositoryError::Internal)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_dependency_write_error)?;
+    }
+    Ok(())
+}
+
+async fn authorize_dependency_writes(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), ItemRepositoryError> {
+    let _: String = sqlx::query_scalar(
+        "SELECT set_config('dayweave.item_dependency_write', 'aggregate-v1', true)",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn validate_dependency_graph_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    let items = list_item_batch_tx(transaction, workspace_id).await?;
+    crate::items::validate_dependency_graph(
+        &items.into_iter().map(|item| (item.id, item)).collect(),
+    )
+}
+
+fn map_dependency_write_error(error: sqlx::Error) -> ItemRepositoryError {
+    if error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::constraint)
+        == Some("item_dependencies_acyclic")
+    {
+        ItemRepositoryError::DependencyCycle
+    } else {
+        internal(error)
+    }
+}
+
 async fn has_active_children(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -1483,7 +1961,8 @@ async fn record_mutation(
     let revision = revision_to_i64(item.revision)?;
     sqlx::query(
         "INSERT INTO item_changes (workspace_id, item_id, item_revision, change_kind, payload, \
-         changed_at) VALUES ($1, $2, $3, $4, $5, $6)",
+         changed_at, change_group_id) VALUES ($1, $2, $3, $4, $5, $6, \
+         NULLIF(current_setting($7, true), '')::uuid)",
     )
     .bind(scope.workspace_id)
     .bind(item.id)
@@ -1491,6 +1970,7 @@ async fn record_mutation(
     .bind(change_name)
     .bind(&payload)
     .bind(item.updated_at)
+    .bind(ITEM_CHANGE_GROUP_SETTING)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -1560,7 +2040,12 @@ fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
     let kind = parse_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?;
     let has_own_effort: bool = row.try_get("has_own_effort").map_err(internal)?;
-    Ok(Item {
+    let authoritative_dependencies: Vec<Dependency> = serde_json::from_value(
+        row.try_get::<Value, _>("authoritative_dependencies")
+            .map_err(internal)?,
+    )
+    .map_err(|_| ItemRepositoryError::Internal)?;
+    let mut item = Item {
         id: row.try_get("id").map_err(internal)?,
         is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
         kind,
@@ -1634,7 +2119,10 @@ fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
             .transpose()?,
         blocked_by_item_id: row.try_get("blocked_by_item_id").map_err(internal)?,
         blocked_reason: row.try_get("blocked_reason").map_err(internal)?,
-    })
+    };
+    item.project_dependencies(&authoritative_dependencies)
+        .map_err(|_| ItemRepositoryError::Internal)?;
+    Ok(item)
 }
 
 fn split_columns(policy: &SplitPolicy) -> (bool, Option<i32>, Option<i32>) {
@@ -1660,6 +2148,15 @@ const fn kind_name(kind: ItemKind) -> &'static str {
         ItemKind::Goal => "goal",
         ItemKind::Project => "project",
         ItemKind::Break => "break",
+    }
+}
+
+const fn dependency_relation_name(relation: DependencyRelation) -> &'static str {
+    match relation {
+        DependencyRelation::FinishToStart => "finish_to_start",
+        DependencyRelation::StartToStart => "start_to_start",
+        DependencyRelation::FinishToFinish => "finish_to_finish",
+        DependencyRelation::StartToFinish => "start_to_finish",
     }
 }
 

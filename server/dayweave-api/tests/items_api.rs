@@ -253,7 +253,10 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
         .unwrap();
     assert_eq!(first_delta.status(), StatusCode::OK);
     let first_delta = body_json(first_delta).await;
-    assert_eq!(first_delta["changes"].as_array().unwrap().len(), 2);
+    // The requested count is a target: the child create and its root refresh
+    // are one committed change group, so the page expands instead of exposing
+    // a cursor between those two rows.
+    assert_eq!(first_delta["changes"].as_array().unwrap().len(), 3);
     assert_eq!(first_delta["has_more"], true);
     let cursor = first_delta["next_cursor"].as_str().unwrap();
 
@@ -269,7 +272,7 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
         .await
         .unwrap();
     let second_delta = body_json(second_delta).await;
-    assert_eq!(second_delta["changes"].as_array().unwrap().len(), 3);
+    assert_eq!(second_delta["changes"].as_array().unwrap().len(), 2);
     assert!(
         second_delta["changes"]
             .as_array()
@@ -521,6 +524,31 @@ async fn strict_item_json_and_idempotency_conflicts_are_structured() {
 #[allow(clippy::too_many_lines)]
 async fn shared_scheduling_metadata_contract_is_enforced_on_create_and_replace() {
     let app = test_app();
+    // The shared metadata fixture deliberately exercises a typed dependency.
+    // API-level graph validation additionally requires that its predecessor is
+    // a real workspace identity, so establish that identity before replaying
+    // the otherwise portable fixture cases.
+    let mut dependency_predecessor = item_body(
+        Uuid::parse_str("00000000-0000-0000-0000-000000000199")
+            .expect("fixture dependency predecessor UUID"),
+        "task",
+        "Fixture dependency predecessor",
+        None,
+        0,
+    );
+    dependency_predecessor["recurrence"] = Value::Null;
+    let predecessor_response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(dependency_predecessor),
+            true,
+            Some("valid-fixture-dependency-predecessor"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(predecessor_response.status(), StatusCode::CREATED);
     let valid = scheduling_fixture("valid-rich-items.json");
     assert_eq!(valid["schema"], "dayweave.scheduling-metadata-fixtures/1");
     let mut saw_explicit_split_defaults = false;

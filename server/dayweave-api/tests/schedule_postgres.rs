@@ -694,6 +694,125 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     )
     .await;
 
+    let dependency_parameters = |predecessor_id: Uuid| {
+        json!({
+            "flexible_constraints": {
+                "constraints": {
+                    "dependencies": [{
+                        "item_id": predecessor_id,
+                        "relation": "finish_to_start",
+                        "minimum_lag": 0,
+                        "strength": { "level": "hard" }
+                    }]
+                }
+            }
+        })
+    };
+    let public_dependency_request = SimulationRequest {
+        base_revision: first_revision.clone(),
+        operations: vec![operation(
+            PlanOperationKind::UpdateConstraint,
+            Some(&public_task.to_string()),
+            dependency_parameters(public_goal_b),
+        )],
+        assumptions: Vec::new(),
+    };
+    let public_dependency = schedules
+        .simulate(&access, public_dependency_request.clone())
+        .await
+        .expect("public dependency proposal simulates");
+    assert!(public_dependency.application_ready);
+    set_item_sensitivity(&items, public_goal_b, true, 213).await;
+    assert_private_simulation_rejected(
+        &test_database.pool,
+        scope,
+        &schedules,
+        &access,
+        &public_dependency_request,
+        &public_dependency,
+        "privacy-dependency-tightened",
+        [213; 32],
+    )
+    .await;
+    set_item_sensitivity(&items, public_goal_b, false, 214).await;
+
+    let private_dependency_request = SimulationRequest {
+        base_revision: first_revision.clone(),
+        operations: vec![operation(
+            PlanOperationKind::UpdateConstraint,
+            Some(&public_task.to_string()),
+            dependency_parameters(private_child),
+        )],
+        assumptions: Vec::new(),
+    };
+    let private_dependency = schedules
+        .simulate(&access, private_dependency_request.clone())
+        .await
+        .expect("private dependency becomes a redacted manual review");
+    let dependency_warning = private_dependency
+        .warnings
+        .iter()
+        .find(|warning| warning.code == "redacted_dependency")
+        .expect("dependency predecessor is privacy checked");
+    assert!(dependency_warning.related_ids.is_empty());
+    assert!(!private_dependency.application_ready);
+    assert_private_simulation_rejected(
+        &test_database.pool,
+        scope,
+        &schedules,
+        &access,
+        &private_dependency_request,
+        &private_dependency,
+        "privacy-dependency-existing",
+        [214; 32],
+    )
+    .await;
+
+    let original_constraints = items
+        .get(public_task)
+        .await
+        .expect("dependency-removal target reads")
+        .flexible_constraints;
+    set_item_constraints(
+        &items,
+        public_task,
+        dependency_parameters(private_child)["flexible_constraints"].clone(),
+        215,
+    )
+    .await;
+    let private_dependency_removal_request = SimulationRequest {
+        base_revision: first_revision.clone(),
+        operations: vec![operation(
+            PlanOperationKind::UpdateConstraint,
+            Some(&public_task.to_string()),
+            json!({ "flexible_constraints": original_constraints.clone() }),
+        )],
+        assumptions: Vec::new(),
+    };
+    let private_dependency_removal = schedules
+        .simulate(&access, private_dependency_removal_request.clone())
+        .await
+        .expect("removing a private predecessor remains privacy checked");
+    assert!(
+        private_dependency_removal
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "redacted_dependency")
+    );
+    assert!(!private_dependency_removal.application_ready);
+    assert_private_simulation_rejected(
+        &test_database.pool,
+        scope,
+        &schedules,
+        &access,
+        &private_dependency_removal_request,
+        &private_dependency_removal,
+        "privacy-dependency-removal",
+        [215; 32],
+    )
+    .await;
+    set_item_constraints(&items, public_task, original_constraints, 216).await;
+
     set_item_sensitivity(&items, public_task, true, 70).await;
     set_item_sensitivity(&items, private_parent, false, 71).await;
     let historically_private = schedules
@@ -3903,7 +4022,7 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         .expect("execution defer authorization migration applies");
     for migration in MIGRATOR
         .iter()
-        .filter(|migration| (22..=24).contains(&migration.version))
+        .filter(|migration| (22..=25).contains(&migration.version))
     {
         test_database
             .pool
@@ -4100,7 +4219,7 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
 
     for migration in MIGRATOR
         .iter()
-        .filter(|migration| (21..=24).contains(&migration.version))
+        .filter(|migration| (21..=25).contains(&migration.version))
     {
         test_database
             .pool
@@ -4327,6 +4446,7 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         include_str!("../migrations/0022_google_schedule_publication.sql"),
         include_str!("../migrations/0023_google_task_provider_metadata.sql"),
         include_str!("../migrations/0024_structural_item_fields.sql"),
+        include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
     ] {
         test_database
             .pool
@@ -5550,6 +5670,53 @@ async fn set_item_sensitivity(items: &ItemService, item_id: Uuid, is_sensitive: 
                 earliest_start_at: current.earliest_start_at,
                 recurrence: current.recurrence,
                 flexible_constraints: current.flexible_constraints,
+                has_own_effort: Some(current.has_own_effort),
+                split_policy: current.split_policy,
+                importance: current.importance,
+                urgency: current.urgency,
+                parent_id: current.parent_id,
+                sibling_order: current.sibling_order,
+                blocked_reason_kind: current.blocked_reason_kind,
+                blocked_by_item_id: current.blocked_by_item_id,
+                blocked_reason: current.blocked_reason,
+            },
+            idempotency(marker),
+        )
+        .await
+        .unwrap();
+}
+
+async fn set_item_constraints(
+    items: &ItemService,
+    item_id: Uuid,
+    flexible_constraints: Value,
+    marker: u8,
+) {
+    let current = items.get(item_id).await.unwrap();
+    items
+        .replace(
+            item_id,
+            current.revision,
+            ReplaceItem {
+                is_sensitive: current.is_sensitive,
+                kind: current.kind,
+                status: current.status,
+                title: current.title,
+                notes: current.notes,
+                timezone_name: current.timezone_name,
+                duration_kind: Some(current.duration_kind),
+                duration_seconds: current.duration_seconds,
+                duration_min_seconds: current.duration_min_seconds,
+                duration_max_seconds: current.duration_max_seconds,
+                duration_source: current.duration_source,
+                deadline_kind: Some(current.deadline_kind),
+                deadline_date: current.deadline_date,
+                deadline_at: current.deadline_at,
+                deadline_strength: current.deadline_strength,
+                deadline_soft_weight: current.deadline_soft_weight,
+                earliest_start_at: current.earliest_start_at,
+                recurrence: current.recurrence,
+                flexible_constraints,
                 has_own_effort: Some(current.has_own_effort),
                 split_policy: current.split_policy,
                 importance: current.importance,

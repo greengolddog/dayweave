@@ -64,8 +64,9 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **HIE-002** Only leaf execution components shall create flexible schedule demand. Tasks are executable by default; a leaf project, goal, or routine requires an explicit independent-effort component. Fixed events retain their own interval, and parent duration/progress roll-up shall never duplicate descendant demand.
 - **HIE-003** A parent may carry an explicit independent progress component in addition to child roll-up.
 - **HIE-004** A parent shall auto-complete when all required descendants complete, unless a user-visible manual override is active.
-- **HIE-005** Dependencies shall support finish-to-start at minimum and an extensible typed relation model. Every dependency shall be hard or soft.
-- **HIE-006** A blocked item shall display the dependency or other cause that blocks it.
+- **HIE-005** Dependencies shall support finish-to-start, start-to-start, finish-to-finish, and start-to-finish relations, each with a nonnegative lag and hard or soft strength.
+- **HIE-006** A blocked item shall display every known dependency or other cause that blocks it.
+- **HIE-007** A dependency into a materialized recurring subtree shall be valid only from within that same subtree, where both endpoints receive occurrence-local identities; external and cross-series references shall be rejected.
 - **GOAL-001** A goal may be an unscheduled outcome with no duration. Every executable action required for the goal shall be represented by one or more leaf tasks and calendar blocks.
 - **GOAL-002** Goals shall support optional target dates, priority, milestones, notes, and multiple named measures.
 - **GOAL-003** A goal shall support minimum and maximum weekly time allocation.

@@ -1184,6 +1184,102 @@ fn recurring_routine_clones_the_tree_and_preserves_step_order() {
 }
 
 #[test]
+fn dependencies_cannot_cross_a_materialized_recurring_subtree_boundary() {
+    let recurring = recurring_item(1010, Recurrence::Daily { times_per_day: 1 });
+    let mut external = recurring_item(1011, Recurrence::Daily { times_per_day: 1 });
+    external.kind = ItemKind::Task;
+    external.constraints.dependencies.push(Dependency {
+        item_id: recurring.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+    let mut input = request(recurring.clone(), START, START + Duration::days(1));
+    input.items = vec![recurring.clone(), external.clone()];
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidRecurrence(message))
+            if message.contains(&external.id.to_string())
+                && message.contains(&recurring.id.to_string())
+                && message.contains("recurring subtree boundary")
+    ));
+
+    let mut other_series = recurring_item(1012, Recurrence::Daily { times_per_day: 1 });
+    other_series.constraints.dependencies.push(Dependency {
+        item_id: recurring.id,
+        relation: DependencyRelation::StartToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Soft { weight: 1 },
+    });
+    input.items = vec![recurring.clone(), other_series.clone()];
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidRecurrence(message))
+            if message.contains(&other_series.id.to_string())
+                && message.contains(&recurring.id.to_string())
+    ));
+
+    let mut routine = recurring;
+    routine.kind = ItemKind::Routine(RoutineSpec {
+        ordered: false,
+        recurrence: Some(Recurrence::Daily { times_per_day: 1 }),
+    });
+    routine.duration = None;
+    let mut child = recurring_item(1013, Recurrence::Daily { times_per_day: 1 });
+    child.kind = ItemKind::Task;
+    child.parent_id = Some(routine.id);
+    external.constraints.dependencies[0].item_id = child.id;
+    input.items = vec![routine, child.clone(), external.clone()];
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidRecurrence(message))
+            if message.contains(&external.id.to_string())
+                && message.contains(&child.id.to_string())
+    ));
+}
+
+#[test]
+fn dependencies_inside_a_recurring_subtree_are_rewritten_per_occurrence() {
+    let mut routine = recurring_item(1020, Recurrence::Daily { times_per_day: 1 });
+    routine.kind = ItemKind::Routine(RoutineSpec {
+        ordered: false,
+        recurrence: Some(Recurrence::Daily { times_per_day: 1 }),
+    });
+    routine.duration = None;
+
+    let mut predecessor = recurring_item(1021, Recurrence::Daily { times_per_day: 1 });
+    predecessor.kind = ItemKind::Task;
+    predecessor.parent_id = Some(routine.id);
+    let mut successor = recurring_item(1022, Recurrence::Daily { times_per_day: 1 });
+    successor.kind = ItemKind::Task;
+    successor.parent_id = Some(routine.id);
+    successor.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+
+    let mut input = request(routine.clone(), START, START + Duration::days(2));
+    input.items = vec![routine, predecessor.clone(), successor.clone()];
+    input.as_of = START;
+    input.availability = all_day_availability(START, 2);
+
+    let plan = Scheduler.plan(&input).unwrap();
+    let predecessor_blocks = plan.blocks_for(predecessor.id).collect::<Vec<_>>();
+    let successor_blocks = plan.blocks_for(successor.id).collect::<Vec<_>>();
+    assert_eq!(predecessor_blocks.len(), 2);
+    assert_eq!(successor_blocks.len(), 2);
+    for successor_block in successor_blocks {
+        let predecessor_block = predecessor_blocks
+            .iter()
+            .find(|block| block.occurrence_id == successor_block.occurrence_id)
+            .expect("each cloned successor keeps an occurrence-local predecessor");
+        assert!(predecessor_block.end <= successor_block.start);
+    }
+}
+
+#[test]
 fn minimum_spacing_is_enforced_between_occurrence_starts() {
     let item = recurring_item(13, Recurrence::Daily { times_per_day: 3 });
     let mut input = request(item.clone(), START, START + Duration::days(1));

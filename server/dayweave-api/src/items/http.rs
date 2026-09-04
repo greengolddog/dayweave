@@ -489,6 +489,20 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
             ApiError::validation("blocking item was not found")
                 .with_details(json!({ "blocked_by_item_id": id }))
         }
+        ItemServiceError::Repository(ItemRepositoryError::DependencyNotFound(id)) => {
+            ApiError::validation("dependency predecessor item was not found")
+                .with_details(json!({ "predecessor_item_id": id }))
+        }
+        ItemServiceError::Repository(ItemRepositoryError::CrossRecurringSubtreeDependency {
+            successor_id,
+            predecessor_id,
+        }) => ApiError::validation(
+            "dependencies cannot cross a materialized recurring subtree boundary",
+        )
+        .with_details(json!({
+            "successor_item_id": successor_id,
+            "predecessor_item_id": predecessor_id,
+        })),
         ItemServiceError::Repository(ItemRepositoryError::RevisionConflict {
             expected,
             actual,
@@ -518,6 +532,7 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
         ItemServiceError::Repository(
             error @ (ItemRepositoryError::SelfParent
             | ItemRepositoryError::HierarchyCycle
+            | ItemRepositoryError::DependencyCycle
             | ItemRepositoryError::InvalidParentState
             | ItemRepositoryError::NonLeafExecutable
             | ItemRepositoryError::HasChildren
@@ -530,14 +545,16 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
             ApiError::validation("expected_revision must be positive")
         }
         ItemServiceError::InvalidCursor => ApiError::validation("delta cursor is invalid"),
-        ItemServiceError::Repository(ItemRepositoryError::Internal)
+        ItemServiceError::Repository(
+            ItemRepositoryError::Internal | ItemRepositoryError::DeltaGroupTooLarge,
+        )
         | ItemServiceError::Internal => ApiError::internal(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use axum::{body::to_bytes, http::HeaderValue};
 
     use super::*;
 
@@ -584,5 +601,31 @@ mod tests {
         expected.update(item_id.as_bytes());
         expected.update(LEGACY_REPLACE_JSON.as_bytes());
         assert_eq!(actual.fingerprint, <[u8; 32]>::from(expected.finalize()));
+    }
+
+    #[tokio::test]
+    async fn recurring_dependency_boundary_has_a_stable_validation_contract() {
+        let successor_id = Uuid::from_u128(701);
+        let predecessor_id = Uuid::from_u128(702);
+        let response = map_item_error(ItemServiceError::Repository(
+            ItemRepositoryError::CrossRecurringSubtreeDependency {
+                successor_id,
+                predecessor_id,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("bounded error envelope");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON error envelope");
+        assert_eq!(body["error"]["code"], "validation_failed");
+        assert_eq!(
+            body["error"]["details"],
+            json!({
+                "successor_item_id": successor_id,
+                "predecessor_item_id": predecessor_id,
+            })
+        );
     }
 }

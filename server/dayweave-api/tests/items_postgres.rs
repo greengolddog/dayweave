@@ -72,6 +72,9 @@ async fn postgres_items_are_atomic_isolated_hierarchical_and_delta_synced() {
         .await
         .unwrap();
     assert!(replay.replayed);
+    let root_delta = service.delta(None, 1).await.unwrap();
+    assert_eq!(root_delta.changes.len(), 1);
+    assert!(!root_delta.has_more);
 
     service
         .create(
@@ -86,6 +89,16 @@ async fn postgres_items_are_atomic_isolated_hierarchical_and_delta_synced() {
         )
         .await
         .unwrap();
+    let first_child_delta = service
+        .delta(Some(&root_delta.next_cursor), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_child_delta.changes.len(),
+        2,
+        "a direct child create and its implicit parent refresh share one page"
+    );
+    assert!(!first_child_delta.has_more);
     let child_b = service
         .create(
             new_item(
@@ -255,6 +268,343 @@ async fn postgres_items_are_atomic_isolated_hierarchical_and_delta_synced() {
     assert_eq!(audit_count, 9);
     assert_eq!(outbox_count, audit_count);
     assert_eq!(change_count, audit_count);
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn postgres_delta_fails_closed_when_a_group_id_is_reused_beyond_the_fetch_window() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; delta group integrity test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "delta-integrity-owner", "delta-integrity").await;
+    let corrupt_group_id = Uuid::new_v4();
+    let mut transaction = pool.begin().await.unwrap();
+    for ordinal in 0..302 {
+        let group_id = if ordinal == 0 || ordinal == 301 {
+            corrupt_group_id
+        } else {
+            Uuid::new_v4()
+        };
+        sqlx::query(
+            "INSERT INTO item_changes \
+             (workspace_id,item_id,item_revision,change_kind,payload,change_group_id) \
+             VALUES ($1,$2,1,'upsert',$3,$4)",
+        )
+        .bind(scope.workspace_id)
+        .bind(Uuid::new_v4())
+        .bind(json!({ "is_sensitive": false }))
+        .bind(group_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    let repository = PostgresItemRepository::new(pool.clone(), scope);
+    assert_eq!(
+        repository.delta(0, 1).await,
+        Err(ItemRepositoryError::Internal),
+        "an authoritative group scan catches reuse after the 301-row fetch window"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn authoritative_dependencies_share_item_revision_delta_and_idempotency_contract() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; dependency authority test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+
+    let scope = seed_scope(pool, "dependency-owner", "dependency-workspace").await;
+    let repository = Arc::new(PostgresItemRepository::new(pool.clone(), scope));
+    let service = ItemService::new(repository, Arc::new(SystemClock));
+    let predecessor_ids = [
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    ];
+    for (index, predecessor_id) in predecessor_ids.iter().enumerate() {
+        let mut predecessor = new_item(
+            *predecessor_id,
+            &format!("Predecessor {index}"),
+            ItemKind::Task,
+            None,
+            u32::try_from(index).unwrap(),
+        );
+        predecessor.recurrence = None;
+        service
+            .create(
+                predecessor,
+                idempotency(
+                    &format!("dependency-predecessor-{index}"),
+                    u8::try_from(index + 1).unwrap(),
+                ),
+            )
+            .await
+            .expect("predecessor created");
+    }
+
+    let successor_id = Uuid::new_v4();
+    let dependencies = json!([
+        {
+            "item_id": predecessor_ids[0],
+            "relation": "finish_to_start",
+            "minimum_lag": 0,
+            "strength": {"level": "hard"}
+        },
+        {
+            "item_id": predecessor_ids[1],
+            "relation": "start_to_start",
+            "minimum_lag": 5,
+            "strength": {"level": "soft", "weight": 10}
+        },
+        {
+            "item_id": predecessor_ids[2],
+            "relation": "finish_to_finish",
+            "minimum_lag": 15,
+            "strength": {"level": "hard"}
+        },
+        {
+            "item_id": predecessor_ids[3],
+            "relation": "start_to_finish",
+            "minimum_lag": 30,
+            "strength": {"level": "soft", "weight": 1_000_000}
+        }
+    ]);
+    let mut successor = new_item(successor_id, "Successor", ItemKind::Task, None, 4);
+    successor.recurrence = None;
+    successor.flexible_constraints = json!({
+        "energy": "deep",
+        "constraints": {"dependencies": dependencies}
+    });
+    let created = service
+        .create(
+            successor.clone(),
+            idempotency("dependency-successor-create", 10),
+        )
+        .await
+        .expect("successor created");
+    let replayed = service
+        .create(successor, idempotency("dependency-successor-create", 10))
+        .await
+        .expect("successor replayed");
+    assert!(replayed.replayed);
+    assert_eq!(replayed.item, created.item);
+    assert_eq!(
+        created.item.flexible_constraints["constraints"]["dependencies"]
+            .as_array()
+            .expect("projected dependency array")
+            .len(),
+        4
+    );
+
+    let stored_dependency_json: Option<Value> = sqlx::query_scalar(
+        "SELECT scheduling_constraints #> '{constraints,dependencies}' \
+         FROM items WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(successor_id)
+    .fetch_one(pool)
+    .await
+    .expect("stored item metadata");
+    assert_eq!(stored_dependency_json, None);
+    let stored_edges: Vec<(Uuid, String, i32, String, Option<i32>)> = sqlx::query_as(
+        "SELECT predecessor_item_id, dependency_kind, lag_seconds, dependency_strength, \
+         dependency_soft_weight FROM item_dependencies \
+         WHERE workspace_id = $1 AND successor_item_id = $2 \
+         ORDER BY predecessor_item_id",
+    )
+    .bind(scope.workspace_id)
+    .bind(successor_id)
+    .fetch_all(pool)
+    .await
+    .expect("normalized dependency edges");
+    assert_eq!(stored_edges.len(), 4);
+    assert!(stored_edges.iter().any(|edge| {
+        edge.0 == predecessor_ids[0]
+            && edge.1 == "finish_to_start"
+            && edge.2 == 0
+            && edge.3 == "hard"
+            && edge.4.is_none()
+    }));
+    assert!(stored_edges.iter().any(|edge| {
+        edge.0 == predecessor_ids[3]
+            && edge.1 == "start_to_finish"
+            && edge.2 == 1_800
+            && edge.3 == "soft"
+            && edge.4 == Some(1_000_000)
+    }));
+
+    let mut dependency_replacement = replacement(&created.item, None, ItemStatus::Planned);
+    dependency_replacement.flexible_constraints = json!({
+        "energy": "deep",
+        "constraints": {"dependencies": [{
+            "item_id": predecessor_ids[0],
+            "relation": "start_to_start",
+            "minimum_lag": 45,
+            "strength": {"level": "soft", "weight": 77}
+        }]}
+    });
+    let updated = service
+        .replace(
+            successor_id,
+            1,
+            dependency_replacement,
+            idempotency("dependency-successor-replace", 11),
+        )
+        .await
+        .expect("dependency set replaced");
+    assert_eq!(updated.item.revision, 2);
+    assert_eq!(
+        updated.item.flexible_constraints["constraints"]["dependencies"],
+        json!([{
+            "item_id": predecessor_ids[0],
+            "relation": "start_to_start",
+            "minimum_lag": 45,
+            "strength": {"level": "soft", "weight": 77}
+        }])
+    );
+    let replaced_edge: (i64, String, i32, String, Option<i32>) = sqlx::query_as(
+        "SELECT count(*) OVER (), dependency_kind, lag_seconds, dependency_strength, \
+         dependency_soft_weight FROM item_dependencies \
+         WHERE workspace_id = $1 AND successor_item_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(successor_id)
+    .fetch_one(pool)
+    .await
+    .expect("replacement edge");
+    assert_eq!(
+        replaced_edge,
+        (
+            1,
+            "start_to_start".to_owned(),
+            2_700,
+            "soft".to_owned(),
+            Some(77)
+        )
+    );
+
+    let missing_id = Uuid::new_v4();
+    let mut missing = replacement(&updated.item, None, ItemStatus::Planned);
+    missing.flexible_constraints = json!({
+        "constraints": {"dependencies": [{
+            "item_id": missing_id,
+            "relation": "finish_to_start",
+            "minimum_lag": 0,
+            "strength": {"level": "hard"}
+        }]}
+    });
+    assert!(matches!(
+        service
+            .replace(
+                successor_id,
+                2,
+                missing,
+                idempotency("dependency-missing-replace", 12),
+            )
+            .await
+            .expect_err("missing predecessor must roll back"),
+        ItemServiceError::Repository(ItemRepositoryError::DependencyNotFound(id)) if id == missing_id
+    ));
+
+    let predecessor = service
+        .get(predecessor_ids[0])
+        .await
+        .expect("current predecessor");
+    let mut cyclic = replacement(&predecessor, None, ItemStatus::Planned);
+    cyclic.flexible_constraints = json!({
+        "constraints": {"dependencies": [{
+            "item_id": successor_id,
+            "relation": "finish_to_finish",
+            "minimum_lag": 0,
+            "strength": {"level": "hard"}
+        }]}
+    });
+    assert!(matches!(
+        service
+            .replace(
+                predecessor.id,
+                predecessor.revision,
+                cyclic,
+                idempotency("dependency-cycle-replace", 13),
+            )
+            .await
+            .expect_err("cycle must roll back"),
+        ItemServiceError::Repository(ItemRepositoryError::DependencyCycle)
+    ));
+    assert_eq!(service.get(successor_id).await.unwrap(), updated.item);
+    assert!(
+        service
+            .get(predecessor_ids[0])
+            .await
+            .unwrap()
+            .flexible_constraints
+            .pointer("/constraints/dependencies")
+            .is_none()
+    );
+
+    let direct_write_error = sqlx::query(
+        "INSERT INTO item_dependencies (workspace_id, predecessor_item_id, successor_item_id, \
+         dependency_kind, lag_seconds, dependency_strength) \
+         VALUES ($1, $2, $3, 'finish_to_start', 0, 'hard')",
+    )
+    .bind(scope.workspace_id)
+    .bind(predecessor_ids[1])
+    .bind(predecessor_ids[2])
+    .execute(pool)
+    .await
+    .expect_err("direct dependency writes must be fenced");
+    assert_eq!(
+        direct_write_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("item_dependencies_aggregate_write_guard")
+    );
+
+    let latest_delta = service.delta(None, 100).await.expect("dependency delta");
+    let delta_item = latest_delta
+        .changes
+        .iter()
+        .find_map(|change| match change {
+            DeltaChange::Upsert { item }
+                if item.id == successor_id && item.revision == updated.item.revision =>
+            {
+                Some(item)
+            }
+            DeltaChange::Upsert { .. } | DeltaChange::Tombstone { .. } => None,
+        })
+        .expect("latest projected dependency delta");
+    assert_eq!(
+        delta_item.flexible_constraints,
+        updated.item.flexible_constraints
+    );
+    let mutation_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \
+              AND entity_type = 'item' AND entity_id = $2), \
+           (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+              AND aggregate_type = 'item' AND aggregate_id = $2), \
+           (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2)",
+    )
+    .bind(scope.workspace_id)
+    .bind(successor_id)
+    .fetch_one(pool)
+    .await
+    .expect("aggregate mutation evidence");
+    assert_eq!(mutation_counts, (2, 2, 2));
 
     test_database.destroy().await;
 }
@@ -942,6 +1292,71 @@ async fn structural_item_migration_backfills_and_preserves_rich_partial_updates(
         .await
         .expect("structural migration applies");
 
+    let legacy_dependencies = json!({
+        "constraints": {
+            "dependencies": [{
+                "item_id": event_id,
+                "relation": "finish_to_start",
+                "minimum_lag": 15,
+                "strength": {"level": "hard"}
+            }]
+        }
+    });
+    sqlx::query(
+        "UPDATE items SET scheduling_constraints = scheduling_constraints || $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(task_id)
+    .bind(legacy_dependencies)
+    .execute(pool)
+    .await
+    .expect("legacy dependency projection fixture");
+    sqlx::query(
+        "INSERT INTO item_dependencies (workspace_id, predecessor_item_id, successor_item_id, \
+         dependency_kind, lag_seconds, dependency_strength, dependency_soft_weight) \
+         VALUES ($1, $2, $3, 'finish_to_start', 900, 'hard', NULL)",
+    )
+    .bind(scope.workspace_id)
+    .bind(event_id)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .expect("matching dormant dependency row fixture");
+    let dependency_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 25)
+        .expect("dependency migration is embedded");
+    pool.execute(AssertSqlSafe(dependency_migration.sql.as_str().to_owned()))
+        .await
+        .expect("dependency authority migration applies");
+    let migrated_dependency: (bool, String, i32, String, Option<i32>) = sqlx::query_as(
+        "SELECT item.scheduling_constraints #> '{constraints,dependencies}' IS NULL, \
+         dependency.dependency_kind, dependency.lag_seconds, \
+         dependency.dependency_strength, dependency.dependency_soft_weight \
+         FROM items AS item JOIN item_dependencies AS dependency \
+           ON dependency.workspace_id = item.workspace_id \
+          AND dependency.successor_item_id = item.id \
+         WHERE item.workspace_id = $1 AND item.id = $2 \
+           AND dependency.predecessor_item_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(task_id)
+    .bind(event_id)
+    .fetch_one(pool)
+    .await
+    .expect("dependency backfill and JSON removal");
+    assert_eq!(
+        migrated_dependency,
+        (
+            true,
+            "finish_to_start".to_owned(),
+            900,
+            "hard".to_owned(),
+            None,
+        )
+    );
+
     let task_shape: (String, i32, i32, String, String, Option<String>, bool, bool) =
         sqlx::query_as(
             "SELECT duration_kind, duration_min_seconds, duration_max_seconds, duration_source, \
@@ -1377,7 +1792,9 @@ async fn structural_item_migration_backfills_and_preserves_rich_partial_updates(
     sqlx::query(
         "INSERT INTO item_dependencies (workspace_id, predecessor_item_id, successor_item_id, \
          dependency_kind, lag_seconds, dependency_strength, dependency_soft_weight) \
-         VALUES ($1,$2,$3,'start_to_finish',60,'soft',25)",
+         SELECT $1,$2,$3,'start_to_finish',60,'soft',25 \
+         FROM (SELECT set_config('dayweave.item_dependency_write', 'aggregate-v1', true)) \
+              AS aggregate_access",
     )
     .bind(scope.workspace_id)
     .bind(task_id)
@@ -1387,7 +1804,9 @@ async fn structural_item_migration_backfills_and_preserves_rich_partial_updates(
     .expect("expanded dependency shape");
     for invalid_lag in [-60, 1, 31_622_460] {
         let error = sqlx::query(
-            "UPDATE item_dependencies SET lag_seconds = $4 \
+            "WITH aggregate_access AS MATERIALIZED ( \
+                 SELECT set_config('dayweave.item_dependency_write', 'aggregate-v1', true) \
+             ) UPDATE item_dependencies SET lag_seconds = $4 FROM aggregate_access \
              WHERE workspace_id = $1 AND predecessor_item_id = $2 AND successor_item_id = $3",
         )
         .bind(scope.workspace_id)
@@ -1467,8 +1886,10 @@ async fn structural_item_migration_backfills_and_preserves_rich_partial_updates(
         Some("items_blocked_reason_shape_check")
     );
     let soft_dependency_without_weight = sqlx::query(
-        "UPDATE item_dependencies SET dependency_strength = 'soft', \
-         dependency_soft_weight = NULL WHERE workspace_id = $1 \
+        "WITH aggregate_access AS MATERIALIZED ( \
+             SELECT set_config('dayweave.item_dependency_write', 'aggregate-v1', true) \
+         ) UPDATE item_dependencies SET dependency_strength = 'soft', \
+         dependency_soft_weight = NULL FROM aggregate_access WHERE workspace_id = $1 \
          AND predecessor_item_id = $2 AND successor_item_id = $3",
     )
     .bind(scope.workspace_id)
@@ -1485,6 +1906,327 @@ async fn structural_item_migration_backfills_and_preserves_rich_partial_updates(
     );
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn dependency_authority_migration_rejects_conflicts_and_cycles_before_cutover() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; dependency migration test skipped");
+        return;
+    };
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 25)
+        .expect("dependency migration is embedded");
+
+    let conflict_database = TestDatabase::create(&database_url).await;
+    let conflict_pool = &conflict_database.pool;
+    for prior in MIGRATOR.iter().filter(|prior| prior.version < 25) {
+        conflict_pool
+            .execute(AssertSqlSafe(prior.sql.as_str().to_owned()))
+            .await
+            .expect("pre-dependency migration applies");
+    }
+    let conflict_scope = seed_scope(
+        conflict_pool,
+        "dependency-migration-conflict-owner",
+        "dependency-migration-conflict",
+    )
+    .await;
+    let predecessor_id = Uuid::parse_str("00000000-0000-4000-8000-000000000200").unwrap();
+    let earlier_predecessor_id = Uuid::parse_str("00000000-0000-4000-8000-000000000100").unwrap();
+    let successor_id = Uuid::parse_str("00000000-0000-4000-8000-000000000300").unwrap();
+    seed_dependency_migration_item(
+        conflict_pool,
+        conflict_scope,
+        predecessor_id,
+        "Conflict predecessor",
+        json!({}),
+    )
+    .await;
+    seed_dependency_migration_item(
+        conflict_pool,
+        conflict_scope,
+        earlier_predecessor_id,
+        "Earlier UUID predecessor",
+        json!({}),
+    )
+    .await;
+    seed_dependency_migration_item(
+        conflict_pool,
+        conflict_scope,
+        successor_id,
+        "Conflict successor",
+        json!({
+            "constraints": {"dependencies": [{
+                "item_id": predecessor_id,
+                "relation": "finish_to_start",
+                "minimum_lag": 15,
+                "strength": {"level": "hard"}
+            }, {
+                "item_id": earlier_predecessor_id,
+                "relation": "start_to_start",
+                "minimum_lag": 5,
+                "strength": {"level": "soft", "weight": 25}
+            }]}
+        }),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO item_dependencies (workspace_id, predecessor_item_id, successor_item_id, \
+         dependency_kind, lag_seconds, dependency_strength) \
+         VALUES ($1, $2, $3, 'start_to_start', 900, 'hard')",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(predecessor_id)
+    .bind(successor_id)
+    .execute(conflict_pool)
+    .await
+    .expect("conflicting dormant graph fixture");
+    let conflict = conflict_pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect_err("conflicting authorities must stop cutover");
+    assert_eq!(
+        conflict
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23514")
+    );
+    assert!(conflict.as_database_error().is_some_and(|error| {
+        error
+            .message()
+            .contains("conflicts with the legacy metadata authority")
+    }));
+    let legacy_projection_survived: bool = sqlx::query_scalar(
+        "SELECT scheduling_constraints #> '{constraints,dependencies}' IS NOT NULL \
+         FROM items WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(successor_id)
+    .fetch_one(conflict_pool)
+    .await
+    .expect("failed cutover rolled back JSON removal");
+    assert!(legacy_projection_survived);
+    sqlx::query(
+        "UPDATE item_dependencies SET dependency_kind = 'finish_to_start' \
+         WHERE workspace_id = $1 AND predecessor_item_id = $2 AND successor_item_id = $3",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(predecessor_id)
+    .bind(successor_id)
+    .execute(conflict_pool)
+    .await
+    .expect("repair dormant graph fixture");
+    conflict_pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect("reconciled dependency cutover applies");
+    let reconciled: (bool, i64) = sqlx::query_as(
+        "SELECT scheduling_constraints #> '{constraints,dependencies}' IS NULL, \
+         (SELECT count(*) FROM item_dependencies WHERE workspace_id = $1 \
+           AND successor_item_id = $2) FROM items WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(successor_id)
+    .fetch_one(conflict_pool)
+    .await
+    .expect("reconciled authority state");
+    assert_eq!(reconciled, (true, 2));
+    let retained_projection_order: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT predecessor_item_id FROM item_dependencies WHERE workspace_id = $1 \
+         AND successor_item_id = $2 ORDER BY projection_ordinal, predecessor_item_id",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(successor_id)
+    .fetch_all(conflict_pool)
+    .await
+    .expect("legacy dependency projection order");
+    assert_eq!(
+        retained_projection_order,
+        vec![predecessor_id, earlier_predecessor_id],
+        "cutover must not change serialized set order without a revision and delta"
+    );
+    let resurrected_projection = sqlx::query(
+        "UPDATE items SET scheduling_constraints = $3 WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(conflict_scope.workspace_id)
+    .bind(successor_id)
+    .bind(json!({
+        "constraints": {"dependencies": [{
+            "item_id": predecessor_id,
+            "relation": "finish_to_start",
+            "minimum_lag": 15,
+            "strength": {"level": "hard"}
+        }]}
+    }))
+    .execute(conflict_pool)
+    .await
+    .expect_err("a pre-cutover writer cannot resurrect embedded dependency authority");
+    assert_eq!(
+        resurrected_projection
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("items_dependency_projection_forbidden")
+    );
+    conflict_database.destroy().await;
+
+    let cycle_database = TestDatabase::create(&database_url).await;
+    let cycle_pool = &cycle_database.pool;
+    for prior in MIGRATOR.iter().filter(|prior| prior.version < 25) {
+        cycle_pool
+            .execute(AssertSqlSafe(prior.sql.as_str().to_owned()))
+            .await
+            .expect("pre-dependency migration applies");
+    }
+    let cycle_scope = seed_scope(
+        cycle_pool,
+        "dependency-migration-cycle-owner",
+        "dependency-migration-cycle",
+    )
+    .await;
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    seed_dependency_migration_item(
+        cycle_pool,
+        cycle_scope,
+        first_id,
+        "Cycle first",
+        json!({
+            "constraints": {"dependencies": [{
+                "item_id": second_id,
+                "relation": "finish_to_start",
+                "minimum_lag": 0,
+                "strength": {"level": "hard"}
+            }]}
+        }),
+    )
+    .await;
+    seed_dependency_migration_item(
+        cycle_pool,
+        cycle_scope,
+        second_id,
+        "Cycle second",
+        json!({
+            "constraints": {"dependencies": [{
+                "item_id": first_id,
+                "relation": "start_to_finish",
+                "minimum_lag": 0,
+                "strength": {"level": "soft", "weight": 1}
+            }]}
+        }),
+    )
+    .await;
+    let cycle = cycle_pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect_err("cyclic legacy graph must stop cutover");
+    assert_eq!(
+        cycle
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("item_dependencies_acyclic")
+    );
+    let rolled_back_edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM item_dependencies WHERE workspace_id = $1")
+            .bind(cycle_scope.workspace_id)
+            .fetch_one(cycle_pool)
+            .await
+            .expect("cycle backfill rolled back");
+    assert_eq!(rolled_back_edges, 0);
+    cycle_database.destroy().await;
+
+    let ordered_database = TestDatabase::create(&database_url).await;
+    let ordered_pool = &ordered_database.pool;
+    for prior in MIGRATOR.iter().filter(|prior| prior.version < 25) {
+        ordered_pool
+            .execute(AssertSqlSafe(prior.sql.as_str().to_owned()))
+            .await
+            .expect("pre-dependency migration applies");
+    }
+    let ordered_scope = seed_scope(
+        ordered_pool,
+        "dependency-migration-ordered-owner",
+        "dependency-migration-ordered",
+    )
+    .await;
+    let routine_id = Uuid::new_v4();
+    let ordered_first_id = Uuid::new_v4();
+    let ordered_second_id = Uuid::new_v4();
+    seed_dependency_migration_item(
+        ordered_pool,
+        ordered_scope,
+        routine_id,
+        "Ordered routine",
+        json!({"routine_ordered": true}),
+    )
+    .await;
+    sqlx::query("UPDATE items SET kind = 'routine' WHERE workspace_id = $1 AND id = $2")
+        .bind(ordered_scope.workspace_id)
+        .bind(routine_id)
+        .execute(ordered_pool)
+        .await
+        .expect("routine fixture kind");
+    seed_dependency_migration_item(
+        ordered_pool,
+        ordered_scope,
+        ordered_first_id,
+        "Ordered first",
+        json!({
+            "constraints": {"dependencies": [{
+                "item_id": ordered_second_id,
+                "relation": "finish_to_start",
+                "minimum_lag": 0,
+                "strength": {"level": "hard"}
+            }]}
+        }),
+    )
+    .await;
+    seed_dependency_migration_item(
+        ordered_pool,
+        ordered_scope,
+        ordered_second_id,
+        "Ordered second",
+        json!({}),
+    )
+    .await;
+    for (position, child_id) in [(0_i32, ordered_first_id), (1_i32, ordered_second_id)] {
+        sqlx::query(
+            "INSERT INTO item_hierarchy (workspace_id, parent_item_id, child_item_id, position) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(ordered_scope.workspace_id)
+        .bind(routine_id)
+        .bind(child_id)
+        .bind(position)
+        .execute(ordered_pool)
+        .await
+        .expect("ordered routine child fixture");
+    }
+    let ordered_cycle = ordered_pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect_err("an explicit edge cannot reverse a derived ordered-routine edge");
+    assert_eq!(
+        ordered_cycle
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("item_dependencies_acyclic")
+    );
+    let ordered_rollback: (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM item_dependencies WHERE workspace_id = $1), \
+         scheduling_constraints #> '{constraints,dependencies}' IS NOT NULL \
+         FROM items WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(ordered_scope.workspace_id)
+    .bind(ordered_first_id)
+    .fetch_one(ordered_pool)
+    .await
+    .expect("ordered-cycle cutover rollback state");
+    assert_eq!(ordered_rollback, (0, true));
+    ordered_database.destroy().await;
 }
 
 #[tokio::test]
@@ -2194,4 +2936,26 @@ async fn seed_scope(pool: &PgPool, subject: &str, slug: &str) -> DatabaseScope {
     .await
     .unwrap();
     scope
+}
+
+async fn seed_dependency_migration_item(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    title: &str,
+    scheduling_constraints: Value,
+) {
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         timezone_name, duration_kind, deadline_kind, scheduling_constraints, has_own_effort) \
+         VALUES ($1, $2, $3, 'goal', 'planned', $4, 'UTC', 'unknown', 'none', $5, false)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(title)
+    .bind(scheduling_constraints)
+    .execute(pool)
+    .await
+    .expect("dependency migration item fixture");
 }

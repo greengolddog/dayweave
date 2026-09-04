@@ -370,7 +370,8 @@ impl Scheduler {
             .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
         let (materialized_request, materialized_execution) =
             apply_execution_context(&materialized.request, &materialized.identities, execution)?;
-        let mut plan = Self::plan_materialized(&materialized_request, &materialized_execution)?;
+        let mut plan =
+            Self::plan_materialized(&materialized_request, &materialized_execution, &[])?;
         plan.manual_placement_assessments = assess_manual_placements(&materialized_request, &plan)?;
         for violation in plan
             .manual_placement_assessments
@@ -437,7 +438,11 @@ impl Scheduler {
             candidate,
         )?;
 
-        let mut plan = Self::plan_materialized(&materialized_request, &materialized_execution)?;
+        let mut plan = Self::plan_materialized(
+            &materialized_request,
+            &materialized_execution,
+            std::slice::from_ref(&target),
+        )?;
         let matching_blocks = plan
             .blocks
             .iter()
@@ -484,9 +489,11 @@ impl Scheduler {
         Ok(DeferCandidateAssessmentResult { plan, assessment })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn plan_materialized(
         request: &PlanRequest,
         execution: &MaterializedExecutionContext,
+        additional_manually_assessed_assignments: &[PreviousAssignment],
     ) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
         validate_manual_placement_demand(request, execution)?;
@@ -552,7 +559,7 @@ impl Scheduler {
         for item_id in ordered {
             let item = items[&item_id];
             let item_dependencies = dependencies.get(&item_id).map_or(&[][..], Vec::as_slice);
-            if hard_dependency_unavailable(item_dependencies, &items, &outcomes) {
+            if hard_dependency_unavailable(item_dependencies, &items, &outcomes, &state.blocks) {
                 let remaining = item
                     .duration
                     .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes);
@@ -586,6 +593,28 @@ impl Scheduler {
             });
         }
 
+        let manually_assessed_blocks = request
+            .previous_assignments
+            .iter()
+            .chain(additional_manually_assessed_assignments)
+            .filter(|assignment| assignment.pinned && assignment.manual_placement_id.is_some())
+            .flat_map(|assignment| {
+                assignment.blocks.iter().map(|block| {
+                    (
+                        assignment.item_id,
+                        block.session_index,
+                        block.start,
+                        block.end,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        state.reconcile_dependency_evidence(
+            request,
+            &items,
+            &dependencies,
+            &manually_assessed_blocks,
+        );
         Ok(state.finish(request))
     }
 }
@@ -675,6 +704,14 @@ impl MaterializedExecutionWorkUnit {
                     .map(|reservation| reservation.session_index),
             )
             .max()
+    }
+
+    fn claims_session_index(&self, session_index: u16) -> bool {
+        self.used_session_indices.contains(&session_index)
+            || self
+                .reservations
+                .iter()
+                .any(|reservation| reservation.session_index == session_index)
     }
 }
 
@@ -887,10 +924,10 @@ fn apply_execution_context(
         if let Some(unit) = materialized.work_units.get(&assignment.item_id) {
             if unit.skipped {
                 assignment.blocks.clear();
-            } else if let Some(high_water) = unit.high_water() {
+            } else {
                 assignment
                     .blocks
-                    .retain(|block| block.session_index > high_water);
+                    .retain(|block| !unit.claims_session_index(block.session_index));
             }
         }
         !assignment.blocks.is_empty()
@@ -1345,6 +1382,20 @@ fn assess_manual_placement_targets(
             continue;
         };
         let item_dependencies = dependencies.get(&item.id).map_or(&[][..], Vec::as_slice);
+        let successor_start = plan
+            .blocks
+            .iter()
+            .filter(|block| block.item_id == Some(item.id))
+            .map(|block| block.start)
+            .min();
+        let successor_finish = plan
+            .blocks
+            .iter()
+            // Recurring instances already have distinct materialized item IDs
+            // here; occurrence IDs are attached only when outputs are remapped.
+            .filter(|block| block.item_id == Some(item.id))
+            .map(|block| block.end)
+            .max();
 
         for source_block in &assignment.blocks {
             if overflow_item_id.is_some() {
@@ -1628,6 +1679,16 @@ fn assess_manual_placement_targets(
                 .iter()
                 .filter(|dependency| dependency.strength.is_hard())
             {
+                if dependency_uses_successor_finish(dependency.relation)
+                    && successor_finish.is_some_and(|finish| interval.end != finish)
+                {
+                    continue;
+                }
+                if !dependency_uses_successor_finish(dependency.relation)
+                    && successor_start.is_some_and(|start| interval.start != start)
+                {
+                    continue;
+                }
                 if items
                     .get(&dependency.item_id)
                     .is_some_and(|predecessor| predecessor.status.satisfies_prerequisite())
@@ -1648,7 +1709,9 @@ fn assess_manual_placement_targets(
                     predecessor.status.is_terminal()
                         || predecessor.status == crate::WorkStatus::Blocked
                 });
-                let satisfied = if predecessor_has_remaining_work || predecessor_is_unavailable {
+                let predecessor_finish_is_unavailable = predecessor_has_remaining_work
+                    && !dependency_uses_predecessor_start(dependency.relation);
+                let satisfied = if predecessor_finish_is_unavailable || predecessor_is_unavailable {
                     false
                 } else if let Some((predecessor_start, predecessor_end)) =
                     dependency_predecessor_bounds(predecessor, predecessor_blocks.iter().copied())
@@ -2366,6 +2429,7 @@ impl PlanningState {
                         dependencies,
                         all_items,
                         Minutes(remaining),
+                        true,
                         index,
                         None,
                         &used_days,
@@ -2424,6 +2488,7 @@ impl PlanningState {
                                 dependencies,
                                 all_items,
                                 Minutes(size),
+                                remainder_after == 0,
                                 index,
                                 session_earliest,
                                 &used_days,
@@ -2517,6 +2582,7 @@ impl PlanningState {
         dependencies: &[Dependency],
         all_items: &BTreeMap<ItemId, &WorkItem>,
         duration: Minutes,
+        finishes_item: bool,
         session_index: u16,
         session_earliest: Option<OffsetDateTime>,
         used_days: &BTreeSet<time::Date>,
@@ -2573,6 +2639,7 @@ impl PlanningState {
                         all_items,
                         availability,
                         interval,
+                        finishes_item,
                         session_index,
                         used_days,
                     ) {
@@ -2612,6 +2679,7 @@ impl PlanningState {
         all_items: &BTreeMap<ItemId, &WorkItem>,
         availability: &AvailabilityWindow,
         interval: Interval,
+        finishes_item: bool,
         session_index: u16,
         used_days: &BTreeSet<time::Date>,
     ) -> Option<Candidate> {
@@ -2804,6 +2872,7 @@ impl PlanningState {
             dependencies,
             all_items,
             interval,
+            finishes_item,
             &mut penalty,
             &mut violations,
             &mut explanations,
@@ -2899,21 +2968,60 @@ impl PlanningState {
         dependencies: &[Dependency],
         all_items: &BTreeMap<ItemId, &WorkItem>,
         interval: Interval,
+        finishes_item: bool,
         penalty: &mut u64,
         violations: &mut Vec<PlanViolation>,
         explanations: &mut Vec<PlacementExplanation>,
     ) -> bool {
+        let existing_successor_start = self
+            .blocks
+            .iter()
+            .filter(|block| block.item_id == Some(item.id))
+            .map(|block| block.start)
+            .min();
+        let existing_successor_finish = self
+            .blocks
+            .iter()
+            .filter(|block| block.item_id == Some(item.id))
+            .map(|block| block.end)
+            .max();
+        let successor_interval = Interval {
+            start: existing_successor_start
+                .map_or(interval.start, |start| start.min(interval.start)),
+            end: existing_successor_finish.map_or(interval.end, |end| end.max(interval.end)),
+        };
+        let candidate_establishes_start =
+            existing_successor_start.is_none_or(|start| interval.start < start);
         for dependency in dependencies {
+            if !finishes_item && dependency_uses_successor_finish(dependency.relation) {
+                continue;
+            }
+            if !candidate_establishes_start
+                && !dependency_uses_successor_finish(dependency.relation)
+            {
+                continue;
+            }
             let predecessor = all_items.get(&dependency.item_id).copied();
             if predecessor.is_some_and(|value| value.status.satisfies_prerequisite()) {
                 continue;
             }
-            let Some((predecessor_start, predecessor_end)) = dependency_predecessor_bounds(
-                predecessor,
-                self.blocks
-                    .iter()
-                    .filter(|block| block.item_id == Some(dependency.item_id)),
-            ) else {
+            let predecessor_has_remaining_work = self
+                .unscheduled
+                .iter()
+                .any(|work| work.item_id == dependency.item_id && !work.remaining.is_zero());
+            let predecessor_finish_is_unavailable = predecessor_has_remaining_work
+                && !dependency_uses_predecessor_start(dependency.relation);
+            let predecessor_bounds = (!predecessor_finish_is_unavailable)
+                .then(|| {
+                    dependency_predecessor_bounds(
+                        predecessor,
+                        self.blocks
+                            .iter()
+                            .filter(|block| block.item_id == Some(dependency.item_id)),
+                    )
+                })
+                .flatten();
+            let Some((predecessor_start, predecessor_end)) = predecessor_bounds else {
                 if dependency.strength.is_hard() {
                     return false;
                 }
@@ -2930,8 +3038,12 @@ impl PlanningState {
                 );
                 continue;
             };
-            let boundary =
-                dependency_boundary(dependency, interval, predecessor_start, predecessor_end);
+            let boundary = dependency_boundary(
+                dependency,
+                successor_interval,
+                predecessor_start,
+                predecessor_end,
+            );
             let satisfied = boundary.is_some_and(|(observed, required)| observed >= required);
             let shortfall = boundary.map_or(u32::MAX, |(observed, required)| {
                 positive_minutes(required - observed)
@@ -2940,10 +3052,12 @@ impl PlanningState {
                 return false;
             }
             if satisfied {
-                explanations.push(explanation(
-                    ExplanationCode::Dependency,
-                    "Follows its predecessor dependency.",
-                ));
+                if dependency.strength.is_hard() {
+                    explanations.push(explanation(
+                        ExplanationCode::Dependency,
+                        "Follows its predecessor dependency.",
+                    ));
+                }
             } else {
                 add_penalty_violation(
                     request,
@@ -2959,6 +3073,223 @@ impl PlanningState {
             }
         }
         true
+    }
+
+    /// Candidate evaluation can observe only predecessors that have already
+    /// been placed. Rebuild soft evidence from aggregate final bounds, and
+    /// assess hard edges owned by retained pinned/execution blocks that never
+    /// passed through candidate validation. Manual placements are assessed by
+    /// the richer bounded manual-placement path instead.
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_dependency_evidence(
+        &mut self,
+        request: &PlanRequest,
+        items: &BTreeMap<ItemId, &WorkItem>,
+        dependencies: &BTreeMap<ItemId, Vec<Dependency>>,
+        manually_assessed_blocks: &BTreeSet<(ItemId, u16, OffsetDateTime, OffsetDateTime)>,
+    ) {
+        let provisional_dependency_penalty = self
+            .violations
+            .iter()
+            .filter(|violation| violation.kind == ViolationKind::Dependency)
+            .fold(0_u64, |total, violation| {
+                total.saturating_add(violation.penalty)
+            });
+        self.violations
+            .retain(|violation| violation.kind != ViolationKind::Dependency);
+        self.score.soft_penalty = self
+            .score
+            .soft_penalty
+            .saturating_sub(provisional_dependency_penalty);
+
+        let unfinished_items = self
+            .unscheduled
+            .iter()
+            .filter(|work| !work.remaining.is_zero())
+            .map(|work| work.item_id)
+            .collect::<BTreeSet<_>>();
+        let mut dependency_explanation_blocks = BTreeSet::new();
+        let mut reconciled = Vec::new();
+
+        for (successor_id, item_dependencies) in dependencies {
+            let successor_blocks = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.item_id == Some(*successor_id))
+                .collect::<Vec<_>>();
+            if successor_blocks.is_empty() {
+                continue;
+            }
+            let has_retained_successor_block = successor_blocks
+                .iter()
+                .any(|(_, block)| block.kind == ScheduleBlockKind::Pinned);
+            let successor_start = successor_blocks
+                .iter()
+                .map(|(_, block)| block.start)
+                .min()
+                .expect("a non-empty successor block set has a start");
+            let successor_finish = successor_blocks
+                .iter()
+                .map(|(_, block)| block.end)
+                .max()
+                .expect("a non-empty successor block set has a finish");
+            let successor_interval = Interval {
+                start: successor_start,
+                end: successor_finish,
+            };
+            let first_block_index = successor_blocks
+                .iter()
+                .min_by_key(|(_, block)| (block.start, block.end, block.session_index, block.id))
+                .map(|(index, _)| *index)
+                .expect("a non-empty successor block set has a first block");
+            let last_block_index = successor_blocks
+                .iter()
+                .max_by_key(|(_, block)| (block.end, block.start, block.session_index, block.id))
+                .map(|(index, _)| *index)
+                .expect("a non-empty successor block set has a last block");
+
+            for dependency in item_dependencies {
+                let is_hard = dependency.strength.is_hard();
+                if is_hard {
+                    if !has_retained_successor_block {
+                        continue;
+                    }
+                    let boundary_is_manually_assessed =
+                        successor_blocks.iter().any(|(_, block)| {
+                            let is_boundary =
+                                if dependency_uses_successor_finish(dependency.relation) {
+                                    block.end == successor_finish
+                                } else {
+                                    block.start == successor_start
+                                };
+                            is_boundary
+                                && manually_assessed_blocks.contains(&(
+                                    *successor_id,
+                                    block.session_index,
+                                    block.start,
+                                    block.end,
+                                ))
+                        });
+                    if boundary_is_manually_assessed {
+                        continue;
+                    }
+                }
+                if dependency_uses_successor_finish(dependency.relation)
+                    && unfinished_items.contains(successor_id)
+                {
+                    // No aggregate final finish exists yet. This matches
+                    // candidate evaluation, which defers finish relations until
+                    // the session that would complete the item.
+                    continue;
+                }
+                let predecessor = items.get(&dependency.item_id).copied();
+                if predecessor.is_some_and(|item| item.status.satisfies_prerequisite()) {
+                    continue;
+                }
+                let predecessor_is_unavailable = predecessor.is_some_and(|item| {
+                    item.status.is_terminal() || item.status == crate::WorkStatus::Blocked
+                });
+                let predecessor_finish_is_unavailable = unfinished_items
+                    .contains(&dependency.item_id)
+                    && !dependency_uses_predecessor_start(dependency.relation);
+                let predecessor_bounds =
+                    if predecessor_is_unavailable || predecessor_finish_is_unavailable {
+                        None
+                    } else {
+                        dependency_predecessor_bounds(
+                            predecessor,
+                            self.blocks
+                                .iter()
+                                .filter(|block| block.item_id == Some(dependency.item_id)),
+                        )
+                    };
+                let Some((predecessor_start, predecessor_end)) = predecessor_bounds else {
+                    if is_hard {
+                        reconciled.push(retained_hard_dependency_violation(
+                            *successor_id,
+                            dependency.item_id,
+                            successor_interval,
+                            "A retained placement has no available hard-dependency predecessor.",
+                        ));
+                        continue;
+                    }
+                    let penalty = u64::from(soft_weight(request, dependency.strength));
+                    reconciled.push(PlanViolation {
+                        kind: ViolationKind::Dependency,
+                        severity: ViolationSeverity::Warning,
+                        item_ids: vec![*successor_id],
+                        occurrence_ids: Vec::new(),
+                        start: Some(successor_interval.start),
+                        end: Some(successor_interval.end),
+                        penalty,
+                        message: "A preferred predecessor is not in this plan.".to_owned(),
+                    });
+                    continue;
+                };
+                let boundary = dependency_boundary(
+                    dependency,
+                    successor_interval,
+                    predecessor_start,
+                    predecessor_end,
+                );
+                if boundary.is_some_and(|(observed, required)| observed >= required) {
+                    dependency_explanation_blocks.insert(
+                        if dependency_uses_successor_finish(dependency.relation) {
+                            last_block_index
+                        } else {
+                            first_block_index
+                        },
+                    );
+                    continue;
+                }
+                if is_hard {
+                    reconciled.push(retained_hard_dependency_violation(
+                        *successor_id,
+                        dependency.item_id,
+                        successor_interval,
+                        "A retained placement violates a hard dependency.",
+                    ));
+                    continue;
+                }
+                let shortfall = boundary.map_or(u32::MAX, |(observed, required)| {
+                    positive_minutes(required - observed)
+                });
+                let penalty = u64::from(soft_weight(request, dependency.strength))
+                    .saturating_mul(u64::from(shortfall.max(1)));
+                reconciled.push(PlanViolation {
+                    kind: ViolationKind::Dependency,
+                    severity: ViolationSeverity::Warning,
+                    item_ids: vec![*successor_id],
+                    occurrence_ids: Vec::new(),
+                    start: Some(successor_interval.start),
+                    end: Some(successor_interval.end),
+                    penalty,
+                    message: "A soft dependency order was compressed.".to_owned(),
+                });
+            }
+        }
+
+        for index in dependency_explanation_blocks {
+            self.blocks[index].explanations.push(explanation(
+                ExplanationCode::Dependency,
+                "Follows its predecessor dependency.",
+            ));
+            self.blocks[index]
+                .explanations
+                .sort_by_key(|value| value.code);
+            self.blocks[index]
+                .explanations
+                .dedup_by(|left, right| left.code == right.code && left.message == right.message);
+        }
+        let reconciled_dependency_penalty = reconciled.iter().fold(0_u64, |total, violation| {
+            total.saturating_add(violation.penalty)
+        });
+        self.violations.extend(reconciled);
+        self.score.soft_penalty = self
+            .score
+            .soft_penalty
+            .saturating_add(reconciled_dependency_penalty);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3404,23 +3735,37 @@ fn validate_manual_block_sequence(
             )
         })?;
     }
-    let expected_first_index = execution
-        .work_units
-        .get(&item.id)
-        .and_then(MaterializedExecutionWorkUnit::high_water)
-        .map_or(Some(0), |index| index.checked_add(1))
-        .ok_or_else(|| {
-            invalid_item(item.id, "manual placement session index space is exhausted")
-        })?;
-    if chronological.first().map(|block| block.session_index) != Some(expected_first_index)
-        || chronological
-            .windows(2)
-            .any(|pair| pair[0].session_index.checked_add(1) != Some(pair[1].session_index))
+    if chronological
+        .windows(2)
+        .any(|pair| pair[0].session_index >= pair[1].session_index)
     {
         return Err(invalid_item(
             item.id,
-            "manual placement session indices must be fresh, consecutive, and chronological",
+            "manual placement session indices must be strictly increasing and chronological",
         ));
+    }
+    let high_water = execution
+        .work_units
+        .get(&item.id)
+        .and_then(MaterializedExecutionWorkUnit::high_water);
+    let first_fresh = chronological
+        .iter()
+        .position(|block| high_water.is_none_or(|index| block.session_index > index));
+    if let Some(first_fresh) = first_fresh {
+        let mut expected = high_water
+            .map_or(Some(0), |index| index.checked_add(1))
+            .ok_or_else(|| {
+                invalid_item(item.id, "manual placement session index space is exhausted")
+            })?;
+        for block in &chronological[first_fresh..] {
+            if block.session_index != expected {
+                return Err(invalid_item(
+                    item.id,
+                    "manual placement fresh session indices must be consecutive",
+                ));
+            }
+            expected = expected.checked_add(1).unwrap_or(expected);
+        }
     }
     Ok((chronological, total_minutes))
 }
@@ -3619,6 +3964,7 @@ fn dependency_order(
     dependencies: &BTreeMap<ItemId, Vec<Dependency>>,
 ) -> (Vec<ItemId>, Vec<ItemId>) {
     let eligible_set: BTreeSet<_> = eligible.iter().copied().collect();
+    let mut remaining = eligible_set.clone();
     let mut indegree: BTreeMap<_, _> = eligible.iter().map(|id| (*id, 0_u32)).collect();
     let mut successors: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
     for id in &eligible {
@@ -3637,7 +3983,21 @@ fn dependency_order(
     let mut ordered = Vec::with_capacity(eligible.len());
     while !ready.is_empty() {
         ready.sort_by(|left, right| schedule_order(items[left], items[right]));
-        let id = ready.remove(0);
+        // Acyclic soft edges are ordering preferences: among items that are
+        // genuinely ready under hard constraints, choose one whose soft
+        // predecessors are no longer pending. When soft preferences cycle, or
+        // point to a predecessor blocked by hard readiness, no such candidate
+        // exists and ordinary deterministic scheduling order breaks the tie.
+        let preferred = ready.iter().position(|id| {
+            dependencies
+                .get(id)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|dependency| !dependency.strength.is_hard())
+                .all(|dependency| !remaining.contains(&dependency.item_id))
+        });
+        let id = ready.remove(preferred.unwrap_or(0));
+        remaining.remove(&id);
         ordered.push(id);
         for successor in successors.get(&id).map_or(&[][..], Vec::as_slice) {
             let degree = indegree
@@ -3697,6 +4057,7 @@ fn hard_dependency_unavailable(
     dependencies: &[Dependency],
     items: &BTreeMap<ItemId, &WorkItem>,
     outcomes: &BTreeMap<ItemId, bool>,
+    blocks: &[ScheduleBlock],
 ) -> bool {
     dependencies.iter().any(|dependency| {
         if !dependency.strength.is_hard() {
@@ -3710,6 +4071,14 @@ fn hard_dependency_unavailable(
             // outcomes. Their concrete blocks are evaluated by the relation
             // constraint below, so absence from `outcomes` is intentional.
             Some(item) if matches!(item.kind, ItemKind::CalendarEvent(_)) => false,
+            Some(_)
+                if dependency_uses_predecessor_start(dependency.relation)
+                    && blocks
+                        .iter()
+                        .any(|block| block.item_id == Some(dependency.item_id)) =>
+            {
+                false
+            }
             Some(_) => outcomes
                 .get(&dependency.item_id)
                 .is_none_or(|success| !success),
@@ -3894,6 +4263,20 @@ fn soft_weight(request: &PlanRequest, strength: ConstraintStrength) -> u32 {
     }
 }
 
+const fn dependency_uses_predecessor_start(relation: DependencyRelation) -> bool {
+    matches!(
+        relation,
+        DependencyRelation::StartToStart | DependencyRelation::StartToFinish
+    )
+}
+
+const fn dependency_uses_successor_finish(relation: DependencyRelation) -> bool {
+    matches!(
+        relation,
+        DependencyRelation::FinishToFinish | DependencyRelation::StartToFinish
+    )
+}
+
 fn dependency_boundary(
     dependency: &Dependency,
     candidate: Interval,
@@ -3909,6 +4292,27 @@ fn dependency_boundary(
     predecessor
         .checked_add(Duration::minutes(i64::from(dependency.minimum_lag.get())))
         .map(|required| (observed, required))
+}
+
+fn retained_hard_dependency_violation(
+    successor_id: ItemId,
+    predecessor_id: ItemId,
+    successor_interval: Interval,
+    message: &str,
+) -> PlanViolation {
+    let mut item_ids = vec![successor_id, predecessor_id];
+    item_ids.sort_unstable();
+    item_ids.dedup();
+    PlanViolation {
+        kind: ViolationKind::Dependency,
+        severity: ViolationSeverity::Error,
+        item_ids,
+        occurrence_ids: Vec::new(),
+        start: Some(successor_interval.start),
+        end: Some(successor_interval.end),
+        penalty: 0,
+        message: message.to_owned(),
+    }
 }
 
 fn dependency_predecessor_bounds<'a>(

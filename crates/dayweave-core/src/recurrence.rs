@@ -34,6 +34,13 @@ pub enum RecurrenceError {
     DuplicateOccurrence(OccurrenceId),
     #[error("manual placement {0} does not bind to an exact materialized occurrence")]
     InvalidManualPlacement(Uuid),
+    #[error(
+        "dependency from item {successor_id} to item {predecessor_id} crosses a materialized recurring subtree boundary"
+    )]
+    CrossRecurringSubtreeDependency {
+        successor_id: ItemId,
+        predecessor_id: ItemId,
+    },
     #[error("calendar date arithmetic exceeded supported range")]
     DateOutOfRange,
 }
@@ -145,6 +152,7 @@ pub(crate) fn materialize_recurrences(
         removed.extend(subtree.iter().copied());
         subtrees.insert(*root, subtree);
     }
+    validate_recurring_subtree_dependencies(request, &subtrees)?;
 
     let mut items: Vec<WorkItem> = request
         .items
@@ -246,6 +254,31 @@ pub(crate) fn materialize_recurrences(
         occurrences,
         identities,
     })
+}
+
+fn validate_recurring_subtree_dependencies(
+    request: &PlanRequest,
+    subtrees: &BTreeMap<ItemId, Vec<ItemId>>,
+) -> Result<(), RecurrenceError> {
+    let recurring_owner = subtrees
+        .iter()
+        .flat_map(|(root_id, subtree)| subtree.iter().map(move |item_id| (*item_id, *root_id)))
+        .collect::<BTreeMap<_, _>>();
+
+    for successor in &request.items {
+        for dependency in &successor.constraints.dependencies {
+            let Some(predecessor_owner) = recurring_owner.get(&dependency.item_id) else {
+                continue;
+            };
+            if recurring_owner.get(&successor.id) != Some(predecessor_owner) {
+                return Err(RecurrenceError::CrossRecurringSubtreeDependency {
+                    successor_id: successor.id,
+                    predecessor_id: dependency.item_id,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn manual_placement_counts(assignments: &[PreviousAssignment]) -> BTreeMap<Uuid, (usize, usize)> {

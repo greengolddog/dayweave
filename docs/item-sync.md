@@ -70,6 +70,41 @@ credentials and network state are periodically revalidated. Per-process stream
 capacity defaults to 32; exhausted capacity or an unavailable durable head
 returns `503` before streaming starts.
 
+## Atomic delta pages and delivery bounds
+
+The delta request `limit` (1 through 200) is a target, not an absolute response
+count. Direct native item transactions and proposal apply/undo transactions
+give all of their direct item changes and implicit old/new-parent refreshes one
+transaction-local change-group ID. A delta page never ends inside such a group.
+This prevents a durable cursor from representing a hierarchy or dependency
+state that never committed on the server. Google projection batches assign one
+separate group per changed canonical item and its parent refreshes, so a large
+provider page remains incrementally drainable without exposing a partial item
+aggregate.
+
+One proposal contains at most 100 commands and one command can produce at most
+three item-change rows. A group is therefore limited to 300 rows. A response
+can contain at most `requested limit - 1 + 300` changes: 499 at the public
+maximum request limit, 349 for the native foreground limit of 50, and 300 for a
+one-row probe. Clients must accept this bounded expansion rather than rejecting
+a valid response merely because it contains more changes than requested.
+
+Both each group and the complete selected page are limited to 8 MiB of compact
+serialized change payload, leaving headroom within the native 12 MiB and 16 MiB
+HTTP/decode envelopes for JSON structure and cursors. The server may stop a
+page before its requested count at an independent row or group boundary to
+respect that byte ceiling. A valid unit always makes progress. Write paths
+check group count and payload before commit; reads independently fail closed on
+an oversized, discontinuous, or cursor-split stored group rather than emitting
+an undrainable or partial response. Proposal previews additionally reserve 1
+KiB per simulated row for bounded timestamp growth before a later apply or
+undo, while committed transactions retain the exact 8 MiB check.
+
+The dependency-authority cutover leaves pre-cutover rows with a null group ID
+readable as legacy history. A database trigger rejects every post-cutover
+`item_changes` insert without a group, so an older queued writer fails closed
+instead of publishing a partial or stale projection.
+
 ## Delivery and recovery semantics
 
 After a direct `ItemService` create, replace, trash, or restore returns a

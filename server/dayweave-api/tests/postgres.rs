@@ -31,7 +31,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
         ]
     );
 
@@ -60,6 +61,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0022_google_schedule_publication.sql"),
         include_str!("../migrations/0023_google_task_provider_metadata.sql"),
         include_str!("../migrations/0024_structural_item_fields.sql"),
+        include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
     ]
     .join("\n");
     for table in [
@@ -173,6 +175,20 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_dependencies_strength_check",
         "duration_seconds above the supported 31622400-second maximum",
         "item_dependencies contains lag_seconds outside the supported 0..31622400 whole-minute range",
+        "item_dependencies_aggregate_write_guard",
+        "item_dependencies_acyclic",
+        "dayweave_dependency_cutover",
+        "LOCK TABLE items, item_hierarchy, item_dependencies IN SHARE ROW EXCLUSIVE MODE",
+        "items_dependency_projection_forbidden",
+        "ADD COLUMN projection_ordinal integer",
+        "item_dependencies_projection_ordinal_check",
+        "ADD COLUMN change_group_id uuid",
+        "item_changes_workspace_group_idx",
+        "require_item_change_group",
+        "item_changes_group_required",
+        "ADD COLUMN review_ordinal smallint",
+        "proposal_application_effects_review_ordinal_uq",
+        "proposal_application_effects_review_complete",
     ] {
         assert!(
             schema.contains(structural_contract),

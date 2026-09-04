@@ -251,7 +251,7 @@ Commands validate authorization and expected revision, write canonical rows and 
 
 Canonical planner items are exposed under `/v1/items`. Clients generate item UUIDs offline and send an `Idempotency-Key` for every create, replace, delete, and restore command. Replacements carry an expected revision and replace the full mutable item contract. The repository commits the item or tombstone, hierarchy edge, idempotency result, audit operation, outbox message, and delta-stream record atomically. Parent changes are serialized per workspace and reject cycles; only leaves may enter executable states, while `sibling_order` gives every level deterministic ordering.
 
-`GET /v1/items/delta` returns ordered upserts and tombstones behind an opaque, versioned, integrity-checked cursor bound to the authenticated deployment workspace. Hierarchy edits also revision and emit affected parent snapshots so derived leaf executability converges without same-revision replacement. Clients persist the returned cursor only in the same local transaction that applies the page. No item command directly invokes Google or another provider; workers consume the transactional outbox separately.
+`GET /v1/items/delta` returns ordered upserts and tombstones behind an opaque, versioned, integrity-checked cursor bound to the authenticated deployment workspace. Hierarchy edits also revision and emit affected parent snapshots so derived leaf executability converges without same-revision replacement. Direct, proposal, and provider-import mutations group each canonical item change with its implicit parent refreshes so pagination never exposes a cursor inside a committed aggregate; a large provider page uses one independently drainable group per changed item. Count expansion is capped at 300 grouped rows and each complete page stays within an 8 MiB serialized-payload budget. Clients persist the returned cursor only in the same local transaction that applies the page. No item command directly invokes Google or another provider; workers consume the transactional outbox separately.
 
 `GET /v1/items/stream` carries only a coalesced opaque cursor invalidation and
 never item content. The cursor must be one previously returned by the delta
@@ -463,6 +463,13 @@ CI is split into fast pull/commit checks and release pipelines:
 - deterministic scheduler fixture comparison across Rust host and client bindings;
 - signed channel artifacts with checksums and provenance; and
 - deployment plus smoke/backup checks for authorized stable releases.
+
+Schema changes are classified as rolling-compatible or hard cutovers. The
+normalized dependency graph in migration 0025 is a hard cutover: all old
+API/worker processes must be drained before migration, and an old binary must
+never be restarted against the migrated database. Its rollback path is a
+validated pre-cutover backup restore or a roll-forward build, as documented in
+[`deploy/README.md`](../deploy/README.md#stopmigratestart-schema-gate).
 
 Development, beta, and stable channels have distinct update metadata. macOS receives a private update-feed artifact; Android receives a securely signed APK and update manifest. Store submission is not assumed.
 

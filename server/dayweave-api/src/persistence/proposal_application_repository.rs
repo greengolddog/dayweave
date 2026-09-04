@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -13,7 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    items::{DeadlineKind, DeadlineStrength, Item, ItemRepositoryError},
+    items::{DeadlineKind, DeadlineStrength, Item, ItemRepositoryError, validate_dependency_graph},
     proposals::{
         Clock, DecisionKind, MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, Proposal,
         ProposalApplicationReceipt, ProposalApplicationStatus, ProposalAppliedMember,
@@ -27,9 +27,11 @@ use crate::{
 };
 
 use super::{
-    DatabaseScope, TransactionalItemCommand, TransactionalItemEffect, apply_item_command_tx,
-    fetch_item_batch_tx, list_item_batch_tx, lock_execution_item_batch_tx, lock_item_batch_tx,
-    proposal_from_row,
+    DatabaseScope, TransactionalGraphMode, TransactionalItemCommand, TransactionalItemEffect,
+    apply_item_command_tx, clear_dependency_edges_tx, fetch_item_batch_tx, list_item_batch_tx,
+    lock_execution_item_batch_tx, lock_item_batch_tx, proposal_from_row, stage_item_create_tx,
+    staged_item_shell, start_item_change_group_tx, validate_dependency_graph_batch_tx,
+    validate_item_change_group_tx, validate_preview_item_change_group_tx,
 };
 
 const PREVIEW_TTL: StdDuration = StdDuration::from_mins(15);
@@ -156,8 +158,15 @@ impl PostgresProposalApplicationRepository {
             .execute(&mut *transaction)
             .await
             .map_err(internal)?;
+        // Recording inside the savepoint produces the exact payloads that apply
+        // would publish, including every intermediate parent refresh. The
+        // records, audits, and outbox rows are rolled back after both apply and
+        // undo delivery bounds have been checked.
+        let apply_group_id = start_item_change_group_tx(&mut transaction)
+            .await
+            .map_err(map_item_error)?;
         let simulated =
-            simulate_commands(&mut transaction, self.scope, &prepared.commands, now, false).await;
+            simulate_commands(&mut transaction, self.scope, &prepared.commands, now, true).await;
         let (effects, implicit_diffs, mut conflicts) = match simulated {
             Ok(mut effects) => {
                 let after_items = list_item_batch_tx(&mut transaction, self.scope.workspace_id)
@@ -183,6 +192,42 @@ impl PostgresProposalApplicationRepository {
                     &affected_item_ids,
                 )
                 .await?;
+                let mut conflicts = conflicts;
+                if let Err(error) = validate_preview_item_change_group_tx(
+                    &mut transaction,
+                    self.scope.workspace_id,
+                    apply_group_id,
+                )
+                .await
+                {
+                    conflicts.push(item_conflict(&prepared.commands[0], &error));
+                }
+
+                let undo_group_id = start_item_change_group_tx(&mut transaction)
+                    .await
+                    .map_err(map_item_error)?;
+                match simulate_preview_undo_group(
+                    &mut transaction,
+                    self.scope,
+                    &prepared.commands,
+                    &effects,
+                    now,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Err(error) = validate_preview_item_change_group_tx(
+                            &mut transaction,
+                            self.scope.workspace_id,
+                            undo_group_id,
+                        )
+                        .await
+                        {
+                            conflicts.push(item_conflict(&prepared.commands[0], &error));
+                        }
+                    }
+                    Err(conflict) => conflicts.push(conflict),
+                }
                 (effects, implicit_diffs, conflicts)
             }
             Err(conflict) => (Vec::new(), Vec::new(), vec![conflict]),
@@ -378,7 +423,13 @@ impl PostgresProposalApplicationRepository {
             ));
         }
         let watermark = item_change_watermark(&mut transaction, self.scope.workspace_id).await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction)
+            .await
+            .map_err(map_item_error)?;
         let effects = execute_commands(&mut transaction, self.scope, &commands, now, true).await?;
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await
+            .map_err(map_item_error)?;
         let affected_item_ids =
             changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
         reject_provider_managed_items(&mut transaction, self.scope, &affected_item_ids).await?;
@@ -584,6 +635,30 @@ impl PostgresProposalApplicationRepository {
         .await?;
         let effects = load_effects_reverse(&mut transaction, self.scope, application_id).await?;
         let watermark = item_change_watermark(&mut transaction, self.scope.workspace_id).await?;
+        let change_group_id = start_item_change_group_tx(&mut transaction)
+            .await
+            .map_err(map_item_error)?;
+        let replaced_dependency_targets = effects
+            .iter()
+            .filter_map(|effect| match effect.operation {
+                ProposalOperation::CreateItem => None,
+                ProposalOperation::ReplaceItem
+                | ProposalOperation::TrashItem
+                | ProposalOperation::RestoreItem => Some(effect.item_id),
+            })
+            .collect::<Vec<_>>();
+        clear_dependency_edges_tx(
+            &mut transaction,
+            self.scope.workspace_id,
+            &replaced_dependency_targets,
+        )
+        .await
+        .map_err(map_item_error)?;
+        let undo_graph_mode = if effects.len() == 1 {
+            TransactionalGraphMode::Immediate
+        } else {
+            TransactionalGraphMode::Deferred
+        };
         for effect in effects {
             let current = fetch_item_batch_tx(
                 &mut transaction,
@@ -594,10 +669,23 @@ impl PostgresProposalApplicationRepository {
             .await
             .map_err(map_item_error)?;
             let inverse = inverse_command(&effect, &current)?;
-            apply_item_command_tx(&mut transaction, self.scope, inverse, now, true)
-                .await
-                .map_err(map_item_error)?;
+            apply_item_command_tx(
+                &mut transaction,
+                self.scope,
+                inverse,
+                now,
+                true,
+                undo_graph_mode,
+            )
+            .await
+            .map_err(map_item_error)?;
         }
+        validate_dependency_graph_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
+            .await
+            .map_err(map_item_error)?;
         let undo_item_ids =
             changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
         let undo_items =
@@ -884,14 +972,83 @@ async fn simulate_commands(
     now: DateTime<Utc>,
     record: bool,
 ) -> Result<Vec<TransactionalItemEffect>, ProposalConflict> {
-    let mut effects = Vec::with_capacity(commands.len());
+    let initial_items = list_item_batch_tx(transaction, scope.workspace_id)
+        .await
+        .map_err(|error| item_conflict(&commands[0], &error))?;
+    let initial_by_id = initial_items
+        .into_iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    validate_initial_command_fences(commands, &initial_by_id)
+        .map_err(|(index, error)| item_conflict(&commands[index], &error))?;
+    let execution_order = command_execution_order(commands, &initial_by_id, now)
+        .map_err(|(index, error)| item_conflict(&commands[index], &error))?;
+
+    // Stage every new identity before authoring any edge or blocked-by foreign
+    // key. These rows remain transaction-local shells until their command is
+    // finalized and are never visible without the matching item mutation.
     for command in commands {
-        let transactional = transactional_command(command.clone());
-        match apply_item_command_tx(transaction, scope, transactional, now, record).await {
-            Ok(effect) => effects.push(effect),
+        if let ProposalCommand::CreateItem { item, .. } = command {
+            stage_item_create_tx(transaction, scope, item, now)
+                .await
+                .map_err(|error| item_conflict(command, &error))?;
+        }
+    }
+    let replaced_dependency_targets = commands
+        .iter()
+        .filter_map(|command| match command {
+            ProposalCommand::ReplaceItem { item_id, .. } => Some(*item_id),
+            ProposalCommand::CreateItem { .. }
+            | ProposalCommand::TrashItem { .. }
+            | ProposalCommand::RestoreItem { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    clear_dependency_edges_tx(
+        transaction,
+        scope.workspace_id,
+        &replaced_dependency_targets,
+    )
+    .await
+    .map_err(|error| item_conflict(&commands[0], &error))?;
+
+    let mut indexed_effects = Vec::with_capacity(commands.len());
+    let graph_mode =
+        if commands.len() == 1 && !matches!(commands[0], ProposalCommand::CreateItem { .. }) {
+            TransactionalGraphMode::Immediate
+        } else {
+            TransactionalGraphMode::DeferredWithStagedCreates
+        };
+    for (execution_ordinal, index) in execution_order.into_iter().enumerate() {
+        let command = &commands[index];
+        let transactional =
+            transactional_command_at_current_revision(transaction, scope.workspace_id, command)
+                .await
+                .map_err(|error| item_conflict(command, &error))?;
+        match apply_item_command_tx(transaction, scope, transactional, now, record, graph_mode)
+            .await
+        {
+            Ok(mut effect) => {
+                effect.before = initial_by_id.get(&effect.after.id).cloned();
+                effect.execution_ordinal = execution_ordinal;
+                indexed_effects.push((index, effect));
+            }
             Err(error) => return Err(item_conflict(command, &error)),
         }
     }
+    validate_dependency_graph_batch_tx(transaction, scope.workspace_id)
+        .await
+        .map_err(|error| {
+            let command = commands
+                .iter()
+                .find(|command| matches!(command, ProposalCommand::ReplaceItem { .. }))
+                .unwrap_or(&commands[0]);
+            item_conflict(command, &error)
+        })?;
+    indexed_effects.sort_by_key(|(index, _)| *index);
+    let mut effects = indexed_effects
+        .into_iter()
+        .map(|(_, effect)| effect)
+        .collect::<Vec<_>>();
     // A later hierarchy command can advance an earlier command target (for
     // example, creating a child refreshes its newly created goal). Review must
     // show the final post-batch state, exactly like durable effect evidence.
@@ -912,6 +1069,544 @@ async fn simulate_commands(
     Ok(effects)
 }
 
+fn validate_initial_command_fences(
+    commands: &[ProposalCommand],
+    initial_by_id: &HashMap<Uuid, Item>,
+) -> Result<(), (usize, ItemRepositoryError)> {
+    for (index, command) in commands.iter().enumerate() {
+        let (item_id, expected_revision, must_be_deleted) = match command {
+            ProposalCommand::CreateItem { item, .. } => {
+                if initial_by_id.contains_key(&item.id) {
+                    return Err((index, ItemRepositoryError::Duplicate(item.id)));
+                }
+                continue;
+            }
+            ProposalCommand::ReplaceItem {
+                item_id,
+                expected_revision,
+                ..
+            }
+            | ProposalCommand::TrashItem {
+                item_id,
+                expected_revision,
+                ..
+            } => (*item_id, *expected_revision, false),
+            ProposalCommand::RestoreItem {
+                item_id,
+                expected_revision,
+                ..
+            } => (*item_id, *expected_revision, true),
+        };
+        let Some(item) = initial_by_id
+            .get(&item_id)
+            .filter(|item| item.deleted_at.is_some() == must_be_deleted)
+        else {
+            return Err((index, ItemRepositoryError::NotFound(item_id)));
+        };
+        if item.revision != expected_revision {
+            return Err((
+                index,
+                ItemRepositoryError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: item.revision,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Replays the exact inverse that a future undo would publish while the preview
+/// savepoint still contains the simulated applied state. This makes the undo
+/// delivery-size guarantee part of review instead of discovering an
+/// undrainable atomic group after approval.
+async fn simulate_preview_undo_group(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    commands: &[ProposalCommand],
+    effects: &[TransactionalItemEffect],
+    now: DateTime<Utc>,
+) -> Result<(), ProposalConflict> {
+    let Some(first_command) = commands.first() else {
+        return Err(ProposalConflict {
+            code: ProposalConflictCode::InvalidItem,
+            command_id: None,
+            item_id: None,
+            expected_revision: None,
+            actual_revision: None,
+            summary: "The proposal contains no item commands.".to_owned(),
+        });
+    };
+    if commands.len() != effects.len() {
+        return Err(item_conflict(first_command, &ItemRepositoryError::Internal));
+    }
+    let mut inverse_order = effects.iter().enumerate().collect::<Vec<_>>();
+    inverse_order.sort_by_key(|(_, effect)| std::cmp::Reverse(effect.execution_ordinal));
+    if inverse_order
+        .iter()
+        .enumerate()
+        .any(|(ordinal, (_, effect))| effect.execution_ordinal != effects.len() - ordinal - 1)
+    {
+        return Err(item_conflict(first_command, &ItemRepositoryError::Internal));
+    }
+
+    let replaced_dependency_targets = inverse_order
+        .iter()
+        .filter_map(|(_, effect)| effect.before.as_ref().map(|_| effect.after.id))
+        .collect::<Vec<_>>();
+    clear_dependency_edges_tx(
+        transaction,
+        scope.workspace_id,
+        &replaced_dependency_targets,
+    )
+    .await
+    .map_err(|error| item_conflict(first_command, &error))?;
+    let graph_mode = if effects.len() == 1 {
+        TransactionalGraphMode::Immediate
+    } else {
+        TransactionalGraphMode::Deferred
+    };
+    for (index, effect) in inverse_order {
+        let command = &commands[index];
+        let current = fetch_item_batch_tx(transaction, scope.workspace_id, effect.after.id, true)
+            .await
+            .map_err(|error| item_conflict(command, &error))?;
+        let stored = StoredEffect {
+            operation: command.operation(),
+            item_id: effect.after.id,
+            before: effect.before.clone(),
+        };
+        let inverse = inverse_command(&stored, &current)
+            .map_err(|_| item_conflict(command, &ItemRepositoryError::Internal))?;
+        apply_item_command_tx(transaction, scope, inverse, now, true, graph_mode)
+            .await
+            .map_err(|error| item_conflict(command, &error))?;
+    }
+    validate_dependency_graph_batch_tx(transaction, scope.workspace_id)
+        .await
+        .map_err(|error| item_conflict(first_command, &error))
+}
+
+#[derive(Clone)]
+struct ProjectedBatchState {
+    items: HashMap<Uuid, Item>,
+    pending_create_ids: HashSet<Uuid>,
+}
+
+const MAX_COMMAND_ORDER_SEARCH_STATES: usize = 50_000;
+
+fn command_execution_order(
+    commands: &[ProposalCommand],
+    initial_by_id: &HashMap<Uuid, Item>,
+    now: DateTime<Utc>,
+) -> Result<Vec<usize>, (usize, ItemRepositoryError)> {
+    // Only a newly created parent is an unconditional prerequisite. Existing
+    // parents may instead need a child detached or trashed before their own
+    // command; treating both the old and new parent as predecessors invents
+    // cycles and makes otherwise valid final-state batches impossible.
+    let created_parent_indices = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| match command {
+            ProposalCommand::CreateItem { item, .. } => Some((item.id, index)),
+            ProposalCommand::ReplaceItem { .. }
+            | ProposalCommand::TrashItem { .. }
+            | ProposalCommand::RestoreItem { .. } => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut successors = vec![Vec::<usize>::new(); commands.len()];
+    let mut prerequisites = vec![Vec::<usize>::new(); commands.len()];
+    let mut indegree = vec![0_usize; commands.len()];
+    let mut edges = HashSet::new();
+    for (child_index, command) in commands.iter().enumerate() {
+        let parent_id = match command {
+            ProposalCommand::CreateItem { item, .. } => item.parent_id,
+            ProposalCommand::ReplaceItem { item, .. } => item.parent_id,
+            ProposalCommand::TrashItem { .. } | ProposalCommand::RestoreItem { .. } => None,
+        };
+        let Some(parent_index) =
+            parent_id.and_then(|parent_id| created_parent_indices.get(&parent_id).copied())
+        else {
+            continue;
+        };
+        if edges.insert((parent_index, child_index)) {
+            successors[parent_index].push(child_index);
+            prerequisites[child_index].push(parent_index);
+            indegree[child_index] += 1;
+        }
+    }
+    for command_prerequisites in &mut prerequisites {
+        command_prerequisites.sort_unstable();
+    }
+    let mut ready = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<BTreeSet<_>>();
+    let initial_projected = projected_batch_state(commands, initial_by_id, now)?;
+    let mut projected = initial_projected.clone();
+    let mut order = Vec::with_capacity(commands.len());
+    while !ready.is_empty() {
+        let mut selected = None;
+        let mut first_order_error = None;
+        for index in ready.iter().copied() {
+            match project_command_for_ordering(&commands[index], &projected, now) {
+                Ok(candidate) => {
+                    selected = Some((index, candidate));
+                    break;
+                }
+                Err(error) if order_error_can_be_resolved(&error) => {
+                    if first_order_error.is_none() {
+                        first_order_error = Some((index, error));
+                    }
+                }
+                Err(error) => return Err((index, error)),
+            }
+        }
+        let Some((index, candidate)) = selected else {
+            let greedy_error = first_order_error.unwrap_or((
+                *ready.first().unwrap_or(&0),
+                ItemRepositoryError::HierarchyCycle,
+            ));
+            return match fallback_command_execution_order(
+                commands,
+                &initial_projected,
+                &prerequisites,
+                now,
+            )? {
+                Some(order) => Ok(order),
+                None => Err(greedy_error),
+            };
+        };
+        projected = candidate;
+        ready.remove(&index);
+        order.push(index);
+        successors[index].sort_unstable();
+        for successor in &successors[index] {
+            indegree[*successor] -= 1;
+            if indegree[*successor] == 0 {
+                ready.insert(*successor);
+            }
+        }
+    }
+    if order.len() == commands.len() && projected.pending_create_ids.is_empty() {
+        Ok(order)
+    } else {
+        Err((
+            indegree.iter().position(|degree| *degree > 0).unwrap_or(0),
+            ItemRepositoryError::HierarchyCycle,
+        ))
+    }
+}
+
+fn fallback_command_execution_order(
+    commands: &[ProposalCommand],
+    initial: &ProjectedBatchState,
+    prerequisites: &[Vec<usize>],
+    now: DateTime<Utc>,
+) -> Result<Option<Vec<usize>>, (usize, ItemRepositoryError)> {
+    let mut remaining_states = MAX_COMMAND_ORDER_SEARCH_STATES;
+    let mut executed = vec![false; commands.len()];
+    let mut order = Vec::with_capacity(commands.len());
+    let mut exhausted_sets = HashSet::new();
+    search_command_execution_order(
+        commands,
+        initial,
+        prerequisites,
+        now,
+        &mut executed,
+        &mut order,
+        &mut exhausted_sets,
+        &mut remaining_states,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_command_execution_order(
+    commands: &[ProposalCommand],
+    projected: &ProjectedBatchState,
+    prerequisites: &[Vec<usize>],
+    now: DateTime<Utc>,
+    executed: &mut [bool],
+    order: &mut Vec<usize>,
+    exhausted_sets: &mut HashSet<Vec<bool>>,
+    remaining_states: &mut usize,
+) -> Result<Option<Vec<usize>>, (usize, ItemRepositoryError)> {
+    if order.len() == commands.len() {
+        return Ok(Some(order.clone()));
+    }
+    let Some(next_remaining) = remaining_states.checked_sub(1) else {
+        let index = executed.iter().position(|done| !done).unwrap_or(0);
+        return Err((index, ItemRepositoryError::Internal));
+    };
+    *remaining_states = next_remaining;
+    if !exhausted_sets.insert(executed.to_vec()) {
+        return Ok(None);
+    }
+
+    for index in 0..commands.len() {
+        if executed[index]
+            || prerequisites[index]
+                .iter()
+                .any(|prerequisite| !executed[*prerequisite])
+        {
+            continue;
+        }
+        let candidate = match project_command_for_ordering(&commands[index], projected, now) {
+            Ok(candidate) => candidate,
+            Err(error) if order_error_can_be_resolved(&error) => continue,
+            Err(error) => return Err((index, error)),
+        };
+        executed[index] = true;
+        order.push(index);
+        let result = search_command_execution_order(
+            commands,
+            &candidate,
+            prerequisites,
+            now,
+            executed,
+            order,
+            exhausted_sets,
+            remaining_states,
+        );
+        order.pop();
+        executed[index] = false;
+        if result.as_ref().is_ok_and(Option::is_some) {
+            return result;
+        }
+        result?;
+    }
+    Ok(None)
+}
+
+fn projected_batch_state(
+    commands: &[ProposalCommand],
+    initial_by_id: &HashMap<Uuid, Item>,
+    now: DateTime<Utc>,
+) -> Result<ProjectedBatchState, (usize, ItemRepositoryError)> {
+    let mut items = initial_by_id.clone();
+
+    // SQL clears every replaced successor's incoming edge set before command
+    // execution. Project the same neutral graph so ordering never rejects an
+    // acyclic final rewire because of an edge that is already staged away.
+    for (index, command) in commands.iter().enumerate() {
+        let ProposalCommand::ReplaceItem { item_id, .. } = command else {
+            continue;
+        };
+        let item = items
+            .get_mut(item_id)
+            .filter(|item| item.deleted_at.is_none())
+            .ok_or((index, ItemRepositoryError::NotFound(*item_id)))?;
+        item.project_dependencies(&[])
+            .map_err(ItemRepositoryError::from)
+            .map_err(|error| (index, error))?;
+    }
+
+    // Mirror the transaction-local rows inserted by `stage_item_create_tx`.
+    // The identity exists for foreign keys, but its final hierarchy,
+    // dependency, completion, and blocker state does not exist yet.
+    let mut pending_create_ids = HashSet::new();
+    for (index, command) in commands.iter().enumerate() {
+        let ProposalCommand::CreateItem { item, .. } = command else {
+            continue;
+        };
+        let shell = staged_item_shell(item, now).map_err(|error| (index, error))?;
+        if items.insert(shell.id, shell).is_some() || !pending_create_ids.insert(item.id) {
+            return Err((index, ItemRepositoryError::Duplicate(item.id)));
+        }
+    }
+    Ok(ProjectedBatchState {
+        items,
+        pending_create_ids,
+    })
+}
+
+fn project_command_for_ordering(
+    command: &ProposalCommand,
+    state: &ProjectedBatchState,
+    now: DateTime<Utc>,
+) -> Result<ProjectedBatchState, ItemRepositoryError> {
+    let mut next = state.clone();
+    let (mut item, parents_to_refresh) = match command {
+        ProposalCommand::CreateItem { item, .. } => {
+            if !next.pending_create_ids.remove(&item.id) {
+                return Err(ItemRepositoryError::Duplicate(item.id));
+            }
+            let item = Item::new(item.clone(), now).map_err(ItemRepositoryError::from)?;
+            validate_projected_parent(&next.items, item.id, item.parent_id)?;
+            validate_projected_blocker(&next.items, item.blocked_by_item_id)?;
+            let parent_id = item.parent_id;
+            (item, vec![parent_id])
+        }
+        ProposalCommand::ReplaceItem { item_id, item, .. } => {
+            let current = next
+                .items
+                .get(item_id)
+                .filter(|item| item.deleted_at.is_none())
+                .cloned()
+                .ok_or(ItemRepositoryError::NotFound(*item_id))?;
+            let previous_parent_id = current.parent_id;
+            let previous_sibling_order = current.sibling_order;
+            let item = current
+                .replaced(item.clone(), now)
+                .map_err(ItemRepositoryError::from)?;
+            validate_projected_parent(&next.items, *item_id, item.parent_id)?;
+            validate_projected_blocker(&next.items, item.blocked_by_item_id)?;
+            if projected_has_active_children(*item_id, &next.items)
+                && item.status.is_executing_state()
+            {
+                return Err(ItemRepositoryError::NonLeafExecutable);
+            }
+            let parents = if previous_parent_id != item.parent_id
+                || previous_sibling_order != item.sibling_order
+            {
+                vec![previous_parent_id, item.parent_id]
+            } else {
+                Vec::new()
+            };
+            (item, parents)
+        }
+        ProposalCommand::TrashItem { item_id, .. } => {
+            let current = next
+                .items
+                .get(item_id)
+                .filter(|item| item.deleted_at.is_none())
+                .cloned()
+                .ok_or(ItemRepositoryError::NotFound(*item_id))?;
+            if projected_has_active_children(*item_id, &next.items) {
+                return Err(ItemRepositoryError::HasChildren);
+            }
+            let parent_id = current.parent_id;
+            (
+                current.trashed(now).map_err(ItemRepositoryError::from)?,
+                vec![parent_id],
+            )
+        }
+        ProposalCommand::RestoreItem { item_id, .. } => {
+            let current = next
+                .items
+                .get(item_id)
+                .filter(|item| item.deleted_at.is_some())
+                .cloned()
+                .ok_or(ItemRepositoryError::NotFound(*item_id))?;
+            validate_projected_parent(&next.items, *item_id, current.parent_id).map_err(
+                |error| match error {
+                    ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
+                    other => other,
+                },
+            )?;
+            let item = current.restored(now).map_err(ItemRepositoryError::from)?;
+            if projected_has_active_children(*item_id, &next.items)
+                && item.status.is_executing_state()
+            {
+                return Err(ItemRepositoryError::NonLeafExecutable);
+            }
+            let parent_id = item.parent_id;
+            (item, vec![parent_id])
+        }
+    };
+
+    let item_id = item.id;
+    next.items.insert(item_id, item);
+    let has_active_children = projected_has_active_children(item_id, &next.items);
+    item = next
+        .items
+        .get(&item_id)
+        .cloned()
+        .ok_or(ItemRepositoryError::Internal)?;
+    item.is_executable = item.execution_is_allowed(has_active_children);
+    next.items.insert(item_id, item);
+    refresh_projected_parents(&mut next.items, parents_to_refresh, now)?;
+    validate_dependency_graph(&next.items)?;
+    Ok(next)
+}
+
+fn validate_projected_parent(
+    items: &HashMap<Uuid, Item>,
+    item_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<(), ItemRepositoryError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    if parent_id == item_id {
+        return Err(ItemRepositoryError::SelfParent);
+    }
+    let parent = items
+        .get(&parent_id)
+        .filter(|item| item.deleted_at.is_none())
+        .ok_or(ItemRepositoryError::ParentNotFound(parent_id))?;
+    if parent.status.is_executing_state() {
+        return Err(ItemRepositoryError::InvalidParentState);
+    }
+    let mut visited = HashSet::new();
+    let mut ancestor_id = Some(parent_id);
+    while let Some(ancestor) = ancestor_id {
+        if ancestor == item_id || !visited.insert(ancestor) {
+            return Err(ItemRepositoryError::HierarchyCycle);
+        }
+        ancestor_id = items.get(&ancestor).and_then(|item| item.parent_id);
+    }
+    Ok(())
+}
+
+fn validate_projected_blocker(
+    items: &HashMap<Uuid, Item>,
+    blocked_by_item_id: Option<Uuid>,
+) -> Result<(), ItemRepositoryError> {
+    if let Some(blocked_by_item_id) = blocked_by_item_id
+        && !items.contains_key(&blocked_by_item_id)
+    {
+        return Err(ItemRepositoryError::BlockedByItemNotFound(
+            blocked_by_item_id,
+        ));
+    }
+    Ok(())
+}
+
+fn projected_has_active_children(item_id: Uuid, items: &HashMap<Uuid, Item>) -> bool {
+    items
+        .values()
+        .any(|item| item.parent_id == Some(item_id) && item.deleted_at.is_none())
+}
+
+fn refresh_projected_parents(
+    items: &mut HashMap<Uuid, Item>,
+    parent_ids: impl IntoIterator<Item = Option<Uuid>>,
+    now: DateTime<Utc>,
+) -> Result<(), ItemRepositoryError> {
+    let mut parent_ids = parent_ids.into_iter().flatten().collect::<Vec<_>>();
+    parent_ids.sort_unstable();
+    parent_ids.dedup();
+    for parent_id in parent_ids {
+        let current = items
+            .get(&parent_id)
+            .filter(|item| item.deleted_at.is_none())
+            .cloned()
+            .ok_or(ItemRepositoryError::ParentNotFound(parent_id))?;
+        let parent = current
+            .refreshed_execution(projected_has_active_children(parent_id, items), now)
+            .map_err(ItemRepositoryError::from)?;
+        items.insert(parent_id, parent);
+    }
+    Ok(())
+}
+
+const fn order_error_can_be_resolved(error: &ItemRepositoryError) -> bool {
+    matches!(
+        error,
+        ItemRepositoryError::ParentNotFound(_)
+            | ItemRepositoryError::HierarchyCycle
+            | ItemRepositoryError::DependencyNotFound(_)
+            | ItemRepositoryError::CrossRecurringSubtreeDependency { .. }
+            | ItemRepositoryError::InvalidParentState
+            | ItemRepositoryError::NonLeafExecutable
+            | ItemRepositoryError::HasChildren
+            | ItemRepositoryError::DeletedParent
+            | ItemRepositoryError::DependencyCycle
+    )
+}
+
 async fn execute_commands(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -924,35 +1619,36 @@ async fn execute_commands(
         .map_err(|conflict| ProposalApplicationError::Stale(conflict.code))
 }
 
-fn transactional_command(command: ProposalCommand) -> TransactionalItemCommand {
+async fn transactional_command_at_current_revision(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    command: &ProposalCommand,
+) -> Result<TransactionalItemCommand, ItemRepositoryError> {
     match command {
-        ProposalCommand::CreateItem { item, .. } => TransactionalItemCommand::Create(item),
-        ProposalCommand::ReplaceItem {
-            item_id,
-            expected_revision,
-            item,
-            ..
-        } => TransactionalItemCommand::Replace {
-            item_id,
-            expected_revision,
-            replacement: item,
-        },
-        ProposalCommand::TrashItem {
-            item_id,
-            expected_revision,
-            ..
-        } => TransactionalItemCommand::Trash {
-            item_id,
-            expected_revision,
-        },
-        ProposalCommand::RestoreItem {
-            item_id,
-            expected_revision,
-            ..
-        } => TransactionalItemCommand::Restore {
-            item_id,
-            expected_revision,
-        },
+        ProposalCommand::CreateItem { item, .. } => {
+            Ok(TransactionalItemCommand::Create(item.clone()))
+        }
+        ProposalCommand::ReplaceItem { item_id, item, .. } => {
+            Ok(TransactionalItemCommand::Replace {
+                item_id: *item_id,
+                expected_revision: fetch_item_batch_tx(transaction, workspace_id, *item_id, true)
+                    .await?
+                    .revision,
+                replacement: item.clone(),
+            })
+        }
+        ProposalCommand::TrashItem { item_id, .. } => Ok(TransactionalItemCommand::Trash {
+            item_id: *item_id,
+            expected_revision: fetch_item_batch_tx(transaction, workspace_id, *item_id, true)
+                .await?
+                .revision,
+        }),
+        ProposalCommand::RestoreItem { item_id, .. } => Ok(TransactionalItemCommand::Restore {
+            item_id: *item_id,
+            expected_revision: fetch_item_batch_tx(transaction, workspace_id, *item_id, true)
+                .await?
+                .revision,
+        }),
     }
 }
 
@@ -971,18 +1667,38 @@ fn item_conflict(command: &ProposalCommand, error: &ItemRepositoryError) -> Prop
         ItemRepositoryError::HierarchyCycle | ItemRepositoryError::SelfParent => {
             (ProposalConflictCode::HierarchyCycle, None, None)
         }
+        ItemRepositoryError::DependencyNotFound(_) => {
+            (ProposalConflictCode::DependencyNotFound, None, None)
+        }
+        ItemRepositoryError::DependencyCycle => (ProposalConflictCode::DependencyCycle, None, None),
         ItemRepositoryError::InvalidParentState => {
             (ProposalConflictCode::InvalidParentState, None, None)
         }
         ItemRepositoryError::NonLeafExecutable => {
             (ProposalConflictCode::NonLeafExecutable, None, None)
         }
-        ItemRepositoryError::ActiveExecutionConflict { .. } => {
+        ItemRepositoryError::ActiveExecutionConflict { .. }
+        | ItemRepositoryError::CrossRecurringSubtreeDependency { .. } => {
             (ProposalConflictCode::InvalidItem, None, None)
         }
         ItemRepositoryError::HasChildren => (ProposalConflictCode::HasChildren, None, None),
         ItemRepositoryError::DeletedParent => (ProposalConflictCode::DeletedParent, None, None),
         _ => (ProposalConflictCode::InvalidItem, None, None),
+    };
+    let summary = match error {
+        ItemRepositoryError::DependencyNotFound(_) => {
+            "A dependency predecessor no longer exists in this workspace."
+        }
+        ItemRepositoryError::DependencyCycle => {
+            "The proposed dependency change would create a cycle."
+        }
+        ItemRepositoryError::CrossRecurringSubtreeDependency { .. } => {
+            "A dependency cannot point into a different materialized recurring subtree."
+        }
+        ItemRepositoryError::DeltaGroupTooLarge => {
+            "Split this proposal into smaller batches because its atomic sync payload exceeds the safe device-delivery limit."
+        }
+        _ => "This change no longer satisfies the current item constraints.",
     };
     ProposalConflict {
         code,
@@ -990,7 +1706,7 @@ fn item_conflict(command: &ProposalCommand, error: &ItemRepositoryError) -> Prop
         item_id: Some(command.target_item_id()),
         expected_revision: expected,
         actual_revision: actual,
-        summary: "This change no longer satisfies the current item constraints.".to_owned(),
+        summary: summary.to_owned(),
     }
 }
 
@@ -1072,6 +1788,7 @@ fn changed_fields(before: Option<&Item>, after: Option<&Item>) -> Vec<ProposalIt
             ProposalItemField::EarliestStartAt,
             ProposalItemField::Recurrence,
             ProposalItemField::FlexibleConstraints,
+            ProposalItemField::Dependencies,
             ProposalItemField::HasOwnEffort,
             ProposalItemField::SplitPolicy,
             ProposalItemField::Importance,
@@ -1116,7 +1833,12 @@ fn changed_fields(before: Option<&Item>, after: Option<&Item>) -> Vec<ProposalIt
     changed!(deadline_soft_weight, DeadlineSoftWeight);
     changed!(earliest_start_at, EarliestStartAt);
     changed!(recurrence, Recurrence);
-    changed!(flexible_constraints, FlexibleConstraints);
+    if before.constraints_without_dependencies() != after.constraints_without_dependencies() {
+        fields.push(ProposalItemField::FlexibleConstraints);
+    }
+    if before.dependencies() != after.dependencies() {
+        fields.push(ProposalItemField::Dependencies);
+    }
     changed!(has_own_effort, HasOwnEffort);
     changed!(split_policy, SplitPolicy);
     changed!(importance, Importance);
@@ -1327,6 +2049,25 @@ fn proposal_risks(
                 requires_explicit_approval: true,
                 summary: "Adds an item beneath an existing or proposed hierarchy parent."
                     .to_owned(),
+            });
+        }
+        let dependencies_changed = effect.before.as_ref().map_or_else(
+            || {
+                effect
+                    .after
+                    .dependencies()
+                    .is_ok_and(|value| !value.is_empty())
+            },
+            |before| before.dependencies() != effect.after.dependencies(),
+        );
+        if dependencies_changed {
+            risks.push(ProposalRisk {
+                code: ProposalRiskCode::ChangesDependencies,
+                level: ProposalRiskLevel::High,
+                command_id: Some(command.command_id()),
+                item_id: Some(command.target_item_id()),
+                requires_explicit_approval: true,
+                summary: "Changes which items constrain this item's schedule.".to_owned(),
             });
         }
         let Some(before) = effect.before.as_ref() else {
@@ -2037,7 +2778,7 @@ async fn insert_effects(
     if commands.len() != effects.len() {
         return Err(ProposalApplicationError::Internal);
     }
-    for (ordinal, (command, effect)) in commands.iter().zip(effects).enumerate() {
+    for (review_ordinal, (command, effect)) in commands.iter().zip(effects).enumerate() {
         let final_item = final_items
             .iter()
             .find(|item| item.id == command.target_item_id())
@@ -2060,15 +2801,19 @@ async fn insert_effects(
             hash_domain_json(b"dayweave.proposal.item-snapshot.v1\0", final_item)?;
         sqlx::query(
             "INSERT INTO proposal_application_effects (workspace_id,user_id,application_id,ordinal, \
-             action_id,operation,command_hash,item_id,expected_revision,before_revision, \
-             after_revision,before_deleted,after_deleted,before_snapshot_hash,after_snapshot_hash, \
-             before_snapshot,after_snapshot,created_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+             review_ordinal,action_id,operation,command_hash,item_id,expected_revision, \
+             before_revision,after_revision,before_deleted,after_deleted,before_snapshot_hash, \
+             after_snapshot_hash,before_snapshot,after_snapshot,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
         )
         .bind(scope.workspace_id)
         .bind(scope.user_id)
         .bind(application_id)
-        .bind(i16::try_from(ordinal).map_err(|_| ProposalApplicationError::Internal)?)
+        .bind(
+            i16::try_from(effect.execution_ordinal)
+                .map_err(|_| ProposalApplicationError::Internal)?,
+        )
+        .bind(i16::try_from(review_ordinal).map_err(|_| ProposalApplicationError::Internal)?)
         .bind(command.command_id())
         .bind(operation_name(command.operation()))
         .bind(command_hash.as_slice())
@@ -2296,7 +3041,7 @@ async fn load_receipt_tx(
         .collect::<Result<Vec<_>, ProposalApplicationError>>()?;
     let command_ids = sqlx::query_scalar(
         "SELECT action_id FROM proposal_application_effects WHERE workspace_id=$1 AND user_id=$2 \
-         AND application_id=$3 ORDER BY ordinal",
+         AND application_id=$3 ORDER BY review_ordinal",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -2640,6 +3385,12 @@ fn map_item_error(error: ItemRepositoryError) -> ProposalApplicationError {
         ItemRepositoryError::HierarchyCycle | ItemRepositoryError::SelfParent => {
             ProposalApplicationError::Stale(ProposalConflictCode::HierarchyCycle)
         }
+        ItemRepositoryError::DependencyNotFound(_) => {
+            ProposalApplicationError::Stale(ProposalConflictCode::DependencyNotFound)
+        }
+        ItemRepositoryError::DependencyCycle => {
+            ProposalApplicationError::Stale(ProposalConflictCode::DependencyCycle)
+        }
         ItemRepositoryError::InvalidParentState => {
             ProposalApplicationError::Stale(ProposalConflictCode::InvalidParentState)
         }
@@ -2647,6 +3398,7 @@ fn map_item_error(error: ItemRepositoryError) -> ProposalApplicationError {
             ProposalApplicationError::Stale(ProposalConflictCode::NonLeafExecutable)
         }
         ItemRepositoryError::ActiveExecutionConflict { .. }
+        | ItemRepositoryError::CrossRecurringSubtreeDependency { .. }
         | ItemRepositoryError::InvalidItem(_) => {
             ProposalApplicationError::Stale(ProposalConflictCode::InvalidItem)
         }
@@ -2712,6 +3464,365 @@ fn internal<T>(_error: T) -> ProposalApplicationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items::{ItemKind, ItemStatus, NewItem, ReplaceItem, SplitPolicy};
+
+    fn review_item(id: Uuid, flexible_constraints: Value) -> Item {
+        Item::new(
+            NewItem {
+                id,
+                is_sensitive: false,
+                kind: ItemKind::Task,
+                status: ItemStatus::Planned,
+                title: "Dependency review fixture".to_owned(),
+                notes: None,
+                timezone_name: "Europe/Madrid".to_owned(),
+                duration_kind: None,
+                duration_seconds: Some(1_800),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
+                deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
+                earliest_start_at: None,
+                recurrence: None,
+                flexible_constraints,
+                has_own_effort: None,
+                split_policy: SplitPolicy::Indivisible,
+                importance: 50,
+                urgency: 50,
+                parent_id: None,
+                sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
+            },
+            "2026-09-04T12:00:00Z".parse().unwrap(),
+        )
+        .expect("review fixture must be valid")
+    }
+
+    fn dependency_constraints(predecessor_id: Uuid) -> Value {
+        json!({
+            "constraints": {
+                "dependencies": [{
+                    "item_id": predecessor_id,
+                    "relation": "finish_to_start",
+                    "minimum_lag": 15,
+                    "strength": { "level": "hard" }
+                }]
+            }
+        })
+    }
+
+    fn hierarchy_review_item(
+        id: Uuid,
+        kind: ItemKind,
+        status: ItemStatus,
+        parent_id: Option<Uuid>,
+        sibling_order: u32,
+        flexible_constraints: Value,
+    ) -> Item {
+        Item::new(
+            NewItem {
+                id,
+                is_sensitive: false,
+                kind,
+                status,
+                title: format!("Hierarchy ordering fixture {id}"),
+                notes: None,
+                timezone_name: "Europe/Madrid".to_owned(),
+                duration_kind: None,
+                duration_seconds: Some(1_800),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
+                deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
+                earliest_start_at: None,
+                recurrence: None,
+                flexible_constraints,
+                has_own_effort: None,
+                split_policy: SplitPolicy::Indivisible,
+                importance: 50,
+                urgency: 50,
+                parent_id,
+                sibling_order,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
+            },
+            "2026-09-04T12:00:00Z".parse().unwrap(),
+        )
+        .expect("hierarchy fixture must be valid")
+    }
+
+    fn hierarchy_replacement(
+        item: &Item,
+        status: ItemStatus,
+        parent_id: Option<Uuid>,
+        sibling_order: u32,
+        flexible_constraints: Value,
+    ) -> ReplaceItem {
+        ReplaceItem {
+            is_sensitive: item.is_sensitive,
+            kind: item.kind,
+            status,
+            title: item.title.clone(),
+            notes: item.notes.clone(),
+            timezone_name: item.timezone_name.clone(),
+            duration_kind: Some(item.duration_kind),
+            duration_seconds: item.duration_seconds,
+            duration_min_seconds: item.duration_min_seconds,
+            duration_max_seconds: item.duration_max_seconds,
+            duration_source: item.duration_source,
+            deadline_kind: Some(item.deadline_kind),
+            deadline_date: item.deadline_date,
+            deadline_at: item.deadline_at,
+            deadline_strength: item.deadline_strength,
+            deadline_soft_weight: item.deadline_soft_weight,
+            earliest_start_at: item.earliest_start_at,
+            recurrence: item.recurrence.clone(),
+            flexible_constraints,
+            has_own_effort: Some(item.has_own_effort),
+            split_policy: item.split_policy.clone(),
+            importance: item.importance,
+            urgency: item.urgency,
+            parent_id,
+            sibling_order,
+            blocked_reason_kind: item.blocked_reason_kind,
+            blocked_by_item_id: item.blocked_by_item_id,
+            blocked_reason: item.blocked_reason.clone(),
+        }
+    }
+
+    fn dependencies(predecessors: &[Uuid]) -> Value {
+        let dependencies = predecessors
+            .iter()
+            .map(|item_id| {
+                json!({
+                    "item_id": item_id,
+                    "relation": "finish_to_start",
+                    "minimum_lag": 15,
+                    "strength": { "level": "hard" }
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"constraints": {"dependencies": dependencies}})
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn command_order_backtracks_when_the_first_feasible_branch_dead_ends() {
+        let ids = (1_u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
+        let mut ordered_routine_with_dependency = dependencies(&[ids[3]]);
+        ordered_routine_with_dependency
+            .as_object_mut()
+            .unwrap()
+            .insert("routine_ordered".to_owned(), Value::Bool(true));
+        let initial = [
+            hierarchy_review_item(
+                ids[0],
+                ItemKind::Task,
+                ItemStatus::Scheduled,
+                Some(ids[5]),
+                2,
+                json!({}),
+            ),
+            hierarchy_review_item(
+                ids[1],
+                ItemKind::Task,
+                ItemStatus::Planned,
+                Some(ids[5]),
+                1,
+                json!({}),
+            ),
+            hierarchy_review_item(
+                ids[2],
+                ItemKind::Task,
+                ItemStatus::Planned,
+                Some(ids[1]),
+                2,
+                json!({}),
+            ),
+            hierarchy_review_item(
+                ids[3],
+                ItemKind::Task,
+                ItemStatus::Planned,
+                Some(ids[5]),
+                1,
+                json!({}),
+            ),
+            hierarchy_review_item(
+                ids[4],
+                ItemKind::Routine,
+                ItemStatus::Planned,
+                Some(ids[2]),
+                3,
+                ordered_routine_with_dependency,
+            ),
+            hierarchy_review_item(
+                ids[5],
+                ItemKind::Routine,
+                ItemStatus::Planned,
+                None,
+                2,
+                json!({"routine_ordered": true}),
+            ),
+        ];
+        let initial_by_id = initial
+            .iter()
+            .cloned()
+            .map(|item| (item.id, item))
+            .collect::<HashMap<_, _>>();
+        let commands = vec![
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: ids[0],
+                expected_revision: 1,
+                item: hierarchy_replacement(
+                    &initial[0],
+                    ItemStatus::Planned,
+                    Some(ids[1]),
+                    2,
+                    json!({}),
+                ),
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: ids[1],
+                expected_revision: 1,
+                item: hierarchy_replacement(
+                    &initial[1],
+                    ItemStatus::Planned,
+                    Some(ids[3]),
+                    0,
+                    json!({}),
+                ),
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: ids[2],
+                expected_revision: 1,
+                item: hierarchy_replacement(
+                    &initial[2],
+                    ItemStatus::Planned,
+                    Some(ids[5]),
+                    1,
+                    dependencies(&[ids[0], ids[3], ids[5]]),
+                ),
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: ids[3],
+                expected_revision: 1,
+                item: hierarchy_replacement(
+                    &initial[3],
+                    ItemStatus::Planned,
+                    Some(ids[2]),
+                    3,
+                    json!({}),
+                ),
+            },
+        ];
+
+        assert_eq!(
+            command_execution_order(
+                &commands,
+                &initial_by_id,
+                "2026-09-04T12:05:00Z".parse().unwrap(),
+            )
+            .expect("fallback finds the valid projected sequence"),
+            vec![0, 3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn dependency_changes_have_a_distinct_diff_field_and_high_risk() {
+        let item_id = Uuid::new_v4();
+        let before = review_item(item_id, json!({}));
+        let after = review_item(item_id, dependency_constraints(Uuid::new_v4()));
+
+        assert_eq!(
+            changed_fields(Some(&before), Some(&after)),
+            vec![ProposalItemField::Dependencies],
+            "the normalized graph is reviewed separately from other scheduling metadata"
+        );
+
+        let command = ProposalCommand::CreateItem {
+            command_id: Uuid::new_v4(),
+            item: NewItem {
+                id: after.id,
+                is_sensitive: after.is_sensitive,
+                kind: after.kind,
+                status: after.status,
+                title: after.title.clone(),
+                notes: after.notes.clone(),
+                timezone_name: after.timezone_name.clone(),
+                duration_kind: Some(after.duration_kind),
+                duration_seconds: after.duration_seconds,
+                duration_min_seconds: after.duration_min_seconds,
+                duration_max_seconds: after.duration_max_seconds,
+                duration_source: after.duration_source,
+                deadline_kind: Some(after.deadline_kind),
+                deadline_date: after.deadline_date,
+                deadline_at: after.deadline_at,
+                deadline_strength: after.deadline_strength,
+                deadline_soft_weight: after.deadline_soft_weight,
+                earliest_start_at: after.earliest_start_at,
+                recurrence: after.recurrence.clone(),
+                flexible_constraints: after.flexible_constraints.clone(),
+                has_own_effort: Some(after.has_own_effort),
+                split_policy: after.split_policy.clone(),
+                importance: after.importance,
+                urgency: after.urgency,
+                parent_id: after.parent_id,
+                sibling_order: after.sibling_order,
+                blocked_reason_kind: after.blocked_reason_kind,
+                blocked_by_item_id: after.blocked_by_item_id,
+                blocked_reason: after.blocked_reason.clone(),
+            },
+        };
+        let risks = proposal_risks(
+            std::slice::from_ref(&command),
+            &[TransactionalItemEffect {
+                before: None,
+                after,
+                execution_ordinal: 0,
+            }],
+        );
+        let risk = risks
+            .iter()
+            .find(|risk| risk.code == ProposalRiskCode::ChangesDependencies)
+            .expect("dependency changes need an explicit review risk");
+        assert_eq!(risk.level, ProposalRiskLevel::High);
+        assert!(risk.requires_explicit_approval);
+        assert_eq!(risk.command_id, Some(command.command_id()));
+
+        let missing = item_conflict(
+            &command,
+            &ItemRepositoryError::DependencyNotFound(Uuid::new_v4()),
+        );
+        assert_eq!(missing.code, ProposalConflictCode::DependencyNotFound);
+        assert!(missing.summary.contains("predecessor"));
+        let cycle = item_conflict(&command, &ItemRepositoryError::DependencyCycle);
+        assert_eq!(cycle.code, ProposalConflictCode::DependencyCycle);
+        assert!(cycle.summary.contains("cycle"));
+        let recurring_boundary = item_conflict(
+            &command,
+            &ItemRepositoryError::CrossRecurringSubtreeDependency {
+                successor_id: command.target_item_id(),
+                predecessor_id: Uuid::new_v4(),
+            },
+        );
+        assert_eq!(recurring_boundary.code, ProposalConflictCode::InvalidItem);
+        assert!(recurring_boundary.summary.contains("recurring subtree"));
+    }
 
     #[test]
     fn deadline_risk_classification_uses_the_typed_shape_and_partial_order() {

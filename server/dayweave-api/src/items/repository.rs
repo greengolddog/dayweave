@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -14,6 +14,33 @@ use uuid::Uuid;
 use crate::execution::ExecutionRepository;
 
 use super::{Item, ItemDomainError, ReplaceItem};
+
+/// A proposal contains at most 100 commands, and one command can emit its
+/// direct aggregate plus refreshes for its old and new parent. Keeping the
+/// bound beside delta pagination makes response expansion explicit and keeps
+/// corrupt or accidentally oversized writer groups fail-closed.
+pub(crate) const MAX_ITEM_CHANGE_GROUP_SIZE: usize = 300;
+
+/// Leaves ample room inside the native clients' 12 MiB/16 MiB response
+/// envelopes for JSON keys, cursors, and decoder overhead.
+pub(crate) const MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// One atomic group must fit wholly inside one payload-bounded page.
+pub(crate) const MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES: usize = MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES;
+
+/// Returns the largest valid response for a requested delta limit. A page may
+/// contain `limit - 1` independent rows followed by one complete maximum-size
+/// atomic group.
+pub(crate) fn max_expanded_delta_page_size(
+    requested_limit: usize,
+) -> Result<usize, ItemRepositoryError> {
+    if requested_limit == 0 {
+        return Err(ItemRepositoryError::Internal);
+    }
+    requested_limit
+        .checked_add(MAX_ITEM_CHANGE_GROUP_SIZE - 1)
+        .ok_or(ItemRepositoryError::Internal)
+}
 
 #[derive(Clone, Debug)]
 pub struct IdempotencyContext {
@@ -70,6 +97,17 @@ pub enum ItemRepositoryError {
     ParentNotFound(Uuid),
     #[error("blocking item {0} was not found")]
     BlockedByItemNotFound(Uuid),
+    #[error("dependency predecessor item {0} was not found")]
+    DependencyNotFound(Uuid),
+    #[error(
+        "dependency from item {successor_id} to item {predecessor_id} crosses a materialized recurring subtree boundary"
+    )]
+    CrossRecurringSubtreeDependency {
+        successor_id: Uuid,
+        predecessor_id: Uuid,
+    },
+    #[error("item dependency graph would contain a cycle")]
+    DependencyCycle,
     #[error("item cannot be its own parent")]
     SelfParent,
     #[error("item hierarchy would contain a cycle")]
@@ -90,6 +128,8 @@ pub enum ItemRepositoryError {
     IdempotencyInProgress,
     #[error("delta cursor does not belong to the available item stream")]
     InvalidCursor,
+    #[error("atomic item delta group exceeds its safe delivery bound")]
+    DeltaGroupTooLarge,
     #[error(transparent)]
     InvalidItem(#[from] ItemDomainError),
     #[error("repository operation failed")]
@@ -208,7 +248,179 @@ struct MemoryIdempotency {
 #[derive(Clone, Debug)]
 struct MemoryChange {
     sequence: u64,
+    change_group_id: Option<Uuid>,
     change: DeltaChange,
+}
+
+/// Chooses a delta prefix without cutting the atomic group that intersects the
+/// requested boundary. Callers provide at most `limit + group_cap` rows, which
+/// leaves one look-ahead row after the largest valid expanded page.
+pub(crate) fn atomic_delta_prefix_len(
+    change_group_ids: &[Option<Uuid>],
+    requested_limit: usize,
+) -> Result<usize, ItemRepositoryError> {
+    let maximum_page = max_expanded_delta_page_size(requested_limit)?;
+    if change_group_ids.len() <= requested_limit {
+        return Ok(change_group_ids.len());
+    }
+    let Some(boundary_group_id) = change_group_ids[requested_limit - 1] else {
+        return Ok(requested_limit);
+    };
+
+    let group_start = change_group_ids[..requested_limit]
+        .iter()
+        .rposition(|group_id| *group_id != Some(boundary_group_id))
+        .map_or(0, |index| index + 1);
+    let group_end = change_group_ids[requested_limit..]
+        .iter()
+        .position(|group_id| *group_id != Some(boundary_group_id))
+        .map_or(change_group_ids.len(), |offset| requested_limit + offset);
+    let group_size = group_end - group_start;
+    if group_size > MAX_ITEM_CHANGE_GROUP_SIZE || group_end > maximum_page {
+        return Err(ItemRepositoryError::DeltaGroupTooLarge);
+    }
+    Ok(group_end)
+}
+
+/// Revalidates every complete group selected for delivery. This is deliberately
+/// independent from write-side checks so malformed rows inserted outside the
+/// repository cannot force an unbounded or native-undecodable response.
+pub(crate) fn validate_atomic_delta_groups(
+    change_group_ids: &[Option<Uuid>],
+    payload_sizes: &[usize],
+) -> Result<(), ItemRepositoryError> {
+    if change_group_ids.len() != payload_sizes.len() {
+        return Err(ItemRepositoryError::Internal);
+    }
+    let mut completed = HashSet::new();
+    let mut current_group_id = None;
+    let mut current_count = 0_usize;
+    let mut current_payload_bytes = 0_usize;
+
+    let finish_group = |group_id: Option<Uuid>, count: usize, payload_bytes: usize| {
+        if group_id.is_some()
+            && (count > MAX_ITEM_CHANGE_GROUP_SIZE
+                || payload_bytes > MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES)
+        {
+            Err(ItemRepositoryError::DeltaGroupTooLarge)
+        } else {
+            Ok(())
+        }
+    };
+
+    for (group_id, payload_size) in change_group_ids.iter().zip(payload_sizes) {
+        if *group_id != current_group_id {
+            finish_group(current_group_id, current_count, current_payload_bytes)?;
+            if let Some(group_id) = current_group_id {
+                completed.insert(group_id);
+            }
+            if group_id.is_some_and(|group_id| completed.contains(&group_id)) {
+                return Err(ItemRepositoryError::Internal);
+            }
+            current_group_id = *group_id;
+            current_count = 0;
+            current_payload_bytes = 0;
+        }
+        if group_id.is_some() {
+            current_count = current_count
+                .checked_add(1)
+                .ok_or(ItemRepositoryError::Internal)?;
+            current_payload_bytes = current_payload_bytes
+                .checked_add(*payload_size)
+                .ok_or(ItemRepositoryError::Internal)?;
+        }
+    }
+    finish_group(current_group_id, current_count, current_payload_bytes)
+}
+
+/// Applies the serialized payload ceiling after count expansion, stopping only
+/// between independent rows or complete transaction groups. A valid first unit
+/// always makes progress; an individually undeliverable unit fails closed.
+pub(crate) fn delivery_bounded_delta_prefix_len(
+    change_group_ids: &[Option<Uuid>],
+    payload_sizes: &[usize],
+    requested_limit: usize,
+) -> Result<usize, ItemRepositoryError> {
+    if change_group_ids.len() != payload_sizes.len() {
+        return Err(ItemRepositoryError::Internal);
+    }
+    let count_prefix = atomic_delta_prefix_len(change_group_ids, requested_limit)?;
+    validate_atomic_delta_groups(
+        &change_group_ids[..count_prefix],
+        &payload_sizes[..count_prefix],
+    )?;
+
+    let mut selected = 0_usize;
+    let mut selected_payload_bytes = 0_usize;
+    while selected < count_prefix {
+        let unit_end = match change_group_ids[selected] {
+            Some(group_id) => change_group_ids[selected + 1..count_prefix]
+                .iter()
+                .position(|candidate| *candidate != Some(group_id))
+                .map_or(count_prefix, |offset| selected + offset + 1),
+            None => selected + 1,
+        };
+        let unit_payload_bytes = payload_sizes[selected..unit_end]
+            .iter()
+            .try_fold(0_usize, |total, size| total.checked_add(*size))
+            .ok_or(ItemRepositoryError::Internal)?;
+        if unit_payload_bytes > MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES {
+            return Err(ItemRepositoryError::DeltaGroupTooLarge);
+        }
+        let next_payload_bytes = selected_payload_bytes
+            .checked_add(unit_payload_bytes)
+            .ok_or(ItemRepositoryError::Internal)?;
+        if next_payload_bytes > MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES {
+            break;
+        }
+        selected = unit_end;
+        selected_payload_bytes = next_payload_bytes;
+    }
+    if count_prefix > 0 && selected == 0 {
+        Err(ItemRepositoryError::DeltaGroupTooLarge)
+    } else {
+        Ok(selected)
+    }
+}
+
+fn validate_memory_group_completeness(
+    all_changes: &[MemoryChange],
+    selected_changes: &[MemoryChange],
+) -> Result<(), ItemRepositoryError> {
+    let selected_counts =
+        selected_changes
+            .iter()
+            .fold(HashMap::<Uuid, usize>::new(), |mut counts, change| {
+                if let Some(group_id) = change.change_group_id {
+                    *counts.entry(group_id).or_default() += 1;
+                }
+                counts
+            });
+    for (group_id, selected_count) in selected_counts {
+        let matching = all_changes
+            .iter()
+            .enumerate()
+            .filter(|(_, change)| change.change_group_id == Some(group_id))
+            .collect::<Vec<_>>();
+        let payload_bytes = matching.iter().try_fold(0_usize, |total, (_, change)| {
+            let size = serde_json::to_vec(&change.change)
+                .map_err(|_| ItemRepositoryError::Internal)?
+                .len();
+            total.checked_add(size).ok_or(ItemRepositoryError::Internal)
+        })?;
+        if matching.len() > MAX_ITEM_CHANGE_GROUP_SIZE
+            || payload_bytes > MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES
+        {
+            return Err(ItemRepositoryError::DeltaGroupTooLarge);
+        }
+        let contiguous = matching.first().zip(matching.last()).is_some_and(
+            |((first_index, _), (last_index, _))| last_index - first_index + 1 == matching.len(),
+        );
+        if matching.len() != selected_count || !contiguous {
+            return Err(ItemRepositoryError::Internal);
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -457,25 +669,44 @@ impl ItemRepository for InMemoryItemRepository {
         if after > state.next_sequence {
             return Err(ItemRepositoryError::InvalidCursor);
         }
-        let fetch_limit = limit.checked_add(1).ok_or(ItemRepositoryError::Internal)?;
-        let mut matching = state
+        let first_index = state
             .changes
+            .partition_point(|change| change.sequence <= after);
+        if first_index > 0
+            && first_index < state.changes.len()
+            && state.changes[first_index].change_group_id.is_some()
+            && state.changes[first_index].change_group_id
+                == state.changes[first_index - 1].change_group_id
+        {
+            return Err(ItemRepositoryError::InvalidCursor);
+        }
+        let fetch_limit = limit
+            .checked_add(MAX_ITEM_CHANGE_GROUP_SIZE)
+            .ok_or(ItemRepositoryError::Internal)?;
+        let available = &state.changes[first_index..];
+        let candidates = &available[..available.len().min(fetch_limit)];
+        let group_ids = candidates
             .iter()
-            .filter(|change| change.sequence > after);
-        let selected: Vec<_> = matching.by_ref().take(fetch_limit).cloned().collect();
-        let has_more = selected.len() > limit;
-        let changes: Vec<_> = selected
-            .into_iter()
-            .take(limit)
-            .map(|change| change.change)
-            .collect();
-        let watermark = state
-            .changes
+            .map(|change| change.change_group_id)
+            .collect::<Vec<_>>();
+        let payload_sizes = candidates
             .iter()
-            .filter(|change| change.sequence > after)
-            .take(limit)
-            .last()
+            .map(|change| {
+                serde_json::to_vec(&change.change)
+                    .map(|payload| payload.len())
+                    .map_err(|_| ItemRepositoryError::Internal)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected_count = delivery_bounded_delta_prefix_len(&group_ids, &payload_sizes, limit)?;
+        validate_memory_group_completeness(&state.changes, &candidates[..selected_count])?;
+        let has_more = available.len() > selected_count;
+        let watermark = candidates
+            .get(selected_count.saturating_sub(1))
             .map_or(after, |change| change.sequence);
+        let changes = candidates[..selected_count]
+            .iter()
+            .map(|change| change.change.clone())
+            .collect();
         Ok(ItemDeltaPage {
             changes,
             watermark,
@@ -497,6 +728,7 @@ fn create_memory(
         return replay;
     }
     let mut next = state.clone();
+    let change_group_id = Uuid::new_v4();
     if next.items.contains_key(&item.id) {
         return Err(ItemRepositoryError::Duplicate(item.id));
     }
@@ -506,13 +738,20 @@ fn create_memory(
     // adapter supplies a stale pre-structural value.
     item.is_executable = item.execution_is_allowed(false);
     next.items.insert(item.id, item.clone());
+    validate_dependency_graph(&next.items)?;
     append_change(
         &mut next,
+        Some(change_group_id),
         DeltaChange::Upsert {
             item: Box::new(item.clone()),
         },
     )?;
-    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
+    refresh_parents(
+        &mut next,
+        [item.parent_id],
+        item.updated_at,
+        change_group_id,
+    )?;
     remember(&mut next, idempotency, item.clone());
     *state = next;
     Ok(ItemMutation {
@@ -533,6 +772,7 @@ fn replace_memory(
         return replay;
     }
     let mut next = state.clone();
+    let change_group_id = Uuid::new_v4();
     let current = next
         .items
         .get(&id)
@@ -551,8 +791,10 @@ fn replace_memory(
     }
     item.is_executable = item.execution_is_allowed(has_children);
     next.items.insert(id, item.clone());
+    validate_dependency_graph(&next.items)?;
     append_change(
         &mut next,
+        Some(change_group_id),
         DeltaChange::Upsert {
             item: Box::new(item.clone()),
         },
@@ -562,6 +804,7 @@ fn replace_memory(
             &mut next,
             [previous_parent_id, item.parent_id],
             item.updated_at,
+            change_group_id,
         )?;
     }
     remember(&mut next, idempotency, item.clone());
@@ -583,6 +826,7 @@ fn restore_memory(
         return replay;
     }
     let mut next = state.clone();
+    let change_group_id = Uuid::new_v4();
     let current = next
         .items
         .get(&id)
@@ -604,13 +848,20 @@ fn restore_memory(
         return Err(ItemRepositoryError::NonLeafExecutable);
     }
     next.items.insert(id, item.clone());
+    validate_dependency_graph(&next.items)?;
     append_change(
         &mut next,
+        Some(change_group_id),
         DeltaChange::Upsert {
             item: Box::new(item.clone()),
         },
     )?;
-    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
+    refresh_parents(
+        &mut next,
+        [item.parent_id],
+        item.updated_at,
+        change_group_id,
+    )?;
     remember(&mut next, idempotency, item.clone());
     *state = next;
     Ok(ItemMutation {
@@ -630,6 +881,7 @@ fn trash_memory(
         return replay;
     }
     let mut next = state.clone();
+    let change_group_id = Uuid::new_v4();
     let current = next
         .items
         .get(&id)
@@ -645,6 +897,7 @@ fn trash_memory(
     next.items.insert(id, item.clone());
     append_change(
         &mut next,
+        Some(change_group_id),
         DeltaChange::Tombstone {
             tombstone: ItemTombstone {
                 id,
@@ -654,7 +907,12 @@ fn trash_memory(
             },
         },
     )?;
-    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
+    refresh_parents(
+        &mut next,
+        [item.parent_id],
+        item.updated_at,
+        change_group_id,
+    )?;
     remember(&mut next, idempotency, item.clone());
     *state = next;
     Ok(ItemMutation {
@@ -712,6 +970,145 @@ fn validate_blocked_by(
     Ok(())
 }
 
+pub(crate) fn validate_dependency_graph(
+    items: &HashMap<Uuid, Item>,
+) -> Result<(), ItemRepositoryError> {
+    let recurring_owners = recurring_subtree_owners(items)?;
+    let mut adjacency: HashMap<Uuid, Vec<Uuid>> =
+        items.keys().copied().map(|id| (id, Vec::new())).collect();
+    let mut indegree: HashMap<Uuid, usize> = items.keys().copied().map(|id| (id, 0)).collect();
+
+    for (successor_id, item) in items {
+        for dependency in item.dependencies()? {
+            let predecessor_id = dependency.item_id.0;
+            if !items.contains_key(&predecessor_id) {
+                return Err(ItemRepositoryError::DependencyNotFound(predecessor_id));
+            }
+            if let Some(predecessor_owner) = recurring_owners.get(&predecessor_id)
+                && recurring_owners.get(successor_id) != Some(predecessor_owner)
+            {
+                return Err(ItemRepositoryError::CrossRecurringSubtreeDependency {
+                    successor_id: *successor_id,
+                    predecessor_id,
+                });
+            }
+            add_dependency_edge(&mut adjacency, &mut indegree, predecessor_id, *successor_id);
+        }
+    }
+
+    for routine in items.values().filter(|item| {
+        item.deleted_at.is_none()
+            && item.kind == super::ItemKind::Routine
+            && item
+                .flexible_constraints
+                .get("routine_ordered")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }) {
+        let mut children: Vec<_> = items
+            .values()
+            .filter(|item| item.deleted_at.is_none() && item.parent_id == Some(routine.id))
+            .collect();
+        children.sort_by_key(|item| (item.sibling_order, item.id));
+        for pair in children.windows(2) {
+            add_dependency_edge(&mut adjacency, &mut indegree, pair[0].id, pair[1].id);
+        }
+    }
+
+    for successors in adjacency.values_mut() {
+        successors.sort_unstable();
+        successors.dedup();
+    }
+    // Recompute after de-duplicating explicit and derived ordered-routine edges.
+    for value in indegree.values_mut() {
+        *value = 0;
+    }
+    for successors in adjacency.values() {
+        for successor in successors {
+            *indegree
+                .get_mut(successor)
+                .ok_or(ItemRepositoryError::Internal)? += 1;
+        }
+    }
+
+    let mut ready: BTreeSet<_> = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+        .collect();
+    let mut visited = 0_usize;
+    while let Some(id) = ready.pop_first() {
+        visited = visited
+            .checked_add(1)
+            .ok_or(ItemRepositoryError::Internal)?;
+        for successor in adjacency.get(&id).into_iter().flatten() {
+            let degree = indegree
+                .get_mut(successor)
+                .ok_or(ItemRepositoryError::Internal)?;
+            *degree = degree.checked_sub(1).ok_or(ItemRepositoryError::Internal)?;
+            if *degree == 0 {
+                ready.insert(*successor);
+            }
+        }
+    }
+    if visited == items.len() {
+        Ok(())
+    } else {
+        Err(ItemRepositoryError::DependencyCycle)
+    }
+}
+
+fn recurring_subtree_owners(
+    items: &HashMap<Uuid, Item>,
+) -> Result<HashMap<Uuid, Uuid>, ItemRepositoryError> {
+    let mut resolved = HashMap::<Uuid, Option<Uuid>>::new();
+    for start in items.keys().copied() {
+        if resolved.contains_key(&start) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut current = Some(start);
+        let mut owner = None;
+        while let Some(item_id) = current {
+            if let Some(cached) = resolved.get(&item_id) {
+                owner = *cached;
+                break;
+            }
+            if !visiting.insert(item_id) {
+                return Err(ItemRepositoryError::HierarchyCycle);
+            }
+            let item = items
+                .get(&item_id)
+                .ok_or(ItemRepositoryError::ParentNotFound(item_id))?;
+            path.push(item_id);
+            current = item.parent_id;
+        }
+        for item_id in path.into_iter().rev() {
+            if owner.is_none() && items[&item_id].recurrence.is_some() {
+                owner = Some(item_id);
+            }
+            resolved.insert(item_id, owner);
+        }
+    }
+    Ok(resolved
+        .into_iter()
+        .filter_map(|(item_id, owner)| owner.map(|owner| (item_id, owner)))
+        .collect())
+}
+
+fn add_dependency_edge(
+    adjacency: &mut HashMap<Uuid, Vec<Uuid>>,
+    indegree: &mut HashMap<Uuid, usize>,
+    predecessor_id: Uuid,
+    successor_id: Uuid,
+) {
+    adjacency
+        .entry(predecessor_id)
+        .or_default()
+        .push(successor_id);
+    indegree.entry(successor_id).or_default();
+}
+
 fn ensure_revision(item: &Item, expected: u64) -> Result<(), ItemRepositoryError> {
     if item.revision == expected {
         Ok(())
@@ -738,6 +1135,7 @@ fn refresh_parents(
     state: &mut MemoryState,
     parent_ids: impl IntoIterator<Item = Option<Uuid>>,
     now: DateTime<Utc>,
+    change_group_id: Uuid,
 ) -> Result<(), ItemRepositoryError> {
     let mut parent_ids: Vec<_> = parent_ids.into_iter().flatten().collect();
     parent_ids.sort_unstable();
@@ -754,6 +1152,7 @@ fn refresh_parents(
         state.items.insert(parent_id, parent.clone());
         append_change(
             state,
+            Some(change_group_id),
             DeltaChange::Upsert {
                 item: Box::new(parent),
             },
@@ -798,13 +1197,18 @@ fn remember(state: &mut MemoryState, context: IdempotencyContext, item: Item) {
     );
 }
 
-fn append_change(state: &mut MemoryState, change: DeltaChange) -> Result<(), ItemRepositoryError> {
+fn append_change(
+    state: &mut MemoryState,
+    change_group_id: Option<Uuid>,
+    change: DeltaChange,
+) -> Result<(), ItemRepositoryError> {
     state.next_sequence = state
         .next_sequence
         .checked_add(1)
         .ok_or(ItemRepositoryError::Internal)?;
     state.changes.push(MemoryChange {
         sequence: state.next_sequence,
+        change_group_id,
         change,
     });
     Ok(())
@@ -896,6 +1300,145 @@ mod tests {
             blocked_by_item_id: item.blocked_by_item_id,
             blocked_reason: item.blocked_reason.clone(),
         }
+    }
+
+    fn dependency_json(predecessor_id: Uuid, strength: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "constraints": {
+                "dependencies": [{
+                    "item_id": predecessor_id,
+                    "relation": "finish_to_start",
+                    "minimum_lag": 15,
+                    "strength": strength
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn atomic_delta_page_expansion_is_bounded() {
+        assert_eq!(
+            MAX_ITEM_CHANGE_GROUP_SIZE,
+            crate::proposals::MAX_PROPOSAL_COMMANDS * 3,
+            "the delivery bound tracks direct plus two-parent effects per proposal command"
+        );
+        let group_id = Uuid::new_v4();
+        let mut group_ids = vec![None; 199];
+        group_ids.extend(std::iter::repeat_n(
+            Some(group_id),
+            MAX_ITEM_CHANGE_GROUP_SIZE,
+        ));
+        group_ids.push(None);
+
+        assert_eq!(
+            max_expanded_delta_page_size(200).unwrap(),
+            499,
+            "a maximum request can expand only through one bounded group"
+        );
+        assert_eq!(atomic_delta_prefix_len(&group_ids, 200).unwrap(), 499);
+        assert_eq!(
+            atomic_delta_prefix_len(
+                &std::iter::repeat_n(Some(group_id), MAX_ITEM_CHANGE_GROUP_SIZE + 1)
+                    .collect::<Vec<_>>(),
+                1,
+            ),
+            Err(ItemRepositoryError::DeltaGroupTooLarge),
+            "an oversized writer group must fail closed instead of expanding without bound"
+        );
+        assert_eq!(
+            validate_atomic_delta_groups(
+                &[Some(group_id)],
+                &[MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES + 1],
+            ),
+            Err(ItemRepositoryError::DeltaGroupTooLarge),
+            "a grouped response that cannot fit native decode limits must fail closed"
+        );
+
+        let mixed_group_ids = [None, Some(group_id), Some(group_id), None];
+        let mixed_payload_sizes = [MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES - 10, 6, 6, 1];
+        assert_eq!(
+            delivery_bounded_delta_prefix_len(&mixed_group_ids, &mixed_payload_sizes, 2).unwrap(),
+            1,
+            "the page stops before a complete group when the group would cross its byte ceiling"
+        );
+        assert_eq!(
+            delivery_bounded_delta_prefix_len(&mixed_group_ids[1..], &mixed_payload_sizes[1..], 1,)
+                .unwrap(),
+            2,
+            "the next page delivers the complete group and makes progress"
+        );
+
+        let ungrouped_payload_sizes = vec![200 * 1024; 50];
+        assert_eq!(
+            delivery_bounded_delta_prefix_len(&vec![None; 50], &ungrouped_payload_sizes, 50)
+                .unwrap(),
+            MAX_ITEM_DELTA_PAGE_PAYLOAD_BYTES / (200 * 1024),
+            "ordinary ungrouped bulk rows are also bounded by total serialized payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_delta_never_splits_direct_mutation_parent_refreshes() {
+        let repository = InMemoryItemRepository::default();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        repository
+            .create(
+                new_item(parent_id, "Parent", None, 0),
+                idempotency("items.create", "atomic-parent", 71),
+            )
+            .await
+            .unwrap();
+        let baseline = repository.delta(0, 1).await.unwrap();
+        assert_eq!(baseline.changes.len(), 1);
+        assert!(!baseline.has_more);
+
+        repository
+            .create(
+                new_item(child_id, "Child", Some(parent_id), 0),
+                idempotency("items.create", "atomic-child", 72),
+            )
+            .await
+            .unwrap();
+        let child_page = repository.delta(baseline.watermark, 1).await.unwrap();
+        assert_eq!(child_page.changes.len(), 2);
+        assert!(!child_page.has_more);
+        assert!(matches!(
+            &child_page.changes[0],
+            DeltaChange::Upsert { item } if item.id == child_id
+        ));
+        assert!(matches!(
+            &child_page.changes[1],
+            DeltaChange::Upsert { item } if item.id == parent_id
+        ));
+
+        assert_eq!(
+            repository.delta(baseline.watermark + 1, 1).await,
+            Err(ItemRepositoryError::InvalidCursor),
+            "a cursor inside a grouped mutation cannot silently lose part of that mutation"
+        );
+
+        let corrupt_repository = InMemoryItemRepository::default();
+        let corrupt_group_id = Uuid::new_v4();
+        {
+            let mut state = corrupt_repository.state.lock().await;
+            for ordinal in 0..302 {
+                let group_id = (ordinal == 0 || ordinal == 301).then_some(corrupt_group_id);
+                append_change(
+                    &mut state,
+                    group_id,
+                    DeltaChange::Upsert {
+                        item: Box::new(new_item(Uuid::new_v4(), "Synthetic", None, 0)),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            corrupt_repository.delta(0, 1).await,
+            Err(ItemRepositoryError::Internal),
+            "group reuse outside the fetch window is detected from authoritative memory state"
+        );
     }
 
     #[tokio::test]
@@ -1153,5 +1696,191 @@ mod tests {
             )
             .await
             .expect("trashed blocker remains a resolvable historical identity");
+    }
+
+    #[tokio::test]
+    async fn dependency_graph_requires_existing_predecessors_and_rejects_all_cycles() {
+        let repository = InMemoryItemRepository::default();
+        let missing_id = Uuid::new_v4();
+        let mut missing = new_item(Uuid::new_v4(), "Missing predecessor", None, 0);
+        missing.flexible_constraints = dependency_json(missing_id, &json!({"level": "hard"}));
+        assert_eq!(
+            repository
+                .create(
+                    missing,
+                    idempotency("items.create", "missing-dependency", 21),
+                )
+                .await
+                .expect_err("unknown dependency must fail"),
+            ItemRepositoryError::DependencyNotFound(missing_id)
+        );
+
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let first = new_item(first_id, "First", None, 0);
+        repository
+            .create(
+                first.clone(),
+                idempotency("items.create", "dependency-first", 22),
+            )
+            .await
+            .unwrap();
+        let mut second = new_item(second_id, "Second", None, 0);
+        second.flexible_constraints =
+            dependency_json(first_id, &json!({"level": "soft", "weight": 400}));
+        repository
+            .create(
+                second.clone(),
+                idempotency("items.create", "dependency-second", 23),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get(second_id, false)
+                .await
+                .unwrap()
+                .dependencies()
+                .unwrap()[0]
+                .item_id
+                .0,
+            first_id
+        );
+
+        let mut cycle = replacement(&first, None, ItemStatus::Planned);
+        cycle.flexible_constraints = dependency_json(second_id, &json!({"level": "hard"}));
+        assert_eq!(
+            repository
+                .replace(
+                    first_id,
+                    1,
+                    cycle,
+                    Utc::now(),
+                    idempotency("items.replace", "dependency-cycle", 24),
+                )
+                .await
+                .expect_err("hard and soft edges share one acyclic graph"),
+            ItemRepositoryError::DependencyCycle
+        );
+        assert!(
+            repository
+                .get(first_id, false)
+                .await
+                .unwrap()
+                .dependencies()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dependencies_must_stay_inside_a_materialized_recurring_subtree() {
+        let repository = InMemoryItemRepository::default();
+        let routine_id = Uuid::new_v4();
+        let predecessor_id = Uuid::new_v4();
+        let internal_successor_id = Uuid::new_v4();
+
+        let mut routine = new_item(routine_id, "Recurring routine", None, 0);
+        routine.kind = ItemKind::Routine;
+        routine.has_own_effort = false;
+        routine.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+        routine.flexible_constraints = json!({"routine_ordered": false});
+        repository
+            .create(
+                routine,
+                idempotency("items.create", "recurring-boundary-root", 41),
+            )
+            .await
+            .unwrap();
+
+        repository
+            .create(
+                new_item(predecessor_id, "Recurring step", Some(routine_id), 0),
+                idempotency("items.create", "recurring-boundary-step", 42),
+            )
+            .await
+            .unwrap();
+        let mut internal_successor = new_item(
+            internal_successor_id,
+            "Internal successor",
+            Some(routine_id),
+            1,
+        );
+        internal_successor.flexible_constraints =
+            dependency_json(predecessor_id, &json!({"level": "hard"}));
+        repository
+            .create(
+                internal_successor,
+                idempotency("items.create", "recurring-boundary-internal", 43),
+            )
+            .await
+            .expect("an occurrence-local dependency is rewritten with its recurring subtree");
+
+        let external_id = Uuid::new_v4();
+        let mut external = new_item(external_id, "External successor", None, 0);
+        external.flexible_constraints =
+            dependency_json(predecessor_id, &json!({"level": "soft", "weight": 1}));
+        assert_eq!(
+            repository
+                .create(
+                    external,
+                    idempotency("items.create", "recurring-boundary-external", 44),
+                )
+                .await
+                .expect_err("an external dependency would retain a dangling series item id"),
+            ItemRepositoryError::CrossRecurringSubtreeDependency {
+                successor_id: external_id,
+                predecessor_id,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_routine_edges_participate_in_cycle_prevention() {
+        let repository = InMemoryItemRepository::default();
+        let routine_id = Uuid::new_v4();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let mut routine = new_item(routine_id, "Morning", None, 0);
+        routine.kind = ItemKind::Routine;
+        routine.has_own_effort = false;
+        routine.flexible_constraints = json!({"routine_ordered": true});
+        repository
+            .create(routine, idempotency("items.create", "ordered-routine", 31))
+            .await
+            .unwrap();
+        let first = new_item(first_id, "First step", Some(routine_id), 0);
+        repository
+            .create(
+                first.clone(),
+                idempotency("items.create", "ordered-first", 32),
+            )
+            .await
+            .unwrap();
+        repository
+            .create(
+                new_item(second_id, "Second step", Some(routine_id), 1),
+                idempotency("items.create", "ordered-second", 33),
+            )
+            .await
+            .unwrap();
+
+        let current = repository.get(first_id, false).await.unwrap();
+        let mut replacement = replacement(&current, Some(routine_id), ItemStatus::Planned);
+        replacement.flexible_constraints =
+            dependency_json(second_id, &json!({"level": "soft", "weight": 1}));
+        assert_eq!(
+            repository
+                .replace(
+                    first_id,
+                    current.revision,
+                    replacement,
+                    Utc::now(),
+                    idempotency("items.replace", "ordered-cycle", 34),
+                )
+                .await
+                .expect_err("explicit edge must not reverse an ordered routine edge"),
+            ItemRepositoryError::DependencyCycle
+        );
     }
 }

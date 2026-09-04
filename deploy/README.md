@@ -67,6 +67,27 @@ the human identity.
 7. Set `DAYWEAVE_PUBLIC_BASE_URL` to the generated tunnel HTTPS URL and run the
    health, OAuth callback, WebSocket, backup, and restore drills.
 
+### Stop–migrate–start schema gate
+
+Migration `0025_authoritative_dependency_graph.sql` is an intentional hard
+cutover, not a rolling-compatible migration. It removes the legacy embedded
+dependency projection, and the new item-delta grouping contract is understood
+only by the matching API/worker build. Before the first deployment containing
+that migration, the operator must:
+
+1. verify a restorable pre-cutover encrypted backup;
+2. stop and drain every API/worker process that can access the database;
+3. start exactly the new build and let its startup migration finish before
+   restoring ingress; and
+4. verify readiness plus item/delta and scheduling smoke checks.
+
+No pre-0025 process may run after the migration commits. Rolling back means
+restoring the pre-cutover backup into an isolated replacement deployment, or
+rolling forward with a corrected new build; restarting an old binary against
+the migrated database is prohibited. The one-VM Compose topology makes this a
+short maintenance-window operation and must never use `docker compose up` as a
+mixed-version rolling handoff for this cutover.
+
 The production URL format is
 `https://web-<tunnel-mask>.tunnel.applications.eu-north1.nebius.cloud` and is
 available directly as the Terraform `tunnel_http_url` output.

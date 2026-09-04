@@ -54,6 +54,7 @@ use super::{
 const MAX_CANONICAL_ITEMS: usize = 10_000;
 const CALENDAR_PROJECTION_MAX_AGE_MINUTES: i64 = 30;
 const MAX_SIMULATION_BYTES: usize = 1024 * 1024;
+const MAX_SIMULATION_PRIVACY_REFERENCES: usize = 100;
 const MAX_MANUAL_BLOCK_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVE_SIMULATIONS: i64 = 256;
 const SIMULATION_TTL: Duration = Duration::minutes(15);
@@ -2091,13 +2092,13 @@ async fn consume_simulation_tx(
     )
     .map_err(|_| SchedulingPortError::NotFound)?;
     if privacy_evidence.schema_version != 1
-        || privacy_evidence.item_ids.len() > 100
-        || privacy_evidence.block_ids.len() > 100
+        || privacy_evidence.item_ids.len() > MAX_SIMULATION_PRIVACY_REFERENCES
+        || privacy_evidence.block_ids.len() > MAX_SIMULATION_PRIVACY_REFERENCES
         || privacy_evidence
             .item_ids
             .len()
             .saturating_add(privacy_evidence.block_ids.len())
-            > 100
+            > MAX_SIMULATION_PRIVACY_REFERENCES
     {
         return Err(SchedulingPortError::NotFound);
     }
@@ -4529,6 +4530,7 @@ async fn simulate_against_revision(
             item_ids.insert(item_id);
         }
     }
+    let mut operation_dependency_ids = Vec::with_capacity(request.operations.len());
     for operation in &request.operations {
         if let Some(item_id) = target_item_id(operation)? {
             item_ids.insert(item_id);
@@ -4536,6 +4538,10 @@ async fn simulate_against_revision(
         if let Some(parent_id) = parent_item_id(operation)? {
             item_ids.insert(parent_id);
         }
+        let dependency_ids =
+            operation_dependency_privacy_ids_tx(transaction, scope, operation).await?;
+        item_ids.extend(dependency_ids.iter().copied());
+        operation_dependency_ids.push(dependency_ids);
     }
     let current_sensitivity = current_item_sensitivity_tx(transaction, scope, &item_ids).await?;
     let sensitive_items = item_ids
@@ -4571,7 +4577,21 @@ async fn simulate_against_revision(
         block_ids: BTreeSet::new(),
         sensitive_at_simulation: false,
     };
-    for operation in &request.operations {
+    for (operation, dependency_ids) in request.operations.iter().zip(&operation_dependency_ids) {
+        let has_redacted_dependency = dependency_ids
+            .iter()
+            .any(|item_id| sensitive_items.contains(item_id));
+        for dependency_id in dependency_ids {
+            privacy_evidence.item_ids.insert(*dependency_id);
+            privacy_evidence.sensitive_at_simulation |= sensitive_items.contains(dependency_id);
+        }
+        if has_redacted_dependency && !access.include_sensitive {
+            warnings.push(issue(
+                "redacted_dependency",
+                "A private dependency predecessor cannot be referenced through this integration.",
+                Vec::new(),
+            ));
+        }
         if let Some(parent_id) = parent_item_id(operation)? {
             privacy_evidence.item_ids.insert(parent_id);
             privacy_evidence.sensitive_at_simulation |= sensitive_items.contains(&parent_id);
@@ -4669,11 +4689,22 @@ async fn simulate_against_revision(
             )),
         }
     }
+    if privacy_evidence
+        .item_ids
+        .len()
+        .saturating_add(privacy_evidence.block_ids.len())
+        > MAX_SIMULATION_PRIVACY_REFERENCES
+    {
+        return Err(SchedulingPortError::InvalidQuery(format!(
+            "simulation operations may reference at most {MAX_SIMULATION_PRIVACY_REFERENCES} private-boundary resources"
+        )));
+    }
     let proposal_evidence = compile_proposal_evidence_tx(
         transaction,
         scope,
         access,
         &request.operations,
+        &operation_dependency_ids,
         &sensitive_items,
         now,
     )
@@ -4708,6 +4739,7 @@ async fn compile_proposal_evidence_tx(
     scope: DatabaseScope,
     access: &ScheduleAccess,
     operations: &[super::PlanOperation],
+    operation_dependency_ids: &[BTreeSet<Uuid>],
     sensitive_items: &BTreeSet<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<SimulationProposalEvidence, SchedulingPortError> {
@@ -4719,8 +4751,29 @@ async fn compile_proposal_evidence_tx(
             ]));
         }
     };
+    if operation_dependency_ids.len() != operations.len() {
+        return Err(SchedulingPortError::Unavailable(
+            "dependency privacy evidence is incomplete".to_owned(),
+        ));
+    }
     let mut compilations = Vec::with_capacity(operations.len());
-    for operation in operations {
+    for (operation, dependency_ids) in operations.iter().zip(operation_dependency_ids) {
+        if dependency_ids
+            .iter()
+            .any(|item_id| sensitive_items.contains(item_id))
+            && !access.include_sensitive
+        {
+            compilations.push(OperationCompilation::ManualReview("redacted_dependency"));
+            continue;
+        }
+        for dependency_id in dependency_ids {
+            if !item_identity_exists_tx(transaction, scope, *dependency_id).await? {
+                return Err(SchedulingPortError::InvalidQuery(format!(
+                    "{} dependency predecessor was not found",
+                    operation_kind_name(operation.kind)
+                )));
+            }
+        }
         if let Some(parent_id) = parent_item_id(operation)? {
             if sensitive_items.contains(&parent_id) && !access.include_sensitive {
                 compilations.push(OperationCompilation::ManualReview("redacted_parent"));
@@ -4785,6 +4838,19 @@ async fn active_item_exists_tx(
     .fetch_one(&mut **transaction)
     .await
     .map_err(storage_port)
+}
+
+async fn item_identity_exists_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    item_id: Uuid,
+) -> Result<bool, SchedulingPortError> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = $1 AND id = $2)")
+        .bind(scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_port)
 }
 
 async fn item_has_active_provider_mapping_tx(
@@ -5072,6 +5138,91 @@ const fn operation_targets_item(kind: PlanOperationKind) -> bool {
     )
 }
 
+fn dependency_predecessor_item_ids(
+    operation: &super::PlanOperation,
+) -> Result<BTreeSet<Uuid>, SchedulingPortError> {
+    let Some(flexible_constraints) = operation.parameters.get("flexible_constraints") else {
+        return Ok(BTreeSet::new());
+    };
+    let root = flexible_constraints.as_object().ok_or_else(|| {
+        SchedulingPortError::InvalidQuery(format!(
+            "{} flexible_constraints must be an object",
+            operation_kind_name(operation.kind)
+        ))
+    })?;
+    let Some(constraints) = root.get("constraints") else {
+        return Ok(BTreeSet::new());
+    };
+    let constraints = constraints.as_object().ok_or_else(|| {
+        SchedulingPortError::InvalidQuery(format!(
+            "{} flexible_constraints.constraints must be an object",
+            operation_kind_name(operation.kind)
+        ))
+    })?;
+    let Some(dependencies) = constraints.get("dependencies") else {
+        return Ok(BTreeSet::new());
+    };
+    let dependencies = dependencies.as_array().ok_or_else(|| {
+        SchedulingPortError::InvalidQuery(format!(
+            "{} flexible_constraints.constraints.dependencies must be an array",
+            operation_kind_name(operation.kind)
+        ))
+    })?;
+    dependencies
+        .iter()
+        .map(|dependency| {
+            let item_id = dependency
+                .as_object()
+                .and_then(|dependency| dependency.get("item_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    SchedulingPortError::InvalidQuery(format!(
+                        "{} dependency item_id must be a UUID",
+                        operation_kind_name(operation.kind)
+                    ))
+                })?;
+            let item_id = Uuid::parse_str(item_id).map_err(|_| {
+                SchedulingPortError::InvalidQuery(format!(
+                    "{} dependency item_id must be a UUID",
+                    operation_kind_name(operation.kind)
+                ))
+            })?;
+            if item_id.is_nil() {
+                return Err(SchedulingPortError::InvalidQuery(format!(
+                    "{} dependency item_id must not be nil",
+                    operation_kind_name(operation.kind)
+                )));
+            }
+            Ok(item_id)
+        })
+        .collect()
+}
+
+async fn operation_dependency_privacy_ids_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    operation: &super::PlanOperation,
+) -> Result<BTreeSet<Uuid>, SchedulingPortError> {
+    let mut ids = dependency_predecessor_item_ids(operation)?;
+    if !operation.parameters.contains_key("flexible_constraints") {
+        return Ok(ids);
+    }
+    let Some(successor_id) = target_item_id(operation)? else {
+        return Ok(ids);
+    };
+    let current_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT predecessor_item_id FROM item_dependencies \
+         WHERE workspace_id = $1 AND successor_item_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(successor_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_port)?;
+    ids.extend(current_ids);
+    Ok(ids)
+}
+
 fn explanation_code_name(code: ExplanationCode) -> String {
     serde_name(&code).unwrap_or_else(|_| "unknown".to_owned())
 }
@@ -5176,7 +5327,7 @@ fn storage_port(_error: impl std::fmt::Debug) -> SchedulingPortError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::ManualPlacementAssignmentInput;
+    use crate::scheduling::{ManualPlacementAssignmentInput, PlanOperation};
 
     fn manual_block_evidence_fixture() -> (
         ManualPlacementInput,
@@ -5245,6 +5396,51 @@ mod tests {
         assert!(validate_simulation_token(&token).is_ok());
         assert!(validate_simulation_token("sim_not/canonical").is_err());
         assert!(validate_simulation_token(&format!("sim_{}", "A".repeat(10_000))).is_err());
+    }
+
+    #[test]
+    fn dependency_predecessors_are_extracted_for_privacy_before_compilation() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let operation = PlanOperation {
+            kind: PlanOperationKind::UpdateConstraint,
+            target_id: Some(Uuid::new_v4().to_string()),
+            parameters: BTreeMap::from([(
+                "flexible_constraints".to_owned(),
+                json!({
+                    "constraints": {
+                        "dependencies": [
+                            {
+                                "item_id": first,
+                                "relation": "finish_to_start",
+                                "minimum_lag": 0,
+                                "strength": { "level": "hard" }
+                            },
+                            {
+                                "item_id": second,
+                                "relation": "start_to_start",
+                                "minimum_lag": 10,
+                                "strength": { "level": "soft", "weight": 25 }
+                            }
+                        ]
+                    }
+                }),
+            )]),
+        };
+        assert_eq!(
+            dependency_predecessor_item_ids(&operation).unwrap(),
+            BTreeSet::from([first, second])
+        );
+
+        let mut malformed = operation;
+        malformed.parameters.insert(
+            "flexible_constraints".to_owned(),
+            json!({ "constraints": { "dependencies": [{ "relation": "finish_to_start" }] } }),
+        );
+        assert!(matches!(
+            dependency_predecessor_item_ids(&malformed),
+            Err(SchedulingPortError::InvalidQuery(_))
+        ));
     }
 
     #[test]

@@ -177,6 +177,18 @@ rewinding history. The item changes, derived parent refreshes, fences, audit,
 outbox, idempotency receipt, and `applied` to `undone` transition commit
 together.
 
+Apply and undo also publish their direct item changes and every implicit parent
+refresh as one bounded item-delta group. Preview savepoint-simulates both the
+apply and its inverse, including their serialized delta payloads. It reserves
+an additional 1 KiB per emitted row for bounded timestamp-serialization growth
+between preview and a later apply or undo; committed apply and undo transactions
+are still checked against their exact payload bytes. A proposal whose apply or
+future undo group plus that reserve would exceed 300 rows or the 8 MiB safe
+device-delivery budget remains reviewable but has `can_apply: false` and an
+`invalid_item` conflict asking the user to split it into smaller batches. The
+simulation's item changes, audits, and outbox rows are rolled back before the
+immutable preview itself is stored.
+
 ## Native review and recovery contract
 
 The macOS and Android clients expose the same single-proposal review workflow.
@@ -188,7 +200,7 @@ updated.
 
 Each client independently validates the complete preview response and derives
 the material changed-field set from every before/after pair. Approval displays
-the exact values of all twenty material fields for direct changes and implicit
+the exact values of the complete material field set for direct changes and implicit
 hierarchy changes, together with identifiable before/after item snapshots,
 risks, and conflicts. Sensitive values are concealed until the user explicitly
 reveals them for that review. Reviews remain memory-only and are invalidated on

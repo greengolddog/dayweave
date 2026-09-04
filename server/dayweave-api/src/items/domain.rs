@@ -7,6 +7,7 @@ use dayweave_compose::{
     MAX_SCHEDULING_METADATA_BYTES, SchedulingMetadataInput, is_canonical_rfc3339,
     validate_scheduling_metadata,
 };
+use dayweave_core::Dependency;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -630,6 +631,66 @@ impl Item {
         self.deleted_at.is_none()
             && !has_active_children
             && self.kind.has_executable_component(self.has_own_effort)
+    }
+
+    /// Returns the typed incoming dependency set carried by the portable item
+    /// projection. The item boundary validates this shape before an `Item` can
+    /// be created, so a decode failure here means stored state is corrupt.
+    pub(crate) fn dependencies(&self) -> Result<Vec<Dependency>, ItemDomainError> {
+        let Some(value) = self
+            .flexible_constraints
+            .get("constraints")
+            .and_then(|constraints| constraints.get("dependencies"))
+        else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_value(value.clone())
+            .map_err(|_| ItemDomainError::InvalidFlexibleConstraints)
+    }
+
+    /// Replaces only the dependency member of the portable scheduling
+    /// projection. Persistence calls this after reading the normalized graph,
+    /// making `item_dependencies` authoritative while keeping existing clients
+    /// and schedule-helper payloads source compatible.
+    pub(crate) fn project_dependencies(
+        &mut self,
+        dependencies: &[Dependency],
+    ) -> Result<(), ItemDomainError> {
+        let root = self
+            .flexible_constraints
+            .as_object_mut()
+            .ok_or(ItemDomainError::InvalidFlexibleConstraints)?;
+        if dependencies.is_empty() {
+            if let Some(constraints) = root.get_mut("constraints") {
+                let constraints = constraints
+                    .as_object_mut()
+                    .ok_or(ItemDomainError::InvalidFlexibleConstraints)?;
+                constraints.remove("dependencies");
+                if constraints.is_empty() {
+                    root.remove("constraints");
+                }
+            }
+            return Ok(());
+        }
+
+        let encoded = serde_json::to_value(dependencies)
+            .map_err(|_| ItemDomainError::InvalidFlexibleConstraints)?;
+        let constraints = root
+            .entry("constraints")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or(ItemDomainError::InvalidFlexibleConstraints)?;
+        constraints.insert("dependencies".to_owned(), encoded);
+        Ok(())
+    }
+
+    /// Returns the item metadata stored beside the normalized graph. Incoming
+    /// dependencies are projected at read time and therefore never persist as
+    /// a second writable copy in `items.scheduling_constraints`.
+    pub(crate) fn constraints_without_dependencies(&self) -> Result<Value, ItemDomainError> {
+        let mut projected = self.clone();
+        projected.project_dependencies(&[])?;
+        Ok(projected.flexible_constraints)
     }
 }
 
