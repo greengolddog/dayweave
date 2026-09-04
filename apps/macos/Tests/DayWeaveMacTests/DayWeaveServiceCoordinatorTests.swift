@@ -209,7 +209,7 @@ struct DayWeaveServiceCoordinatorTests {
         ])
     }
 
-    @Test("habit sync starts after canonical bootstrap and is scrubbed at the privacy boundary")
+    @Test("habit sync establishes its checkpoint before canonical bootstrap and is scrubbed at privacy")
     func habitLifecycleIsOrderedAndPrivate() async {
         let events = ServiceEventLog()
         let proposals = ProposalRecoveryDouble(
@@ -234,9 +234,9 @@ struct DayWeaveServiceCoordinatorTests {
 
         #expect(events.values == [
             "execution.refresh",
+            "habit.activate",
             "canonical.bootstrap",
             "canonical.poll",
-            "habit.activate",
             "habit.poll",
             "execution.poll",
             "canonical.stop",

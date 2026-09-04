@@ -59,6 +59,7 @@ struct ExecutionSyncStoreTests {
         )
         let sync = ExecutionSyncStore(
             planner: planner,
+            habitCompositionProvider: ExecutionHabitCheckpointStub(Self.habitCheckpoint()),
             configurationStore: TestSuggestionConfigurationStore(
                 baseURL: baseURL.url.absoluteString
             ),
@@ -285,6 +286,45 @@ struct ExecutionSyncStoreTests {
         #expect(await Self.controller(planner: planner, transport: transport).start(Self.blockID)
             == .invalidLocalState)
         #expect(await transport.receivedCommands().isEmpty)
+    }
+
+    @Test("pending or unreadable habit authority blocks only a new Start")
+    func habitAuthorityFailsClosedAtExecutionStart() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()]
+        )
+        let provider = ExecutionHabitCheckpointStub(Self.habitCheckpoint(
+            pendingMutationIDs: [Self.uuid(902)]
+        ))
+        let transport = Self.emptyReadTransport()
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            habitProvider: provider
+        )
+
+        #expect(sync.habitExecutionStartIsBlocked)
+        #expect(await sync.start(Self.blockID) == .invalidLocalState)
+        #expect(await transport.receivedCommands().isEmpty)
+        #expect(planner.executionState.pendingCommand == nil)
+
+        let priorGeneration = sync.habitExecutionReadinessGeneration
+        provider.update(Self.habitCheckpoint())
+        #expect(!sync.habitExecutionStartIsBlocked)
+        #expect(sync.habitExecutionReadinessGeneration == priorGeneration + 1)
+
+        provider.update(Self.habitCheckpoint(
+            configurationIdentifier: nil,
+            deltaCursor: nil,
+            deltaCaughtUp: false
+        ))
+        #expect(sync.habitExecutionStartIsBlocked)
+        planner.skip(Self.blockID)
+        #expect(planner.blocks.first?.status == .skipped)
     }
 
     @Test("credential rotation cannot rebind a durable pending command")
@@ -4140,6 +4180,7 @@ struct ExecutionSyncStoreTests {
     private static func controller(
         planner: PlannerStore,
         transport: ExecutionTransportDouble,
+        habitProvider: (any HabitCompositionCheckpointProviding)? = nil,
         streamTransport: (any DayWeaveExecutionStreamTransport)? = nil,
         binding: String = binding,
         now: @escaping @Sendable () -> Date = { baseDate },
@@ -4160,6 +4201,7 @@ struct ExecutionSyncStoreTests {
         )
         return ExecutionSyncStore(
             planner: planner,
+            habitCompositionProvider: habitProvider,
             connectionProvider: { connection },
             now: now,
             makeUUID: { uuid(500) },
@@ -4174,6 +4216,25 @@ struct ExecutionSyncStoreTests {
         return ExecutionTransportDouble(
             snapshots: [empty, empty],
             pages: [.init(sessions: [], nextOffset: nil)]
+        )
+    }
+
+    private static func habitCheckpoint(
+        configurationIdentifier: String? = canonicalConfiguration,
+        deltaCursor: String? = "habit-cursor",
+        deltaCaughtUp: Bool = true,
+        pendingMutationIDs: [UUID] = [],
+        hasActiveOperation: Bool = false
+    ) -> HabitCompositionCheckpoint {
+        .init(
+            configurationIdentifier: configurationIdentifier,
+            deltaCursor: deltaCursor,
+            deltaCaughtUp: deltaCaughtUp,
+            occurrences: [],
+            pauses: [],
+            pendingMutationIDs: pendingMutationIDs,
+            hasActiveOperation: hasActiveOperation,
+            operationGeneration: 1
         )
     }
 
@@ -4558,6 +4619,27 @@ struct ExecutionSyncStoreTests {
                 key: key
             )
         )
+    }
+}
+
+@MainActor
+private final class ExecutionHabitCheckpointStub: HabitCompositionCheckpointProviding {
+    private(set) var habitCompositionCheckpoint: HabitCompositionCheckpoint
+    private var observers: [@MainActor () -> Void] = []
+
+    init(_ checkpoint: HabitCompositionCheckpoint) {
+        habitCompositionCheckpoint = checkpoint
+    }
+
+    func observeHabitCompositionCheckpointChanges(
+        _ observer: @escaping @MainActor () -> Void
+    ) {
+        observers.append(observer)
+    }
+
+    func update(_ checkpoint: HabitCompositionCheckpoint) {
+        habitCompositionCheckpoint = checkpoint
+        observers.forEach { $0() }
     }
 }
 

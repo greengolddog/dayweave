@@ -49,6 +49,14 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
+    var targetID: UUID {
+        switch self {
+        case let .outcome(value): value.occurrenceID
+        case let .pauseStart(value): value.command.pauseID
+        case let .pauseResume(value): value.pauseID
+        }
+    }
+
     var idempotencyKey: String {
         switch self {
         case let .outcome(value): value.idempotencyKey
@@ -121,6 +129,10 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
     let savedAt: Date
     let configurationIdentifier: String?
     let deltaCursor: String?
+    /// A cursor is composition-authoritative only after it was committed with
+    /// a terminal delta page. Legacy snapshots omit this field and therefore
+    /// migrate fail-closed.
+    let deltaCaughtUp: Bool
     let occurrences: [DayWeaveHabitOccurrence]
     let pauses: [DayWeaveHabitPause]
     let analytics: [DayWeaveHabitAnalytics]
@@ -131,6 +143,7 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
         savedAt: Date,
         configurationIdentifier: String?,
         deltaCursor: String?,
+        deltaCaughtUp: Bool = false,
         occurrences: [DayWeaveHabitOccurrence],
         pauses: [DayWeaveHabitPause],
         analytics: [DayWeaveHabitAnalytics],
@@ -140,6 +153,7 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
         self.savedAt = savedAt
         self.configurationIdentifier = configurationIdentifier
         self.deltaCursor = deltaCursor
+        self.deltaCaughtUp = deltaCaughtUp
         self.occurrences = occurrences
         self.pauses = pauses
         self.analytics = analytics
@@ -151,6 +165,7 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
             savedAt: date,
             configurationIdentifier: nil,
             deltaCursor: nil,
+            deltaCaughtUp: false,
             occurrences: [],
             pauses: [],
             analytics: [],
@@ -167,22 +182,126 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
               pendingMutations.count <= Self.maximumPendingMutations,
               configurationIdentifier.map(Self.isValidBinding) ?? isEmpty,
               deltaCursor.map(Self.isValidCursor) ?? true,
-              occurrences.allSatisfy({ $0.evidence.hasValidShape }),
+              !deltaCaughtUp || deltaCursor != nil,
+              occurrences.allSatisfy({
+                  $0.evidence.hasValidShape && ($0.outcome?.hasValidShape ?? true)
+              }),
               pauses.allSatisfy(\.hasValidShape),
               analytics.allSatisfy(\.hasValidShape),
               pendingMutations.allSatisfy(\.hasValidShape),
               Set(occurrences.map(\.id)).count == occurrences.count,
+              Set(occurrences.map(\.evidence.plannerOccurrenceID)).count == occurrences.count,
               Set(pauses.map(\.id)).count == pauses.count,
+              Set(analytics.map(\.habitID)).count == analytics.count,
               Set(pendingMutations.map(\.id)).count == pendingMutations.count,
               Set(pendingMutations.map(\.idempotencyKey)).count == pendingMutations.count else {
             return false
         }
-        return true
+        return hasValidPauseTopology && hasValidPendingMutationRelations
     }
 
     private var isEmpty: Bool {
-        deltaCursor == nil && occurrences.isEmpty && pauses.isEmpty && analytics.isEmpty
+        deltaCursor == nil && !deltaCaughtUp
+            && occurrences.isEmpty && pauses.isEmpty && analytics.isEmpty
             && pendingMutations.isEmpty
+    }
+
+    private var hasValidPauseTopology: Bool {
+        for habitPauses in Dictionary(grouping: pauses, by: \.habitID).values {
+            let ordered = habitPauses.sorted {
+                if $0.startedAt == $1.startedAt { return $0.id.uuidString < $1.id.uuidString }
+                return $0.startedAt < $1.startedAt
+            }
+            guard ordered.count(where: { $0.endedAt == nil }) <= 1 else { return false }
+            for (prior, next) in zip(ordered, ordered.dropFirst()) {
+                guard let priorEnd = prior.endedAt, priorEnd <= next.startedAt else { return false }
+            }
+        }
+        return true
+    }
+
+    /// Only unresolved writes retain replay authority. A conflict that has
+    /// already been surfaced for review remains inspectable even if a later
+    /// authoritative delta advances or removes its original target.
+    private var hasValidPendingMutationRelations: Bool {
+        let unresolved = pendingMutations.filter { !$0.conflictDetected }
+        let targets = unresolved.map { HabitMutationTarget(habitID: $0.habitID, id: $0.targetID) }
+        guard Set(targets).count == targets.count else { return false }
+        let pauseHabits = unresolved.compactMap { mutation -> UUID? in
+            if case .outcome = mutation { return nil }
+            return mutation.habitID
+        }
+        guard Set(pauseHabits).count == pauseHabits.count else { return false }
+
+        let occurrenceByID = Dictionary(uniqueKeysWithValues: occurrences.map { ($0.id, $0) })
+        let pauseByID = Dictionary(uniqueKeysWithValues: pauses.map { ($0.id, $0) })
+        for mutation in unresolved {
+            switch mutation {
+            case let .outcome(value):
+                guard let occurrence = occurrenceByID[value.occurrenceID],
+                      occurrence.evidence.habitID == value.habitID,
+                      (occurrence.outcome?.revision ?? 0) == value.command.expectedRevision else {
+                    return false
+                }
+                if value.command.outcome.quantity != nil,
+                   let expectedUnit = occurrence.evidence.expectedUnit,
+                   value.command.outcome.unit != expectedUnit {
+                    return false
+                }
+            case let .pauseStart(value):
+                guard pauseByID[value.command.pauseID] == nil,
+                      !pauses.contains(where: {
+                          $0.habitID == value.habitID && $0.endedAt == nil
+                      }) else { return false }
+            case let .pauseResume(value):
+                guard let pause = pauseByID[value.pauseID],
+                      pause.habitID == value.habitID,
+                      pause.endedAt == nil,
+                      pause.revision == value.command.expectedRevision,
+                      value.command.endedAt > pause.startedAt else { return false }
+            }
+        }
+        return true
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case savedAt
+        case configurationIdentifier
+        case deltaCursor
+        case deltaCaughtUp
+        case occurrences
+        case pauses
+        case analytics
+        case pendingMutations
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        savedAt = try container.decode(Date.self, forKey: .savedAt)
+        configurationIdentifier = try container.decodeIfPresent(
+            String.self,
+            forKey: .configurationIdentifier
+        )
+        let decodedCursor = try container.decodeIfPresent(String.self, forKey: .deltaCursor)
+        if container.contains(.deltaCaughtUp) {
+            deltaCursor = decodedCursor
+            deltaCaughtUp = try container.decode(Bool.self, forKey: .deltaCaughtUp)
+        } else {
+            // Legacy clients bounded occurrence history without retaining every
+            // correction-safe completion anchor. Their tail cursor cannot
+            // repair an already-evicted anchor, so migrate to a full replay.
+            deltaCursor = nil
+            deltaCaughtUp = false
+        }
+        occurrences = try container.decode([DayWeaveHabitOccurrence].self, forKey: .occurrences)
+        pauses = try container.decode([DayWeaveHabitPause].self, forKey: .pauses)
+        analytics = try container.decode([DayWeaveHabitAnalytics].self, forKey: .analytics)
+        pendingMutations = try container.decode(
+            [DayWeavePendingHabitMutation].self,
+            forKey: .pendingMutations
+        )
     }
 
     private static func isValidBinding(_ value: String) -> Bool {
@@ -193,6 +312,11 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
     private static func isValidCursor(_ value: String) -> Bool {
         DayWeaveHabitCursorContract.isValidTransportToken(value)
     }
+}
+
+private struct HabitMutationTarget: Hashable {
+    let habitID: UUID
+    let id: UUID
 }
 
 enum HabitPersistenceError: Error, Equatable, LocalizedError, Sendable {
@@ -360,7 +484,7 @@ struct EncryptedHabitPersistence: Sendable {
               ]).isSubset(of: Set(root.keys)),
               Set(root.keys).isSubset(of: [
                   "schemaVersion", "savedAt", "configurationIdentifier", "deltaCursor",
-                  "occurrences", "pauses", "analytics", "pendingMutations",
+                  "deltaCaughtUp", "occurrences", "pauses", "analytics", "pendingMutations",
               ]) else { throw HabitPersistenceError.invalidSnapshot }
         let snapshot: DayWeaveHabitClientSnapshot
         do { snapshot = try Self.decoder().decode(DayWeaveHabitClientSnapshot.self, from: plaintext) }

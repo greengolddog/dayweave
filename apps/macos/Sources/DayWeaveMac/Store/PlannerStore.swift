@@ -1216,6 +1216,11 @@ final class PlannerStore: ObservableObject {
             guard provenance.sourceItemRevisions == currentRevisions else {
                 return "Canonical item revisions changed after on-device composition. Compose again."
             }
+            guard !canonicalItems.contains(where: {
+                $0.kind == .habit && $0.deletedAt == nil
+            }) || provenance.habitCheckpointFingerprint != nil else {
+                return "The visible on-device schedule has no complete habit-history evidence."
+            }
             generatedAt = provenance.generatedAt
             asOf = provenance.asOf
             horizonStart = provenance.horizonStart

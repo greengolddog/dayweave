@@ -53,28 +53,26 @@ is complete.
 | Reproducible local macOS and signed-APK build paths, guarded signing boundaries, CI security scans, container builds, encrypted backup scripts, and a cost-guarded Nebius Terraform plan | Parts of `OPS`, `SEC-004`, `SEC-011`, and `DATA-003`–`DATA-006` | [release workflow](../.github/workflows/release.yml), [local build scripts](../scripts), and [deployment assets](../deploy) |
 | Shared habit recurrence and lifecycle core: bounded custom rules, rolling and completion-relative cadence, stable occurrence identity and move proof, missed/spacing policies, corrections, partial-progress demand, pauses, streaks, analytics, and scheduler-helper budgets; plus strict Android habit API transport | Core of `HAB-001`–`HAB-009`, parts of `CON` and `SCH` | [habit domain](../crates/dayweave-core/src/habits.rs), [recurrence engine](../crates/dayweave-core/src/recurrence.rs), [custom recurrence](../crates/dayweave-core/src/custom_recurrence.rs), [scheduler tests](../crates/dayweave-core/tests/scheduler.rs), and [habit ledger design](habit-occurrence-ledger.md) |
 | Authoritative habit backend with published-schedule evidence admission, immutable PostgreSQL occurrence/correction/pause history, idempotent mutations, ordered delta and content-free invalidation, private analytics, and lifecycle hydration that preserves non-habit recurrence state while rejecting spoofed or obsolete habit IDs | Server slice of `HAB-006`–`HAB-009`, `SYNC`, and `SEC` | [habit service](../server/dayweave-api/src/habits), [PostgreSQL repository](../server/dayweave-api/src/persistence/habit_repository.rs), [migration 0026](../server/dayweave-api/migrations/0026_habit_occurrence_ledger.sql), [API tests](../server/dayweave-api/tests/habits_api.rs), and [PostgreSQL tests](../server/dayweave-api/tests/habits_postgres.rs) |
-| macOS habit occurrence and statistics experience with strict transport, encrypted origin-bound offline persistence, exact replay, conflict review, done/partial/skipped corrections, pause/resume, trends, streaks, quantities, content-free invalidation/catch-up with polling fallback, and privacy scrubbing | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC` and `SEC` | [habit models](../apps/macos/Sources/DayWeaveMac/Models/HabitModels.swift), [habit sync store](../apps/macos/Sources/DayWeaveMac/Store/HabitSyncStore.swift), [habit invalidation stream](../apps/macos/Sources/DayWeaveMac/Store/HabitInvalidationStream.swift), and adjacent tests |
+| macOS habit occurrence and statistics experience with strict transport, encrypted origin-bound offline persistence, exact replay and response binding, conflict review, terminal delta authority, done/partial/skipped corrections, pause/resume, trends, streaks, quantities, content-free invalidation/catch-up with polling fallback, habit-aware local composition, and privacy scrubbing | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC`, `SEC`, `SCH`, and `UX` | [habit models](../apps/macos/Sources/DayWeaveMac/Models/HabitModels.swift), [habit sync store](../apps/macos/Sources/DayWeaveMac/Store/HabitSyncStore.swift), [canonical composition store](../apps/macos/Sources/DayWeaveMac/Store/CanonicalSyncStore.swift), [habit invalidation stream](../apps/macos/Sources/DayWeaveMac/Store/HabitInvalidationStream.swift), and adjacent tests |
 | Android habit occurrence and statistics experience with strict origin-bound transport, an encrypted Room V17 offline ledger, exact replay and reviewed failures, terminal delta checkpoints, content-free invalidation with polling fallback, observed-revision and durability-first done/partial/skipped corrections, pause/resume, bounded analytics, habit-aware local composition, and finite custom-RRULE authoring | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC`, `SEC`, `SCH`, and `UX` | [habit models](../apps/android/app/src/main/java/com/greengolddog/dayweave/model/HabitModels.kt), [habit sync manager](../apps/android/app/src/main/java/com/greengolddog/dayweave/sync/HabitSyncManager.kt), [habit UI](../apps/android/app/src/main/java/com/greengolddog/dayweave/ui/screens/HabitSections.kt), [Room migration test](../apps/android/app/src/androidTest/java/com/greengolddog/dayweave/HabitLedgerMigrationTest.kt), and adjacent unit tests |
 
 ## Active implementation
 
-The current milestone is macOS habit-integrity closure followed by
-cross-platform end-to-end verification. The shared core, authoritative backend,
-and Android client slices are implemented and covered; these remaining checks
-keep the broader habit path in progress:
+The current milestone is cross-platform habit end-to-end closure. The shared
+core, authoritative backend, macOS client, and Android client slices are
+implemented and covered; these remaining checks keep the broader habit path in
+progress:
 
-- add a durable terminal-page checkpoint to macOS habit catch-up and require it
-  before the ledger can authorize local composition;
-- feed authoritative macOS habit outcomes, partial progress, completion
-  anchors, and pauses into deterministic local composition with an in-flight
-  mutation fence;
-- bind every macOS mutation response and restored outbox command to its exact
-  ledger identity before removing or replaying the durable journal;
-- run the complete macOS wrapper and cross-platform client/server verification,
-  then close controlled real-device and seven-day acceptance gates.
+- run integrated Rust/backend/macOS/Android contract and protocol gates against
+  one controlled service deployment;
+- exercise the complete occurrence, correction, pause, analytics, invalidation,
+  offline replay, conflict, and recomposition path on both native clients;
+- verify the local macOS build and signed APK on the owner's Mac and Pixel 11;
+- complete the required seven-consecutive-day trial, fix every critical or
+  major issue, and rerun affected acceptance paths.
 
-These items remain **in progress** until the complete slice passes the Rust,
-backend, macOS, Android, persistence, and protocol test gates and is committed.
+These items remain **in progress** until the integrated client/service gates,
+controlled device checks, and real-life acceptance trial are complete.
 
 ## Features still to add or close
 
@@ -94,7 +92,7 @@ percentage.
 | Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
 | Scheduling restrictions and profiles (`CON`) | **In progress** | **60%** | Close every per-item hard/soft restriction, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence case. |
 | Scheduler intelligence (`SCH`) | **In progress** | **55%** | Complete configurable objective ordering, movement-cost tuning, alternatives/what-if, overload resolution, fragile-deadline warnings, “Why here?”, learned preference controls, and 90-day performance proof. |
-| Habits (`HAB`) | **In progress** | **85%** | Finish the macOS integrity work above, then run cross-platform, real-device, and seven-day verification of all nine habit requirements. |
+| Habits (`HAB`) | **In progress** | **90%** | Run controlled cross-platform service/client E2E, local macOS and Pixel 11 verification, and the seven-day acceptance trial for all nine habit requirements. |
 | Active execution (`EXE`) | **In progress** | **65%** | Add Focus/DND mappings, inactivity correction, duration-learning controls, Pomodoro/mandatory-break settings, and full cross-device/UI coverage. |
 | Google Calendar (`GCAL`) | **In progress** | **45%** | Complete full bidirectional parity for series scopes, attendees/RSVP, conferencing, attachments, flexible-event moves, birthdays/observances, OOO/free/tentative policy, conflicts, travel, density, and notification ownership. |
 | Google Tasks (`GTASK`) | **In progress** | **45%** | Finish bidirectional field/list parity, external completion/deletion/due-date reactions, shared conflict/undo behavior, and controlled real-account tests. |

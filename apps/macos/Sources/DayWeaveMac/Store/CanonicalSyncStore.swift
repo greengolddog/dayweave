@@ -66,6 +66,7 @@ final class CanonicalSyncStore: ObservableObject {
     private let authCoordinator: DurableAuthCoordinator?
     private let session: URLSession
     private let localComposer: any LocalScheduleComposing
+    private let habitCompositionProvider: (any HabitCompositionCheckpointProviding)?
     private let now: @Sendable () -> Date
     private let createPushLimit: Int
     private let authoringPushLimit: Int
@@ -119,6 +120,7 @@ final class CanonicalSyncStore: ObservableObject {
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         localComposer: any LocalScheduleComposing = SchedulerHelperClient(),
+        habitCompositionProvider: (any HabitCompositionCheckpointProviding)? = nil,
         createPushLimit: Int = CanonicalSyncStore.maximumCreatePushesPerSync,
         authoringPushLimit: Int = CanonicalSyncStore.maximumAuthoringPushesPerSync,
         statusPushLimit: Int = CanonicalSyncStore.maximumStatusPushesPerSync,
@@ -143,6 +145,7 @@ final class CanonicalSyncStore: ObservableObject {
         self.authCoordinator = authCoordinator
         self.session = session
         self.localComposer = localComposer
+        self.habitCompositionProvider = habitCompositionProvider
         self.createPushLimit = max(0, createPushLimit)
         self.authoringPushLimit = max(0, authoringPushLimit)
         self.statusPushLimit = max(0, statusPushLimit)
@@ -159,6 +162,9 @@ final class CanonicalSyncStore: ObservableObject {
         planner.observeCommittedScheduleProfileChanges { [weak self] in
             self?.scheduleProfileDidCommit()
         }
+        habitCompositionProvider?.observeHabitCompositionCheckpointChanges { [weak self] in
+            self?.habitCompositionCheckpointDidChange()
+        }
     }
 
     var isConfigured: Bool {
@@ -170,7 +176,7 @@ final class CanonicalSyncStore: ObservableObject {
     /// fence, so this value is only an enablement hint rather than authority.
     var canRecomposeLocally: Bool {
         do {
-            try requireLocalCompositionPreflight()
+            _ = try requireLocalCompositionPreflight()
             return true
         } catch {
             return false
@@ -899,8 +905,9 @@ final class CanonicalSyncStore: ObservableObject {
     /// network request or creating a server publication journal.
     @discardableResult
     func recomposeLocally() async -> Bool {
+        let habitCheckpoint: HabitCompositionCheckpoint?
         do {
-            try requireLocalCompositionPreflight()
+            habitCheckpoint = try requireLocalCompositionPreflight()
         } catch {
             reportLocalCompositionFailure(error)
             return false
@@ -928,7 +935,7 @@ final class CanonicalSyncStore: ObservableObject {
             )
 
             let priorWarningCount = warnings.count
-            let request = try makePreviewRequest()
+            let request = try makePreviewRequest(habitCheckpoint: habitCheckpoint)
             let requestWarnings = Array(warnings.dropFirst(priorWarningCount))
             if warnings.count > priorWarningCount {
                 warnings.removeLast(warnings.count - priorWarningCount)
@@ -949,7 +956,8 @@ final class CanonicalSyncStore: ObservableObject {
                 blocks: planner.blocks,
                 scheduleProfile: planner.scheduleProfile,
                 freezeHours: planner.freezeHours,
-                timezoneName: planningTimezone
+                timezoneName: planningTimezone,
+                habitCompositionCheckpoint: habitCheckpoint
             )
             let composer = localComposer
             let task = Task.detached(priority: .userInitiated) {
@@ -969,7 +977,11 @@ final class CanonicalSyncStore: ObservableObject {
                 operationID: operationID,
                 generation: generation
             )
-            guard fence.matches(planner: planner, timezoneName: planningTimezone) else {
+            guard fence.matches(
+                planner: planner,
+                timezoneName: planningTimezone,
+                currentHabitCheckpoint: habitCompositionProvider?.habitCompositionCheckpoint
+            ) else {
                 throw LocalCompositionCoordinatorError.canonicalStateChanged
             }
             guard composition.sourceItemCount == canonicalItems.count,
@@ -1011,7 +1023,8 @@ final class CanonicalSyncStore: ObservableObject {
                 horizonStart: composition.plan.horizonStart,
                 horizonEnd: composition.plan.horizonEnd,
                 timezoneName: request.timezoneName,
-                sourceItemRevisions: composition.sourceItemRevisions
+                sourceItemRevisions: composition.sourceItemRevisions,
+                habitCheckpointFingerprint: habitCheckpoint?.fingerprint
             )
             guard provenance.hasValidShape else {
                 throw LocalCompositionCoordinatorError.invalidHelperResponse
@@ -3286,24 +3299,44 @@ final class CanonicalSyncStore: ObservableObject {
         )
     }
 
-    private func makePreviewRequest() throws -> DayWeaveSchedulePreviewRequest {
+    private func makePreviewRequest(
+        habitCheckpoint: HabitCompositionCheckpoint? = nil
+    ) throws -> DayWeaveSchedulePreviewRequest {
         struct ExceptionRecord {
             let occurredAt: Date
             let occurrenceID: UUID
             let value: JSONValue
         }
+        struct PauseRecord {
+            let habitID: UUID
+            let start: Date
+            let end: Date
+        }
         let expandedProfile = try planner.scheduleProfile.expanded(asOf: now())
         let asOf = expandedProfile.asOf
         let start = expandedProfile.horizonStart
         let end = expandedProfile.horizonEnd
-        let activeItemIDs = Set(planner.canonicalItems.map(\.id))
+        let activeItems = planner.canonicalItems.filter { $0.deletedAt == nil }
+        let activeItemIDs = Set(activeItems.map(\.id))
+        let activeHabitIDs = Set(activeItems.filter { $0.kind == .habit }.map(\.id))
+        let authoritativeHabitIDs = habitCheckpoint == nil ? Set<UUID>() : activeHabitIDs
         let currentRevisionByItem = Dictionary(
             uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
         )
-        let activeOutcomes = planner.recurrenceSessionOutcomes.filter {
-            activeItemIDs.contains($0.itemID)
+        let storedMoves = planner.recurrenceOccurrenceMoves
+        guard storedMoves.allSatisfy({ move in
+            move.hasValidShape
+                && currentRevisionByItem[move.itemID] == move.source?.itemRevision
+        }) else {
+            throw CanonicalSyncError.staleOccurrenceMove
         }
-        let completedOccurrenceIDs: [JSONValue] = Dictionary(
+        let movedOccurrenceIDsInHorizon = Set(storedMoves.compactMap { move in
+            move.startAt >= start && move.endAt <= end ? move.occurrenceID : nil
+        })
+        let activeOutcomes = planner.recurrenceSessionOutcomes.filter {
+            activeItemIDs.contains($0.itemID) && !authoritativeHabitIDs.contains($0.itemID)
+        }
+        let ordinaryCompletions = Dictionary(
             grouping: activeOutcomes.filter {
                 $0.disposition == .completed
                     && $0.occurrenceFullyScheduled
@@ -3314,23 +3347,72 @@ final class CanonicalSyncStore: ObservableObject {
             .compactMap { occurrenceID, outcomes in
                 outcomes.map(\.occurredAt).max().map { (occurrenceID, $0) }
             }
-            .sorted {
-                if $0.1 != $1.1 { return $0.1 > $1.1 }
-                return $0.0.uuidString < $1.0.uuidString
-            }
-            .prefix(3_000)
-            .map { JSONValue.string($0.0.uuidString.lowercased()) }
-        let completionAnchors = planner.recurrenceCompletionAnchors()
-            .filter { activeItemIDs.contains($0.key) }
+        let authoritativeOccurrences = (habitCheckpoint?.occurrences ?? []).filter { occurrence in
+            guard authoritativeHabitIDs.contains(occurrence.habitID),
+                  let revision = currentRevisionByItem[occurrence.habitID],
+                  occurrence.sourceItemRevision <= revision else { return false }
+            return (occurrence.windowStart < end && occurrence.windowEnd > start)
+                || movedOccurrenceIDsInHorizon.contains(occurrence.plannerOccurrenceID)
+        }
+        let authoritativeCompletions: [(UUID, Date)] = authoritativeOccurrences.compactMap {
+            occurrence in
+            guard let outcome = occurrence.outcome, outcome.status == .completed else { return nil }
+            return (occurrence.plannerOccurrenceID, outcome.occurredAt)
+        }
+        var completionByOccurrence: [UUID: Date] = [:]
+        for entry in ordinaryCompletions {
+            completionByOccurrence[entry.0] = max(
+                completionByOccurrence[entry.0] ?? .distantPast,
+                entry.1
+            )
+        }
+        for entry in authoritativeCompletions {
+            completionByOccurrence[entry.0] = max(
+                completionByOccurrence[entry.0] ?? .distantPast,
+                entry.1
+            )
+        }
+        let completedOccurrenceIDs: [JSONValue] = completionByOccurrence
             .sorted {
                 if $0.value != $1.value { return $0.value > $1.value }
                 return $0.key.uuidString < $1.key.uuidString
             }
-            .prefix(3_000)
-            .reduce(into: [String: JSONValue]()) { result, entry in
-                result[entry.key.uuidString.lowercased()] = .string(format(entry.value))
+            .map { JSONValue.string($0.key.uuidString.lowercased()) }
+
+        var completionAnchorDates = planner.recurrenceCompletionAnchors().filter {
+            activeItemIDs.contains($0.key) && !authoritativeHabitIDs.contains($0.key)
+        }
+        for occurrence in habitCheckpoint?.occurrences ?? [] {
+            guard authoritativeHabitIDs.contains(occurrence.habitID),
+                  let revision = currentRevisionByItem[occurrence.habitID],
+                  occurrence.sourceItemRevision <= revision,
+                  let outcome = occurrence.outcome,
+                  outcome.status == .completed else { continue }
+            completionAnchorDates[occurrence.habitID] = max(
+                completionAnchorDates[occurrence.habitID] ?? .distantPast,
+                outcome.occurredAt
+            )
+        }
+        let completionAnchors = completionAnchorDates.reduce(into: [String: JSONValue]()) {
+            result, entry in
+            result[entry.key.uuidString.lowercased()] = .string(format(entry.value))
+        }
+        let partialProgress = try authoritativeOccurrences.reduce(
+            into: [String: JSONValue]()
+        ) { result, occurrence in
+            guard let outcome = occurrence.outcome,
+                  outcome.status == .partial,
+                  let expectedSeconds = occurrence.expectedDurationSeconds else { return }
+            let rounded = expectedSeconds.addingReportingOverflow(59)
+            guard !rounded.overflow, rounded.partialValue / 60 > 0 else {
+                throw LocalCompositionCoordinatorError.incompleteHabitLedger
             }
-        let skipExceptions = activeOutcomes
+            result[occurrence.plannerOccurrenceID.uuidString.lowercased()] = .object([
+                "progress_basis_points": .number(.init(UInt64(outcome.progressBasisPoints))),
+                "expected_duration_minutes": .number(.init(rounded.partialValue / 60)),
+            ])
+        }
+        let ordinarySkipExceptions = activeOutcomes
             .filter { $0.disposition == .skipped }
             .reduce(into: [UUID: RecurrenceSessionOutcome]()) { latest, outcome in
                 if latest[outcome.occurrenceID]?.occurredAt ?? .distantPast < outcome.occurredAt {
@@ -3356,12 +3438,44 @@ final class CanonicalSyncStore: ObservableObject {
                     ])
                 )
             }
-        let storedMoves = planner.recurrenceOccurrenceMoves
-        guard storedMoves.allSatisfy({ move in
-            move.hasValidShape
-                && currentRevisionByItem[move.itemID] == move.source?.itemRevision
-        }) else {
-            throw CanonicalSyncError.staleOccurrenceMove
+        let authoritativeSkipExceptions: [ExceptionRecord] = authoritativeOccurrences.compactMap {
+            occurrence in
+            guard let outcome = occurrence.outcome, outcome.status == .skipped else { return nil }
+            return ExceptionRecord(
+                occurredAt: outcome.occurredAt,
+                occurrenceID: occurrence.plannerOccurrenceID,
+                value: .object([
+                    "item_id": .string(occurrence.habitID.uuidString.lowercased()),
+                    "selector": .object([
+                        "type": .string("occurrence"),
+                        "id": .string(occurrence.plannerOccurrenceID.uuidString.lowercased()),
+                    ]),
+                    "action": .object(["type": .string("skip")]),
+                ])
+            )
+        }
+        let skipExceptions = ordinarySkipExceptions + authoritativeSkipExceptions
+        let pauseRecords: [PauseRecord] = (habitCheckpoint?.pauses ?? [])
+            .compactMap { pause in
+                guard authoritativeHabitIDs.contains(pause.habitID) else { return nil }
+                let clippedStart = max(pause.startedAt, start)
+                let clippedEnd = min(pause.endedAt ?? end, end)
+                guard clippedStart < clippedEnd else { return nil }
+                return PauseRecord(habitID: pause.habitID, start: clippedStart, end: clippedEnd)
+            }
+            .sorted {
+                if $0.habitID != $1.habitID {
+                    return $0.habitID.uuidString < $1.habitID.uuidString
+                }
+                if $0.start != $1.start { return $0.start < $1.start }
+                return $0.end < $1.end
+            }
+        let recurrencePauses: [JSONValue] = pauseRecords.map { pause in
+                .object([
+                    "item_id": .string(pause.habitID.uuidString.lowercased()),
+                    "start": .string(format(pause.start)),
+                    "end": .string(format(pause.end)),
+                ])
         }
         let moveExceptions = storedMoves
             .map { move in
@@ -3391,11 +3505,8 @@ final class CanonicalSyncStore: ObservableObject {
                     ])
                 )
             }
-        let exceptionCapacity = max(
-            0,
-            9_000 - completedOccurrenceIDs.count - completionAnchors.count
-        )
-        guard skipExceptions.count + moveExceptions.count <= exceptionCapacity else {
+        guard completedOccurrenceIDs.count + completionAnchors.count + partialProgress.count
+            + recurrencePauses.count + skipExceptions.count + moveExceptions.count <= 9_000 else {
             throw CanonicalSyncError.recurrenceContextCapacity
         }
         let recurrenceExceptions = (skipExceptions + moveExceptions)
@@ -3405,7 +3516,6 @@ final class CanonicalSyncStore: ObservableObject {
                 }
                 return $0.occurrenceID.uuidString < $1.occurrenceID.uuidString
             }
-            .prefix(exceptionCapacity)
             .map(\.value)
         return .init(
             asOf: asOf,
@@ -3419,6 +3529,8 @@ final class CanonicalSyncStore: ObservableObject {
             recurrenceContext: [
                 "completed_occurrence_ids": .array(completedOccurrenceIDs),
                 "completion_anchors": .object(completionAnchors),
+                "partial_progress": .object(partialProgress),
+                "pauses": .array(recurrencePauses),
                 "exceptions": .array(recurrenceExceptions),
             ]
         )
@@ -3717,7 +3829,7 @@ final class CanonicalSyncStore: ObservableObject {
         }
     }
 
-    private func requireLocalCompositionPreflight() throws {
+    private func requireLocalCompositionPreflight() throws -> HabitCompositionCheckpoint? {
         guard !Task.isCancelled,
               activeSyncID == nil,
               activeSyncTask == nil,
@@ -3767,6 +3879,26 @@ final class CanonicalSyncStore: ObservableObject {
         guard planner.canonicalItems.count <= 10_000 else {
             throw LocalCompositionCoordinatorError.canonicalResourceLimit
         }
+        let checkpoint = habitCompositionProvider?.habitCompositionCheckpoint
+        if let checkpoint,
+           !checkpoint.pendingMutationIDs.isEmpty || checkpoint.hasActiveOperation {
+            throw LocalCompositionCoordinatorError.incompleteHabitLedger
+        }
+        let activeHabitRevisions = Dictionary(uniqueKeysWithValues:
+            planner.canonicalItems.compactMap { item in
+                item.kind == .habit && item.deletedAt == nil
+                    ? (item.id, item.revision) : nil
+            }
+        )
+        guard !activeHabitRevisions.isEmpty else { return checkpoint }
+        guard let checkpoint,
+              checkpoint.isAuthoritative(
+                  for: configurationIdentifier,
+                  activeHabitRevisions: activeHabitRevisions
+              ) else {
+            throw LocalCompositionCoordinatorError.incompleteHabitLedger
+        }
+        return checkpoint
     }
 
     private func ensureLocalCompositionCurrent(
@@ -3824,6 +3956,12 @@ final class CanonicalSyncStore: ObservableObject {
         warnings = []
         clearTransientLocalComposition()
         reloadConfigurationStatus()
+    }
+
+    private func habitCompositionCheckpointDidChange() {
+        planner.invalidateCanonicalPreview()
+        lastPreview = nil
+        clearTransientLocalComposition()
     }
 
     private func makeClient(reportFailure: Bool) -> DayWeaveAPIClient? {
@@ -3895,9 +4033,14 @@ private struct LocalCompositionMutationFence: Sendable {
     let scheduleProfile: ScheduleProfile
     let freezeHours: Int
     let timezoneName: String
+    let habitCompositionCheckpoint: HabitCompositionCheckpoint?
 
     @MainActor
-    func matches(planner: PlannerStore, timezoneName currentTimezoneName: String) -> Bool {
+    func matches(
+        planner: PlannerStore,
+        timezoneName currentTimezoneName: String,
+        currentHabitCheckpoint: HabitCompositionCheckpoint?
+    ) -> Bool {
         canonicalItems == planner.canonicalItems
             && canonicalDeltaCursor == planner.canonicalDeltaCursor
             && canonicalConfigurationIdentifier == planner.canonicalConfigurationIdentifier
@@ -3910,6 +4053,7 @@ private struct LocalCompositionMutationFence: Sendable {
             && scheduleProfile == planner.scheduleProfile
             && freezeHours == planner.freezeHours
             && timezoneName == currentTimezoneName
+            && habitCompositionCheckpoint == currentHabitCheckpoint
     }
 }
 
@@ -3925,6 +4069,7 @@ private enum LocalCompositionCoordinatorError: LocalizedError {
     case pendingAuthoringMutation
     case executionLeaseActive
     case canonicalResourceLimit
+    case incompleteHabitLedger
     case canonicalStateChanged
     case operationSuperseded
     case invalidHelperResponse
@@ -3953,6 +4098,8 @@ private enum LocalCompositionCoordinatorError: LocalizedError {
             "Reconcile the remote execution lease and actionability state before composing on this device."
         case .canonicalResourceLimit:
             "The canonical cache exceeds the on-device scheduler's 10,000-item safety limit."
+        case .incompleteHabitLedger:
+            "Synchronize the complete habit history before composing on this device."
         case .canonicalStateChanged:
             "Canonical schedule inputs changed while the helper was running; its result was discarded."
         case .operationSuperseded:

@@ -126,6 +126,127 @@ struct LocalCompositionStoreTests {
         }
     }
 
+    @Test("active habits require an exact complete and idle habit checkpoint")
+    func habitCheckpointPreflightFailsClosed() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))
+        let habit = try LocalCompositionFixture.item(revision: 2, kind: "habit")
+        let ready = Self.habitCheckpoint(item: habit, now: now)
+        let variants: [HabitCompositionCheckpoint?] = [
+            nil,
+            Self.habitCheckpoint(item: habit, now: now, configurationIdentifier: "other"),
+            Self.habitCheckpoint(item: habit, now: now, deltaCursor: nil),
+            Self.habitCheckpoint(item: habit, now: now, deltaCaughtUp: false),
+            Self.habitCheckpoint(item: habit, now: now, pendingMutationIDs: [UUID()]),
+            Self.habitCheckpoint(item: habit, now: now, hasActiveOperation: true),
+            Self.habitCheckpoint(
+                item: habit,
+                now: now,
+                sourceItemRevision: habit.revision + 1
+            ),
+        ]
+
+        for checkpoint in variants {
+            let context = try Self.makePlanner(now: now, item: habit)
+            defer { try? FileManager.default.removeItem(at: context.directory) }
+            let composer = RecordingLocalComposer()
+            let provider = checkpoint.map(HabitCheckpointStub.init)
+            let store = Self.makeStore(
+                planner: context.planner,
+                composer: composer,
+                now: now,
+                habitProvider: provider
+            )
+
+            #expect(!store.canRecomposeLocally)
+            #expect(!(await store.recomposeLocally()))
+            #expect(await composer.calls() == 0)
+        }
+        #expect(ready.fingerprint?.hasPrefix("habit-sha256:") == true)
+    }
+
+    @Test("authoritative habit outcomes progress and pauses feed local composition provenance")
+    func habitLedgerFeedsComposition() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))
+        let habit = try LocalCompositionFixture.item(revision: 2, kind: "habit")
+        let checkpoint = Self.habitCheckpoint(item: habit, now: now)
+        let provider = HabitCheckpointStub(checkpoint)
+        let context = try Self.makePlanner(now: now, item: habit)
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let composer = RecordingLocalComposer()
+        let store = Self.makeStore(
+            planner: context.planner,
+            composer: composer,
+            now: now,
+            habitProvider: provider
+        )
+
+        #expect(await store.recomposeLocally())
+        let request = try #require(await composer.lastRequest())
+        guard case let .array(completed)? = request.recurrenceContext["completed_occurrence_ids"],
+              case let .object(anchors)? = request.recurrenceContext["completion_anchors"],
+              case let .object(partial)? = request.recurrenceContext["partial_progress"],
+              case let .array(pauses)? = request.recurrenceContext["pauses"],
+              case let .array(exceptions)? = request.recurrenceContext["exceptions"] else {
+            Issue.record("Expected the complete authoritative habit recurrence projection")
+            return
+        }
+        #expect(completed == [.string(Self.completedPlannerOccurrenceID.uuidString.lowercased())])
+        #expect(anchors[habit.id.uuidString.lowercased()] == .string(Self.timestamp(now)))
+        #expect(partial[Self.partialPlannerOccurrenceID.uuidString.lowercased()] == .object([
+            "progress_basis_points": .number(.init(UInt64(2_500))),
+            "expected_duration_minutes": .number(.init(UInt64(30))),
+        ]))
+        #expect(pauses.count == 1)
+        #expect(exceptions.contains(.object([
+            "item_id": .string(habit.id.uuidString.lowercased()),
+            "selector": .object([
+                "type": .string("occurrence"),
+                "id": .string(Self.skippedPlannerOccurrenceID.uuidString.lowercased()),
+            ]),
+            "action": .object(["type": .string("skip")]),
+        ])))
+        let provenance = try #require(context.planner.localScheduleCompositionProvenance)
+        #expect(provenance.habitCheckpointFingerprint == checkpoint.fingerprint)
+        #expect(context.planner.canonicalPreviewFreshnessIssue == nil)
+
+        provider.update(Self.habitCheckpoint(
+            item: habit,
+            now: now,
+            deltaCursor: "habit-cursor-two"
+        ))
+        #expect(context.planner.canonicalPreviewFreshnessIssue != nil)
+    }
+
+    @Test("a habit operation crossing the helper await invalidates the in-flight fence")
+    func habitCheckpointRaceDiscardsHelperResult() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))
+        let habit = try LocalCompositionFixture.item(revision: 2, kind: "habit")
+        let checkpoint = Self.habitCheckpoint(item: habit, now: now)
+        let provider = HabitCheckpointStub(checkpoint)
+        let context = try Self.makePlanner(now: now, item: habit)
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let composer = BlockingLocalComposer()
+        let store = Self.makeStore(
+            planner: context.planner,
+            composer: composer,
+            now: now,
+            habitProvider: provider
+        )
+        let run = Task { @MainActor in await store.recomposeLocally() }
+        await composer.waitUntilStarted()
+
+        provider.replaceWithoutNotification(Self.habitCheckpoint(
+            item: habit,
+            now: now,
+            operationGeneration: checkpoint.operationGeneration + 1
+        ))
+        await composer.release()
+
+        #expect(!(await run.value))
+        #expect(context.planner.localScheduleCompositionProvenance == nil)
+        #expect(store.localCompositionStatus.message.contains("changed"))
+    }
+
     @Test("a canonical revision change while awaiting the helper discards its result")
     func revisionRaceDiscardsHelperResult() async throws {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))
@@ -513,7 +634,8 @@ struct LocalCompositionStoreTests {
     private static func makeStore(
         planner: PlannerStore,
         composer: any LocalScheduleComposing,
-        now: Date
+        now: Date,
+        habitProvider: (any HabitCompositionCheckpointProviding)? = nil
     ) -> CanonicalSyncStore {
         CanonicalSyncStore(
             planner: planner,
@@ -521,8 +643,99 @@ struct LocalCompositionStoreTests {
             tokenStore: TestBearerTokenStore(token: "local-composition-test-token"),
             session: URLProtocolStub.makeSession(),
             localComposer: composer,
+            habitCompositionProvider: habitProvider,
             now: { now }
         )
+    }
+
+    private static let completedPlannerOccurrenceID =
+        UUID(uuidString: "c1000000-0000-5000-8000-000000000001")!
+    private static let partialPlannerOccurrenceID =
+        UUID(uuidString: "c1000000-0000-5000-8000-000000000002")!
+    private static let skippedPlannerOccurrenceID =
+        UUID(uuidString: "c1000000-0000-5000-8000-000000000003")!
+
+    private static func habitCheckpoint(
+        item: DayWeaveCanonicalItem,
+        now: Date,
+        configurationIdentifier: String? = Self.configurationIdentifier,
+        deltaCursor: String? = "habit-cursor",
+        deltaCaughtUp: Bool = true,
+        pendingMutationIDs: [UUID] = [],
+        hasActiveOperation: Bool = false,
+        operationGeneration: UInt64 = 1,
+        sourceItemRevision: UInt64 = 1
+    ) -> HabitCompositionCheckpoint {
+        let windowStart = now.addingTimeInterval(-1_800)
+        let windowEnd = now.addingTimeInterval(7_200)
+        func occurrence(
+            id: UUID,
+            plannerID: UUID,
+            status: DayWeaveHabitOutcomeStatus,
+            progress: UInt16,
+            duration: UInt64?
+        ) -> HabitCompositionCheckpoint.Occurrence {
+            .init(
+                id: id,
+                habitID: item.id,
+                plannerOccurrenceID: plannerID,
+                sourceItemRevision: sourceItemRevision,
+                nominalStart: now,
+                windowStart: windowStart,
+                windowEnd: windowEnd,
+                expectedDurationSeconds: duration,
+                outcome: .init(
+                    revision: 1,
+                    status: status,
+                    progressBasisPoints: progress,
+                    occurredAt: now
+                )
+            )
+        }
+        return .init(
+            configurationIdentifier: configurationIdentifier,
+            deltaCursor: deltaCursor,
+            deltaCaughtUp: deltaCaughtUp,
+            occurrences: [
+                occurrence(
+                    id: UUID(uuidString: "c2000000-0000-4000-8000-000000000001")!,
+                    plannerID: completedPlannerOccurrenceID,
+                    status: .completed,
+                    progress: 10_000,
+                    duration: 1_800
+                ),
+                occurrence(
+                    id: UUID(uuidString: "c2000000-0000-4000-8000-000000000002")!,
+                    plannerID: partialPlannerOccurrenceID,
+                    status: .partial,
+                    progress: 2_500,
+                    duration: 1_800
+                ),
+                occurrence(
+                    id: UUID(uuidString: "c2000000-0000-4000-8000-000000000003")!,
+                    plannerID: skippedPlannerOccurrenceID,
+                    status: .skipped,
+                    progress: 0,
+                    duration: 1_800
+                ),
+            ],
+            pauses: [.init(
+                id: UUID(uuidString: "c3000000-0000-4000-8000-000000000001")!,
+                habitID: item.id,
+                revision: 1,
+                startedAt: now.addingTimeInterval(-900),
+                endedAt: now.addingTimeInterval(900)
+            )],
+            pendingMutationIDs: pendingMutationIDs,
+            hasActiveOperation: hasActiveOperation,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     private static func makePlanner(
@@ -744,11 +957,14 @@ private enum LocalCompositionFixture {
     static let itemID = UUID(uuidString: "b1000000-0000-4000-8000-000000000001")!
     static let plannedBlockID = UUID(uuidString: "b2000000-0000-4000-8000-000000000002")!
 
-    static func item(revision: UInt64) throws -> DayWeaveCanonicalItem {
+    static func item(
+        revision: UInt64,
+        kind: String = "task"
+    ) throws -> DayWeaveCanonicalItem {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(DayWeaveCanonicalItem.self, from: Data("""
-        {"id":"\(itemID.uuidString.lowercased())","is_sensitive":false,"kind":"task",
+        {"id":"\(itemID.uuidString.lowercased())","is_sensitive":false,"kind":"\(kind)",
         "status":"scheduled","title":"Compose locally","notes":"private notes",
         "timezone_name":"Europe/Madrid","duration_seconds":1800,"deadline_at":null,
         "earliest_start_at":null,"recurrence":null,"flexible_constraints":{},
@@ -996,6 +1212,31 @@ private enum LocalCompositionFixture {
     private static var planningTimezone: String {
         let identifier = TimeZone.autoupdatingCurrent.identifier
         return identifier == "GMT" ? "UTC" : identifier
+    }
+}
+
+@MainActor
+private final class HabitCheckpointStub: HabitCompositionCheckpointProviding {
+    private(set) var habitCompositionCheckpoint: HabitCompositionCheckpoint
+    private var observers: [@MainActor () -> Void] = []
+
+    init(_ checkpoint: HabitCompositionCheckpoint) {
+        habitCompositionCheckpoint = checkpoint
+    }
+
+    func observeHabitCompositionCheckpointChanges(
+        _ observer: @escaping @MainActor () -> Void
+    ) {
+        observers.append(observer)
+    }
+
+    func update(_ checkpoint: HabitCompositionCheckpoint) {
+        habitCompositionCheckpoint = checkpoint
+        observers.forEach { $0() }
+    }
+
+    func replaceWithoutNotification(_ checkpoint: HabitCompositionCheckpoint) {
+        habitCompositionCheckpoint = checkpoint
     }
 }
 

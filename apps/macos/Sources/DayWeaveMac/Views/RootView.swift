@@ -1712,6 +1712,7 @@ struct AuthoritativeExecutionControls: View {
             && executionSync.activeSession == nil
             && store.executionState.historyVerified
             && store.executionState.pendingCommand == nil
+            && !executionSync.habitExecutionStartIsBlocked
             && store.pendingCanonicalMutations.isEmpty
             && block.sourceItemRevision == block.sourceItemID.flatMap {
                 store.canonicalItem(id: $0)?.revision
@@ -2572,6 +2573,7 @@ private struct AuthoritativeExecutionContextMenu: View {
             && executionSync.activeSession == nil
             && store.executionState.historyVerified
             && store.executionState.pendingCommand == nil
+            && !executionSync.habitExecutionStartIsBlocked
             && store.pendingCanonicalMutations.isEmpty
             && block.sourceItemRevision == block.sourceItemID.flatMap {
                 store.canonicalItem(id: $0)?.revision

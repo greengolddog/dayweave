@@ -147,11 +147,15 @@ final class ExecutionSyncStore: ObservableObject {
         DayWeaveBreakNotificationTapIssue? = nil
     @Published private(set) var isRequestingBreakNotificationAuthorization = false
     @Published private(set) var breakResolutionWakeGeneration: UInt64 = 0
+    /// Observation-only token so Start controls recompute when the private
+    /// habit authority fence changes without exposing any habit payload.
+    @Published private(set) var habitExecutionReadinessGeneration: UInt64 = 0
     @Published private var breakAlternativeHandoffSource:
         BreakAlternativeHandoffSource? = nil
     @Published private var selectedBreakAlternativeBlockID: UUID? = nil
 
     private let planner: PlannerStore
+    private let habitCompositionProvider: (any HabitCompositionCheckpointProviding)?
     private let connectionProvider: @MainActor @Sendable () throws -> DayWeaveExecutionConnection
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
@@ -175,6 +179,7 @@ final class ExecutionSyncStore: ObservableObject {
 
     init(
         planner: PlannerStore,
+        habitCompositionProvider: any HabitCompositionCheckpointProviding,
         configurationStore: any SuggestionAPIConfigurationStoring =
             UserDefaultsSuggestionAPIConfigurationStore(),
         tokenStore: any BearerTokenStoring = KeychainBearerTokenStore(),
@@ -192,6 +197,7 @@ final class ExecutionSyncStore: ObservableObject {
         }
     ) {
         self.planner = planner
+        self.habitCompositionProvider = habitCompositionProvider
         self.now = now
         self.makeUUID = makeUUID
         self.breakNotificationCoordinator = breakNotificationCoordinator
@@ -235,11 +241,13 @@ final class ExecutionSyncStore: ObservableObject {
             )
         }
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
+        observeHabitCompositionReadiness()
         scheduleBreakDeadlineWakeIfNeeded()
     }
 
     init(
         planner: PlannerStore,
+        habitCompositionProvider: (any HabitCompositionCheckpointProviding)? = nil,
         connectionProvider: @escaping @MainActor @Sendable () throws
             -> DayWeaveExecutionConnection,
         now: @escaping @Sendable () -> Date = Date.init,
@@ -254,6 +262,7 @@ final class ExecutionSyncStore: ObservableObject {
         }
     ) {
         self.planner = planner
+        self.habitCompositionProvider = habitCompositionProvider
         self.connectionProvider = connectionProvider
         self.now = now
         self.makeUUID = makeUUID
@@ -261,10 +270,37 @@ final class ExecutionSyncStore: ObservableObject {
         self.breakDeadlineSleep = breakDeadlineSleep
         self.executionStreamSleep = executionStreamSleep
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
+        observeHabitCompositionReadiness()
         scheduleBreakDeadlineWakeIfNeeded()
     }
 
     var activeSession: DayWeaveExecutionSession? { planner.executionState.activeSession }
+
+    /// Production construction always injects the encrypted habit authority.
+    /// A nil provider exists only as an explicit unit-test seam for legacy
+    /// execution tests; an injected unreadable/incomplete provider fails closed.
+    var habitExecutionStartIsBlocked: Bool {
+        guard let habitCompositionProvider else { return false }
+        guard let configurationIdentifier = planner.canonicalConfigurationIdentifier else {
+            return true
+        }
+        let activeHabitRevisions = Dictionary(uniqueKeysWithValues:
+            planner.canonicalItems.compactMap { item in
+                item.kind == .habit && item.deletedAt == nil
+                    ? (item.id, item.revision) : nil
+            }
+        )
+        return !habitCompositionProvider.habitCompositionCheckpoint.isAuthoritative(
+            for: configurationIdentifier,
+            activeHabitRevisions: activeHabitRevisions
+        )
+    }
+
+    private func observeHabitCompositionReadiness() {
+        habitCompositionProvider?.observeHabitCompositionCheckpointChanges { [weak self] in
+            self?.habitExecutionReadinessGeneration &+= 1
+        }
+    }
 
     var breakAlternativePresentation: BreakAlternativePresentation? {
         guard let source = breakAlternativeHandoffSource else { return nil }
@@ -661,6 +697,15 @@ final class ExecutionSyncStore: ObservableObject {
             guard self.planner.canonicalAuthoringMutation(itemID: itemID) == nil else {
                 throw ExecutionSyncControllerError.invalidLocalState(
                     "Sync or resolve this item's queued edit before starting it."
+                )
+            }
+            // This closure runs on MainActor immediately before the durable
+            // execution journal is built, with no suspension point between the
+            // authority check and persistence. Later/Skip command paths do not
+            // use this fence and remain independently available.
+            guard !self.habitExecutionStartIsBlocked else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "Habit progress is not fully synchronized. Wait for habit recovery before starting a new session."
                 )
             }
             guard !self.executionStartIsBlocked(for: block) else {

@@ -84,21 +84,23 @@ struct DayWeaveMacApp: App {
             journal: store
         )
         _proposalApplications = StateObject(wrappedValue: proposalApplications)
+        let habitSync = HabitSyncStore(authCoordinator: authCoordinator)
+        _habitSync = StateObject(wrappedValue: habitSync)
         let canonicalSync = CanonicalSyncStore(
             planner: store,
-            authCoordinator: authCoordinator
+            authCoordinator: authCoordinator,
+            habitCompositionProvider: habitSync
         )
         _canonicalSync = StateObject(wrappedValue: canonicalSync)
         let executionSync = ExecutionSyncStore(
             planner: store,
+            habitCompositionProvider: habitSync,
             authCoordinator: authCoordinator
         )
         executionSync.installDeferredPublicationCoordinator {
             await canonicalSync.syncThroughFreshComposition()
         }
         _executionSync = StateObject(wrappedValue: executionSync)
-        let habitSync = HabitSyncStore(authCoordinator: authCoordinator)
-        _habitSync = StateObject(wrappedValue: habitSync)
         let googleIntegration = GoogleIntegrationStore(
             authCoordinator: authCoordinator
         )

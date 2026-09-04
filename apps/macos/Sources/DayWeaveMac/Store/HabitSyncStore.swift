@@ -1,4 +1,109 @@
+import CryptoKit
 import Foundation
+
+/// An immutable, read-only scheduling projection of the private habit cache.
+/// Mutation commands and private notes never cross this boundary.
+struct HabitCompositionCheckpoint: Equatable, Sendable {
+    let configurationIdentifier: String?
+    let deltaCursor: String?
+    let deltaCaughtUp: Bool
+    let occurrences: [Occurrence]
+    let pauses: [Pause]
+    let pendingMutationIDs: [UUID]
+    let hasActiveOperation: Bool
+    /// Monotonic in-memory fence. It is intentionally excluded from the
+    /// durable fingerprint but detects a sync that starts and finishes while
+    /// a helper composition is in flight.
+    let operationGeneration: UInt64
+
+    struct Occurrence: Codable, Equatable, Sendable {
+        let id: UUID
+        let habitID: UUID
+        let plannerOccurrenceID: UUID
+        let sourceItemRevision: UInt64
+        let nominalStart: Date
+        let windowStart: Date
+        let windowEnd: Date
+        let expectedDurationSeconds: UInt64?
+        let outcome: Outcome?
+    }
+
+    struct Outcome: Codable, Equatable, Sendable {
+        let revision: UInt64
+        let status: DayWeaveHabitOutcomeStatus
+        let progressBasisPoints: UInt16
+        let occurredAt: Date
+    }
+
+    struct Pause: Codable, Equatable, Sendable {
+        let id: UUID
+        let habitID: UUID
+        let revision: UInt64
+        let startedAt: Date
+        let endedAt: Date?
+    }
+
+    /// Content-free proof stored beside a local schedule. Its payload contains
+    /// only fields consumed by composition and is deterministically ordered.
+    var fingerprint: String? {
+        let payload = FingerprintPayload(
+            configurationIdentifier: configurationIdentifier,
+            deltaCursor: deltaCursor,
+            deltaCaughtUp: deltaCaughtUp,
+            occurrences: occurrences.sorted {
+                $0.id.uuidString < $1.id.uuidString
+            },
+            pauses: pauses.sorted { $0.id.uuidString < $1.id.uuidString },
+            pendingMutationIDs: pendingMutationIDs.sorted { $0.uuidString < $1.uuidString }
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let bytes = try? encoder.encode(payload) else { return nil }
+        return "habit-sha256:" + SHA256.hash(data: bytes).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
+    /// Shared fail-closed authority predicate for composition and execution.
+    /// Historical rows for deleted habits remain harmless, while evidence for
+    /// a currently active habit may never claim a revision the canonical cache
+    /// has not observed.
+    func isAuthoritative(
+        for configurationIdentifier: String,
+        activeHabitRevisions: [UUID: UInt64]
+    ) -> Bool {
+        guard self.configurationIdentifier == configurationIdentifier,
+              deltaCaughtUp,
+              let deltaCursor,
+              DayWeaveHabitCursorContract.isValidTransportToken(deltaCursor),
+              pendingMutationIDs.isEmpty,
+              !hasActiveOperation,
+              fingerprint != nil else { return false }
+        return occurrences.allSatisfy { occurrence in
+            guard let canonicalRevision = activeHabitRevisions[occurrence.habitID] else {
+                return true
+            }
+            return occurrence.sourceItemRevision <= canonicalRevision
+        }
+    }
+
+    private struct FingerprintPayload: Encodable {
+        let configurationIdentifier: String?
+        let deltaCursor: String?
+        let deltaCaughtUp: Bool
+        let occurrences: [Occurrence]
+        let pauses: [Pause]
+        let pendingMutationIDs: [UUID]
+    }
+}
+
+@MainActor
+protocol HabitCompositionCheckpointProviding: AnyObject {
+    var habitCompositionCheckpoint: HabitCompositionCheckpoint { get }
+    func observeHabitCompositionCheckpointChanges(
+        _ observer: @escaping @MainActor () -> Void
+    )
+}
 
 struct DayWeaveHabitConnection: Sendable {
     let configurationIdentifier: String
@@ -75,7 +180,7 @@ private enum HabitSyncControllerError: Error, LocalizedError {
 /// Private notes are released into memory only after `activate` and removed at
 /// every app-lock/background privacy boundary.
 @MainActor
-final class HabitSyncStore: ObservableObject {
+final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProviding {
     static let maximumDeltaPagesPerSync = 1_000
     static let maximumImmediateStreamDrains = 2
 
@@ -107,6 +212,12 @@ final class HabitSyncStore: ObservableObject {
     private var foregroundStreamLatestHintCursor: String?
     private var foregroundStreamUnavailableForActivation = false
     private var foregroundStreamImmediateAttempts = 0
+    /// Set synchronously when SSE reports a different opaque cursor. The
+    /// durable snapshot is also marked incomplete, but this in-memory fence
+    /// closes the interval before that write and survives a write failure.
+    private var foregroundStreamInvalidationPending = false
+    private var compositionCheckpointObservers: [@MainActor () -> Void] = []
+    private var habitCompositionOperationGeneration: UInt64 = 0
 
     init(
         configurationStore: any SuggestionAPIConfigurationStoring =
@@ -176,6 +287,53 @@ final class HabitSyncStore: ObservableObject {
 
     var hasPendingConflict: Bool { pendingMutations.contains(where: \.conflictDetected) }
 
+    var habitCompositionCheckpoint: HabitCompositionCheckpoint {
+        HabitCompositionCheckpoint(
+            configurationIdentifier: snapshot?.configurationIdentifier,
+            deltaCursor: snapshot?.deltaCursor,
+            deltaCaughtUp: (snapshot?.deltaCaughtUp ?? false)
+                && !foregroundStreamInvalidationPending,
+            occurrences: (snapshot?.occurrences ?? []).map { occurrence in
+                .init(
+                    id: occurrence.id,
+                    habitID: occurrence.evidence.habitID,
+                    plannerOccurrenceID: occurrence.evidence.plannerOccurrenceID,
+                    sourceItemRevision: occurrence.evidence.sourceItemRevision,
+                    nominalStart: occurrence.evidence.nominalStart,
+                    windowStart: occurrence.evidence.windowStart,
+                    windowEnd: occurrence.evidence.windowEnd,
+                    expectedDurationSeconds: occurrence.evidence.expectedDurationSeconds,
+                    outcome: occurrence.outcome.map {
+                        .init(
+                            revision: $0.revision,
+                            status: $0.status,
+                            progressBasisPoints: $0.progressBasisPoints,
+                            occurredAt: $0.occurredAt
+                        )
+                    }
+                )
+            },
+            pauses: (snapshot?.pauses ?? []).map {
+                .init(
+                    id: $0.id,
+                    habitID: $0.habitID,
+                    revision: $0.revision,
+                    startedAt: $0.startedAt,
+                    endedAt: $0.endedAt
+                )
+            },
+            pendingMutationIDs: (snapshot?.pendingMutations ?? []).map(\.id),
+            hasActiveOperation: operationID != nil,
+            operationGeneration: habitCompositionOperationGeneration
+        )
+    }
+
+    func observeHabitCompositionCheckpointChanges(
+        _ observer: @escaping @MainActor () -> Void
+    ) {
+        compositionCheckpointObservers.append(observer)
+    }
+
     func canonicalOccurrence(for block: ScheduleBlock) -> DayWeaveHabitOccurrence? {
         guard block.kind == .habit,
               let habitID = block.sourceItemID,
@@ -184,7 +342,7 @@ final class HabitSyncStore: ObservableObject {
         return occurrences.first { occurrence in
             occurrence.evidence.habitID == habitID
                 && occurrence.evidence.plannerOccurrenceID == plannerOccurrenceID
-                && occurrence.evidence.sourceItemRevision == itemRevision
+                && occurrence.evidence.sourceItemRevision <= itemRevision
         }
     }
 
@@ -221,7 +379,7 @@ final class HabitSyncStore: ObservableObject {
     func activate() async -> HabitSyncOutcome {
         guard operationID == nil else { return .unexpectedFailure }
         let operation = makeUUID()
-        operationID = operation
+        beginOperation(operation)
         let expectedGeneration = generation
         status = .init(phase: .syncing, message: "Restoring encrypted habit progress…")
         defer { releaseOperation(operation) }
@@ -238,7 +396,7 @@ final class HabitSyncStore: ObservableObject {
                storedBinding != connection.configurationIdentifier,
                !restored.pendingMutations.isEmpty {
                 clearInMemoryPrivateData()
-                snapshot = nil
+                install(nil)
                 lastSyncedAt = nil
                 status = .init(
                     phase: .attentionRequired,
@@ -251,15 +409,16 @@ final class HabitSyncStore: ObservableObject {
                 install(restored)
             } else {
                 clearInMemoryPrivateData()
-                snapshot = .init(
+                install(.init(
                     savedAt: now(),
                     configurationIdentifier: connection.configurationIdentifier,
                     deltaCursor: nil,
+                    deltaCaughtUp: false,
                     occurrences: [],
                     pauses: [],
                     analytics: [],
                     pendingMutations: []
-                )
+                ))
             }
 
             try await replayPendingMutations(using: connection, operation: operation)
@@ -281,7 +440,7 @@ final class HabitSyncStore: ObservableObject {
         guard snapshot != nil else { return await activate() }
         guard operationID == nil else { return .unexpectedFailure }
         let operation = makeUUID()
-        operationID = operation
+        beginOperation(operation)
         status = .init(phase: .syncing, message: "Syncing habit progress…")
         defer { releaseOperation(operation) }
         do {
@@ -440,6 +599,10 @@ final class HabitSyncStore: ObservableObject {
         }
         candidate = replacing(
             candidate,
+            // A reviewed conflict may have been restored from a snapshot
+            // written by an older client. Removing the final journal is not
+            // itself proof that the server ledger is terminally caught up.
+            deltaCaughtUp: false,
             pendingMutations: candidate.pendingMutations.filter { $0.id != id }
         )
         do {
@@ -460,7 +623,7 @@ final class HabitSyncStore: ObservableObject {
         guard operationID == nil, !habitIDs.isEmpty else { return .unexpectedFailure }
         let uniqueIDs = Array(Set(habitIDs)).sorted { $0.uuidString < $1.uuidString }
         let operation = makeUUID()
-        operationID = operation
+        beginOperation(operation)
         status = .init(phase: .syncing, message: "Calculating private habit trends…")
         defer { releaseOperation(operation) }
         do {
@@ -495,17 +658,21 @@ final class HabitSyncStore: ObservableObject {
     }
 
     func suspendForPrivacyBoundary() {
+        let priorCheckpoint = habitCompositionCheckpoint
         stopForegroundPolling()
         generation &+= 1
+        habitCompositionOperationGeneration &+= 1
         operationID = nil
+        foregroundStreamInvalidationPending = false
         clearInMemoryPrivateData()
-        snapshot = nil
+        install(nil)
         persistenceRevision = .missing
         lastSyncedAt = nil
         status = .init(
             phase: .locked,
             message: "Unlock DayWeave to load private habit progress."
         )
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
     }
 
     func startForegroundPolling(every interval: Duration) {
@@ -556,6 +723,7 @@ final class HabitSyncStore: ObservableObject {
               foregroundStreamTask == nil,
               !foregroundStreamUnavailableForActivation,
               let current = snapshot,
+              current.deltaCaughtUp,
               let durableCursor = current.deltaCursor,
               DayWeaveHabitCursorContract.isValidTransportToken(durableCursor),
               let connection = try? connectionProvider(),
@@ -584,6 +752,7 @@ final class HabitSyncStore: ObservableObject {
             guard let current = snapshot,
                   current.configurationIdentifier == connection.configurationIdentifier,
                   connectionIsCurrent(connection),
+                  current.deltaCaughtUp,
                   let durableCursor = current.deltaCursor,
                   DayWeaveHabitCursorContract.isValidTransportToken(durableCursor),
                   let streamTransport = connection.streamTransport else { return }
@@ -640,8 +809,22 @@ final class HabitSyncStore: ObservableObject {
             return
         }
         if cursor == snapshot?.deltaCursor { return }
+        let priorCheckpoint = habitCompositionCheckpoint
         foregroundStreamObservationGeneration &+= 1
         foregroundStreamLatestHintCursor = cursor
+        foregroundStreamInvalidationPending = true
+        if let current = snapshot, current.deltaCaughtUp {
+            // The hint is never installed as a cursor. It only revokes the
+            // terminal verdict until an authoritative delta reaches a terminal
+            // page. Persisting that revocation makes process death fail closed.
+            do {
+                try persist(replacing(current, deltaCaughtUp: false))
+            } catch {
+                // The process-local flag above still prevents composition. The
+                // normal drain reports/retries the underlying storage failure.
+            }
+        }
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
         enqueueForegroundStreamDrain(generation: generation)
     }
 
@@ -665,8 +848,9 @@ final class HabitSyncStore: ObservableObject {
             let targetGeneration = foregroundStreamObservationGeneration
             guard targetGeneration > foregroundStreamReconciledGeneration else { return }
             if foregroundStreamLatestHintCursor == snapshot?.deltaCursor {
-                foregroundStreamReconciledGeneration = foregroundStreamObservationGeneration
-                foregroundStreamLatestHintCursor = nil
+                reconcileForegroundInvalidations(
+                    through: foregroundStreamObservationGeneration
+                )
                 continue
             }
             guard operationID == nil,
@@ -682,13 +866,14 @@ final class HabitSyncStore: ObservableObject {
             if foregroundStreamLatestHintCursor == snapshot?.deltaCursor {
                 // Exact equality is the only relationship inferred between
                 // opaque tokens. It also covers hints received in flight.
-                foregroundStreamReconciledGeneration = foregroundStreamObservationGeneration
-                foregroundStreamLatestHintCursor = nil
+                reconcileForegroundInvalidations(
+                    through: foregroundStreamObservationGeneration
+                )
             } else {
                 // A fully drained authoritative delta covers the observation
                 // captured before this request. A newer in-flight observation
                 // receives one separately bounded immediate drain.
-                foregroundStreamReconciledGeneration = targetGeneration
+                reconcileForegroundInvalidations(through: targetGeneration)
             }
         }
     }
@@ -721,11 +906,20 @@ final class HabitSyncStore: ObservableObject {
     }
 
     private func releaseOperation(_ operation: UUID) {
+        let priorCheckpoint = habitCompositionCheckpoint
         if operationID == operation { operationID = nil }
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
         guard foregroundStreamObservationGeneration > foregroundStreamReconciledGeneration else {
             return
         }
         enqueueForegroundStreamDrain(generation: foregroundStreamGeneration)
+    }
+
+    private func beginOperation(_ operation: UUID) {
+        let priorCheckpoint = habitCompositionCheckpoint
+        habitCompositionOperationGeneration &+= 1
+        operationID = operation
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
     }
 
     private func enqueueAndExecute(
@@ -735,7 +929,7 @@ final class HabitSyncStore: ObservableObject {
             return .unexpectedFailure
         }
         let operation = pending.id
-        operationID = operation
+        beginOperation(operation)
         status = .init(phase: .syncing, message: "Saving this habit update securely…")
         defer { releaseOperation(operation) }
         do {
@@ -745,6 +939,7 @@ final class HabitSyncStore: ObservableObject {
             }
             candidate = replacing(
                 candidate,
+                analytics: candidate.analytics.filter { $0.habitID != pending.habitID },
                 pendingMutations: candidate.pendingMutations + [pending]
             )
             try persist(candidate)
@@ -754,9 +949,8 @@ final class HabitSyncStore: ObservableObject {
         } catch {
             if isConflict(error), let current = snapshot,
                let index = current.pendingMutations.firstIndex(where: { $0.id == pending.id }) {
-                var blocked = current.pendingMutations
-                blocked[index] = blocked[index].markingConflict()
-                do { try persist(replacing(current, pendingMutations: blocked)) } catch { return handle(error) }
+                do { try markPendingConflict(current.pendingMutations[index].id) }
+                catch { return handle(error) }
                 status = .init(
                     phase: .attentionRequired,
                     message: "This habit changed on another device. Review the current progress before replacing it."
@@ -793,7 +987,11 @@ final class HabitSyncStore: ObservableObject {
         }
         var blocked = current.pendingMutations
         blocked[index] = blocked[index].markingConflict()
-        try persist(replacing(current, pendingMutations: blocked))
+        try persist(replacing(
+            current,
+            deltaCaughtUp: false,
+            pendingMutations: blocked
+        ))
     }
 
     private func execute(
@@ -803,6 +1001,13 @@ final class HabitSyncStore: ObservableObject {
     ) async throws {
         switch pending {
         case let .outcome(value):
+            guard let prior = snapshot?.occurrences.first(where: {
+                $0.id == value.occurrenceID
+            }),
+                prior.evidence.habitID == value.habitID,
+                (prior.outcome?.revision ?? 0) == value.command.expectedRevision else {
+                throw HabitSyncControllerError.protocolFailure
+            }
             let response = try await connection.transport.putHabitOutcome(
                 habitID: value.habitID,
                 occurrenceID: value.occurrenceID,
@@ -810,8 +1015,12 @@ final class HabitSyncStore: ObservableObject {
                 idempotencyKey: value.idempotencyKey
             )
             try assertCurrent(operation: operation, connection: connection)
-            guard snapshot?.occurrences.first(where: { $0.id == value.occurrenceID })?
-                .evidence == response.occurrence.evidence else {
+            let nextRevision = value.command.expectedRevision.addingReportingOverflow(1)
+            guard !nextRevision.overflow,
+                  prior.evidence == response.occurrence.evidence,
+                  let received = response.occurrence.outcome,
+                  received.revision == nextRevision.partialValue,
+                  received.input == value.command.outcome else {
                 throw HabitSyncControllerError.protocolFailure
             }
             try commitMutation(pending.id, occurrence: response.occurrence, pause: nil)
@@ -822,10 +1031,21 @@ final class HabitSyncStore: ObservableObject {
                 idempotencyKey: value.idempotencyKey
             )
             try assertCurrent(operation: operation, connection: connection)
+            let nextRevision = value.command.expectedRevision.addingReportingOverflow(1)
+            guard response.pause.id == value.command.pauseID,
+                  response.pause.habitID == value.habitID,
+                  !nextRevision.overflow,
+                  response.pause.revision == nextRevision.partialValue,
+                  response.pause.startedAt == value.command.startedAt,
+                  response.pause.endedAt == nil else {
+                throw HabitSyncControllerError.protocolFailure
+            }
             try commitMutation(pending.id, occurrence: nil, pause: response.pause)
         case let .pauseResume(value):
             guard let prior = snapshot?.pauses.first(where: { $0.id == value.pauseID }),
-                  prior.endedAt == nil else {
+                  prior.habitID == value.habitID,
+                  prior.endedAt == nil,
+                  prior.revision == value.command.expectedRevision else {
                 throw HabitSyncControllerError.protocolFailure
             }
             let response = try await connection.transport.resumeHabitPause(
@@ -835,7 +1055,13 @@ final class HabitSyncStore: ObservableObject {
                 idempotencyKey: value.idempotencyKey
             )
             try assertCurrent(operation: operation, connection: connection)
-            guard response.pause.startedAt == prior.startedAt,
+            let nextRevision = value.command.expectedRevision.addingReportingOverflow(1)
+            guard !nextRevision.overflow,
+                  response.pause.id == value.pauseID,
+                  response.pause.habitID == value.habitID,
+                  response.pause.revision == nextRevision.partialValue,
+                  response.pause.endedAt == value.command.endedAt,
+                  response.pause.startedAt == prior.startedAt,
                   response.pause.createdAt == prior.createdAt,
                   response.pause.preservesStreak == prior.preservesStreak else {
                 throw HabitSyncControllerError.protocolFailure
@@ -857,11 +1083,20 @@ final class HabitSyncStore: ObservableObject {
         if let occurrence { occurrenceIndex[occurrence.id] = occurrence }
         var pauseIndex = Dictionary(uniqueKeysWithValues: candidate.pauses.map { ($0.id, $0) })
         if let pause { pauseIndex[pause.id] = pause }
+        let remainingMutations = candidate.pendingMutations.filter { $0.id != operationID }
+        let retentionDate = now()
         candidate = replacing(
             candidate,
-            occurrences: boundedOccurrences(Array(occurrenceIndex.values)),
-            pauses: boundedPauses(Array(pauseIndex.values)),
-            pendingMutations: candidate.pendingMutations.filter { $0.id != operationID }
+            occurrences: try Self.retainedOccurrences(
+                Array(occurrenceIndex.values),
+                pendingMutations: remainingMutations,
+                referenceDate: retentionDate
+            ),
+            pauses: try Self.retainedPauses(
+                Array(pauseIndex.values),
+                pendingMutations: remainingMutations
+            ),
+            pendingMutations: remainingMutations
         )
         try persist(candidate)
     }
@@ -874,11 +1109,20 @@ final class HabitSyncStore: ObservableObject {
         while true {
             guard pages < Self.maximumDeltaPagesPerSync,
                   let current = snapshot else { throw HabitSyncControllerError.protocolFailure }
+            let observedInvalidationGeneration = foregroundStreamObservationGeneration
             let page = try await connection.transport.habitDelta(
                 cursor: current.deltaCursor,
                 limit: 200
             )
             try assertCurrent(operation: operation, connection: connection)
+            // A successful authoritative response proves that the previously
+            // terminal cache may be stale. Revoke process-local authority
+            // before validating or persisting the page; only a committed
+            // terminal candidate below may restore it. This also covers a CAS
+            // or storage failure from `persist(candidate)` itself.
+            let checkpointBeforePage = habitCompositionCheckpoint
+            foregroundStreamInvalidationPending = true
+            notifyCompositionCheckpointObservers(ifChangedFrom: checkpointBeforePage)
             guard !page.hasMore || page.nextCursor != current.deltaCursor else {
                 throw HabitSyncControllerError.protocolFailure
             }
@@ -909,17 +1153,59 @@ final class HabitSyncStore: ObservableObject {
                     pauseIndex[value.id] = value
                 }
             }
-            let candidate = replacing(
-                current,
-                deltaCursor: page.nextCursor,
-                occurrences: boundedOccurrences(Array(occurrenceIndex.values)),
-                pauses: boundedPauses(Array(pauseIndex.values))
-            )
+            let observationsAtCommit = foregroundStreamObservationGeneration
+            let receivedObservationInFlight =
+                observationsAtCommit > observedInvalidationGeneration
+            // Opaque stream cursors have no ordering relationship. A terminal
+            // page can cover observations that predated its request, but an
+            // observation received while the request was in flight is covered
+            // only by exact equality with that observation's latest cursor.
+            let coversInFlightObservations = !receivedObservationInFlight
+                || page.nextCursor == foregroundStreamLatestHintCursor
+            let terminalCaughtUp = !page.hasMore && coversInFlightObservations
+            let candidate: DayWeaveHabitClientSnapshot
+            do {
+                candidate = replacing(
+                    current,
+                    deltaCursor: page.nextCursor,
+                    deltaCaughtUp: terminalCaughtUp,
+                    occurrences: try Self.retainedOccurrences(
+                        Array(occurrenceIndex.values),
+                        pendingMutations: current.pendingMutations,
+                        referenceDate: now()
+                    ),
+                    pauses: try Self.retainedPauses(
+                        Array(pauseIndex.values),
+                        pendingMutations: current.pendingMutations
+                    )
+                )
+            } catch {
+                // Once a new authoritative page has been observed, an older
+                // terminal snapshot cannot remain composition-authoritative if
+                // the page cannot be retained safely.
+                if current.deltaCaughtUp {
+                    let priorCheckpoint = habitCompositionCheckpoint
+                    foregroundStreamInvalidationPending = true
+                    try? persist(replacing(current, deltaCaughtUp: false))
+                    notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
+                }
+                throw error
+            }
             // The complete page and its opaque cursor share one encrypted CAS
             // commit. A crash can replay the page, but can never skip it.
             try persist(candidate)
             pages += 1
-            if !page.hasMore { return }
+            if !page.hasMore {
+                reconcileForegroundInvalidations(
+                    through: coversInFlightObservations
+                        ? observationsAtCommit : observedInvalidationGeneration
+                )
+                if terminalCaughtUp { return }
+                // The terminal page raced a newer opaque observation and did
+                // not prove it covered that observation. Its cursor is durable
+                // but incomplete; fetch from it before reporting success.
+                continue
+            }
         }
     }
 
@@ -931,12 +1217,34 @@ final class HabitSyncStore: ObservableObject {
         install(saved)
     }
 
-    private func install(_ value: DayWeaveHabitClientSnapshot) {
+    private func install(_ value: DayWeaveHabitClientSnapshot?) {
+        let priorCheckpoint = habitCompositionCheckpoint
         snapshot = value
-        occurrences = value.occurrences
-        pauses = value.pauses
-        analytics = value.analytics
-        pendingMutations = value.pendingMutations
+        occurrences = value?.occurrences ?? []
+        pauses = value?.pauses ?? []
+        analytics = value?.analytics ?? []
+        pendingMutations = value?.pendingMutations ?? []
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
+    }
+
+    private func notifyCompositionCheckpointObservers(
+        ifChangedFrom priorCheckpoint: HabitCompositionCheckpoint
+    ) {
+        guard priorCheckpoint != habitCompositionCheckpoint else { return }
+        compositionCheckpointObservers.forEach { $0() }
+    }
+
+    private func reconcileForegroundInvalidations(through generation: UInt64) {
+        let priorCheckpoint = habitCompositionCheckpoint
+        foregroundStreamReconciledGeneration = max(
+            foregroundStreamReconciledGeneration,
+            generation
+        )
+        if foregroundStreamReconciledGeneration >= foregroundStreamObservationGeneration {
+            foregroundStreamLatestHintCursor = nil
+            foregroundStreamInvalidationPending = false
+        }
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
     }
 
     private func clearInMemoryPrivateData() {
@@ -963,6 +1271,7 @@ final class HabitSyncStore: ObservableObject {
         savedAt: Date? = nil,
         configurationIdentifier: String? = nil,
         deltaCursor: String? = nil,
+        deltaCaughtUp: Bool? = nil,
         occurrences: [DayWeaveHabitOccurrence]? = nil,
         pauses: [DayWeaveHabitPause]? = nil,
         analytics: [DayWeaveHabitAnalytics]? = nil,
@@ -972,6 +1281,7 @@ final class HabitSyncStore: ObservableObject {
             savedAt: savedAt ?? value.savedAt,
             configurationIdentifier: configurationIdentifier ?? value.configurationIdentifier,
             deltaCursor: deltaCursor ?? value.deltaCursor,
+            deltaCaughtUp: deltaCaughtUp ?? value.deltaCaughtUp,
             occurrences: occurrences ?? value.occurrences,
             pauses: pauses ?? value.pauses,
             analytics: analytics ?? value.analytics,
@@ -979,22 +1289,111 @@ final class HabitSyncStore: ObservableObject {
         )
     }
 
-    private func boundedOccurrences(
-        _ values: [DayWeaveHabitOccurrence]
-    ) -> [DayWeaveHabitOccurrence] {
-        Array(values.sorted {
+    static func retainedOccurrences(
+        _ values: [DayWeaveHabitOccurrence],
+        pendingMutations: [DayWeavePendingHabitMutation],
+        referenceDate: Date = Date(),
+        limit: Int = DayWeaveHabitClientSnapshot.maximumOccurrences
+    ) throws -> [DayWeaveHabitOccurrence] {
+        guard limit >= 0 else { throw HabitSyncControllerError.protocolFailure }
+        let ordered = values.sorted {
             if $0.evidence.nominalStart == $1.evidence.nominalStart {
                 return $0.id.uuidString < $1.id.uuidString
             }
             return $0.evidence.nominalStart < $1.evidence.nominalStart
-        }.suffix(DayWeaveHabitClientSnapshot.maximumOccurrences))
+        }
+        guard ordered.count > limit else {
+            return ordered
+        }
+        let mandatoryIDs = Set(pendingMutations.compactMap { mutation -> UUID? in
+            guard case let .outcome(value) = mutation else { return nil }
+            return value.occurrenceID
+        })
+        var retained: [UUID: DayWeaveHabitOccurrence] = [:]
+        for value in ordered.reversed() where mandatoryIDs.contains(value.id) {
+            retained[value.id] = value
+        }
+        guard retained.count <= limit else {
+            throw HabitSyncControllerError.protocolFailure
+        }
+        // Protect the complete scheduling neighborhood before allocating any
+        // capacity to historical completion anchors. Without this reservation,
+        // one old completion from many deleted habits can crowd every current
+        // occurrence out of an otherwise terminal cache.
+        let compositionStart = referenceDate.addingTimeInterval(-24 * 60 * 60)
+        let compositionEnd = referenceDate.addingTimeInterval(8 * 24 * 60 * 60)
+        let compositionRows = ordered.filter {
+            $0.evidence.windowEnd > compositionStart
+                && $0.evidence.windowStart < compositionEnd
+        }
+        // Every completed occurrence remains an authoritative fallback anchor.
+        // A later completion can be corrected to partial/skipped, at which
+        // point an older completion becomes the streak anchor again. Until the
+        // wire contract provides a compact correction-safe anchor, no completed
+        // row may be evicted silently.
+        let completedRows = ordered.filter { $0.outcome?.status == .completed }
+        let requiredIDs = mandatoryIDs
+            .union(compositionRows.map(\.id))
+            .union(completedRows.map(\.id))
+        guard requiredIDs.count <= limit else {
+            throw HabitSyncControllerError.protocolFailure
+        }
+        for value in compositionRows.reversed() {
+            retained[value.id] = value
+        }
+        for value in completedRows.sorted(by: {
+            ($0.outcome?.occurredAt ?? .distantPast) > ($1.outcome?.occurredAt ?? .distantPast)
+        }) {
+            retained[value.id] = value
+        }
+        for value in ordered.reversed()
+            where retained.count < limit {
+            retained[value.id] = value
+        }
+        guard mandatoryIDs.allSatisfy({ id in
+            !ordered.contains(where: { $0.id == id }) || retained[id] != nil
+        }) else { throw HabitSyncControllerError.protocolFailure }
+        return retained.values.sorted {
+            if $0.evidence.nominalStart == $1.evidence.nominalStart {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            return $0.evidence.nominalStart < $1.evidence.nominalStart
+        }
     }
 
-    private func boundedPauses(_ values: [DayWeaveHabitPause]) -> [DayWeaveHabitPause] {
-        Array(values.sorted {
+    static func retainedPauses(
+        _ values: [DayWeaveHabitPause],
+        pendingMutations: [DayWeavePendingHabitMutation],
+        limit: Int = DayWeaveHabitClientSnapshot.maximumPauses
+    ) throws -> [DayWeaveHabitPause] {
+        guard limit >= 0 else { throw HabitSyncControllerError.protocolFailure }
+        let ordered = values.sorted {
             if $0.startedAt == $1.startedAt { return $0.id.uuidString < $1.id.uuidString }
             return $0.startedAt < $1.startedAt
-        }.suffix(DayWeaveHabitClientSnapshot.maximumPauses))
+        }
+        guard ordered.count > limit else { return ordered }
+        let mandatoryIDs = Set(pendingMutations.compactMap { mutation -> UUID? in
+            guard case let .pauseResume(value) = mutation else { return nil }
+            return value.pauseID
+        }).union(ordered.compactMap { $0.endedAt == nil ? $0.id : nil })
+        guard mandatoryIDs.count <= limit else {
+            throw HabitSyncControllerError.protocolFailure
+        }
+        var retained: [UUID: DayWeaveHabitPause] = [:]
+        for value in ordered.reversed() where mandatoryIDs.contains(value.id) {
+            retained[value.id] = value
+        }
+        for value in ordered.reversed()
+            where retained.count < limit {
+            retained[value.id] = value
+        }
+        guard mandatoryIDs.allSatisfy({ id in
+            !ordered.contains(where: { $0.id == id }) || retained[id] != nil
+        }) else { throw HabitSyncControllerError.protocolFailure }
+        return retained.values.sorted {
+            if $0.startedAt == $1.startedAt { return $0.id.uuidString < $1.id.uuidString }
+            return $0.startedAt < $1.startedAt
+        }
     }
 
     private func canonicalMutationDate(_ value: Date, relativeTo anchor: Date) -> Date? {
@@ -1027,7 +1426,7 @@ final class HabitSyncStore: ObservableObject {
             // after the API origin or credential binding changes. The old
             // encrypted snapshot remains untouched for an exact restoration.
             clearInMemoryPrivateData()
-            snapshot = nil
+            install(nil)
             lastSyncedAt = nil
             outcome = .configurationChanged
             phase = .attentionRequired

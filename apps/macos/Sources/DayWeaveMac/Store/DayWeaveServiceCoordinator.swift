@@ -66,7 +66,7 @@ protocol HabitServiceSynchronizing: AnyObject {
 extension HabitSyncStore: HabitServiceSynchronizing {}
 
 /// Owns the foreground-service lifecycle so automatic and user-requested
-/// proposal recovery resume the same execution -> canonical -> polling order.
+/// proposal recovery resume the same execution -> habit -> canonical -> polling order.
 /// A failed startup recovery releases the activation state instead of leaving
 /// the app permanently marked active with its synchronizers stopped.
 @MainActor
@@ -196,6 +196,10 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         guard operationIsCurrent(generation) else { return false }
         let executionOutcome = await executionSync.refresh()
         guard operationIsCurrent(generation) else { return false }
+        if let habitSync {
+            _ = await habitSync.activate()
+            guard operationIsCurrent(generation) else { return false }
+        }
         if executionOutcome == .success, canonicalSync.isConfigured {
             _ = await canonicalSync.bootstrapForegroundActivation()
             guard operationIsCurrent(generation) else { return false }
@@ -209,8 +213,6 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         }
         guard operationIsCurrent(generation) else { return false }
         if let habitSync {
-            _ = await habitSync.activate()
-            guard operationIsCurrent(generation) else { return false }
             habitSync.startForegroundPolling(every: .seconds(30))
         }
         guard operationIsCurrent(generation) else { return false }

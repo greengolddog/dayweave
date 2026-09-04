@@ -1041,12 +1041,35 @@ struct DayWeaveOnboardingFirstItemAnchor: Equatable, Codable, Sendable {
 struct LocalScheduleCompositionProvenance: Equatable, Codable, Sendable {
     let configurationIdentifier: String
     let localInputFingerprint: String
+    let habitCheckpointFingerprint: String?
     let generatedAt: Date
     let asOf: Date
     let horizonStart: Date
     let horizonEnd: Date
     let timezoneName: String
     let sourceItemRevisions: [UUID: UInt64]
+
+    init(
+        configurationIdentifier: String,
+        localInputFingerprint: String,
+        generatedAt: Date,
+        asOf: Date,
+        horizonStart: Date,
+        horizonEnd: Date,
+        timezoneName: String,
+        sourceItemRevisions: [UUID: UInt64],
+        habitCheckpointFingerprint: String? = nil
+    ) {
+        self.configurationIdentifier = configurationIdentifier
+        self.localInputFingerprint = localInputFingerprint
+        self.habitCheckpointFingerprint = habitCheckpointFingerprint
+        self.generatedAt = generatedAt
+        self.asOf = asOf
+        self.horizonStart = horizonStart
+        self.horizonEnd = horizonEnd
+        self.timezoneName = timezoneName
+        self.sourceItemRevisions = sourceItemRevisions
+    }
 
     var hasValidShape: Bool {
         let prefix = "local-sha256:"
@@ -1056,6 +1079,7 @@ struct LocalScheduleCompositionProvenance: Equatable, Codable, Sendable {
             && digest.utf8.allSatisfy {
                 (48...57).contains($0) || (97...102).contains($0)
             }
+            && (habitCheckpointFingerprint.map(Self.isValidHabitFingerprint) ?? true)
             && !configurationIdentifier.isEmpty
             && configurationIdentifier.utf8.count <= 4_096
             && !configurationIdentifier.unicodeScalars.contains(
@@ -1069,6 +1093,16 @@ struct LocalScheduleCompositionProvenance: Equatable, Codable, Sendable {
             && TimeZone(identifier: timezoneName) != nil
             && sourceItemRevisions.count <= 10_000
             && sourceItemRevisions.values.allSatisfy { $0 > 0 }
+    }
+
+    private static func isValidHabitFingerprint(_ value: String) -> Bool {
+        let prefix = "habit-sha256:"
+        let digest = value.dropFirst(prefix.count)
+        return value.hasPrefix(prefix)
+            && digest.count == 64
+            && digest.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
     }
 }
 

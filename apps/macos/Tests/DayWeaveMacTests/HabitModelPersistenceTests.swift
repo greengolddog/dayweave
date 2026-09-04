@@ -241,6 +241,115 @@ struct HabitModelPersistenceTests {
         }
     }
 
+    @Test("legacy snapshots reset their tail cursor for correction-safe full replay")
+    func legacySnapshotMigratesDeltaCaughtUpFailClosed() throws {
+        let snapshot = Self.snapshot(binding: "origin-a|auth=device-a", note: "private")
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: Self.encoder().encode(snapshot))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "deltaCaughtUp")
+        let legacy = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+
+        let restored = try Self.decoder().decode(DayWeaveHabitClientSnapshot.self, from: legacy)
+
+        #expect(restored.deltaCursor == nil)
+        #expect(!restored.deltaCaughtUp)
+        #expect(restored.hasValidShape)
+    }
+
+    @Test("a terminal pagination verdict requires a durable cursor")
+    func terminalDeltaRequiresCursor() {
+        let invalid = DayWeaveHabitClientSnapshot(
+            savedAt: Self.date("2026-09-04T12:31:00.123456Z"),
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: nil,
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [],
+            analytics: [],
+            pendingMutations: []
+        )
+        #expect(!invalid.hasValidShape)
+    }
+
+    @Test("unresolved outbox relations fail closed while reviewed conflicts remain recoverable")
+    func outboxRelationsAndReviewedConflict() {
+        let valid = Self.snapshot(binding: "origin-a|auth=device-a", note: nil)
+        let pending = valid.pendingMutations[0]
+        let missingTarget = DayWeaveHabitClientSnapshot(
+            savedAt: valid.savedAt,
+            configurationIdentifier: valid.configurationIdentifier,
+            deltaCursor: valid.deltaCursor,
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [pending]
+        )
+        #expect(!missingTarget.hasValidShape)
+
+        let reviewed = DayWeaveHabitClientSnapshot(
+            savedAt: valid.savedAt,
+            configurationIdentifier: valid.configurationIdentifier,
+            deltaCursor: valid.deltaCursor,
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [pending.markingConflict()]
+        )
+        #expect(reviewed.hasValidShape)
+    }
+
+    @Test("overlapping and multiply-open pause histories are rejected")
+    func pauseTopologyFailsClosed() {
+        let habitID = UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!
+        let start = Self.date("2026-09-04T08:00:00.000000Z")
+        let firstOpen = Self.pause(id: UUID(), habitID: habitID, startedAt: start)
+        let secondOpen = Self.pause(
+            id: UUID(),
+            habitID: habitID,
+            startedAt: start.addingTimeInterval(3_600)
+        )
+        let multipleOpen = DayWeaveHabitClientSnapshot(
+            savedAt: Self.date("2026-09-04T12:31:00.123456Z"),
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "aGVhZDox",
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [firstOpen, secondOpen],
+            analytics: [],
+            pendingMutations: []
+        )
+        #expect(!multipleOpen.hasValidShape)
+
+        let overlapping = DayWeaveHabitClientSnapshot(
+            savedAt: multipleOpen.savedAt,
+            configurationIdentifier: multipleOpen.configurationIdentifier,
+            deltaCursor: multipleOpen.deltaCursor,
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [
+                Self.pause(
+                    id: UUID(),
+                    habitID: habitID,
+                    startedAt: start,
+                    endedAt: start.addingTimeInterval(7_200)
+                ),
+                Self.pause(
+                    id: UUID(),
+                    habitID: habitID,
+                    startedAt: start.addingTimeInterval(3_600),
+                    endedAt: start.addingTimeInterval(10_800)
+                ),
+            ],
+            analytics: [],
+            pendingMutations: []
+        )
+        #expect(!overlapping.hasValidShape)
+    }
+
     @Test("symlink substitution is rejected before encrypted bytes are read")
     func symlinkReadRejected() throws {
         let context = try Context()
@@ -296,6 +405,7 @@ struct HabitModelPersistenceTests {
             savedAt: date("2026-09-04T12:31:00.123456Z"),
             configurationIdentifier: binding,
             deltaCursor: "aGVhZDox",
+            deltaCaughtUp: true,
             occurrences: [occurrence],
             pauses: [],
             analytics: [],
@@ -336,6 +446,34 @@ struct HabitModelPersistenceTests {
                 updatedAt: date("2026-09-04T12:31:00.123456Z")
             )
         )
+    }
+
+    private static func pause(
+        id: UUID,
+        habitID: UUID,
+        startedAt: Date,
+        endedAt: Date? = nil
+    ) -> DayWeaveHabitPause {
+        .init(
+            id: id,
+            habitID: habitID,
+            revision: 1,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            preservesStreak: true,
+            createdAt: startedAt,
+            updatedAt: endedAt ?? startedAt
+        )
+    }
+
+    private static func encoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(CanonicalRFC3339Instant(date: date)!.canonicalUTCString)
+        }
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
     }
 
     private static func decoder() -> JSONDecoder {
