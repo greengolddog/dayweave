@@ -35,6 +35,15 @@ pub const MAX_HABIT_QUANTITY_UNIT_BYTES: usize = 128;
 /// Largest absolute quantitative value accepted as occurrence evidence.
 pub const MAX_HABIT_QUANTITY: i64 = 1_000_000_000_000;
 
+/// Returns whether a quantitative unit label is safe to persist and exchange.
+///
+/// Length is measured in Unicode scalar values rather than bytes or grapheme
+/// clusters so every client and service can apply the same portable bound.
+#[must_use]
+pub fn is_valid_habit_quantity_unit(value: &str) -> bool {
+    valid_text(value, MAX_HABIT_QUANTITY_UNIT_CHARS, false)
+}
+
 /// Largest actual elapsed time accepted for one occurrence (366 days).
 pub const MAX_HABIT_ACTUAL_SECONDS: u64 = 366 * 24 * 60 * 60;
 
@@ -137,7 +146,7 @@ impl HabitQuantityProgress {
         if self.amount.unsigned_abs() > MAX_HABIT_QUANTITY as u64 {
             return Err(HabitOccurrenceError::InvalidQuantity);
         }
-        if !valid_text(&self.unit, MAX_HABIT_QUANTITY_UNIT_CHARS, true) {
+        if !is_valid_habit_quantity_unit(&self.unit) || self.unit.trim() != self.unit {
             return Err(HabitOccurrenceError::InvalidQuantityUnit);
         }
         Ok(())

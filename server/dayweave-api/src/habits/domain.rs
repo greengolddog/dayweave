@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike as _, Duration, NaiveDate, Utc};
+use dayweave_core::is_valid_habit_quantity_unit;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -8,8 +9,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub const MAX_HABIT_NOTE_CHARS: usize = 10_000;
-pub const MAX_HABIT_UNIT_CHARS: usize = 200;
-pub const MAX_HABIT_QUANTITY: i64 = 1_000_000_000_000;
+pub const MAX_HABIT_UNIT_CHARS: usize = dayweave_core::MAX_HABIT_QUANTITY_UNIT_CHARS;
+pub const MAX_HABIT_QUANTITY: i64 = dayweave_core::MAX_HABIT_QUANTITY;
 pub const MAX_HABIT_ACTUAL_SECONDS: u64 = 366 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -98,9 +99,12 @@ impl HabitOutcomeInput {
         {
             return Err(HabitDomainError::InvalidQuantity);
         }
-        if let Some(unit) = self.unit.as_deref() {
-            validate_text(unit, MAX_HABIT_UNIT_CHARS, false)
-                .map_err(|()| HabitDomainError::InvalidUnit)?;
+        if self
+            .unit
+            .as_deref()
+            .is_some_and(|unit| !is_valid_habit_quantity_unit(unit))
+        {
+            return Err(HabitDomainError::InvalidUnit);
         }
         if self
             .actual_seconds

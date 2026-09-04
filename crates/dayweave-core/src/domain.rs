@@ -493,6 +493,18 @@ pub struct QuantityTarget {
     pub unit: String,
 }
 
+impl QuantityTarget {
+    /// Whether this target satisfies the canonical persistence contract.
+    ///
+    /// Unit labels are bounded by Unicode scalar count and cannot be blank or
+    /// contain control characters. Surrounding whitespace remains valid for
+    /// compatibility with already persisted targets.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.amount > 0 && crate::habits::is_valid_habit_quantity_unit(&self.unit)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Recurrence {

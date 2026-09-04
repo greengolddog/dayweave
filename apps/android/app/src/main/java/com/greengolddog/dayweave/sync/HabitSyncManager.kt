@@ -16,6 +16,7 @@ import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.HabitApiException
 import com.greengolddog.dayweave.network.HabitTransport
+import com.greengolddog.dayweave.network.MAX_HABIT_RESPONSE_PAGE_LIMIT
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.RemoteHabitAnalyticsBucket
 import com.greengolddog.dayweave.network.RemoteHabitDeltaChange
@@ -111,7 +112,9 @@ class HabitSyncManager(
                     var pages = 0
                     val seenCursors = mutableSetOf<String>()
                     do {
-                        if (++pages > MAX_PAGE_CHAIN) throw InvalidHabitProtocolException()
+                        if (++pages > MAX_OCCURRENCE_PAGE_CHAIN) {
+                            throw InvalidHabitProtocolException()
+                        }
                         if (cursor != null && !seenCursors.add(cursor)) {
                             throw InvalidHabitProtocolException()
                         }
@@ -121,7 +124,7 @@ class HabitSyncManager(
                             startDate,
                             endDate,
                             cursor,
-                            MAX_PAGE_SIZE,
+                            MAX_HABIT_RESPONSE_PAGE_LIMIT,
                         )
                         if (page.hasMore != (page.nextCursor != null)) {
                             throw InvalidHabitProtocolException()
@@ -493,13 +496,13 @@ class HabitSyncManager(
         var repairedRejectedCursor = false
         val seenCursors = mutableSetOf<String>()
         while (true) {
-            if (++pages > MAX_PAGE_CHAIN) throw InvalidHabitProtocolException()
+            if (++pages > MAX_DELTA_PAGE_CHAIN) throw InvalidHabitProtocolException()
             val cursor = plannerStore.state.value.habitLedger.deltaCursor
             if (cursor != null && !seenCursors.add(cursor)) {
                 throw InvalidHabitProtocolException()
             }
             val page = try {
-                transport.delta(configuration, cursor, MAX_PAGE_SIZE)
+                transport.delta(configuration, cursor, MAX_HABIT_RESPONSE_PAGE_LIMIT)
             } catch (error: HabitApiException.Validation) {
                 if (
                     error.statusCode != INVALID_DELTA_CURSOR_STATUS ||
@@ -777,8 +780,12 @@ class HabitSyncManager(
     }
 
     private companion object {
-        const val MAX_PAGE_SIZE = 200
-        const val MAX_PAGE_CHAIN = 100
+        // Preserve the former 200 x 100 catch-up budget while each response stays under 2 MiB.
+        const val MAX_HABIT_RECORDS_PER_OPERATION = 20_000
+        const val MAX_OCCURRENCE_PAGE_CHAIN =
+            MAX_HABIT_RECORDS_PER_OPERATION / MAX_HABIT_RESPONSE_PAGE_LIMIT
+        const val MAX_DELTA_PAGE_CHAIN =
+            MAX_HABIT_RECORDS_PER_OPERATION / MAX_HABIT_RESPONSE_PAGE_LIMIT
         const val INVALID_DELTA_CURSOR_STATUS = 400
         const val MIN_HABIT_DATE_YEAR = 1900
         const val MAX_HABIT_DATE_YEAR = 2200

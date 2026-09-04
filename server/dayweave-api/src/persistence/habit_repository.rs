@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use dayweave_core::{
     ItemId, Minutes, Occurrence, OccurrenceId, RecurrenceContext, RecurrenceException,
     RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrencePartialProgress,
-    RecurrencePause,
+    RecurrencePause, is_valid_habit_quantity_unit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,8 +18,7 @@ use crate::{
     habits::{
         HabitDeltaChange, HabitDeltaPage, HabitIdempotency, HabitMutation, HabitOccurrence,
         HabitOccurrenceEvidence, HabitOutcome, HabitPause, HabitRepository, HabitRepositoryError,
-        MAX_HABIT_QUANTITY, MAX_HABIT_UNIT_CHARS, OccurrencePageCursor, OutcomeWrite, PauseCreate,
-        PauseResume,
+        MAX_HABIT_QUANTITY, OccurrencePageCursor, OutcomeWrite, PauseCreate, PauseResume,
     },
     scheduling::ComposeScheduleResult,
 };
@@ -1272,11 +1271,7 @@ pub(crate) async fn record_published_habit_occurrences_tx(
                     .ok_or(PublishedHabitEvidenceError::Invalid)?;
                 let unit = unit
                     .as_str()
-                    .filter(|unit| {
-                        !unit.trim().is_empty()
-                            && unit.chars().count() <= MAX_HABIT_UNIT_CHARS
-                            && !unit.chars().any(char::is_control)
-                    })
+                    .filter(|unit| is_valid_habit_quantity_unit(unit))
                     .ok_or(PublishedHabitEvidenceError::Invalid)?
                     .to_owned();
                 (Some(amount), Some(unit))

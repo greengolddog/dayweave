@@ -357,6 +357,25 @@ class CanonicalAuthoringModelsTest {
     }
 
     @Test
+    fun habitTargetUnitMatchesTheHabitServiceUnicodeTextContract() {
+        val exactLimit = "💧".repeat(MAX_CANONICAL_HABIT_TARGET_UNIT_SCALARS)
+        CanonicalHabitTargetDraft(1, exactLimit).requireValid()
+
+        listOf(
+            " ",
+            exactLimit + "💧",
+            "pages\u0000",
+            "pages\n",
+            "\uD83D",
+            "\uDE00",
+        ).forEach { invalidUnit ->
+            assertThrows(IllegalArgumentException::class.java) {
+                CanonicalHabitTargetDraft(1, invalidUnit).requireValid()
+            }
+        }
+    }
+
+    @Test
     fun incompleteInboxAndUnknownDurationPlannedWorkRemainValidStoredStates() {
         taskDraft().copy(durationSeconds = null, split = CanonicalSplitDraft())
             .requireValid(ITEM_ID)

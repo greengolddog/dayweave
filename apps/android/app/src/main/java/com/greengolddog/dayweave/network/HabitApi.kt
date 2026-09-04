@@ -28,6 +28,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
+/** Keeps a worst-case server occurrence or delta page within Android's 2 MiB response budget. */
+internal const val MAX_HABIT_RESPONSE_PAGE_LIMIT = 25
+
 @Serializable
 enum class RemoteHabitOutcomeStatus {
     @SerialName("unresolved")
@@ -272,7 +275,7 @@ interface HabitTransport {
         startDate: LocalDate,
         endDate: LocalDate,
         cursor: String? = null,
-        limit: Int = 200,
+        limit: Int = MAX_HABIT_RESPONSE_PAGE_LIMIT,
     ): RemoteHabitOccurrencePage
 
     /** [requestJson] is the exact encrypted outbox body and must not be re-encoded on retry. */
@@ -287,7 +290,7 @@ interface HabitTransport {
     suspend fun delta(
         configuration: AuthenticatedApiConfiguration,
         cursor: String? = null,
-        limit: Int = 200,
+        limit: Int = MAX_HABIT_RESPONSE_PAGE_LIMIT,
     ): RemoteHabitDeltaPage
 
     /** [requestJson] is the exact encrypted outbox body and must not be re-encoded on retry. */
@@ -334,7 +337,7 @@ class OkHttpHabitTransport(
         limit: Int,
     ): RemoteHabitOccurrencePage {
         requireDateRange(startDate, endDate)
-        require(limit in 1..MAX_PAGE_LIMIT)
+        require(limit in 1..MAX_HABIT_RESPONSE_PAGE_LIMIT)
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/habits")
             .addPathSegment(habitId.requireCanonicalUuid())
@@ -408,7 +411,7 @@ class OkHttpHabitTransport(
         cursor: String?,
         limit: Int,
     ): RemoteHabitDeltaPage {
-        require(limit in 1..MAX_PAGE_LIMIT)
+        require(limit in 1..MAX_HABIT_RESPONSE_PAGE_LIMIT)
         val previousCursor = cursor?.requireCursor()
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/habits/occurrences/delta")
@@ -705,7 +708,6 @@ class OkHttpHabitTransport(
     }
 
     private companion object {
-        const val MAX_PAGE_LIMIT = 200
         const val MAX_REQUEST_CHARS = 64 * 1024
         const val MAX_RESPONSE_BYTES = 2 * 1024 * 1024
         const val REPLAY_HEADER = "Idempotency-Replayed"

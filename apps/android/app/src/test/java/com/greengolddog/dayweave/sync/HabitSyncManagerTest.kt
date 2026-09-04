@@ -202,6 +202,31 @@ class HabitSyncManagerTest {
             store.state.value.habitLedger.occurrences.keys)
         assertEquals("cursor-0", store.state.value.habitLedger.deltaCursor)
         assertEquals(listOf(null, "page-2"), transport.occurrenceCursors)
+        assertEquals(listOf(25, 25), transport.occurrenceLimits)
+    }
+
+    @Test
+    fun occurrencePaginationCanReachATerminalPageBeyondTheOldHundredPageLimit() = runBlocking {
+        val transport = FakeHabitTransport().apply {
+            repeat(101) { index ->
+                occurrencePages += RemoteHabitOccurrencePage(
+                    occurrences = emptyList(),
+                    nextCursor = if (index == 100) null else "occurrence-page-${index + 1}",
+                    hasMore = index < 100,
+                )
+            }
+        }
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager(boundStore(), transport, emptyList()).loadHabit(
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-02"),
+            ),
+        )
+        assertEquals(101, transport.occurrenceCursors.size)
+        assertTrue(transport.occurrenceLimits.all { it == 25 })
     }
 
     @Test
@@ -274,7 +299,31 @@ class HabitSyncManagerTest {
         assertEquals(HabitSyncOutcome.SUCCESS, manager(store, transport, emptyList()).refresh())
 
         assertEquals(listOf("cursor-0", null), transport.deltaCursors)
+        assertEquals(listOf(25, 25), transport.deltaLimits)
         assertEquals("cursor-repaired", store.state.value.habitLedger.deltaCursor)
+        assertTrue(store.state.value.habitLedger.deltaCaughtUp)
+    }
+
+    @Test
+    fun deltaPaginationCanReachATerminalPageBeyondTheOldHundredPageLimit() = runBlocking {
+        val store = boundStore()
+        var page = 0
+        val transport = FakeHabitTransport().apply {
+            deltaHandler = { cursor ->
+                assertEquals("cursor-$page", cursor)
+                page += 1
+                RemoteHabitDeltaPage(
+                    changes = emptyList(),
+                    nextCursor = "cursor-$page",
+                    hasMore = page < 101,
+                )
+            }
+        }
+
+        assertEquals(HabitSyncOutcome.SUCCESS, manager(store, transport, emptyList()).refresh())
+        assertEquals(101, transport.deltaCursors.size)
+        assertTrue(transport.deltaLimits.all { it == 25 })
+        assertEquals("cursor-101", store.state.value.habitLedger.deltaCursor)
         assertTrue(store.state.value.habitLedger.deltaCaughtUp)
     }
 
@@ -546,11 +595,13 @@ class HabitSyncManagerTest {
 private class FakeHabitTransport : HabitTransport {
     val occurrencePages = ArrayDeque<RemoteHabitOccurrencePage>()
     val occurrenceCursors = mutableListOf<String?>()
+    val occurrenceLimits = mutableListOf<Int>()
     val outcomeKeys = mutableListOf<String>()
     val outcomeBodies = mutableListOf<String>()
     val startPauseBodies = mutableListOf<String>()
     val resumePauseBodies = mutableListOf<String>()
     val deltaCursors = mutableListOf<String?>()
+    val deltaLimits = mutableListOf<Int>()
 
     var outcomeHandler: suspend (String, String, String, String) ->
         RemoteHabitMutation<RemoteHabitOccurrence> = { _, _, _, _ -> error("not configured") }
@@ -577,6 +628,7 @@ private class FakeHabitTransport : HabitTransport {
         limit: Int,
     ): RemoteHabitOccurrencePage {
         occurrenceCursors += cursor
+        occurrenceLimits += limit
         return occurrencePages.removeFirst()
     }
 
@@ -598,6 +650,7 @@ private class FakeHabitTransport : HabitTransport {
         limit: Int,
     ): RemoteHabitDeltaPage {
         deltaCursors += cursor
+        deltaLimits += limit
         return deltaHandler(cursor)
     }
 

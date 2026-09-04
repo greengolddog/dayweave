@@ -227,14 +227,10 @@ struct DayWeaveHabitOutcomeInput: Codable, Equatable, Sendable {
               quantity.map({ $0 >= -Self.maximumQuantity && $0 <= Self.maximumQuantity }) ?? true,
               actualSeconds.map({ $0 <= Self.maximumActualSeconds }) ?? true,
               (quantity == nil) == (unit == nil),
-              unit.map({ Self.isValidText(
-                  $0,
-                  maximumCharacters: Self.maximumUnitCharacters,
-                  permitsFormattingControls: false
-              ) }) ?? true,
+              unit.map(Self.isValidUnit) ?? true,
               note.map({ Self.isValidText(
                   $0,
-                  maximumCharacters: Self.maximumNoteCharacters,
+                  maximumScalars: Self.maximumNoteCharacters,
                   permitsFormattingControls: true
               ) }) ?? true else { return false }
 
@@ -280,15 +276,23 @@ struct DayWeaveHabitOutcomeInput: Codable, Equatable, Sendable {
         )
     }
 
+    static func isValidUnit(_ value: String) -> Bool {
+        isValidText(
+            value,
+            maximumScalars: maximumUnitCharacters,
+            permitsFormattingControls: false
+        )
+    }
+
     private static func isValidText(
         _ value: String,
-        maximumCharacters: Int,
+        maximumScalars: Int,
         permitsFormattingControls: Bool
     ) -> Bool {
         guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              value.count <= maximumCharacters else { return false }
+              value.unicodeScalars.count <= maximumScalars else { return false }
         return !value.unicodeScalars.contains { scalar in
-            guard CharacterSet.controlCharacters.contains(scalar) else { return false }
+            guard scalar.properties.generalCategory == .control else { return false }
             return !(permitsFormattingControls && [10, 13, 9].contains(scalar.value))
         }
     }
@@ -680,13 +684,7 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
               (expectedQuantity == nil) == (expectedUnit == nil),
               expectedQuantity.map({ $0 > 0 && $0 <= DayWeaveHabitOutcomeInput.maximumQuantity })
                 ?? true,
-              expectedUnit.map({ value in
-                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && value.count <= DayWeaveHabitOutcomeInput.maximumUnitCharacters
-                      && !value.unicodeScalars.contains(
-                          where: CharacterSet.controlCharacters.contains
-                      )
-              }) ?? true else { return false }
+              expectedUnit.map(DayWeaveHabitOutcomeInput.isValidUnit) ?? true else { return false }
         return true
     }
 
@@ -1043,9 +1041,7 @@ struct DayWeaveHabitQuantityTotal: Codable, Equatable, Sendable {
     var hasValidShape: Bool {
         amount >= -Self.maximumAbsoluteAmount
             && amount <= Self.maximumAbsoluteAmount
-            && !unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && unit.count <= DayWeaveHabitOutcomeInput.maximumUnitCharacters
-            && !unit.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            && DayWeaveHabitOutcomeInput.isValidUnit(unit)
     }
 }
 

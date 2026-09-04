@@ -51,7 +51,7 @@ class OkHttpHabitTransportTest {
         assertEquals("/tenant/v1/habits/$HABIT_ID/occurrences", request.url.encodedPath)
         assertEquals("2026-09-01", request.url.queryParameter("start_date"))
         assertEquals("2026-09-07", request.url.queryParameter("end_date"))
-        assertEquals("200", request.url.queryParameter("limit"))
+        assertEquals("25", request.url.queryParameter("limit"))
         assertEquals("Bearer unit-test-secret", request.headers["Authorization"])
         assertEquals("no-store", request.headers["Cache-Control"])
         assertEquals("no-cache", request.headers["Pragma"])
@@ -110,6 +110,38 @@ class OkHttpHabitTransportTest {
         val request = server.takeRequest()
         assertEquals("/tenant/v1/habits/occurrences/delta", request.url.encodedPath)
         assertEquals("39", request.url.queryParameter("cursor"))
+        assertEquals("25", request.url.queryParameter("limit"))
+    }
+
+    @Test
+    fun deltaRejectsAPageLimitThatCouldExceedTheResponseBudgetBeforeNetwork() {
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                transport.delta(
+                    configuration(),
+                    limit = MAX_HABIT_RESPONSE_PAGE_LIMIT + 1,
+                )
+            }
+        }
+
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun occurrenceListRejectsAPageLimitThatCouldExceedTheResponseBudgetBeforeNetwork() {
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                    limit = MAX_HABIT_RESPONSE_PAGE_LIMIT + 1,
+                )
+            }
+        }
+
+        assertEquals(0, server.requestCount)
     }
 
     @Test

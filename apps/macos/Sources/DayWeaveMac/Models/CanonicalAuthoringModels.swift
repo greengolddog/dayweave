@@ -767,7 +767,8 @@ extension JSONValue {
                 guard case let .object(target) = value,
                       Set(target.keys) == ["amount", "unit"],
                       target["amount"]?.canonicalUnsigned.map({ $0 > 0 }) == true,
-                      target["unit"]?.canonicalNonemptyString == true else { return false }
+                      case let .string(unit)? = target["unit"],
+                      DayWeaveHabitOutcomeInput.isValidUnit(unit) else { return false }
             case "goal_measures":
                 guard case let .array(measures) = value else { return false }
                 for measure in measures {

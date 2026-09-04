@@ -25,6 +25,9 @@ import kotlinx.serialization.json.put
 /** Matches `dayweave_compose::MAX_SCHEDULING_OFFSET_MINUTES`. */
 internal const val MAX_SCHEDULING_OFFSET_MINUTES = 527_040L
 
+/** Matches the habit service's canonical quantity-unit text limit. */
+internal const val MAX_CANONICAL_HABIT_TARGET_UNIT_SCALARS = 200
+
 @Serializable
 enum class CanonicalDraftPlacement(val wireValue: String) {
     INBOX("inbox"),
@@ -775,7 +778,14 @@ data class CanonicalHabitTargetDraft(val amount: Long, val unit: String) {
 
     fun requireValid() {
         require(amount in 1..4_294_967_295L)
-        require(unit.isNotBlank())
+        require(
+            unit.isNotBlank() &&
+                unit.hasAtMostUnicodeScalars(MAX_CANONICAL_HABIT_TARGET_UNIT_SCALARS) &&
+                unit.none(Char::isISOControl),
+        ) {
+            "Habit target unit must contain 1-$MAX_CANONICAL_HABIT_TARGET_UNIT_SCALARS " +
+                "Unicode scalar values without control characters"
+        }
     }
 
     fun toCanonicalJson(): JsonObject {

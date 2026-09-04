@@ -623,6 +623,40 @@ struct CanonicalAuthoringModelsTests {
         #expect(misplaced.validationIssue(itemID: UUID())?.contains("Habit metadata") == true)
     }
 
+    @Test("habit target units use server Unicode scalar and control limits")
+    func habitTargetUnitValidation() {
+        func draft(unit: String) -> DayWeaveCanonicalItemDraft {
+            DayWeaveCanonicalItemDraft(
+                kind: .habit,
+                status: .planned,
+                title: "Read",
+                timezoneName: "UTC",
+                recurrence: .object([
+                    "type": .string("daily"),
+                    "times_per_day": .number(JSONNumber(UInt64(1))),
+                ]),
+                flexibleConstraints: .object([
+                    "habit_target": .object([
+                        "amount": .number(JSONNumber(UInt64(1))),
+                        "unit": .string(unit),
+                    ]),
+                ])
+            )
+        }
+
+        let decomposedCharacter = "e\u{301}"
+        let maximumUnit = String(repeating: decomposedCharacter, count: 100)
+        let oversizedUnit = maximumUnit + "x"
+
+        #expect(maximumUnit.count == 100)
+        #expect(maximumUnit.unicodeScalars.count == 200)
+        #expect(draft(unit: maximumUnit).validationIssue(itemID: UUID()) == nil)
+        #expect(draft(unit: "steps\u{200D}daily").validationIssue(itemID: UUID()) == nil)
+        #expect(draft(unit: oversizedUnit).validationIssue(itemID: UUID()) != nil)
+        #expect(draft(unit: "pa\u{0}ges").validationIssue(itemID: UUID()) != nil)
+        #expect(draft(unit: " \n\t").validationIssue(itemID: UUID()) != nil)
+    }
+
     @Test("every shared valid metadata fixture has an explicit native authoring classification")
     func sharedValidFixtureClassifications() throws {
         let fixtures = try Self.fixtureCases(named: "valid-rich-items.json")
@@ -691,6 +725,8 @@ struct CanonicalAuthoringModelsTests {
             "all_day_bounds_not_local_midnight", "event_cannot_be_split",
             "split_extensions_on_indivisible_item", "maximum_sessions_cannot_fit_duration",
             "invalid_goal_allocation", "zero_habit_target",
+            "habit_target_unit_exceeds_unicode_scalar_limit",
+            "habit_target_unit_contains_control_character",
             "duplicate_canonical_and_metadata_earliest_start",
             "preferred_start_without_duration", "reversed_occurrence_window",
             "calendar_frequency_with_rolling_anchor",
@@ -712,7 +748,7 @@ struct CanonicalAuthoringModelsTests {
             "metadata_timestamp_rejects_offset_beyond_eighteen_hours",
         ]
 
-        #expect(fixtures.count == 45)
+        #expect(fixtures.count == 47)
         #expect(Set(fixtures.map(\.name)) == expectedNames)
         for fixture in fixtures {
             do {

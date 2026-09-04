@@ -232,3 +232,15 @@ fn only_completed_status_proves_a_prerequisite() {
         assert!(!status.satisfies_prerequisite());
     }
 }
+
+#[test]
+fn quantity_targets_use_the_portable_unicode_scalar_contract() {
+    let target = |amount, unit: String| QuantityTarget { amount, unit };
+
+    assert!(target(1, "🧵".repeat(200)).is_valid());
+    assert!(target(1, " pages ".to_owned()).is_valid());
+    assert!(!target(0, "pages".to_owned()).is_valid());
+    assert!(!target(1, " ".to_owned()).is_valid());
+    assert!(!target(1, "🧵".repeat(201)).is_valid());
+    assert!(!target(1, "pages\nweekly".to_owned()).is_valid());
+}

@@ -55,6 +55,58 @@ struct HabitModelPersistenceTests {
         ).hasValidShape)
     }
 
+    @Test("habit text limits count Unicode scalars and match server control semantics")
+    func habitTextUnicodeScalarValidation() {
+        let occurredAt = Self.date("2026-09-04T12:30:00.123456Z")
+        let decomposedCharacter = "e\u{301}"
+        let maximumUnit = String(repeating: decomposedCharacter, count: 100)
+        let oversizedUnit = maximumUnit + "x"
+        let maximumNote = String(repeating: decomposedCharacter, count: 5_000)
+        let oversizedNote = maximumNote + "x"
+        let formatScalarUnit = "steps\u{200D}daily"
+
+        #expect(maximumUnit.count == 100)
+        #expect(maximumUnit.unicodeScalars.count == 200)
+        #expect(oversizedUnit.count == 101)
+        #expect(oversizedUnit.unicodeScalars.count == 201)
+        #expect(DayWeaveHabitOutcomeInput.completed(
+            quantity: 1,
+            unit: maximumUnit,
+            occurredAt: occurredAt
+        ).hasValidShape)
+        #expect(!DayWeaveHabitOutcomeInput.completed(
+            quantity: 1,
+            unit: oversizedUnit,
+            occurredAt: occurredAt
+        ).hasValidShape)
+        #expect(!DayWeaveHabitOutcomeInput.completed(
+            quantity: 1,
+            unit: "pa\u{0}ges",
+            occurredAt: occurredAt
+        ).hasValidShape)
+        #expect(DayWeaveHabitOutcomeInput.completed(
+            quantity: 1,
+            unit: formatScalarUnit,
+            occurredAt: occurredAt
+        ).hasValidShape)
+
+        #expect(maximumNote.count == 5_000)
+        #expect(maximumNote.unicodeScalars.count == 10_000)
+        #expect(DayWeaveHabitOutcomeInput.skipped(
+            note: maximumNote,
+            occurredAt: occurredAt
+        ).hasValidShape)
+        #expect(!DayWeaveHabitOutcomeInput.skipped(
+            note: oversizedNote,
+            occurredAt: occurredAt
+        ).hasValidShape)
+
+        #expect(DayWeaveHabitQuantityTotal(unit: maximumUnit, amount: 1).hasValidShape)
+        #expect(!DayWeaveHabitQuantityTotal(unit: oversizedUnit, amount: 1).hasValidShape)
+        #expect(Self.occurrence(note: nil, unit: maximumUnit).evidence.hasValidShape)
+        #expect(!Self.occurrence(note: nil, unit: oversizedUnit).evidence.hasValidShape)
+    }
+
     @Test("strict outcome decoding rejects unknown and omitted nullable keys")
     func strictOutcomeDecoding() {
         let unknown = Data("""
@@ -413,7 +465,10 @@ struct HabitModelPersistenceTests {
         )
     }
 
-    private static func occurrence(note: String?) -> DayWeaveHabitOccurrence {
+    private static func occurrence(
+        note: String?,
+        unit: String = "pages"
+    ) -> DayWeaveHabitOccurrence {
         let occurredAt = date("2026-09-04T12:30:00.123456Z")
         return .init(
             evidence: .init(
@@ -432,14 +487,14 @@ struct HabitModelPersistenceTests {
                 timezoneName: "Europe/Paris",
                 expectedDurationSeconds: 3_600,
                 expectedQuantity: 20,
-                expectedUnit: "pages"
+                expectedUnit: unit
             ),
             outcome: .init(
                 revision: 1,
                 status: .partial,
                 progressBasisPoints: 2_500,
                 quantity: 5,
-                unit: "pages",
+                unit: unit,
                 actualSeconds: 600,
                 note: note,
                 occurredAt: occurredAt,

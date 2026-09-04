@@ -231,6 +231,30 @@
       }
     },
     {
+      "name": "habit_target_unit_exceeds_unicode_scalar_limit",
+      "expected_error_contains": "1-200 Unicode scalar values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000246",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "daily" },
+        "flexible_constraints": { "habit_target": { "amount": 1, "unit": "👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦 👨‍👩‍👧‍👦" } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "habit_target_unit_contains_control_character",
+      "expected_error_contains": "without control characters",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000247",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "daily" },
+        "flexible_constraints": { "habit_target": { "amount": 1, "unit": "pages\nweekly" } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
       "name": "duplicate_canonical_and_metadata_earliest_start",
       "expected_error_contains": "defined in both the canonical field and metadata",
       "fields": {

@@ -778,10 +778,10 @@ fn validate_metadata_values(value: &SchedulingMetadata) -> Result<(), Scheduling
         }
     }
     if let Some(target) = &value.habit_target
-        && (target.amount == 0 || target.unit.trim().is_empty())
+        && !target.is_valid()
     {
         return Err(flexible(
-            "habit_target requires a positive amount and non-empty unit",
+            "habit_target requires a positive amount and a unit containing 1-200 Unicode scalar values without control characters",
         ));
     }
     validate_policy_minutes(
