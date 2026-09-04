@@ -53,6 +53,8 @@ class OkHttpHabitTransportTest {
         assertEquals("2026-09-07", request.url.queryParameter("end_date"))
         assertEquals("200", request.url.queryParameter("limit"))
         assertEquals("Bearer unit-test-secret", request.headers["Authorization"])
+        assertEquals("no-store", request.headers["Cache-Control"])
+        assertEquals("no-cache", request.headers["Pragma"])
     }
 
     @Test
@@ -60,6 +62,7 @@ class OkHttpHabitTransportTest {
         server.enqueue(
             jsonResponse(
                 """{"occurrence":${occurrenceJson(withOutcome = true)},"replayed":true}""",
+                replayed = true,
             ),
         )
         val body = """{"operation_id":"$OPERATION_ID","expected_revision":0,"outcome":{"status":"partial","progress_basis_points":3500,"quantity":7,"unit":"pages","actual_seconds":600,"note":"Good start","occurred_at":"2026-09-01T07:30:00Z"}}"""
@@ -111,10 +114,16 @@ class OkHttpHabitTransportTest {
 
     @Test
     fun pauseMutationsUseDistinctEvidencePathsAndExactBodies() = runBlocking {
-        server.enqueue(jsonResponse("""{"pause":${pauseJson()},"replayed":false}"""))
+        server.enqueue(
+            jsonResponse(
+                """{"pause":${pauseJson()},"replayed":false}""",
+                replayed = false,
+            ),
+        )
         server.enqueue(
             jsonResponse(
                 """{"pause":${pauseJson(endedAt = "2026-09-03T08:00:00Z", revision = 2)},"replayed":false}""",
+                replayed = false,
             ),
         )
         val startBody = """{"operation_id":"$OPERATION_ID","pause_id":"$PAUSE_ID","expected_revision":0,"started_at":"2026-09-02T08:00:00Z"}"""
@@ -157,6 +166,43 @@ class OkHttpHabitTransportTest {
         assertEquals(RemoteHabitSupportiveFactCode.ACTIVE_STREAK, analytics.supportiveFactCodes[0])
         val request = server.takeRequest()
         assertEquals("week", request.url.queryParameter("bucket"))
+    }
+
+    @Test
+    fun skippedEvidenceAndAnalyticsRetainLegitimateSignedQuantities() = runBlocking {
+        val skipped = occurrenceJson(withOutcome = true)
+            .replace("\"status\":\"partial\"", "\"status\":\"skipped\"")
+            .replace("\"progress_basis_points\":3500", "\"progress_basis_points\":2500")
+            .replace("\"quantity\":7", "\"quantity\":-7")
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$skipped],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                """{"analytics":${analyticsJson().replace("\"amount\":105", "\"amount\":-105")}}""",
+            ),
+        )
+
+        val occurrence = transport.listOccurrences(
+            configuration(),
+            HABIT_ID,
+            LocalDate.parse("2026-09-01"),
+            LocalDate.parse("2026-09-07"),
+        ).occurrences.single()
+        val analytics = transport.analytics(
+            configuration(),
+            HABIT_ID,
+            LocalDate.parse("2026-09-01"),
+            LocalDate.parse("2026-09-07"),
+            RemoteHabitAnalyticsBucket.WEEK,
+        )
+
+        assertEquals(RemoteHabitOutcomeStatus.SKIPPED, occurrence.outcome?.status)
+        assertEquals(2_500, occurrence.outcome?.progressBasisPoints)
+        assertEquals(-7L, occurrence.outcome?.quantity)
+        assertEquals(-105L, analytics.quantityTotals.single().amount)
     }
 
     @Test
@@ -211,6 +257,59 @@ class OkHttpHabitTransportTest {
     }
 
     @Test
+    fun duplicateKeysPrivateHeadersAndReplayEvidenceFailClosed() {
+        val escapedDuplicate =
+            """{"occurrences":[],"next_cursor":null,"has_more":false,"has_m\u006fre":false}"""
+        server.enqueue(jsonResponse(escapedDuplicate))
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                )
+            }
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .addHeader("Content-Type", "application/json")
+                .body("""{"occurrences":[],"next_cursor":null,"has_more":false}""")
+                .build(),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                )
+            }
+        }
+
+        server.enqueue(
+            jsonResponse(
+                """{"occurrence":${occurrenceJson(withOutcome = true)},"replayed":true}""",
+                replayed = false,
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.putOutcome(
+                    configuration(),
+                    HABIT_ID,
+                    OCCURRENCE_ID,
+                    OPERATION_ID,
+                    """{"operation_id":"$OPERATION_ID"}""",
+                )
+            }
+        }
+    }
+
+    @Test
     fun invalidLocalIdentityAndRangesFailBeforeNetworkIo() {
         assertThrows(HabitApiException.InvalidResponse::class.java) {
             runBlocking {
@@ -237,14 +336,25 @@ class OkHttpHabitTransportTest {
 
     @Test
     fun typedErrorsAndOversizedResponsesNeverExposeBearer() {
-        server.enqueue(MockResponse.Builder().code(401).body("{}").build())
+        server.enqueue(errorResponse(401, "unauthorized"))
         val authentication = assertThrows(HabitApiException.Authentication::class.java) {
             runBlocking { transport.delta(configuration()) }
         }
         assertFalse(authentication.toString().contains("unit-test-secret"))
 
-        server.enqueue(MockResponse.Builder().code(409).body("{}").build())
+        server.enqueue(errorResponse(409, "conflict"))
         assertThrows(HabitApiException.Conflict::class.java) {
+            runBlocking { transport.delta(configuration()) }
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(409)
+                .addHeader("Content-Type", "application/json")
+                .body("""{"error":{"code":"conflict","message":"stale"}}""")
+                .build(),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
             runBlocking { transport.delta(configuration()) }
         }
 
@@ -260,11 +370,26 @@ class OkHttpHabitTransportTest {
             "unit-test-secret",
         )
 
-    private fun jsonResponse(body: String): MockResponse = MockResponse.Builder()
-        .code(200)
-        .addHeader("Content-Type", "application/json")
-        .body(body)
-        .build()
+    private fun jsonResponse(body: String, replayed: Boolean? = null): MockResponse =
+        MockResponse.Builder()
+            .code(200)
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Cache-Control", "no-store, max-age=0")
+            .addHeader("Pragma", "no-cache")
+            .apply {
+                replayed?.let { addHeader("Idempotency-Replayed", it.toString()) }
+            }
+            .body(body)
+            .build()
+
+    private fun errorResponse(status: Int, code: String): MockResponse =
+        MockResponse.Builder()
+            .code(status)
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Cache-Control", "no-store, max-age=0")
+            .addHeader("Pragma", "no-cache")
+            .body("""{"error":{"code":"$code","message":"test error"}}""")
+            .build()
 
     private fun occurrenceJson(withOutcome: Boolean = false): String = """
         {

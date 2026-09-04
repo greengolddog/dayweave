@@ -1,16 +1,23 @@
 package com.greengolddog.dayweave.network
 
+import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.io.Reader
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.LocalDate
+import java.util.Locale
 import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -217,6 +224,18 @@ private data class HabitDeltaEnvelope(
 @Serializable
 private data class HabitAnalyticsEnvelope(
     val analytics: RemoteHabitAnalytics,
+)
+
+@Serializable
+private data class HabitErrorEnvelope(
+    val error: HabitErrorBody,
+)
+
+@Serializable
+private data class HabitErrorBody(
+    val code: String,
+    val message: String,
+    val details: JsonElement? = null,
 )
 
 sealed class HabitApiException(message: String, cause: Throwable? = null) :
@@ -510,52 +529,169 @@ class OkHttpHabitTransport(
         .tag(AuthenticatedApiConfiguration::class.java, configuration)
         .header("Accept", "application/json")
         .header("Authorization", "Bearer ${configuration.bearerToken}")
+        .header("Cache-Control", "no-store")
+        .header("Pragma", "no-cache")
 
     private suspend inline fun <reified T> execute(request: Request): T {
         val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
             ?: throw HabitApiException.InvalidResponse()
         val response = configuration.executeAuthenticated(client, request)
         response.use {
-            if (response.code != 200) throw response.toHabitApiException()
-            val responseText = response.body.charStream().use { it.readBoundedHabitText() }
-            try {
-                return json.decodeFromString<T>(responseText)
-            } catch (error: SerializationException) {
-                throw HabitApiException.InvalidResponse(error)
-            } catch (error: IllegalArgumentException) {
+            if (!response.hasStrictHabitHeaders() || !response.hasHabitJsonMediaType()) {
+                throw HabitApiException.InvalidResponse()
+            }
+            val responseText = response.body.byteStream().use { it.readBoundedHabitText() }
+            val duplicateKeys = runCatching {
+                StrictHabitJsonKeyScanner(responseText, json).hasDuplicateKeys()
+            }.getOrElse { error ->
                 throw HabitApiException.InvalidResponse(error)
             }
+            if (duplicateKeys) throw HabitApiException.InvalidResponse()
+            if (response.code != 200) {
+                val envelope = responseText.decodeHabitResponse<HabitErrorEnvelope>()
+                validatedHabitResponse { envelope.error.requireValid() }
+                throw response.toHabitApiException(envelope.error.code)
+            }
+            val decoded = responseText.decodeHabitResponse<T>()
+            response.requireValidReplayEvidence(request, decoded)
+            return decoded
         }
     }
 
-    private fun Response.toHabitApiException(): HabitApiException = when (code) {
-        401 -> HabitApiException.Authentication()
-        404 -> HabitApiException.NotFound()
-        409 -> HabitApiException.Conflict()
-        400, 422 -> HabitApiException.Validation(code)
-        else -> HabitApiException.Http(code)
+    private inline fun <reified T> String.decodeHabitResponse(): T = try {
+        json.decodeFromString(this)
+    } catch (error: SerializationException) {
+        throw HabitApiException.InvalidResponse(error)
+    } catch (error: IllegalArgumentException) {
+        throw HabitApiException.InvalidResponse(error)
     }
 
-    private fun Reader.readBoundedHabitText(): String {
-        val result = StringBuilder()
-        val buffer = CharArray(DEFAULT_BUFFER_SIZE)
+    private fun Response.toHabitApiException(errorCode: String): HabitApiException = when (code) {
+        401 -> if (errorCode == "unauthorized") {
+            HabitApiException.Authentication()
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        404 -> if (errorCode == "not_found") {
+            HabitApiException.NotFound()
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        409 -> if (errorCode == "conflict") {
+            HabitApiException.Conflict()
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        400 -> if (errorCode in setOf("bad_request", "invalid_json")) {
+            HabitApiException.Validation(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        413 -> if (errorCode == "payload_too_large") {
+            HabitApiException.Validation(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        422 -> if (errorCode == "validation_failed") {
+            HabitApiException.Validation(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        403 -> if (errorCode == "forbidden") {
+            HabitApiException.Http(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        429 -> if (errorCode == "rate_limited") {
+            HabitApiException.Http(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        500 -> if (errorCode == "internal_error") {
+            HabitApiException.Http(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        502 -> if (errorCode == "bad_gateway") {
+            HabitApiException.Http(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        503 -> if (errorCode == "service_unavailable") {
+            HabitApiException.Http(code)
+        } else {
+            HabitApiException.InvalidResponse()
+        }
+        else -> HabitApiException.InvalidResponse()
+    }
+
+    private fun Response.hasStrictHabitHeaders(): Boolean =
+        headers.values("Cache-Control").singleOrNull()?.lowercase(Locale.ROOT) ==
+            "no-store, max-age=0" &&
+            headers.values("Pragma").singleOrNull()?.lowercase(Locale.ROOT) == "no-cache"
+
+    private fun Response.hasHabitJsonMediaType(): Boolean {
+        val values = headers.values("Content-Type")
+        if (values.size != 1) return false
+        val mediaType = values.single().toMediaTypeOrNull() ?: return false
+        val charset = mediaType.charset(StandardCharsets.UTF_8)
+        return mediaType.type == "application" && mediaType.subtype == "json" &&
+            charset == StandardCharsets.UTF_8
+    }
+
+    private fun <T> Response.requireValidReplayEvidence(request: Request, decoded: T) {
+        val isMutation = request.method == "PUT" || request.method == "POST"
+        val replayValues = headers.values(REPLAY_HEADER)
+        if (!isMutation) {
+            if (replayValues.isNotEmpty()) throw HabitApiException.InvalidResponse()
+            return
+        }
+        val replayed = when (decoded) {
+            is HabitOccurrenceEnvelope -> decoded.replayed
+            is HabitPauseEnvelope -> decoded.replayed
+            else -> throw HabitApiException.InvalidResponse()
+        }
+        val header = replayValues.singleOrNull()?.lowercase(Locale.ROOT)
+            ?: throw HabitApiException.InvalidResponse()
+        if (header !in setOf("true", "false") || (header == "true") != replayed) {
+            throw HabitApiException.InvalidResponse()
+        }
+    }
+
+    private fun InputStream.readBoundedHabitText(): String {
+        val result = ByteArrayOutputStream()
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
         while (true) {
             val read = read(buffer)
             if (read < 0) break
-            if (result.length + read > MAX_RESPONSE_CHARS) {
+            if (result.size() > MAX_RESPONSE_BYTES - read) {
                 throw HabitApiException.InvalidResponse()
             }
-            result.append(buffer, 0, read)
+            result.write(buffer, 0, read)
         }
-        return result.toString()
+        return try {
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(result.toByteArray()))
+                .toString()
+        } catch (error: IOException) {
+            throw HabitApiException.InvalidResponse(error)
+        }
     }
 
     private companion object {
         const val MAX_PAGE_LIMIT = 200
         const val MAX_REQUEST_CHARS = 64 * 1024
-        const val MAX_RESPONSE_CHARS = 2 * 1024 * 1024
+        const val MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+        const val REPLAY_HEADER = "Idempotency-Replayed"
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
+}
+
+private fun HabitErrorBody.requireValid() {
+    require(code.matches(Regex("[a-z0-9_]{1,128}")))
+    requireText(message, MAX_ERROR_MESSAGE_CHARS, multiline = true)
 }
 
 private fun RemoteHabitOccurrence.requireValid(expectedHabitId: String) {
@@ -596,12 +732,10 @@ private fun RemoteHabitOutcome.requireValid() {
         )
         RemoteHabitOutcomeStatus.PARTIAL -> require(progressBasisPoints in 1..9_999)
         RemoteHabitOutcomeStatus.COMPLETED -> require(progressBasisPoints == 10_000)
-        RemoteHabitOutcomeStatus.SKIPPED -> require(
-            progressBasisPoints == 0 && quantity == null && unit == null && actualSeconds == null,
-        )
+        RemoteHabitOutcomeStatus.SKIPPED -> require(progressBasisPoints in 0..9_999)
     }
     require(quantity == null == (unit == null))
-    quantity?.let { require(it in 0..MAX_QUANTITY) }
+    quantity?.let(::requireSignedQuantity)
     unit?.let(::requireUnit)
     actualSeconds?.let { require(it in 0..MAX_EXPECTED_SECONDS) }
     note?.let { requireText(it, MAX_NOTE_CHARS, multiline = true) }
@@ -688,18 +822,18 @@ private fun requireTotalsValid(
     quantityTotals: List<RemoteHabitQuantityTotal>,
 ) {
     listOf(expected, eligible, completed, partial, skipped, missed, excused, unresolved)
-        .forEach { require(it >= 0) }
+        .forEach { require(it in 0..MAX_ANALYTICS_OCCURRENCES) }
     require(eligible <= expected)
     require(excused <= expected)
     require(completed + partial + skipped + missed + unresolved == eligible)
     require(eligible + excused == expected)
     require(adherenceBasisPoints in 0..10_000)
-    require(actualSecondsTotal >= 0)
+    require(actualSecondsTotal in 0..MAX_ANALYTICS_SECONDS)
     require(quantityTotals.size <= MAX_QUANTITY_TOTALS)
     require(quantityTotals.map { it.unit }.distinct().size == quantityTotals.size)
     quantityTotals.forEach {
         requireUnit(it.unit)
-        require(it.amount >= 0)
+        requireSignedQuantity(it.amount, MAX_ANALYTICS_QUANTITY)
     }
 }
 
@@ -739,13 +873,138 @@ private fun requireInstant(value: String): Instant {
 
 private fun requireUnit(value: String) = requireText(value, 200, multiline = false)
 
+private fun requireSignedQuantity(value: Long, maximum: Long = MAX_QUANTITY) {
+    require(value != Long.MIN_VALUE && kotlin.math.abs(value) <= maximum)
+}
+
 private fun requireText(value: String, maxChars: Int, multiline: Boolean) {
     require(value.isNotBlank() && value.length <= maxChars)
     require(value.none { it.isISOControl() && !(multiline && it in setOf('\n', '\r', '\t')) })
 }
 
 private const val MAX_NOTE_CHARS = 10_000
+private const val MAX_ERROR_MESSAGE_CHARS = 16_384
 private const val MAX_QUANTITY = 1_000_000_000_000L
 private const val MAX_EXPECTED_SECONDS = 366L * 24 * 60 * 60
+private const val MAX_ANALYTICS_OCCURRENCES = 50_000L
+private const val MAX_ANALYTICS_SECONDS = MAX_ANALYTICS_OCCURRENCES * MAX_EXPECTED_SECONDS
+private const val MAX_ANALYTICS_QUANTITY = MAX_ANALYTICS_OCCURRENCES * MAX_QUANTITY
 private const val MAX_TREND_BUCKETS = 366
 private const val MAX_QUANTITY_TOTALS = 200
+
+/** Detects duplicate object keys, including equivalent escaped spellings, before decoding. */
+private class StrictHabitJsonKeyScanner(
+    private val source: String,
+    private val json: Json,
+) {
+    private var index = 0
+
+    fun hasDuplicateKeys(): Boolean {
+        skipWhitespace()
+        val duplicate = parseValue(depth = 0)
+        skipWhitespace()
+        require(index == source.length)
+        return duplicate
+    }
+
+    private fun parseValue(depth: Int): Boolean {
+        require(depth <= MAX_DEPTH)
+        skipWhitespace()
+        require(index < source.length)
+        return when (source[index]) {
+            '{' -> parseObject(depth)
+            '[' -> parseArray(depth)
+            '"' -> {
+                parseString()
+                false
+            }
+            else -> {
+                parsePrimitive()
+                false
+            }
+        }
+    }
+
+    private fun parseObject(depth: Int): Boolean {
+        index += 1
+        skipWhitespace()
+        if (takeIfPresent('}')) return false
+        val keys = hashSetOf<String>()
+        var duplicate = false
+        while (true) {
+            skipWhitespace()
+            require(source.getOrNull(index) == '"')
+            if (!keys.add(parseString())) duplicate = true
+            skipWhitespace()
+            require(takeIfPresent(':'))
+            if (parseValue(depth + 1)) duplicate = true
+            skipWhitespace()
+            when {
+                takeIfPresent('}') -> return duplicate
+                takeIfPresent(',') -> Unit
+                else -> throw IllegalArgumentException("Invalid JSON object")
+            }
+        }
+    }
+
+    private fun parseArray(depth: Int): Boolean {
+        index += 1
+        skipWhitespace()
+        if (takeIfPresent(']')) return false
+        var duplicate = false
+        while (true) {
+            if (parseValue(depth + 1)) duplicate = true
+            skipWhitespace()
+            when {
+                takeIfPresent(']') -> return duplicate
+                takeIfPresent(',') -> Unit
+                else -> throw IllegalArgumentException("Invalid JSON array")
+            }
+        }
+    }
+
+    private fun parseString(): String {
+        val start = index
+        require(takeIfPresent('"'))
+        while (index < source.length) {
+            when (source[index++]) {
+                '"' -> return json.decodeFromString(source.substring(start, index))
+                '\\' -> {
+                    require(index < source.length)
+                    if (source[index++] == 'u') {
+                        repeat(4) {
+                            require(source.getOrNull(index)?.isHexDigit() == true)
+                            index += 1
+                        }
+                    }
+                }
+            }
+        }
+        throw IllegalArgumentException("Unterminated JSON string")
+    }
+
+    private fun parsePrimitive() {
+        val start = index
+        while (index < source.length && source[index] !in PRIMITIVE_DELIMITERS) index += 1
+        require(index > start)
+    }
+
+    private fun skipWhitespace() {
+        while (index < source.length && source[index] in JSON_WHITESPACE) index += 1
+    }
+
+    private fun takeIfPresent(character: Char): Boolean {
+        if (source.getOrNull(index) != character) return false
+        index += 1
+        return true
+    }
+
+    private fun Char.isHexDigit(): Boolean =
+        this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    private companion object {
+        const val MAX_DEPTH = 32
+        val JSON_WHITESPACE = setOf(' ', '\t', '\r', '\n')
+        val PRIMITIVE_DELIMITERS = JSON_WHITESPACE + setOf(',', ']', '}')
+    }
+}
