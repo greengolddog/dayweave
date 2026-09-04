@@ -30,7 +30,11 @@ class MoveLaterPolicyTest {
         )
         val state = state(source, hard).copy(
             canonicalItems = listOf(
-                item().copy(deadlineAt = "2026-09-01T10:30:00Z"),
+                item().copy(
+                    deadlineAt = "2026-09-01T10:30:00Z",
+                    deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+                    deadlineStrength = CanonicalDeadlineStrength.HARD,
+                ),
             ),
         )
 
@@ -193,6 +197,73 @@ class MoveLaterPolicyTest {
         assertFalse(assessment.crossesUnrelaxableHardDeadline)
         assertEquals(null, assessment.canonicalDeadlineRelaxation)
         assertTrue(assessment.requiresConfirmation)
+    }
+
+    @Test
+    fun eventIntervalEndIsNotReinterpretedAsADeadline() {
+        val state = state(
+            block(
+                id = BLOCK_ID,
+                start = "2026-09-01T08:00:00Z",
+                end = "2026-09-01T09:00:00Z",
+            ),
+        ).copy(
+            canonicalItems = listOf(
+                item().copy(
+                    kind = "event",
+                    deadlineAt = "2026-09-01T10:30:00Z",
+                    deadlineKind = CanonicalDeadlineKind.NONE,
+                    deadlineStrength = null,
+                ),
+            ),
+        )
+
+        val assessment = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-01T11:00:00Z"),
+                Instant.parse("2026-09-01T07:00:00Z"),
+            ),
+        )
+
+        assertFalse(assessment.crossesDeadline)
+        assertEquals(null, assessment.deadline)
+        assertEquals(null, assessment.canonicalDeadlineRelaxation)
+    }
+
+    @Test
+    fun dateOnlySoftDeadlineUsesExclusiveNextLocalMidnight() {
+        val state = state(
+            block(
+                id = BLOCK_ID,
+                start = "2026-09-01T08:00:00Z",
+                end = "2026-09-01T09:00:00Z",
+            ),
+        ).copy(
+            canonicalItems = listOf(
+                item().copy(
+                    timezoneName = "Europe/Paris",
+                    deadlineAt = null,
+                    deadlineKind = CanonicalDeadlineKind.DATE,
+                    deadlineDate = "2026-09-01",
+                    deadlineStrength = CanonicalDeadlineStrength.SOFT,
+                    deadlineSoftWeight = 42,
+                    hasExplicitStructuralMetadata = true,
+                ),
+            ),
+        )
+
+        val assessment = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-01T22:30:00Z"),
+                Instant.parse("2026-09-01T07:00:00Z"),
+            ),
+        )
+
+        assertEquals(Instant.parse("2026-09-01T22:00:00Z"), assessment.deadline)
+        assertTrue(assessment.crossesDeadline)
+        assertFalse(assessment.deadlineIsHard)
     }
 
     @Test

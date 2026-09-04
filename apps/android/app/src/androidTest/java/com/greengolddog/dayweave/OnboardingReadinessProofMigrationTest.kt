@@ -34,7 +34,7 @@ class OnboardingReadinessProofMigrationTest {
     }
 
     @Test
-    fun migrationFourteenToFifteenPreservesPayloadUntilStrictRepositoryRewrite() {
+    fun migrationFourteenToSixteenPreservesPayloadUntilStrictRepositoryRewrite() {
         System.loadLibrary("sqlcipher")
         migrationHelper.createDatabase(DATABASE_NAME, 14).apply {
             execSQL(
@@ -48,9 +48,10 @@ class OnboardingReadinessProofMigrationTest {
 
         val migrated = migrationHelper.runMigrationsAndValidate(
             DATABASE_NAME,
-            15,
+            16,
             true,
             PlannerDatabaseMigrations.MIGRATION_14_15,
+            PlannerDatabaseMigrations.MIGRATION_15_16,
         )
         migrated.query(
             "SELECT payload, updatedAtEpochMillis, payloadFormat " +

@@ -2,6 +2,8 @@ package com.greengolddog.dayweave.model
 
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalTime
 import java.time.ZoneId
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -343,13 +345,53 @@ private data class MoveLaterDeadlineBoundary(
 
 /**
  * Returns a successful nullable boundary, or null when deadline metadata cannot be proven safe.
- * Canonical `deadline_at` is hard. Rich scheduler metadata may instead carry a hard or soft
- * `constraints.latest_finish`; the compose contract rejects defining both.
+ * Typed canonical deadlines may be date-only or date-time and hard or soft. Event `deadline_at`
+ * retains the fixed interval end while `deadline_kind=none`, so it is deliberately not a deadline.
+ * Rich scheduler metadata may instead carry `constraints.latest_finish`; the compose contract
+ * rejects defining both.
  */
 private fun CanonicalItemSnapshot.moveLaterDeadlineBoundary(): Result<MoveLaterDeadlineBoundary?>? {
-    val canonical = deadlineAt?.let { raw ->
-        val instant = parseMoveInstant(raw) ?: return null
-        MoveLaterDeadlineBoundary(instant, isHard = true, isCanonicalField = true)
+    val canonicalHardness = when (deadlineStrength) {
+        CanonicalDeadlineStrength.HARD -> if (deadlineSoftWeight == null) true else return null
+        CanonicalDeadlineStrength.SOFT -> if (deadlineSoftWeight in 0L..1_000_000L) {
+            false
+        } else {
+            return null
+        }
+        null -> if (deadlineSoftWeight == null) null else return null
+        else -> return null
+    }
+    val canonical = when (deadlineKind) {
+        CanonicalDeadlineKind.NONE -> null
+        CanonicalDeadlineKind.DATE_TIME -> {
+            val raw = deadlineAt ?: return null
+            val instant = parseMoveInstant(raw) ?: return null
+            MoveLaterDeadlineBoundary(
+                instant,
+                isHard = canonicalHardness ?: return null,
+                isCanonicalField = true,
+            )
+        }
+        CanonicalDeadlineKind.DATE -> {
+            val raw = deadlineDate ?: return null
+            val date = runCatching { LocalDate.parse(raw) }
+                .getOrNull()
+                ?.takeIf { it.toString() == raw }
+                ?: return null
+            val zone = runCatching { ZoneId.of(timezoneName) }.getOrNull() ?: return null
+            val nextMidnight = runCatching { date.plusDays(1).atTime(LocalTime.MIDNIGHT) }
+                .getOrNull() ?: return null
+            val instant = zone.rules.getValidOffsets(nextMidnight)
+                .map { nextMidnight.toInstant(it) }
+                .minOrNull()
+                ?: return null
+            MoveLaterDeadlineBoundary(
+                instant,
+                isHard = canonicalHardness ?: return null,
+                isCanonicalField = true,
+            )
+        }
+        else -> return null
     }
     val root = runCatching {
         MOVE_LATER_JSON.parseToJsonElement(flexibleConstraintsJson) as? JsonObject

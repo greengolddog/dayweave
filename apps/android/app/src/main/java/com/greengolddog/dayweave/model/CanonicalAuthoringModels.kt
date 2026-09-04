@@ -932,6 +932,9 @@ data class CanonicalItemDraft(
             require(it != itemId) { "An item cannot be its own parent" }
         }
         when (value.kind) {
+            ItemKind.PROJECT -> error(
+                "Project structure is read-only until typed structural authoring is available",
+            )
             ItemKind.HABIT -> {
                 require(
                     value.constraints.routineOrdered == null &&
@@ -1062,7 +1065,7 @@ data class CanonicalItemDraft(
                 value.timezoneName,
                 value.durationSeconds,
             )
-            item.deletedAt == null &&
+            !item.hasExplicitStructuralMetadata && item.deletedAt == null &&
                 item.kind == value.kind.name.lowercase() &&
                 item.status == value.placement.wireValue &&
                 item.isSensitive == value.isSensitive &&
@@ -1304,6 +1307,9 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
  * row must remain trashable (and an exact tombstone restorable).
  */
 internal fun CanonicalItemSnapshot.requireCanonicalReplacementSupport(): CanonicalItemDraft {
+    require(!hasExplicitStructuralMetadata) {
+        "Typed structural metadata is read-only until full-item authoring supports it"
+    }
     val roundTripped = toCanonicalDraft()
     require(roundTripped.recurrence?.kind != CanonicalRecurrenceKind.CUSTOM) {
         "Custom RRULE recurrence is retained for read compatibility but is read-only on Android"

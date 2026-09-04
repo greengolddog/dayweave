@@ -55,6 +55,56 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun structuralNullKeysAreAtomicAndFutureValuesRemainExact() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[{"type":"upsert","item":${structuralItemJson("future_estimator_v2")}}],"next_cursor":"cursor","has_more":false}""",
+            ),
+        )
+
+        val item = requireNotNull(transport.itemDelta(configuration(), null).changes.single().item)
+
+        assertEquals("exact", item.durationKind?.wireValue)
+        assertEquals("future_estimator_v2", item.durationSource?.wireValue)
+        assertEquals("date_time", item.deadlineKind?.wireValue)
+        assertEquals(null, item.deadlineDate)
+        assertEquals(null, item.deadlineSoftWeight)
+        assertEquals(null, item.blockedReasonKind)
+        assertEquals(false, item.hasOwnEffort)
+    }
+
+    @Test
+    fun partialStructuralWireShapeFailsClosedEvenWhenMissingFieldWouldBeNull() {
+        val partial = structuralItemJson().replace("\"blocked_reason\":null,", "")
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[{"type":"upsert","item":$partial}],"next_cursor":"cursor","has_more":false}""",
+            ),
+        )
+
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.itemDelta(configuration(), null) }
+        }
+    }
+
+    @Test
+    fun completeStructuralWireShapeStillRejectsNullRequiredDiscriminator() {
+        val invalid = structuralItemJson().replace(
+            "\"duration_kind\":\"exact\"",
+            "\"duration_kind\":null",
+        )
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[{"type":"upsert","item":$invalid}],"next_cursor":"cursor","has_more":false}""",
+            ),
+        )
+
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.itemDelta(configuration(), null) }
+        }
+    }
+
+    @Test
     fun foregroundDeltaProbeRequestsOnlyOneChangeWithoutChangingNormalDeltaLimit() = runBlocking {
         server.enqueue(
             jsonResponse(
@@ -836,6 +886,23 @@ class OkHttpCanonicalPlannerTransportTest {
           "deleted_at":null
         }
     """.trimIndent()
+
+    private fun structuralItemJson(durationSource: String = "user"): String = itemJson().replace(
+        "\"duration_seconds\":3600,",
+        """"duration_seconds":3600,
+          "duration_kind":"exact",
+          "duration_min_seconds":3600,
+          "duration_max_seconds":3600,
+          "duration_source":"$durationSource",
+          "deadline_kind":"date_time",
+          "deadline_date":null,
+          "deadline_strength":"hard",
+          "deadline_soft_weight":null,
+          "has_own_effort":false,
+          "blocked_reason_kind":null,
+          "blocked_by_item_id":null,
+          "blocked_reason":null,""",
+    )
 
     private fun previewJson(): String = """
         {

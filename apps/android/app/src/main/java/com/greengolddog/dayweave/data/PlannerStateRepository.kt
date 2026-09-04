@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.canonicalTrashItemBytes
 import com.greengolddog.dayweave.model.hasValidOnboardingFirstItemAnchorRelationship
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
+import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withInvalidTimedBreakNotificationAttemptAbandoned
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
@@ -22,6 +23,8 @@ import java.time.Instant
 import java.util.UUID
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -58,6 +61,12 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V16 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+                requireCanonicalStructuralFields = true,
+            )
             PlannerSnapshotFormats.JSON_V15 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
                 requireGoogleSchedulePublicationField = true,
@@ -181,6 +190,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11 ||
@@ -193,6 +203,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14
         ) {
@@ -211,7 +222,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V15 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V16 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -230,6 +241,7 @@ class RoomPlannerStateRepository(
             retainedState.localScheduleCompositionProvenance?.matchesState(retainedState) != false,
         ) { "Local schedule composition provenance does not match the encrypted snapshot" }
         validateSchedulePublicationState(retainedState)
+        validateCanonicalStructuralState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
         validateOnboardingFirstItemAnchor(retainedState)
@@ -240,7 +252,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V15,
+                payloadFormat = PlannerSnapshotFormats.JSON_V16,
             ),
         )
     }
@@ -279,6 +291,7 @@ class RoomPlannerStateRepository(
         requireFirmHorizonDaysField: Boolean = true,
         requireGoogleSchedulePublicationField: Boolean = false,
         requireOnboardingFirstItemAnchorField: Boolean = false,
+        requireCanonicalStructuralFields: Boolean = false,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -335,12 +348,17 @@ class RoomPlannerStateRepository(
             // V13 and predecessors cannot gain schedule-write authority from an injected field.
             JsonObject(googleOutboundSafeRoot - "pendingGoogleSchedulePublication")
         }
-        val root = if (requireOnboardingFirstItemAnchorField) {
+        val onboardingSafeRoot = if (requireOnboardingFirstItemAnchorField) {
             googleSchedulePublicationSafeRoot
         } else {
             // V14 and predecessors cannot designate an arbitrary existing item as reviewed by
             // injecting a field that only the V15 binary understands.
             JsonObject(googleSchedulePublicationSafeRoot - "onboardingFirstItemAnchor")
+        }
+        val root = if (requireCanonicalStructuralFields) {
+            onboardingSafeRoot
+        } else {
+            withoutCanonicalStructuralFields(onboardingSafeRoot)
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -392,6 +410,9 @@ class RoomPlannerStateRepository(
         ) {
             throw SerializationException("Current onboarding first-item anchor is required")
         }
+        if (requireCanonicalStructuralFields) {
+            requireCanonicalStructuralItemFields(root)
+        }
         if (
             requireProposalApplicationFields &&
             (!root.containsKey("pendingProposalApplicationMutation") ||
@@ -439,11 +460,95 @@ class RoomPlannerStateRepository(
                     throw SerializationException("Schedule composition profile is invalid")
                 }
                 validateSchedulePublicationState(it)
+                validateCanonicalStructuralState(it)
                 validateProposalApplicationState(it)
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
                 validateOnboardingFirstItemAnchor(it)
                 validateGoogleOutboundState(it)
             }
+    }
+
+    private fun withoutCanonicalStructuralFields(root: JsonObject): JsonObject {
+        fun strippedItem(element: JsonElement): JsonElement = if (element is JsonObject) {
+            JsonObject(element - CANONICAL_STRUCTURAL_SNAPSHOT_FIELDS)
+        } else {
+            element
+        }
+
+        fun strippedNestedItem(
+            element: JsonElement,
+            field: String,
+        ): JsonElement {
+            if (element !is JsonObject) return element
+            val nested = element[field] ?: return element
+            return JsonObject(element + (field to strippedItem(nested)))
+        }
+
+        var normalized = root
+        (normalized["canonicalItems"] as? JsonArray)?.let { entries ->
+            normalized = JsonObject(
+                normalized + ("canonicalItems" to JsonArray(entries.map(::strippedItem))),
+            )
+        }
+        (normalized["pendingCanonicalAuthoringMutations"] as? JsonArray)?.let { entries ->
+            normalized = JsonObject(
+                normalized + (
+                    "pendingCanonicalAuthoringMutations" to
+                        JsonArray(entries.map { strippedNestedItem(it, "baseItem") })
+                    ),
+            )
+        }
+        (normalized["canonicalRecentlyDeleted"] as? JsonArray)?.let { entries ->
+            normalized = JsonObject(
+                normalized + (
+                    "canonicalRecentlyDeleted" to
+                        JsonArray(entries.map { strippedNestedItem(it, "lastKnownItem") })
+                    ),
+            )
+        }
+        return normalized
+    }
+
+    private fun requireCanonicalStructuralItemFields(root: JsonObject) {
+        fun requireItem(element: JsonElement, path: String) {
+            val item = element as? JsonObject
+                ?: throw SerializationException("$path must be an object")
+            if (!item.keys.containsAll(CANONICAL_STRUCTURAL_SNAPSHOT_FIELDS)) {
+                throw SerializationException("$path is missing canonical structural metadata")
+            }
+        }
+
+        (root["canonicalItems"] as? JsonArray)?.forEachIndexed { index, element ->
+            requireItem(element, "canonicalItems[$index]")
+        }
+        (root["pendingCanonicalAuthoringMutations"] as? JsonArray)?.forEachIndexed {
+                index,
+                element,
+            ->
+            val nested = (element as? JsonObject)?.get("baseItem")
+            if (nested != null && nested !is JsonNull) {
+                requireItem(nested, "pendingCanonicalAuthoringMutations[$index].baseItem")
+            }
+        }
+        (root["canonicalRecentlyDeleted"] as? JsonArray)?.forEachIndexed { index, element ->
+            val nested = (element as? JsonObject)?.get("lastKnownItem")
+            if (nested != null && nested !is JsonNull) {
+                requireItem(nested, "canonicalRecentlyDeleted[$index].lastKnownItem")
+            }
+        }
+    }
+
+    private fun validateCanonicalStructuralState(state: DayWeaveUiState) {
+        val items = buildList {
+            addAll(state.canonicalItems)
+            state.pendingCanonicalAuthoringMutations.mapNotNullTo(this) { it.baseItem }
+            state.canonicalRecentlyDeleted.mapNotNullTo(this) { it.lastKnownItem }
+        }
+        items.forEach { item ->
+            runCatching(item::requireValidStructuralMetadata).getOrElse {
+                throw SerializationException("Canonical structural metadata is invalid", it)
+            }
+        }
     }
 
     private fun DayWeaveUiState.withoutTimedBreakNotificationReceipts(): DayWeaveUiState = copy(
@@ -1032,6 +1137,21 @@ class RoomPlannerStateRepository(
             "lastConsumedBreakEndNotificationDigest",
             "lastRejectedBreakEndNotificationDigest",
             "acknowledgedBreakEndDigest",
+        )
+        val CANONICAL_STRUCTURAL_SNAPSHOT_FIELDS = setOf(
+            "durationKind",
+            "durationMinSeconds",
+            "durationMaxSeconds",
+            "durationSource",
+            "deadlineKind",
+            "deadlineDate",
+            "deadlineStrength",
+            "deadlineSoftWeight",
+            "hasOwnEffort",
+            "blockedReasonKind",
+            "blockedByItemId",
+            "blockedReason",
+            "hasExplicitStructuralMetadata",
         )
         val SNAPSHOT_JSON = Json {
             encodeDefaults = true

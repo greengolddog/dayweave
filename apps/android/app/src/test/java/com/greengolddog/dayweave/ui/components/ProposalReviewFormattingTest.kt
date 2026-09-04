@@ -1,5 +1,9 @@
 package com.greengolddog.dayweave.ui.components
 
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
 import com.greengolddog.dayweave.network.RemoteProposalItemField
 import com.greengolddog.dayweave.network.RemoteProposalItemKind
@@ -20,8 +24,16 @@ class ProposalReviewFormattingTest {
             RemoteProposalItemField.TITLE to "\"Focus \\\"deeply\\\"\"",
             RemoteProposalItemField.NOTES to "\"Line one\\nLine two\"",
             RemoteProposalItemField.TIMEZONE_NAME to "\"Europe/Madrid\"",
+            RemoteProposalItemField.DURATION_KIND to "\"exact\"",
+            RemoteProposalItemField.DURATION_MIN_SECONDS to "2700",
             RemoteProposalItemField.DURATION_SECONDS to "2700",
+            RemoteProposalItemField.DURATION_MAX_SECONDS to "2700",
+            RemoteProposalItemField.DURATION_SOURCE to "\"user\"",
+            RemoteProposalItemField.DEADLINE_KIND to "\"date_time\"",
             RemoteProposalItemField.DEADLINE_AT to "\"2026-09-01T17:00:00Z\"",
+            RemoteProposalItemField.DEADLINE_DATE to "null",
+            RemoteProposalItemField.DEADLINE_STRENGTH to "\"hard\"",
+            RemoteProposalItemField.DEADLINE_SOFT_WEIGHT to "null",
             RemoteProposalItemField.EARLIEST_START_AT to "\"2026-09-01T08:00:00Z\"",
             RemoteProposalItemField.RECURRENCE to "{\"frequency\":\"weekly\"}",
             RemoteProposalItemField.FLEXIBLE_CONSTRAINTS to "{\"window\":\"morning\"}",
@@ -30,6 +42,10 @@ class ProposalReviewFormattingTest {
             RemoteProposalItemField.URGENCY to "61",
             RemoteProposalItemField.PARENT_ID to "\"22222222-2222-4222-8222-222222222222\"",
             RemoteProposalItemField.SIBLING_ORDER to "4",
+            RemoteProposalItemField.HAS_OWN_EFFORT to "false",
+            RemoteProposalItemField.BLOCKED_REASON_KIND to "null",
+            RemoteProposalItemField.BLOCKED_BY_ITEM_ID to "null",
+            RemoteProposalItemField.BLOCKED_REASON to "null",
             RemoteProposalItemField.IS_EXECUTABLE to "false",
             RemoteProposalItemField.REVISION to "7",
             RemoteProposalItemField.COMPLETED_AT to "\"2026-09-01T18:00:00Z\"",
@@ -88,7 +104,13 @@ class ProposalReviewFormattingTest {
         notes = "Line one\nLine two",
         timezoneName = "Europe/Madrid",
         durationSeconds = 2_700,
+        durationKind = CanonicalDurationKind.EXACT,
+        durationMinSeconds = 2_700,
+        durationMaxSeconds = 2_700,
+        durationSource = CanonicalDurationSource.USER,
         deadlineAt = "2026-09-01T17:00:00Z",
+        deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+        deadlineStrength = CanonicalDeadlineStrength.HARD,
         earliestStartAt = "2026-09-01T08:00:00Z",
         recurrence = buildJsonObject { put("frequency", "weekly") },
         flexibleConstraints = buildJsonObject { put("window", "morning") },
@@ -97,6 +119,7 @@ class ProposalReviewFormattingTest {
         urgency = 61,
         parentId = "22222222-2222-4222-8222-222222222222",
         siblingOrder = 4,
+        hasOwnEffort = false,
         isExecutable = false,
         revision = 7,
         createdAt = "2026-08-30T10:00:00Z",

@@ -2,7 +2,12 @@ package com.greengolddog.dayweave.ui.authoring
 
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
@@ -34,13 +39,25 @@ internal data class CanonicalAuthoringRow(
     val itemId: String,
     val title: String,
     val kind: ItemKind,
+    val status: String,
     val placement: CanonicalDraftPlacement,
     val parentId: String?,
     val depth: Int,
     val breadcrumb: List<String>,
     val isSensitive: Boolean,
+    val durationKind: CanonicalDurationKind,
+    val durationMinSeconds: Long?,
     val durationSeconds: Long?,
+    val durationMaxSeconds: Long?,
+    val durationSource: CanonicalDurationSource?,
+    val deadlineKind: CanonicalDeadlineKind,
     val deadlineAt: String?,
+    val deadlineDate: String?,
+    val deadlineStrength: CanonicalDeadlineStrength?,
+    val deadlineSoftWeight: Long?,
+    val blockedReasonKind: CanonicalBlockedReasonKind?,
+    val blockedByItemId: String?,
+    val blockedReason: String?,
     val source: CanonicalAuthoringRowSource,
     val syncState: CanonicalAuthoringSyncState,
     val mutationId: String?,
@@ -60,10 +77,11 @@ internal data class CanonicalAuthoringRow(
 internal data class CanonicalAuthoringPresentation(
     val inbox: List<CanonicalAuthoringRow>,
     val planned: List<CanonicalAuthoringRow>,
+    val blocked: List<CanonicalAuthoringRow>,
     val conflicts: List<CanonicalAuthoringRow>,
     val recentlyDeleted: List<CanonicalAuthoringRow>,
 ) {
-    val itemCount: Int get() = (inbox + planned + recentlyDeleted)
+    val itemCount: Int get() = (inbox + planned + blocked + recentlyDeleted)
         .distinctBy(CanonicalAuthoringRow::itemId)
         .size
 
@@ -77,6 +95,7 @@ internal data class CanonicalAuthoringPresentation(
                 it.status in setOf(
                         CanonicalDraftPlacement.INBOX.wireValue,
                         CanonicalDraftPlacement.PLANNED.wireValue,
+                        "blocked",
                     )
             }
             val nodes = linkedMapOf<String, AuthoringNode>()
@@ -104,6 +123,7 @@ internal data class CanonicalAuthoringPresentation(
             val hierarchy = AuthoringHierarchy(nodes)
             val inbox = mutableListOf<CanonicalAuthoringRow>()
             val planned = mutableListOf<CanonicalAuthoringRow>()
+            val blocked = mutableListOf<CanonicalAuthoringRow>()
             val conflicts = mutableListOf<CanonicalAuthoringRow>()
             val deleted = mutableListOf<CanonicalAuthoringRow>()
 
@@ -123,9 +143,10 @@ internal data class CanonicalAuthoringPresentation(
                     hasMissingParent = itemId in hierarchy.missingParentIds,
                     hasHierarchyCycle = itemId in hierarchy.cyclicIds,
                 )
-                when (row.placement) {
-                    CanonicalDraftPlacement.INBOX -> inbox += row
-                    CanonicalDraftPlacement.PLANNED -> planned += row
+                when (row.status) {
+                    CanonicalDraftPlacement.INBOX.wireValue -> inbox += row
+                    CanonicalDraftPlacement.PLANNED.wireValue -> planned += row
+                    "blocked" -> blocked += row
                 }
                 if (row.syncState == CanonicalAuthoringSyncState.CONFLICTED) conflicts += row
             }
@@ -139,13 +160,35 @@ internal data class CanonicalAuthoringPresentation(
                         itemId = mutation.itemId,
                         title = item?.title ?: "Deleted item",
                         kind = item?.kind.toItemKind(),
+                        status = item?.status ?: draft?.placement?.wireValue ?: "inbox",
                         placement = draft?.placement ?: item?.status.toPlacement(),
                         parentId = item?.parentId,
                         depth = 0,
                         breadcrumb = emptyList(),
                         isSensitive = sensitivityFor(state, mutation.itemId),
+                        durationKind = item?.durationKind ?: inferredDurationKind(
+                            item?.durationSeconds,
+                        ),
+                        durationMinSeconds = item?.durationMinSeconds ?: item?.durationSeconds,
                         durationSeconds = item?.durationSeconds,
+                        durationMaxSeconds = item?.durationMaxSeconds ?: item?.durationSeconds,
+                        durationSource = item?.durationSource ?: inferredDurationSource(
+                            item?.durationSeconds,
+                        ),
+                        deadlineKind = item?.deadlineKind ?: inferredDeadlineKind(
+                            item?.kind,
+                            item?.deadlineAt,
+                        ),
                         deadlineAt = item?.deadlineAt,
+                        deadlineDate = item?.deadlineDate,
+                        deadlineStrength = item?.deadlineStrength ?: inferredDeadlineStrength(
+                            item?.kind,
+                            item?.deadlineAt,
+                        ),
+                        deadlineSoftWeight = item?.deadlineSoftWeight,
+                        blockedReasonKind = item?.blockedReasonKind,
+                        blockedByItemId = item?.blockedByItemId,
+                        blockedReason = item?.blockedReason,
                         source = CanonicalAuthoringRowSource.PENDING_TRASH,
                         syncState = mutation.syncState(),
                         mutationId = mutation.id,
@@ -177,13 +220,35 @@ internal data class CanonicalAuthoringPresentation(
                         itemId = record.id,
                         title = item?.title ?: "Deleted item",
                         kind = item?.kind.toItemKind(),
+                        status = item?.status ?: draft?.placement?.wireValue ?: "inbox",
                         placement = draft?.placement ?: item?.status.toPlacement(),
                         parentId = record.parentId,
                         depth = 0,
                         breadcrumb = emptyList(),
                         isSensitive = record.isSensitive,
+                        durationKind = item?.durationKind ?: inferredDurationKind(
+                            item?.durationSeconds,
+                        ),
+                        durationMinSeconds = item?.durationMinSeconds ?: item?.durationSeconds,
                         durationSeconds = item?.durationSeconds,
+                        durationMaxSeconds = item?.durationMaxSeconds ?: item?.durationSeconds,
+                        durationSource = item?.durationSource ?: inferredDurationSource(
+                            item?.durationSeconds,
+                        ),
+                        deadlineKind = item?.deadlineKind ?: inferredDeadlineKind(
+                            item?.kind,
+                            item?.deadlineAt,
+                        ),
                         deadlineAt = item?.deadlineAt,
+                        deadlineDate = item?.deadlineDate,
+                        deadlineStrength = item?.deadlineStrength ?: inferredDeadlineStrength(
+                            item?.kind,
+                            item?.deadlineAt,
+                        ),
+                        deadlineSoftWeight = item?.deadlineSoftWeight,
+                        blockedReasonKind = item?.blockedReasonKind,
+                        blockedByItemId = item?.blockedByItemId,
+                        blockedReason = item?.blockedReason,
                         source = if (mutation == null) {
                             CanonicalAuthoringRowSource.RECENTLY_DELETED
                         } else {
@@ -205,6 +270,7 @@ internal data class CanonicalAuthoringPresentation(
             return CanonicalAuthoringPresentation(
                 inbox = inbox,
                 planned = planned,
+                blocked = blocked,
                 conflicts = conflicts.distinctBy(CanonicalAuthoringRow::itemId),
                 recentlyDeleted = deleted.distinctBy(CanonicalAuthoringRow::itemId),
             )
@@ -226,11 +292,23 @@ private data class AuthoringNode(
     val itemId: String,
     val title: String,
     val kind: ItemKind,
+    val status: String,
     val placement: CanonicalDraftPlacement,
     val parentId: String?,
     val siblingOrder: Long,
+    val durationKind: CanonicalDurationKind,
+    val durationMinSeconds: Long?,
     val durationSeconds: Long?,
+    val durationMaxSeconds: Long?,
+    val durationSource: CanonicalDurationSource?,
+    val deadlineKind: CanonicalDeadlineKind,
     val deadlineAt: String?,
+    val deadlineDate: String?,
+    val deadlineStrength: CanonicalDeadlineStrength?,
+    val deadlineSoftWeight: Long?,
+    val blockedReasonKind: CanonicalBlockedReasonKind?,
+    val blockedByItemId: String?,
+    val blockedReason: String?,
     val mutation: PendingCanonicalAuthoringMutation?,
     val draft: CanonicalItemDraft?,
     val revision: Long?,
@@ -255,13 +333,25 @@ private data class AuthoringNode(
             itemId = itemId,
             title = title,
             kind = kind,
+            status = status,
             placement = placement,
             parentId = parentId,
             depth = depth,
             breadcrumb = breadcrumb,
             isSensitive = isSensitive,
+            durationKind = durationKind,
+            durationMinSeconds = durationMinSeconds,
             durationSeconds = durationSeconds,
+            durationMaxSeconds = durationMaxSeconds,
+            durationSource = durationSource,
+            deadlineKind = deadlineKind,
             deadlineAt = deadlineAt,
+            deadlineDate = deadlineDate,
+            deadlineStrength = deadlineStrength,
+            deadlineSoftWeight = deadlineSoftWeight,
+            blockedReasonKind = blockedReasonKind,
+            blockedByItemId = blockedByItemId,
+            blockedReason = blockedReason,
             source = source,
             syncState = mutation?.syncState() ?: CanonicalAuthoringSyncState.SYNCED,
             mutationId = mutation?.id,
@@ -292,15 +382,59 @@ private data class AuthoringNode(
                 Result.success(pendingDraft)
             }
             val decoded = decodedAttempt.getOrNull()
+            val usesPendingDraft = pendingDraft != null
+            val presentedDuration = decoded?.durationSeconds ?: item.durationSeconds
+            val presentedDeadline = decoded?.deadlineAt ?: item.deadlineAt
+            val presentedKind = decoded?.kind ?: item.kind.toItemKind()
             return AuthoringNode(
                 itemId = item.id,
                 title = decoded?.title ?: item.title,
-                kind = decoded?.kind ?: item.kind.toItemKind(),
+                kind = presentedKind,
+                status = if (usesPendingDraft) {
+                    requireNotNull(decoded).placement.wireValue
+                } else {
+                    item.status
+                },
                 placement = decoded?.placement ?: item.status.toPlacement(),
                 parentId = decoded?.parentId ?: item.parentId,
                 siblingOrder = decoded?.siblingOrder ?: item.siblingOrder,
-                durationSeconds = decoded?.durationSeconds ?: item.durationSeconds,
-                deadlineAt = decoded?.deadlineAt ?: item.deadlineAt,
+                durationKind = if (usesPendingDraft) {
+                    inferredDurationKind(presentedDuration)
+                } else {
+                    item.durationKind
+                },
+                durationMinSeconds = if (usesPendingDraft) {
+                    presentedDuration
+                } else {
+                    item.durationMinSeconds
+                },
+                durationSeconds = presentedDuration,
+                durationMaxSeconds = if (usesPendingDraft) {
+                    presentedDuration
+                } else {
+                    item.durationMaxSeconds
+                },
+                durationSource = if (usesPendingDraft) {
+                    inferredDurationSource(presentedDuration)
+                } else {
+                    item.durationSource
+                },
+                deadlineKind = if (usesPendingDraft) {
+                    inferredDeadlineKind(presentedKind.name.lowercase(), presentedDeadline)
+                } else {
+                    item.deadlineKind
+                },
+                deadlineAt = presentedDeadline,
+                deadlineDate = if (usesPendingDraft) null else item.deadlineDate,
+                deadlineStrength = if (usesPendingDraft) {
+                    inferredDeadlineStrength(presentedKind.name.lowercase(), presentedDeadline)
+                } else {
+                    item.deadlineStrength
+                },
+                deadlineSoftWeight = if (usesPendingDraft) null else item.deadlineSoftWeight,
+                blockedReasonKind = if (usesPendingDraft) null else item.blockedReasonKind,
+                blockedByItemId = if (usesPendingDraft) null else item.blockedByItemId,
+                blockedReason = if (usesPendingDraft) null else item.blockedReason,
                 mutation = mutation,
                 draft = decoded,
                 revision = item.revision,
@@ -325,11 +459,26 @@ private data class AuthoringNode(
             itemId = mutation.itemId,
             title = draft.title,
             kind = draft.kind,
+            status = draft.placement.wireValue,
             placement = draft.placement,
             parentId = draft.parentId,
             siblingOrder = draft.siblingOrder,
+            durationKind = inferredDurationKind(draft.durationSeconds),
+            durationMinSeconds = draft.durationSeconds,
             durationSeconds = draft.durationSeconds,
+            durationMaxSeconds = draft.durationSeconds,
+            durationSource = inferredDurationSource(draft.durationSeconds),
+            deadlineKind = inferredDeadlineKind(draft.kind.name.lowercase(), draft.deadlineAt),
             deadlineAt = draft.deadlineAt,
+            deadlineDate = null,
+            deadlineStrength = inferredDeadlineStrength(
+                draft.kind.name.lowercase(),
+                draft.deadlineAt,
+            ),
+            deadlineSoftWeight = null,
+            blockedReasonKind = null,
+            blockedByItemId = null,
+            blockedReason = null,
             mutation = mutation,
             draft = draft,
             revision = null,
@@ -440,3 +589,25 @@ private fun String?.toItemKind(): ItemKind = ItemKind.entries.firstOrNull {
 private fun String?.toPlacement(): CanonicalDraftPlacement =
     CanonicalDraftPlacement.entries.firstOrNull { it.wireValue == this }
         ?: CanonicalDraftPlacement.INBOX
+
+private fun inferredDurationKind(durationSeconds: Long?): CanonicalDurationKind =
+    if (durationSeconds == null) CanonicalDurationKind.UNKNOWN else CanonicalDurationKind.EXACT
+
+private fun inferredDurationSource(durationSeconds: Long?): CanonicalDurationSource? =
+    if (durationSeconds == null) null else CanonicalDurationSource.USER
+
+private fun inferredDeadlineKind(kind: String?, deadlineAt: String?): CanonicalDeadlineKind =
+    if (kind == "event" || deadlineAt == null) {
+        CanonicalDeadlineKind.NONE
+    } else {
+        CanonicalDeadlineKind.DATE_TIME
+    }
+
+private fun inferredDeadlineStrength(
+    kind: String?,
+    deadlineAt: String?,
+): CanonicalDeadlineStrength? = if (kind == "event" || deadlineAt == null) {
+    null
+} else {
+    CanonicalDeadlineStrength.HARD
+}

@@ -45,6 +45,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundCandidate
 import com.greengolddog.dayweave.model.InboxItem
@@ -124,7 +128,8 @@ internal fun CanonicalAuthoringList(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Canonical items", style = MaterialTheme.typography.titleMedium)
                             Text(
-                                "Inbox waits for triage. Planned becomes eligible for composition after sync.",
+                                "Inbox waits for triage. Planned becomes eligible for composition " +
+                                    "after sync. Blocked stays visible with its cause.",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -216,6 +221,35 @@ internal fun CanonicalAuthoringList(
             onCopy = { row ->
                 row.mutationId?.let { mutationId ->
                     perform("The retained draft could not be copied.") { onCopyConflict(mutationId) }
+                }
+            },
+            googlePublicationCandidate = state::googleCalendarOutboundCandidate,
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
+        )
+        canonicalSection(
+            title = "Blocked",
+            rows = presentation.blocked,
+            emptyMessage = "Nothing is currently waiting on a blocker.",
+            actionsEnabled = effectiveActionsEnabled,
+            onOpenEditor = onOpenEditor,
+            onTrash = { trashCandidate = it },
+            onRestore = { row ->
+                perform("The restore could not be queued.") { onRestore(row.itemId) }
+            },
+            onDiscard = { row ->
+                row.mutationId?.let { mutationId ->
+                    perform("The queued change could not be discarded.") {
+                        onDiscard(mutationId)
+                    }
+                }
+            },
+            onCopy = { row ->
+                row.mutationId?.let { mutationId ->
+                    perform("The retained draft could not be copied.") {
+                        onCopyConflict(mutationId)
+                    }
                 }
             },
             googlePublicationCandidate = state::googleCalendarOutboundCandidate,
@@ -453,10 +487,8 @@ private fun CanonicalAuthoringCard(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(row.kind.label, style = MaterialTheme.typography.labelMedium)
-                    Text("· ${row.placement.label()}", style = MaterialTheme.typography.labelMedium)
-                    row.durationSeconds?.let { seconds ->
-                        Text("· ${durationLabel(seconds)}", style = MaterialTheme.typography.labelMedium)
-                    }
+                    Text("· ${canonicalStatusLabel(row.status)}", style = MaterialTheme.typography.labelMedium)
+                    Text("· ${canonicalDurationLabel(row)}", style = MaterialTheme.typography.labelMedium)
                     if (row.isSensitive) {
                         Icon(
                             Icons.Outlined.PrivacyTip,
@@ -470,11 +502,19 @@ private fun CanonicalAuthoringCard(
                         )
                     }
                 }
-                row.deadlineAt?.let { deadline ->
+                canonicalTimingLabel(row)?.let { timing ->
                     Text(
-                        "Due ${formatInstant(deadline)}",
+                        timing,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                canonicalBlockedReasonLabel(row)?.let { blocker ->
+                    Text(
+                        blocker,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag("canonical_blocked_reason_${row.itemId}"),
                     )
                 }
                 if (row.hasMissingParent || row.hasHierarchyCycle) {
@@ -706,12 +746,83 @@ private fun CanonicalAuthoringSyncState.label(): String = when (this) {
     CanonicalAuthoringSyncState.CONFLICTED -> "CONFLICT"
 }
 
-private fun com.greengolddog.dayweave.model.CanonicalDraftPlacement.label(): String =
-    if (this == com.greengolddog.dayweave.model.CanonicalDraftPlacement.INBOX) {
-        "Inbox"
-    } else {
-        "Planned"
+internal fun canonicalStatusLabel(status: String): String = when (status) {
+    "inbox" -> "Inbox"
+    "planned" -> "Planned"
+    "scheduled" -> "Scheduled"
+    "in_progress" -> "In progress"
+    "paused" -> "Paused"
+    "blocked" -> "Blocked"
+    "completed" -> "Completed"
+    "skipped" -> "Skipped"
+    "cancelled" -> "Cancelled"
+    else -> status.replace('_', ' ').replaceFirstChar(Char::uppercase)
+}
+
+internal fun canonicalDurationLabel(row: CanonicalAuthoringRow): String {
+    val base = when (row.durationKind) {
+        CanonicalDurationKind.UNKNOWN -> "Unknown duration"
+        CanonicalDurationKind.EXACT -> row.durationSeconds?.let(::durationLabel)
+            ?: "Duration unavailable"
+        CanonicalDurationKind.RANGE -> {
+            val minimum = row.durationMinSeconds?.let(::durationLabel)
+            val expected = row.durationSeconds?.let(::durationLabel)
+            val maximum = row.durationMaxSeconds?.let(::durationLabel)
+            if (minimum == null || expected == null || maximum == null) {
+                "Duration unavailable"
+            } else {
+                "$minimum–$maximum · expected $expected"
+            }
+        }
+        else -> "Newer duration policy"
     }
+    val source = row.durationSource?.wireValue?.replace('_', ' ')
+        ?.replaceFirstChar(Char::uppercase)
+    return if (source == null || row.durationKind == CanonicalDurationKind.UNKNOWN) {
+        base
+    } else {
+        "$base · $source"
+    }
+}
+
+internal fun canonicalTimingLabel(row: CanonicalAuthoringRow): String? {
+    if (row.kind == com.greengolddog.dayweave.model.ItemKind.EVENT && row.deadlineAt != null) {
+        return "Ends ${formatInstant(row.deadlineAt)}"
+    }
+    val base = when (row.deadlineKind) {
+        CanonicalDeadlineKind.NONE -> return null
+        CanonicalDeadlineKind.DATE -> row.deadlineDate?.let { "Due $it" }
+        CanonicalDeadlineKind.DATE_TIME -> row.deadlineAt?.let { "Due ${formatInstant(it)}" }
+        else -> return "Deadline uses a newer policy"
+    } ?: return "Deadline unavailable"
+    val strength = when (row.deadlineStrength) {
+        CanonicalDeadlineStrength.HARD -> "Hard"
+        CanonicalDeadlineStrength.SOFT -> row.deadlineSoftWeight?.let { "Soft · weight $it" }
+            ?: "Soft"
+        null -> "Policy unavailable"
+        else -> "Newer policy"
+    }
+    return "$base · $strength"
+}
+
+internal fun canonicalBlockedReasonLabel(row: CanonicalAuthoringRow): String? {
+    if (row.status != "blocked") return null
+    return when (row.blockedReasonKind) {
+        CanonicalBlockedReasonKind.DEPENDENCY -> {
+            val dependency = row.blockedByItemId?.take(8)?.let { "waiting for item $it" }
+                ?: "waiting for a dependency"
+            row.blockedReason?.let { "Blocked · $dependency · $it" } ?: "Blocked · $dependency"
+        }
+        CanonicalBlockedReasonKind.MANUAL -> row.blockedReason?.let {
+            "Manually blocked · $it"
+        } ?: "Manually blocked"
+        CanonicalBlockedReasonKind.EXTERNAL -> row.blockedReason?.let {
+            "External blocker · $it"
+        } ?: "External blocker"
+        null -> "Blocked reason unavailable"
+        else -> "Blocked for a reason that requires a newer DayWeave version"
+    }
+}
 
 private fun durationLabel(seconds: Long): String = when {
     seconds % 3_600L == 0L -> "${seconds / 3_600L}h"

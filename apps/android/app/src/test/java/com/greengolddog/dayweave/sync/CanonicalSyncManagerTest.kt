@@ -5,6 +5,11 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemDraft
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
@@ -20,6 +25,7 @@ import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.localScheduleCompositionFingerprintComputationCount
+import com.greengolddog.dayweave.model.requireCanonicalReplacementSupport
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -88,6 +94,135 @@ import org.junit.Test
 
 class CanonicalSyncManagerTest {
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
+
+    @Test
+    fun explicitLegacyEquivalentStructureRemainsAuthorable() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val explicit = remoteItem(split = false).copy(
+            flexibleConstraints = buildJsonObject { },
+            durationKind = CanonicalDurationKind.EXACT,
+            durationMinSeconds = 3_600,
+            durationMaxSeconds = 3_600,
+            durationSource = CanonicalDurationSource.USER,
+            deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+            deadlineStrength = CanonicalDeadlineStrength.HARD,
+            hasOwnEffort = false,
+        )
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(preview())
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = explicit)),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshCurrentPublishedSchedule(),
+        )
+        val cached = plannerStore.state.value.canonicalItems.single()
+        assertFalse(cached.hasExplicitStructuralMetadata)
+        assertNotNull(cached.requireCanonicalReplacementSupport())
+        assertTrue(
+            runCatching {
+                cached.copy(kind = "project").requireCanonicalReplacementSupport()
+            }.isFailure,
+        )
+    }
+
+    @Test
+    fun futureStructureAndItemSemanticsRemainExactAndReadOnly() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val explicit = remoteItem(split = false).copy(
+            kind = "travel_reservation",
+            status = "waiting_for_review",
+            durationKind = CanonicalDurationKind.EXACT,
+            durationMinSeconds = 3_600,
+            durationMaxSeconds = 3_600,
+            durationSource = CanonicalDurationSource("future_estimator_v2"),
+            deadlineKind = CanonicalDeadlineKind.NONE,
+            deadlineStrength = null,
+            hasOwnEffort = false,
+            blockedReasonKind = CanonicalBlockedReasonKind.MANUAL,
+            blockedReason = "Waiting for review",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(preview())
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = explicit)),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshCurrentPublishedSchedule(),
+        )
+        val cached = plannerStore.state.value.canonicalItems.single()
+        assertEquals("travel_reservation", cached.kind)
+        assertEquals("waiting_for_review", cached.status)
+        assertEquals("future_estimator_v2", cached.durationSource?.wireValue)
+        assertEquals(CanonicalBlockedReasonKind.MANUAL, cached.blockedReasonKind)
+        assertTrue(cached.hasExplicitStructuralMetadata)
+    }
+
+    @Test
+    fun oversizedFutureStructuralDiscriminatorFailsClosed() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val invalid = remoteItem(split = false).copy(
+            durationKind = CanonicalDurationKind.EXACT,
+            durationMinSeconds = 3_600,
+            durationMaxSeconds = 3_600,
+            durationSource = CanonicalDurationSource("x".repeat(65)),
+            deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+            deadlineStrength = CanonicalDeadlineStrength.HARD,
+            hasOwnEffort = false,
+        )
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(preview())
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = invalid)),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(plannerStore, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+    }
+
+    @Test
+    fun dateOnlyDeadlineOutsidePortableCanonicalRangeFailsClosed() = runBlocking {
+        listOf("0000-01-01", "9999-12-31").forEach { deadlineDate ->
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val invalid = remoteItem(split = false).copy(
+                deadlineAt = null,
+                deadlineKind = CanonicalDeadlineKind.DATE,
+                deadlineDate = deadlineDate,
+                deadlineStrength = CanonicalDeadlineStrength.HARD,
+                hasOwnEffort = false,
+            )
+            val transport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(preview())
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = invalid)),
+                    "cursor-1",
+                    false,
+                )
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+                manager(plannerStore, transport).refreshCurrentPublishedSchedule(),
+            )
+            assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        }
+    }
 
     @Test
     fun currentScheduleDeltaStaysReadOnlyUntilExactSnapshotIsAtomicallyInstalled() = runBlocking {

@@ -334,5 +334,6 @@ fun ItemKind.color(): Color = when (this) {
     ItemKind.HABIT -> HabitColor
     ItemKind.ROUTINE -> RoutineColor
     ItemKind.GOAL -> GoalColor
+    ItemKind.PROJECT -> GoalColor
     ItemKind.BREAK -> BreakColor
 }

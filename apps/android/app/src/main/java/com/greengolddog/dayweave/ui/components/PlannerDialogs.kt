@@ -119,7 +119,7 @@ fun QuickCaptureSheet(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                ItemKind.entries.forEach { option ->
+                ItemKind.entries.filterNot { it == ItemKind.PROJECT }.forEach { option ->
                     FilterChip(
                         selected = option == kind,
                         onClick = { kind = option },
@@ -1230,8 +1230,23 @@ internal fun proposalReviewFieldValue(
         RemoteProposalItemField.TITLE -> quoted(item.title)
         RemoteProposalItemField.NOTES -> quotedOrNull(item.notes)
         RemoteProposalItemField.TIMEZONE_NAME -> quoted(item.timezoneName)
+        RemoteProposalItemField.DURATION_KIND ->
+            item.durationKind?.wireValue?.let(::quoted) ?: "null"
+        RemoteProposalItemField.DURATION_MIN_SECONDS ->
+            item.durationMinSeconds?.toString() ?: "null"
         RemoteProposalItemField.DURATION_SECONDS -> item.durationSeconds?.toString() ?: "null"
+        RemoteProposalItemField.DURATION_MAX_SECONDS ->
+            item.durationMaxSeconds?.toString() ?: "null"
+        RemoteProposalItemField.DURATION_SOURCE ->
+            item.durationSource?.wireValue?.let(::quoted) ?: "null"
+        RemoteProposalItemField.DEADLINE_KIND ->
+            item.deadlineKind?.wireValue?.let(::quoted) ?: "null"
         RemoteProposalItemField.DEADLINE_AT -> quotedOrNull(item.deadlineAt)
+        RemoteProposalItemField.DEADLINE_DATE -> quotedOrNull(item.deadlineDate)
+        RemoteProposalItemField.DEADLINE_STRENGTH ->
+            item.deadlineStrength?.wireValue?.let(::quoted) ?: "null"
+        RemoteProposalItemField.DEADLINE_SOFT_WEIGHT ->
+            item.deadlineSoftWeight?.toString() ?: "null"
         RemoteProposalItemField.EARLIEST_START_AT -> quotedOrNull(item.earliestStartAt)
         RemoteProposalItemField.RECURRENCE -> item.recurrence?.toString() ?: "null"
         RemoteProposalItemField.FLEXIBLE_CONSTRAINTS -> item.flexibleConstraints.toString()
@@ -1240,6 +1255,11 @@ internal fun proposalReviewFieldValue(
         RemoteProposalItemField.URGENCY -> item.urgency.toString()
         RemoteProposalItemField.PARENT_ID -> quotedOrNull(item.parentId)
         RemoteProposalItemField.SIBLING_ORDER -> item.siblingOrder.toString()
+        RemoteProposalItemField.HAS_OWN_EFFORT -> item.hasOwnEffort?.toString() ?: "null"
+        RemoteProposalItemField.BLOCKED_REASON_KIND ->
+            item.blockedReasonKind?.wireValue?.let(::quoted) ?: "null"
+        RemoteProposalItemField.BLOCKED_BY_ITEM_ID -> quotedOrNull(item.blockedByItemId)
+        RemoteProposalItemField.BLOCKED_REASON -> quotedOrNull(item.blockedReason)
         RemoteProposalItemField.IS_EXECUTABLE -> item.isExecutable.toString()
         RemoteProposalItemField.REVISION -> item.revision.toString()
         RemoteProposalItemField.COMPLETED_AT -> quotedOrNull(item.completedAt)

@@ -304,32 +304,40 @@ class RustScheduleComposer(
         }
     }
 
-    private fun CanonicalItemSnapshot.toHelperItem() = HelperCanonicalItem(
-        id = id,
-        isSensitive = isSensitive,
-        kind = kind,
-        status = status,
-        title = title,
-        // Notes do not affect deterministic placement and never need to cross the native boundary.
-        notes = null,
-        timezoneName = timezoneName,
-        durationSeconds = durationSeconds,
-        deadlineAt = deadlineAt,
-        earliestStartAt = earliestStartAt,
-        recurrence = recurrenceJson?.let(::parseStoredJson),
-        flexibleConstraints = parseStoredJson(flexibleConstraintsJson),
-        splitPolicy = parseStoredJson(splitPolicyJson),
-        importance = importance,
-        urgency = urgency,
-        parentId = parentId,
-        siblingOrder = siblingOrder,
-        isExecutable = isExecutable,
-        revision = revision,
-        createdAt = createdAt,
-        updatedAt = updatedAt,
-        completedAt = completedAt,
-        deletedAt = deletedAt,
-    )
+    private fun CanonicalItemSnapshot.toHelperItem(): HelperCanonicalItem {
+        require(!hasExplicitStructuralMetadata) {
+            "The bundled scheduler cannot normalize unsupported canonical structure"
+        }
+        require(kind in HELPER_SUPPORTED_ITEM_KINDS && status in HELPER_SUPPORTED_ITEM_STATUSES) {
+            "The bundled scheduler cannot normalize unknown canonical semantics"
+        }
+        return HelperCanonicalItem(
+            id = id,
+            isSensitive = isSensitive,
+            kind = kind,
+            status = status,
+            title = title,
+            // Notes do not affect deterministic placement and never cross the native boundary.
+            notes = null,
+            timezoneName = timezoneName,
+            durationSeconds = durationSeconds,
+            deadlineAt = deadlineAt,
+            earliestStartAt = earliestStartAt,
+            recurrence = recurrenceJson?.let(::parseStoredJson),
+            flexibleConstraints = parseStoredJson(flexibleConstraintsJson),
+            splitPolicy = parseStoredJson(splitPolicyJson),
+            importance = importance,
+            urgency = urgency,
+            parentId = parentId,
+            siblingOrder = siblingOrder,
+            isExecutable = isExecutable,
+            revision = revision,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            completedAt = completedAt,
+            deletedAt = deletedAt,
+        )
+    }
 
     private fun parseStoredJson(raw: String): JsonElement {
         val bytes = raw.toByteArray(Charsets.UTF_8)
@@ -362,6 +370,13 @@ class RustScheduleComposer(
         const val REQUEST_SUFFIX = "}}"
         const val LOCAL_FINGERPRINT_PREFIX = "local-sha256:"
         val ERROR_CODE_PATTERN = Regex("[a-z][a-z0-9_]{0,63}")
+        val HELPER_SUPPORTED_ITEM_KINDS = setOf(
+            "event", "task", "habit", "routine", "goal", "project", "break",
+        )
+        val HELPER_SUPPORTED_ITEM_STATUSES = setOf(
+            "inbox", "planned", "scheduled", "in_progress", "paused", "blocked", "completed",
+            "skipped", "cancelled",
+        )
         val JSON = Json {
             encodeDefaults = true
             explicitNulls = true

@@ -2900,7 +2900,16 @@ class PlannerStore(
             flexibleConstraintsJson == other.flexibleConstraintsJson &&
             splitPolicyJson == other.splitPolicyJson && importance == other.importance &&
             urgency == other.urgency && parentId == other.parentId &&
-            siblingOrder == other.siblingOrder
+            siblingOrder == other.siblingOrder && durationKind == other.durationKind &&
+            durationMinSeconds == other.durationMinSeconds &&
+            durationMaxSeconds == other.durationMaxSeconds &&
+            durationSource == other.durationSource && deadlineKind == other.deadlineKind &&
+            deadlineDate == other.deadlineDate && deadlineStrength == other.deadlineStrength &&
+            deadlineSoftWeight == other.deadlineSoftWeight &&
+            hasOwnEffort == other.hasOwnEffort &&
+            blockedReasonKind == other.blockedReasonKind &&
+            blockedByItemId == other.blockedByItemId && blockedReason == other.blockedReason &&
+            hasExplicitStructuralMetadata == other.hasExplicitStructuralMetadata
 
     private fun String?.sameInstant(other: String?): Boolean = when {
         this == null || other == null -> this == other

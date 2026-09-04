@@ -820,7 +820,7 @@ internal fun CanonicalItemEditorSheet(
                     minLines = 3,
                 )
                 ChoiceRow {
-                    ItemKind.entries.forEach { option ->
+                    ItemKind.entries.filterNot { it == ItemKind.PROJECT }.forEach { option ->
                         FilterChip(
                             selected = form.kind == option,
                             onClick = { form = form.withKind(option) },
@@ -1240,7 +1240,7 @@ internal fun CanonicalItemEditorSheet(
                         testTag = "canonical_editor_break_resume_prompt",
                     )
                 }
-                ItemKind.EVENT, ItemKind.TASK -> Unit
+                ItemKind.EVENT, ItemKind.TASK, ItemKind.PROJECT -> Unit
             }
 
             EditorSection("Flexible constraints") {

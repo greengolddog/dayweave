@@ -21,11 +21,13 @@ import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.exactFirmHorizonDayCount
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
+import com.greengolddog.dayweave.model.hasLegacyEquivalentStructuralMetadata
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.recurrenceIdentityObject
 import com.greengolddog.dayweave.model.recurrenceIdentityType
+import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.validatedRecurrenceIdentityJson
 import com.greengolddog.dayweave.network.ApiBindingChangedException
@@ -2251,24 +2253,32 @@ class CanonicalSyncManager(
         targetIsSensitive: Boolean,
         earliestStartAt: String?,
         deadlineAt: String? = item.deadlineAt,
-    ) = CanonicalItemReplacement(
-        isSensitive = targetIsSensitive,
-        kind = item.kind,
-        status = targetStatus,
-        title = item.title,
-        notes = item.notes,
-        timezoneName = item.timezoneName,
-        durationSeconds = item.durationSeconds,
-        deadlineAt = deadlineAt,
-        earliestStartAt = earliestStartAt,
-        recurrence = item.recurrenceJson?.let(::parseJsonObject),
-        flexibleConstraints = parseJsonObject(item.flexibleConstraintsJson),
-        splitPolicy = parseJsonObject(item.splitPolicyJson),
-        importance = item.importance,
-        urgency = item.urgency,
-        parentId = item.parentId,
-        siblingOrder = item.siblingOrder,
-    )
+    ): CanonicalItemReplacement {
+        require(!item.hasExplicitStructuralMetadata) {
+            "Typed structural metadata cannot be erased by a legacy replacement"
+        }
+        require(item.kind in SUPPORTED_ITEM_KINDS && item.status in SUPPORTED_ITEM_STATUSES) {
+            "Unsupported canonical item semantics cannot be replaced"
+        }
+        return CanonicalItemReplacement(
+            isSensitive = targetIsSensitive,
+            kind = item.kind,
+            status = targetStatus,
+            title = item.title,
+            notes = item.notes,
+            timezoneName = item.timezoneName,
+            durationSeconds = item.durationSeconds,
+            deadlineAt = deadlineAt,
+            earliestStartAt = earliestStartAt,
+            recurrence = item.recurrenceJson?.let(::parseJsonObject),
+            flexibleConstraints = parseJsonObject(item.flexibleConstraintsJson),
+            splitPolicy = parseJsonObject(item.splitPolicyJson),
+            importance = item.importance,
+            urgency = item.urgency,
+            parentId = item.parentId,
+            siblingOrder = item.siblingOrder,
+        )
+    }
 
     /**
      * Projects one confirmed terminal execution onto an eligible one-shot parent item.
@@ -4490,12 +4500,40 @@ class CanonicalSyncManager(
         ): CanonicalItemSnapshot {
             validateUuid(remote.id)
             remote.parentId?.let(::validateUuid)
+            remote.blockedByItemId?.let(::validateUuid)
+            val structuralAnchors = listOf(
+                remote.durationKind,
+                remote.deadlineKind,
+                remote.hasOwnEffort,
+            )
+            val hasAnyStructuralAnchor = structuralAnchors.any { it != null }
+            val hasExplicitStructuralMetadata = structuralAnchors.all { it != null }
+            val hasStructuralCompanion = listOf(
+                remote.durationMinSeconds,
+                remote.durationMaxSeconds,
+                remote.durationSource,
+                remote.deadlineDate,
+                remote.deadlineStrength,
+                remote.deadlineSoftWeight,
+                remote.blockedReasonKind,
+                remote.blockedByItemId,
+                remote.blockedReason,
+            ).any { it != null }
+            if (
+                hasAnyStructuralAnchor != hasExplicitStructuralMetadata ||
+                !hasAnyStructuralAnchor && hasStructuralCompanion
+            ) {
+                throw RemotePlannerMappingException()
+            }
             val recurrenceJson = remote.recurrence?.toString()
             val constraintsJson = remote.flexibleConstraints.toString()
             val splitPolicyJson = remote.splitPolicy.toString()
             if (
-                remote.kind !in SUPPORTED_ITEM_KINDS || remote.status !in SUPPORTED_ITEM_STATUSES ||
-                remote.title.isBlank() || remote.title != remote.title.trim() ||
+                remote.kind.isEmpty() || remote.kind.codePointCount(0, remote.kind.length) > 64 ||
+                remote.kind.any(Char::isISOControl) || remote.status.isEmpty() ||
+                remote.status.codePointCount(0, remote.status.length) > 64 ||
+                remote.status.any(Char::isISOControl) || remote.title.isBlank() ||
+                remote.title != remote.title.trim() ||
                 remote.title.codePointCount(0, remote.title.length) > MAX_TITLE_CHARS ||
                 remote.notes?.let {
                     it.codePointCount(0, it.length) > MAX_NOTES_CHARS
@@ -4509,7 +4547,7 @@ class CanonicalSyncManager(
                 remote.revision <= 0 || requireActive && remote.deletedAt != null ||
                 remote.importance !in 0..100 || remote.urgency !in 0..100 ||
                 remote.siblingOrder !in 0..1_000_000 ||
-                remote.durationSeconds?.let { it <= 0 || it > 366L * 24L * 60L * 60L } == true
+                remote.durationSeconds?.let { it <= 0 || it > 31_622_400L } == true
             ) {
                 throw RemotePlannerMappingException()
             }
@@ -4552,7 +4590,7 @@ class CanonicalSyncManager(
                 }
                 else -> throw RemotePlannerMappingException()
             }
-            return CanonicalItemSnapshot(
+            val legacy = CanonicalItemSnapshot(
                 id = remote.id,
                 isSensitive = remote.isSensitive,
                 kind = remote.kind,
@@ -4577,6 +4615,38 @@ class CanonicalSyncManager(
                 completedAt = remote.completedAt,
                 deletedAt = remote.deletedAt,
             )
+            val structural = if (hasExplicitStructuralMetadata) {
+                val explicit = legacy.copy(
+                    durationKind = requireNotNull(remote.durationKind),
+                    durationMinSeconds = remote.durationMinSeconds,
+                    durationMaxSeconds = remote.durationMaxSeconds,
+                    durationSource = remote.durationSource,
+                    deadlineKind = requireNotNull(remote.deadlineKind),
+                    deadlineDate = remote.deadlineDate,
+                    deadlineStrength = remote.deadlineStrength,
+                    deadlineSoftWeight = remote.deadlineSoftWeight,
+                    hasOwnEffort = requireNotNull(remote.hasOwnEffort),
+                    blockedReasonKind = remote.blockedReasonKind,
+                    blockedByItemId = remote.blockedByItemId,
+                    blockedReason = remote.blockedReason,
+                    hasExplicitStructuralMetadata = true,
+                )
+                explicit
+            } else {
+                legacy
+            }
+            val mapped = structural.copy(
+                hasExplicitStructuralMetadata =
+                    !structural.hasLegacyEquivalentStructuralMetadata(),
+            )
+            return try {
+                mapped.requireValidStructuralMetadata()
+                mapped
+            } catch (error: IllegalArgumentException) {
+                throw RemotePlannerMappingException(error)
+            } catch (error: IllegalStateException) {
+                throw RemotePlannerMappingException(error)
+            }
         }
 
         private fun validateHierarchy(items: Map<String, CanonicalItemSnapshot>) {
@@ -4602,8 +4672,9 @@ class CanonicalSyncManager(
             "habit" -> ItemKind.HABIT
             "routine" -> ItemKind.ROUTINE
             "goal" -> ItemKind.GOAL
+            "project" -> ItemKind.PROJECT
             "break" -> ItemKind.BREAK
-            else -> throw RemotePlannerMappingException()
+            else -> ItemKind.TASK
         }
 
         private fun mapItemStatus(status: String): ItemStatus = when (status) {
@@ -4611,10 +4682,11 @@ class CanonicalSyncManager(
             "scheduled" -> ItemStatus.SCHEDULED
             "in_progress" -> ItemStatus.ACTIVE
             "paused" -> ItemStatus.PAUSED
+            "blocked" -> ItemStatus.BLOCKED
             "completed" -> ItemStatus.COMPLETED
             "skipped" -> ItemStatus.SKIPPED
             "cancelled" -> ItemStatus.CANCELED
-            else -> throw RemotePlannerMappingException()
+            else -> ItemStatus.BLOCKED
         }
 
         private fun energyValue(element: kotlinx.serialization.json.JsonElement): String? = when (
@@ -4684,6 +4756,7 @@ class CanonicalSyncManager(
             "habit",
             "routine",
             "goal",
+            "project",
             "break",
         )
         private val SUPPORTED_ITEM_STATUSES = setOf(
@@ -4692,6 +4765,7 @@ class CanonicalSyncManager(
             "scheduled",
             "in_progress",
             "paused",
+            "blocked",
             "completed",
             "skipped",
             "cancelled",

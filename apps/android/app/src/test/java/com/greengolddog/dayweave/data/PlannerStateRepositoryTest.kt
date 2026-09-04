@@ -2,6 +2,8 @@ package com.greengolddog.dayweave.data
 
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
@@ -67,6 +69,84 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
+    fun v15CanonicalItemsGainTypedLegacyInferenceWithoutTrustingInjectedStructure() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 1_000 }
+        repository.save(DayWeaveUiState(canonicalItems = listOf(sensitiveCanonicalItem())))
+        val current = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(current.payload).jsonObject
+        val item = (root.getValue("canonicalItems") as JsonArray).single().jsonObject
+        val injected = JsonObject(
+            item + mapOf(
+                "durationKind" to JsonPrimitive("range"),
+                "durationMinSeconds" to JsonPrimitive(300),
+                "durationMaxSeconds" to JsonPrimitive(7_200),
+                "durationSource" to JsonPrimitive("assistant"),
+                "hasExplicitStructuralMetadata" to JsonPrimitive(true),
+            ),
+        )
+        dao.snapshot = current.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(root + ("canonicalItems" to JsonArray(listOf(injected)))),
+            ),
+            payloadFormat = PlannerSnapshotFormats.JSON_V15,
+        )
+
+        val restored = requireNotNull(repository.load())
+        val restoredItem = restored.canonicalItems.single()
+
+        assertEquals(CanonicalDurationKind.EXACT, restoredItem.durationKind)
+        assertEquals(1_800L, restoredItem.durationMinSeconds)
+        assertEquals(1_800L, restoredItem.durationMaxSeconds)
+        assertEquals(CanonicalDurationSource.USER, restoredItem.durationSource)
+        assertFalse(restoredItem.hasExplicitStructuralMetadata)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
+        val rewritten = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
+        val rewrittenItem = (rewritten.getValue("canonicalItems") as JsonArray)
+            .single().jsonObject
+        assertTrue(rewrittenItem.keys.containsAll(CANONICAL_STRUCTURAL_TEST_FIELDS))
+    }
+
+    @Test
+    fun v16RequiresCompleteStructureAndRejectsRichMetadataWithLegacyMarker() = runBlocking {
+        listOf<(JsonObject) -> JsonObject>(
+            { item -> JsonObject(item - "blockedReason") },
+            { item ->
+                JsonObject(
+                    item + mapOf(
+                        "durationKind" to JsonPrimitive("range"),
+                        "durationMinSeconds" to JsonPrimitive(300),
+                        "durationMaxSeconds" to JsonPrimitive(7_200),
+                        "hasExplicitStructuralMetadata" to JsonPrimitive(false),
+                    ),
+                )
+            },
+        ).forEach { mutate ->
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { 1_000 }
+            repository.save(DayWeaveUiState(canonicalItems = listOf(sensitiveCanonicalItem())))
+            val current = requireNotNull(dao.snapshot)
+            val root = Json.parseToJsonElement(current.payload).jsonObject
+            val item = (root.getValue("canonicalItems") as JsonArray).single().jsonObject
+            val malformed = current.copy(
+                payload = Json.encodeToString(
+                    JsonObject.serializer(),
+                    JsonObject(
+                        root + ("canonicalItems" to JsonArray(listOf(mutate(item)))),
+                    ),
+                ),
+            )
+            dao.snapshot = malformed
+
+            assertThrows(SerializationException::class.java) {
+                runBlocking { repository.load() }
+            }
+            assertEquals(malformed, dao.snapshot)
+        }
+    }
+
+    @Test
     fun v1ThroughV9LabelsDiscardInjectedNewerPolicyAndOutboundAuthority() = runBlocking {
         val predecessorFormats = listOf(
             PlannerSnapshotFormats.JSON_V1,
@@ -115,7 +195,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.localScheduleCompositionProvenance)
             assertEquals(ScheduleCompositionProfileSnapshot(), restored.scheduleCompositionProfile)
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -224,7 +304,7 @@ class PlannerStateRepositoryTest {
                         original.pendingSchedulePublication?.request?.bodyJson,
                         restored.pendingSchedulePublication?.request?.bodyJson,
                     )
-                    assertEquals(PlannerSnapshotFormats.JSON_V15, rewritten.payloadFormat)
+                    assertEquals(PlannerSnapshotFormats.JSON_V16, rewritten.payloadFormat)
                     assertEquals(
                         JsonPrimitive(7),
                         rewrittenRoot.getValue("scheduleCompositionProfile")
@@ -298,7 +378,7 @@ class PlannerStateRepositoryTest {
                 ZoneId.of("America/Havana"),
             ),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -331,7 +411,7 @@ class PlannerStateRepositoryTest {
                 ZoneId.of("UTC"),
             ),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -354,7 +434,7 @@ class PlannerStateRepositoryTest {
                         ZoneId.of("UTC"),
                     ),
                 )
-                assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+                assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
             }
     }
 
@@ -378,7 +458,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
             assertTrue(
                 requireNotNull(dao.snapshot).payload.contains(
                     "\"pendingGoogleCalendarOutbound\":null",
@@ -443,7 +523,7 @@ class PlannerStateRepositoryTest {
                         GoogleCalendarOutboundOperation.UPSERT,
                         restoredJournal.operation,
                     )
-                    assertEquals(PlannerSnapshotFormats.JSON_V15, rewritten.payloadFormat)
+                    assertEquals(PlannerSnapshotFormats.JSON_V16, rewritten.payloadFormat)
                     assertEquals(JsonPrimitive(2), rewrittenJournal["schemaVersion"])
                     assertEquals(
                         JsonPrimitive("calendar_event"),
@@ -561,7 +641,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(journal, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -585,7 +665,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(journal, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -766,7 +846,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
             assertTrue(requireNotNull(dao.snapshot).payload.contains(
                 "\"lastBreakEndNotificationAttemptDigest\":null",
             ))
@@ -797,7 +877,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -875,7 +955,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -913,7 +993,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -966,7 +1046,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -1179,7 +1259,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -1208,7 +1288,7 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matches(restored.schedule.single()),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
 
         dao.snapshot = requireNotNull(dao.snapshot).copy(
             payload = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -1361,7 +1441,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(null, restored.publishedScheduleProof)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
@@ -1431,7 +1511,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -1539,7 +1619,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -1563,7 +1643,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 
@@ -1990,6 +2070,21 @@ class PlannerStateRepositoryTest {
     }
 
     private companion object {
+        val CANONICAL_STRUCTURAL_TEST_FIELDS = setOf(
+            "durationKind",
+            "durationMinSeconds",
+            "durationMaxSeconds",
+            "durationSource",
+            "deadlineKind",
+            "deadlineDate",
+            "deadlineStrength",
+            "deadlineSoftWeight",
+            "hasOwnEffort",
+            "blockedReasonKind",
+            "blockedByItemId",
+            "blockedReason",
+            "hasExplicitStructuralMetadata",
+        )
         const val EXECUTION_SESSION_ID = "44444444-4444-4444-8444-444444444444"
         const val EXECUTION_DEVICE_ID = "55555555-5555-4555-8555-555555555555"
         const val OUTBOUND_API_BASE_URL = "https://api.example.test/"

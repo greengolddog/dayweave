@@ -2,7 +2,12 @@ package com.greengolddog.dayweave.ui.authoring
 
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord
@@ -114,6 +119,59 @@ class CanonicalAuthoringPresentationTest {
         assertTrue(row.isReadOnly)
         assertTrue(row.canTrash)
         assertTrue(row.diagnostic.orEmpty().contains("read-only"))
+    }
+
+    @Test
+    fun blockedAndTypedTimingMetadataRemainVisibleWithoutLegacyReinterpretation() {
+        val blocker = item(PARENT_ID, "External prerequisite", "inbox")
+        val blocked = item(CHILD_ID, "Waiting action", "blocked").copy(
+            durationSeconds = 3_600,
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 1_800,
+            durationMaxSeconds = 5_400,
+            durationSource = CanonicalDurationSource.ASSISTANT,
+            deadlineAt = null,
+            deadlineKind = CanonicalDeadlineKind.DATE,
+            deadlineDate = "2026-09-30",
+            deadlineStrength = CanonicalDeadlineStrength.SOFT,
+            deadlineSoftWeight = 42,
+            blockedReasonKind = CanonicalBlockedReasonKind.DEPENDENCY,
+            blockedByItemId = blocker.id,
+            blockedReason = "Vendor approval",
+            hasExplicitStructuralMetadata = true,
+        )
+
+        val presentation = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(blocker, blocked)),
+        )
+
+        val row = presentation.blocked.single()
+        assertEquals("Waiting action", row.title)
+        assertEquals("blocked", row.status)
+        assertTrue(row.isReadOnly)
+        assertEquals(2, presentation.itemCount)
+        assertEquals(
+            "30m–90m · expected 1h · Assistant",
+            canonicalDurationLabel(row),
+        )
+        assertEquals("Due 2026-09-30 · Soft · weight 42", canonicalTimingLabel(row))
+        assertEquals(
+            "Blocked · waiting for item ${PARENT_ID.take(8)} · Vendor approval",
+            canonicalBlockedReasonLabel(row),
+        )
+
+        val event = item(CONFLICT_ITEM_ID, "Calendar interval", "planned").copy(
+            kind = "event",
+            deadlineAt = "2026-09-03T11:00:00Z",
+            deadlineKind = CanonicalDeadlineKind.NONE,
+            deadlineDate = null,
+            deadlineStrength = null,
+        )
+        val eventRow = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(event)),
+        ).planned.single()
+        assertTrue(canonicalTimingLabel(eventRow).orEmpty().startsWith("Ends "))
+        assertFalse(canonicalTimingLabel(eventRow).orEmpty().startsWith("Due "))
     }
 
     @Test

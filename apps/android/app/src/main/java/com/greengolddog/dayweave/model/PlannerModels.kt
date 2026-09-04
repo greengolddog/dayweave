@@ -6,6 +6,7 @@ import java.security.MessageDigest
 import java.time.DayOfWeek
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -21,6 +22,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 
 @Serializable
 enum class AppDestination(val label: String) {
@@ -38,6 +42,7 @@ enum class ItemKind(val label: String) {
     HABIT("Habit"),
     ROUTINE("Routine"),
     GOAL("Goal"),
+    PROJECT("Project"),
     BREAK("Break"),
 }
 
@@ -51,6 +56,71 @@ enum class ItemStatus(val label: String) {
     SKIPPED("Skipped"),
     CANCELED("Canceled"),
     BLOCKED("Blocked"),
+}
+
+@Serializable
+@JvmInline
+value class CanonicalDurationKind(val wireValue: String) {
+    val isSupported: Boolean
+        get() = this == UNKNOWN || this == EXACT || this == RANGE
+
+    companion object {
+        val UNKNOWN = CanonicalDurationKind("unknown")
+        val EXACT = CanonicalDurationKind("exact")
+        val RANGE = CanonicalDurationKind("range")
+    }
+}
+
+@Serializable
+@JvmInline
+value class CanonicalDurationSource(val wireValue: String) {
+    val isSupported: Boolean
+        get() = this == USER || this == ASSISTANT || this == LEARNED || this == IMPORTED
+
+    companion object {
+        val USER = CanonicalDurationSource("user")
+        val ASSISTANT = CanonicalDurationSource("assistant")
+        val LEARNED = CanonicalDurationSource("learned")
+        val IMPORTED = CanonicalDurationSource("imported")
+    }
+}
+
+@Serializable
+@JvmInline
+value class CanonicalDeadlineKind(val wireValue: String) {
+    val isSupported: Boolean
+        get() = this == NONE || this == DATE || this == DATE_TIME
+
+    companion object {
+        val NONE = CanonicalDeadlineKind("none")
+        val DATE = CanonicalDeadlineKind("date")
+        val DATE_TIME = CanonicalDeadlineKind("date_time")
+    }
+}
+
+@Serializable
+@JvmInline
+value class CanonicalDeadlineStrength(val wireValue: String) {
+    val isSupported: Boolean
+        get() = this == HARD || this == SOFT
+
+    companion object {
+        val HARD = CanonicalDeadlineStrength("hard")
+        val SOFT = CanonicalDeadlineStrength("soft")
+    }
+}
+
+@Serializable
+@JvmInline
+value class CanonicalBlockedReasonKind(val wireValue: String) {
+    val isSupported: Boolean
+        get() = this == DEPENDENCY || this == MANUAL || this == EXTERNAL
+
+    companion object {
+        val DEPENDENCY = CanonicalBlockedReasonKind("dependency")
+        val MANUAL = CanonicalBlockedReasonKind("manual")
+        val EXTERNAL = CanonicalBlockedReasonKind("external")
+    }
 }
 
 @Serializable
@@ -263,7 +333,207 @@ data class CanonicalItemSnapshot(
     val updatedAt: String,
     val completedAt: String? = null,
     val deletedAt: String? = null,
+    val durationKind: CanonicalDurationKind = if (durationSeconds == null) {
+        CanonicalDurationKind.UNKNOWN
+    } else {
+        CanonicalDurationKind.EXACT
+    },
+    val durationMinSeconds: Long? = durationSeconds,
+    val durationMaxSeconds: Long? = durationSeconds,
+    val durationSource: CanonicalDurationSource? = if (durationSeconds == null) {
+        null
+    } else {
+        CanonicalDurationSource.USER
+    },
+    val deadlineKind: CanonicalDeadlineKind = if (kind == "event" || deadlineAt == null) {
+        CanonicalDeadlineKind.NONE
+    } else {
+        CanonicalDeadlineKind.DATE_TIME
+    },
+    val deadlineDate: String? = null,
+    val deadlineStrength: CanonicalDeadlineStrength? = if (
+        kind == "event" || deadlineAt == null
+    ) {
+        null
+    } else {
+        CanonicalDeadlineStrength.HARD
+    },
+    val deadlineSoftWeight: Long? = null,
+    val hasOwnEffort: Boolean = legacyHasOwnEffort(flexibleConstraintsJson),
+    val blockedReasonKind: CanonicalBlockedReasonKind? = null,
+    val blockedByItemId: String? = null,
+    val blockedReason: String? = null,
+    /** Prevents pre-structural full replacements from erasing richer server state. */
+    val hasExplicitStructuralMetadata: Boolean = false,
 )
+
+internal fun CanonicalItemSnapshot.requireValidStructuralMetadata() {
+    val structuralEnums = listOf(
+        durationKind.wireValue,
+        durationSource?.wireValue,
+        deadlineKind.wireValue,
+        deadlineStrength?.wireValue,
+        blockedReasonKind?.wireValue,
+    ).filterNotNull()
+    require(structuralEnums.all(::isValidStructuralWireValue))
+    val durationValues = listOfNotNull(durationMinSeconds, durationSeconds, durationMaxSeconds)
+    require(durationValues.all { it in 0..MAX_CANONICAL_DURATION_SECONDS })
+    when (durationKind.wireValue) {
+        CanonicalDurationKind.UNKNOWN.wireValue -> require(
+            durationMinSeconds == null && durationSeconds == null && durationMaxSeconds == null &&
+                durationSource == null,
+        )
+        CanonicalDurationKind.EXACT.wireValue -> require(
+            durationSeconds != null && durationSeconds > 0 && durationMinSeconds == durationSeconds &&
+                durationMaxSeconds == durationSeconds && durationSource != null,
+        )
+        CanonicalDurationKind.RANGE.wireValue -> require(
+            durationMinSeconds != null && durationMinSeconds > 0 && durationSeconds != null &&
+                durationSeconds > 0 && durationMaxSeconds != null && durationMaxSeconds > 0 &&
+                durationMinSeconds < durationMaxSeconds &&
+                durationMinSeconds <= durationSeconds && durationSeconds <= durationMaxSeconds &&
+                durationSource != null,
+        )
+        else -> Unit // Future discriminators are retained exactly and fenced from writes.
+    }
+
+    when (deadlineKind.wireValue) {
+        CanonicalDeadlineKind.NONE.wireValue -> require(
+            (deadlineAt == null || kind == "event" ||
+                kind !in SUPPORTED_CANONICAL_KIND_WIRE_VALUES) && deadlineDate == null &&
+                deadlineStrength == null && deadlineSoftWeight == null,
+        )
+        CanonicalDeadlineKind.DATE.wireValue -> require(
+            kind != "event" && deadlineAt == null &&
+                deadlineDate?.isCanonicalDateOnly() == true && deadlineStrength != null,
+        )
+        CanonicalDeadlineKind.DATE_TIME.wireValue -> require(
+            kind != "event" && deadlineAt != null && deadlineDate == null &&
+                deadlineStrength != null,
+        )
+        else -> require(deadlineDate?.isCanonicalDateOnly() != false)
+    }
+    when {
+        !deadlineKind.isSupported -> require(deadlineSoftWeight?.let { it in 0..1_000_000 } != false)
+        deadlineStrength == null -> require(
+            deadlineKind == CanonicalDeadlineKind.NONE && deadlineSoftWeight == null,
+        )
+        deadlineStrength == CanonicalDeadlineStrength.HARD -> require(
+            deadlineKind != CanonicalDeadlineKind.NONE && deadlineSoftWeight == null,
+        )
+        deadlineStrength == CanonicalDeadlineStrength.SOFT -> require(
+            deadlineKind != CanonicalDeadlineKind.NONE &&
+                deadlineSoftWeight != null && deadlineSoftWeight in 0..1_000_000,
+        )
+        else -> require(
+            deadlineKind != CanonicalDeadlineKind.NONE &&
+                deadlineSoftWeight?.let { it in 0..1_000_000 } != false,
+        )
+    }
+
+    val legacyOwnEffort = legacyOwnEffortValue(flexibleConstraintsJson)
+    require(legacyOwnEffort != LegacyBoolean.INVALID)
+    if (legacyOwnEffort != LegacyBoolean.ABSENT) {
+        require((legacyOwnEffort == LegacyBoolean.TRUE) == hasOwnEffort)
+    }
+
+    val validReason = blockedReason?.let(::isValidBlockedReason) == true
+    fun hasValidBlockerTuple(): Boolean = when (blockedReasonKind?.wireValue) {
+        CanonicalBlockedReasonKind.DEPENDENCY.wireValue ->
+            blockedByItemId != null && blockedByItemId != id &&
+                (blockedReason == null || validReason)
+        CanonicalBlockedReasonKind.MANUAL.wireValue,
+        CanonicalBlockedReasonKind.EXTERNAL.wireValue,
+        -> blockedByItemId == null && validReason
+        null -> false
+        else -> (blockedByItemId == null || blockedByItemId != id) &&
+            (blockedReason == null || validReason)
+    }
+    if (status == "blocked") {
+        require(blockedReasonKind != null && hasValidBlockerTuple())
+    } else if (status !in SUPPORTED_CANONICAL_STATUS_WIRE_VALUES) {
+        require(
+            if (blockedReasonKind == null) {
+                blockedByItemId == null && blockedReason == null
+            } else {
+                hasValidBlockerTuple()
+            },
+        )
+    } else {
+        require(blockedReasonKind == null && blockedByItemId == null && blockedReason == null)
+    }
+
+    if (!hasExplicitStructuralMetadata) require(hasLegacyEquivalentStructuralMetadata())
+}
+
+internal fun CanonicalItemSnapshot.hasLegacyEquivalentStructuralMetadata(): Boolean {
+    val inferredDurationKind = if (durationSeconds == null) {
+        CanonicalDurationKind.UNKNOWN
+    } else {
+        CanonicalDurationKind.EXACT
+    }
+    val inferredDeadlineKind = if (kind == "event" || deadlineAt == null) {
+        CanonicalDeadlineKind.NONE
+    } else {
+        CanonicalDeadlineKind.DATE_TIME
+    }
+    return durationKind == inferredDurationKind &&
+        durationMinSeconds == durationSeconds && durationMaxSeconds == durationSeconds &&
+        durationSource == durationSeconds?.let { CanonicalDurationSource.USER } &&
+        deadlineKind == inferredDeadlineKind && deadlineDate == null &&
+        deadlineStrength == (if (inferredDeadlineKind == CanonicalDeadlineKind.NONE) {
+            null
+        } else {
+            CanonicalDeadlineStrength.HARD
+        }) && deadlineSoftWeight == null &&
+        hasOwnEffort == legacyHasOwnEffort(flexibleConstraintsJson) &&
+        status != "blocked" && blockedReasonKind == null && blockedByItemId == null &&
+        blockedReason == null
+}
+
+private const val MAX_CANONICAL_DURATION_SECONDS = 31_622_400L
+private val SUPPORTED_CANONICAL_KIND_WIRE_VALUES = setOf(
+    "event", "task", "habit", "routine", "goal", "project", "break",
+)
+private val SUPPORTED_CANONICAL_STATUS_WIRE_VALUES = setOf(
+    "inbox", "planned", "scheduled", "in_progress", "paused", "blocked", "completed",
+    "skipped", "cancelled",
+)
+
+private fun isValidStructuralWireValue(value: String): Boolean =
+    value.isNotEmpty() && value.codePointCount(0, value.length) <= 64 &&
+        value.none(Char::isISOControl)
+
+private enum class LegacyBoolean { ABSENT, TRUE, FALSE, INVALID }
+
+private fun legacyOwnEffortValue(raw: String): LegacyBoolean = runCatching {
+    val objectValue = Json.parseToJsonElement(raw) as? JsonObject
+        ?: return LegacyBoolean.INVALID
+    when (val value = objectValue["has_own_effort"]) {
+        null -> LegacyBoolean.ABSENT
+        is JsonPrimitive -> when (value.booleanOrNull) {
+            true -> LegacyBoolean.TRUE
+            false -> LegacyBoolean.FALSE
+            null -> LegacyBoolean.INVALID
+        }
+        else -> LegacyBoolean.INVALID
+    }
+}.getOrDefault(LegacyBoolean.INVALID)
+
+private fun legacyHasOwnEffort(raw: String): Boolean =
+    legacyOwnEffortValue(raw) == LegacyBoolean.TRUE
+
+private fun String.isCanonicalDateOnly(): Boolean =
+    length == 10 && this[4] == '-' && this[7] == '-' &&
+        take(4).all(Char::isDigit) && substring(5, 7).all(Char::isDigit) &&
+        takeLast(2).all(Char::isDigit) && substring(0, 4).toInt() in 1..9_999 &&
+        this != "9999-12-31" &&
+        runCatching { LocalDate.parse(this).toString() == this }.getOrDefault(false)
+
+private fun isValidBlockedReason(value: String): Boolean =
+    value.isNotEmpty() && value == value.trim(Char::isWhitespace) &&
+        value.codePointCount(0, value.length) <= 1_000 &&
+        value.none(Char::isISOControl)
 
 /** Resolves ancestor privacy and fails closed when a cached hierarchy is incomplete or cyclic. */
 fun effectiveCanonicalSensitivity(

@@ -1,5 +1,12 @@
 package com.greengolddog.dayweave.network
 
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
+import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -12,6 +19,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -81,8 +89,16 @@ enum class RemoteProposalItemField {
     @SerialName("title") TITLE,
     @SerialName("notes") NOTES,
     @SerialName("timezone_name") TIMEZONE_NAME,
+    @SerialName("duration_kind") DURATION_KIND,
+    @SerialName("duration_min_seconds") DURATION_MIN_SECONDS,
     @SerialName("duration_seconds") DURATION_SECONDS,
+    @SerialName("duration_max_seconds") DURATION_MAX_SECONDS,
+    @SerialName("duration_source") DURATION_SOURCE,
+    @SerialName("deadline_kind") DEADLINE_KIND,
     @SerialName("deadline_at") DEADLINE_AT,
+    @SerialName("deadline_date") DEADLINE_DATE,
+    @SerialName("deadline_strength") DEADLINE_STRENGTH,
+    @SerialName("deadline_soft_weight") DEADLINE_SOFT_WEIGHT,
     @SerialName("earliest_start_at") EARLIEST_START_AT,
     @SerialName("recurrence") RECURRENCE,
     @SerialName("flexible_constraints") FLEXIBLE_CONSTRAINTS,
@@ -91,6 +107,10 @@ enum class RemoteProposalItemField {
     @SerialName("urgency") URGENCY,
     @SerialName("parent_id") PARENT_ID,
     @SerialName("sibling_order") SIBLING_ORDER,
+    @SerialName("has_own_effort") HAS_OWN_EFFORT,
+    @SerialName("blocked_reason_kind") BLOCKED_REASON_KIND,
+    @SerialName("blocked_by_item_id") BLOCKED_BY_ITEM_ID,
+    @SerialName("blocked_reason") BLOCKED_REASON,
     @SerialName("is_executable") IS_EXECUTABLE,
     @SerialName("revision") REVISION,
     @SerialName("completed_at") COMPLETED_AT,
@@ -98,25 +118,27 @@ enum class RemoteProposalItemField {
 }
 
 @Serializable
-enum class RemoteProposalItemKind {
-    @SerialName("event") EVENT,
-    @SerialName("task") TASK,
-    @SerialName("habit") HABIT,
-    @SerialName("routine") ROUTINE,
-    @SerialName("goal") GOAL,
-    @SerialName("break") BREAK,
+enum class RemoteProposalItemKind(val wireValue: String) {
+    @SerialName("event") EVENT("event"),
+    @SerialName("task") TASK("task"),
+    @SerialName("habit") HABIT("habit"),
+    @SerialName("routine") ROUTINE("routine"),
+    @SerialName("goal") GOAL("goal"),
+    @SerialName("project") PROJECT("project"),
+    @SerialName("break") BREAK("break"),
 }
 
 @Serializable
-enum class RemoteProposalItemStatus {
-    @SerialName("inbox") INBOX,
-    @SerialName("planned") PLANNED,
-    @SerialName("scheduled") SCHEDULED,
-    @SerialName("in_progress") IN_PROGRESS,
-    @SerialName("paused") PAUSED,
-    @SerialName("completed") COMPLETED,
-    @SerialName("skipped") SKIPPED,
-    @SerialName("cancelled") CANCELLED,
+enum class RemoteProposalItemStatus(val wireValue: String) {
+    @SerialName("inbox") INBOX("inbox"),
+    @SerialName("planned") PLANNED("planned"),
+    @SerialName("scheduled") SCHEDULED("scheduled"),
+    @SerialName("in_progress") IN_PROGRESS("in_progress"),
+    @SerialName("paused") PAUSED("paused"),
+    @SerialName("blocked") BLOCKED("blocked"),
+    @SerialName("completed") COMPLETED("completed"),
+    @SerialName("skipped") SKIPPED("skipped"),
+    @SerialName("cancelled") CANCELLED("cancelled"),
 }
 
 /** Strict canonical-item projection used only inside an application review diff. */
@@ -130,7 +152,15 @@ data class RemoteProposalCanonicalItem(
     val notes: String?,
     @SerialName("timezone_name") val timezoneName: String,
     @SerialName("duration_seconds") val durationSeconds: Long?,
+    @SerialName("duration_kind") val durationKind: CanonicalDurationKind? = null,
+    @SerialName("duration_min_seconds") val durationMinSeconds: Long? = null,
+    @SerialName("duration_max_seconds") val durationMaxSeconds: Long? = null,
+    @SerialName("duration_source") val durationSource: CanonicalDurationSource? = null,
     @SerialName("deadline_at") val deadlineAt: String?,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind? = null,
+    @SerialName("deadline_date") val deadlineDate: String? = null,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalDeadlineStrength? = null,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: Long? = null,
     @SerialName("earliest_start_at") val earliestStartAt: String?,
     val recurrence: JsonElement?,
     @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
@@ -139,6 +169,11 @@ data class RemoteProposalCanonicalItem(
     val urgency: Int,
     @SerialName("parent_id") val parentId: String?,
     @SerialName("sibling_order") val siblingOrder: Long,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean? = null,
+    @SerialName("blocked_reason_kind")
+    val blockedReasonKind: CanonicalBlockedReasonKind? = null,
+    @SerialName("blocked_by_item_id") val blockedByItemId: String? = null,
+    @SerialName("blocked_reason") val blockedReason: String? = null,
     @SerialName("is_executable") val isExecutable: Boolean,
     val revision: Long,
     @SerialName("created_at") val createdAt: String,
@@ -398,7 +433,11 @@ class OkHttpProposalApplicationsTransport(
         val httpRequest = requestBuilder(configuration, url.toString())
             .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        val preview = execute<RemoteProposalApplicationPreview>(httpRequest, expectedStatus = 201)
+        val preview = execute<RemoteProposalApplicationPreview>(
+            request = httpRequest,
+            expectedStatus = 201,
+            validateBody = ::requireAtomicProposalStructuralMetadata,
+        )
         validateResponse { validatePreview(preview) }
         if (preview.proposals != request.proposals) {
             throw ProposalApplicationApiException.InvalidResponse()
@@ -525,7 +564,11 @@ class OkHttpProposalApplicationsTransport(
         .header("Cache-Control", PROPOSAL_APPLICATION_CACHE_CONTROL)
         .header("Pragma", PROPOSAL_APPLICATION_PRAGMA)
 
-    private suspend inline fun <reified T> execute(request: Request, expectedStatus: Int): T {
+    private suspend inline fun <reified T> execute(
+        request: Request,
+        expectedStatus: Int,
+        noinline validateBody: ((String) -> Unit)? = null,
+    ): T {
         val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
             ?: throw ProposalApplicationApiException.InvalidRequest()
         val response = configuration.executeAuthenticated(client, request)
@@ -536,6 +579,7 @@ class OkHttpProposalApplicationsTransport(
             }
             val responseText = response.readBoundedProposalApplicationText()
             try {
+                validateBody?.invoke(responseText)
                 return json.decodeFromString<T>(responseText)
             } catch (error: SerializationException) {
                 throw ProposalApplicationApiException.InvalidResponse(error)
@@ -885,6 +929,47 @@ private fun validatePreviewRequest(request: ProposalPreviewRequest) {
     }
 }
 
+private fun requireAtomicProposalStructuralMetadata(responseText: String) {
+    val root = proposalApplicationJson().parseToJsonElement(responseText) as? JsonObject
+        ?: throw SerializationException("Proposal preview must be an object")
+
+    fun requireItem(element: JsonElement?) {
+        if (element == null || element is kotlinx.serialization.json.JsonNull) return
+        val item = element as? JsonObject
+            ?: throw SerializationException("Proposal canonical item must be an object")
+        val present = item.keys.intersect(PROPOSAL_STRUCTURAL_WIRE_KEYS)
+        if (present.isNotEmpty() && present.size != PROPOSAL_STRUCTURAL_WIRE_KEYS.size) {
+            throw SerializationException("Proposal structural metadata must be emitted atomically")
+        }
+        if (
+            present.isNotEmpty() && listOf(
+                "duration_kind",
+                "deadline_kind",
+                "has_own_effort",
+            ).any { key -> item[key] is kotlinx.serialization.json.JsonNull }
+        ) {
+            throw SerializationException("Proposal structural discriminators cannot be null")
+        }
+    }
+
+    val diffs = root["diffs"] as? JsonArray
+        ?: throw SerializationException("Proposal diffs must be an array")
+    diffs.forEach { element ->
+        val diff = element as? JsonObject
+            ?: throw SerializationException("Proposal diff must be an object")
+        requireItem(diff["before"])
+        requireItem(diff["after"])
+    }
+    val implicitDiffs = root["implicit_diffs"] as? JsonArray
+        ?: throw SerializationException("Proposal implicit diffs must be an array")
+    implicitDiffs.forEach { element ->
+        val diff = element as? JsonObject
+            ?: throw SerializationException("Proposal implicit diff must be an object")
+        requireItem(diff["before"])
+        requireItem(diff["after"])
+    }
+}
+
 private fun validatePreview(preview: RemoteProposalApplicationPreview) {
     requireCanonicalUuid(preview.previewId)
     validatePreviewRequest(ProposalPreviewRequest(preview.proposals))
@@ -969,7 +1054,13 @@ private fun materialChangedFields(
     before: RemoteProposalCanonicalItem?,
     after: RemoteProposalCanonicalItem?,
 ): List<RemoteProposalItemField> {
-    if (before == null) return MATERIAL_PROPOSAL_ITEM_FIELDS
+    if (before == null) {
+        return if (after?.hasStructuralWireShape == true) {
+            MATERIAL_PROPOSAL_ITEM_FIELDS
+        } else {
+            LEGACY_MATERIAL_PROPOSAL_ITEM_FIELDS
+        }
+    }
     if (after == null) return listOf(RemoteProposalItemField.DELETED_AT)
     return buildList {
         fun changed(
@@ -985,12 +1076,40 @@ private fun materialChangedFields(
         changed(RemoteProposalItemField.TITLE, before.title, after.title)
         changed(RemoteProposalItemField.NOTES, before.notes, after.notes)
         changed(RemoteProposalItemField.TIMEZONE_NAME, before.timezoneName, after.timezoneName)
+        changed(RemoteProposalItemField.DURATION_KIND, before.durationKind, after.durationKind)
         changed(
             RemoteProposalItemField.DURATION_SECONDS,
             before.durationSeconds,
             after.durationSeconds,
         )
+        changed(
+            RemoteProposalItemField.DURATION_MIN_SECONDS,
+            before.durationMinSeconds,
+            after.durationMinSeconds,
+        )
+        changed(
+            RemoteProposalItemField.DURATION_MAX_SECONDS,
+            before.durationMaxSeconds,
+            after.durationMaxSeconds,
+        )
+        changed(
+            RemoteProposalItemField.DURATION_SOURCE,
+            before.durationSource,
+            after.durationSource,
+        )
+        changed(RemoteProposalItemField.DEADLINE_KIND, before.deadlineKind, after.deadlineKind)
+        changed(RemoteProposalItemField.DEADLINE_DATE, before.deadlineDate, after.deadlineDate)
         changed(RemoteProposalItemField.DEADLINE_AT, before.deadlineAt, after.deadlineAt)
+        changed(
+            RemoteProposalItemField.DEADLINE_STRENGTH,
+            before.deadlineStrength,
+            after.deadlineStrength,
+        )
+        changed(
+            RemoteProposalItemField.DEADLINE_SOFT_WEIGHT,
+            before.deadlineSoftWeight,
+            after.deadlineSoftWeight,
+        )
         changed(
             RemoteProposalItemField.EARLIEST_START_AT,
             before.earliestStartAt,
@@ -1002,17 +1121,32 @@ private fun materialChangedFields(
             before.flexibleConstraints,
             after.flexibleConstraints,
         )
+        changed(RemoteProposalItemField.HAS_OWN_EFFORT, before.hasOwnEffort, after.hasOwnEffort)
         changed(RemoteProposalItemField.SPLIT_POLICY, before.splitPolicy, after.splitPolicy)
         changed(RemoteProposalItemField.IMPORTANCE, before.importance, after.importance)
         changed(RemoteProposalItemField.URGENCY, before.urgency, after.urgency)
         changed(RemoteProposalItemField.PARENT_ID, before.parentId, after.parentId)
         changed(RemoteProposalItemField.SIBLING_ORDER, before.siblingOrder, after.siblingOrder)
+        changed(
+            RemoteProposalItemField.BLOCKED_REASON_KIND,
+            before.blockedReasonKind,
+            after.blockedReasonKind,
+        )
+        changed(
+            RemoteProposalItemField.BLOCKED_BY_ITEM_ID,
+            before.blockedByItemId,
+            after.blockedByItemId,
+        )
+        changed(RemoteProposalItemField.BLOCKED_REASON, before.blockedReason, after.blockedReason)
         changed(RemoteProposalItemField.IS_EXECUTABLE, before.isExecutable, after.isExecutable)
         changed(RemoteProposalItemField.REVISION, before.revision, after.revision)
         changed(RemoteProposalItemField.COMPLETED_AT, before.completedAt, after.completedAt)
         changed(RemoteProposalItemField.DELETED_AT, before.deletedAt, after.deletedAt)
     }
 }
+
+private val RemoteProposalCanonicalItem.hasStructuralWireShape: Boolean
+    get() = durationKind != null && deadlineKind != null && hasOwnEffort != null
 
 private fun validateCanonicalItem(item: RemoteProposalCanonicalItem) {
     requireCanonicalUuid(item.id)
@@ -1022,6 +1156,7 @@ private fun validateCanonicalItem(item: RemoteProposalCanonicalItem) {
     require(item.timezoneName.isNotBlank())
     requireNotNull(runCatching { ZoneId.of(item.timezoneName) }.getOrNull())
     require(item.durationSeconds == null || item.durationSeconds in 1..MAX_DURATION_SECONDS)
+    item.blockedByItemId?.let(::requireCanonicalUuid)
     val deadline = item.deadlineAt?.let(::requireInstant)
     val earliest = item.earliestStartAt?.let(::requireInstant)
     require(deadline == null || earliest == null || earliest < deadline)
@@ -1047,6 +1182,70 @@ private fun validateCanonicalItem(item: RemoteProposalCanonicalItem) {
     require(completed == null || completed >= created)
     require(deleted == null || deleted >= created)
     require(deleted == null || !item.isExecutable)
+
+    val structuralAnchors = listOf(item.durationKind, item.deadlineKind, item.hasOwnEffort)
+    val hasAnyStructuralAnchor = structuralAnchors.any { it != null }
+    val hasExplicitStructuralMetadata = structuralAnchors.all { it != null }
+    val hasStructuralCompanion = listOf(
+        item.durationMinSeconds,
+        item.durationMaxSeconds,
+        item.durationSource,
+        item.deadlineDate,
+        item.deadlineStrength,
+        item.deadlineSoftWeight,
+        item.blockedReasonKind,
+        item.blockedByItemId,
+        item.blockedReason,
+    ).any { it != null }
+    require(
+        hasAnyStructuralAnchor == hasExplicitStructuralMetadata &&
+            (hasAnyStructuralAnchor || !hasStructuralCompanion),
+    )
+    val legacy = CanonicalItemSnapshot(
+        id = item.id,
+        isSensitive = item.isSensitive,
+        kind = item.kind.wireValue,
+        status = item.status.wireValue,
+        title = item.title,
+        notes = item.notes,
+        timezoneName = item.timezoneName,
+        durationSeconds = item.durationSeconds,
+        deadlineAt = item.deadlineAt,
+        earliestStartAt = item.earliestStartAt,
+        recurrenceJson = item.recurrence?.toString(),
+        flexibleConstraintsJson = item.flexibleConstraints.toString(),
+        splitPolicyJson = item.splitPolicy.toString(),
+        importance = item.importance,
+        urgency = item.urgency,
+        parentId = item.parentId,
+        siblingOrder = item.siblingOrder,
+        isExecutable = item.isExecutable,
+        revision = item.revision,
+        createdAt = item.createdAt,
+        updatedAt = item.updatedAt,
+        completedAt = item.completedAt,
+        deletedAt = item.deletedAt,
+    )
+    val structural = if (hasExplicitStructuralMetadata) {
+        legacy.copy(
+            durationKind = requireNotNull(item.durationKind),
+            durationMinSeconds = item.durationMinSeconds,
+            durationMaxSeconds = item.durationMaxSeconds,
+            durationSource = item.durationSource,
+            deadlineKind = requireNotNull(item.deadlineKind),
+            deadlineDate = item.deadlineDate,
+            deadlineStrength = item.deadlineStrength,
+            deadlineSoftWeight = item.deadlineSoftWeight,
+            hasOwnEffort = requireNotNull(item.hasOwnEffort),
+            blockedReasonKind = item.blockedReasonKind,
+            blockedByItemId = item.blockedByItemId,
+            blockedReason = item.blockedReason,
+            hasExplicitStructuralMetadata = true,
+        )
+    } else {
+        legacy
+    }
+    structural.requireValidStructuralMetadata()
 }
 
 private fun validateSplitPolicy(policy: JsonObject, durationSeconds: Long?) {
@@ -1159,6 +1358,20 @@ private const val MAX_PROPOSAL_COMMANDS = 100
 private const val MAX_DURATION_SECONDS = 366L * 24 * 60 * 60
 private const val MAX_RECURRENCE_BYTES = 16 * 1024
 private const val MAX_CONSTRAINT_BYTES = 32 * 1024
+private val PROPOSAL_STRUCTURAL_WIRE_KEYS = setOf(
+    "duration_kind",
+    "duration_min_seconds",
+    "duration_max_seconds",
+    "duration_source",
+    "deadline_kind",
+    "deadline_date",
+    "deadline_strength",
+    "deadline_soft_weight",
+    "has_own_effort",
+    "blocked_reason_kind",
+    "blocked_by_item_id",
+    "blocked_reason",
+)
 private val MATERIAL_PROPOSAL_ITEM_FIELDS = listOf(
     RemoteProposalItemField.IS_SENSITIVE,
     RemoteProposalItemField.KIND,
@@ -1166,19 +1379,47 @@ private val MATERIAL_PROPOSAL_ITEM_FIELDS = listOf(
     RemoteProposalItemField.TITLE,
     RemoteProposalItemField.NOTES,
     RemoteProposalItemField.TIMEZONE_NAME,
+    RemoteProposalItemField.DURATION_KIND,
     RemoteProposalItemField.DURATION_SECONDS,
+    RemoteProposalItemField.DURATION_MIN_SECONDS,
+    RemoteProposalItemField.DURATION_MAX_SECONDS,
+    RemoteProposalItemField.DURATION_SOURCE,
+    RemoteProposalItemField.DEADLINE_KIND,
+    RemoteProposalItemField.DEADLINE_DATE,
     RemoteProposalItemField.DEADLINE_AT,
+    RemoteProposalItemField.DEADLINE_STRENGTH,
+    RemoteProposalItemField.DEADLINE_SOFT_WEIGHT,
     RemoteProposalItemField.EARLIEST_START_AT,
     RemoteProposalItemField.RECURRENCE,
     RemoteProposalItemField.FLEXIBLE_CONSTRAINTS,
+    RemoteProposalItemField.HAS_OWN_EFFORT,
     RemoteProposalItemField.SPLIT_POLICY,
     RemoteProposalItemField.IMPORTANCE,
     RemoteProposalItemField.URGENCY,
     RemoteProposalItemField.PARENT_ID,
     RemoteProposalItemField.SIBLING_ORDER,
+    RemoteProposalItemField.BLOCKED_REASON_KIND,
+    RemoteProposalItemField.BLOCKED_BY_ITEM_ID,
+    RemoteProposalItemField.BLOCKED_REASON,
     RemoteProposalItemField.IS_EXECUTABLE,
     RemoteProposalItemField.REVISION,
     RemoteProposalItemField.COMPLETED_AT,
     RemoteProposalItemField.DELETED_AT,
 )
+private val LEGACY_MATERIAL_PROPOSAL_ITEM_FIELDS = MATERIAL_PROPOSAL_ITEM_FIELDS.filterNot {
+    it in setOf(
+        RemoteProposalItemField.DURATION_KIND,
+        RemoteProposalItemField.DURATION_MIN_SECONDS,
+        RemoteProposalItemField.DURATION_MAX_SECONDS,
+        RemoteProposalItemField.DURATION_SOURCE,
+        RemoteProposalItemField.DEADLINE_KIND,
+        RemoteProposalItemField.DEADLINE_DATE,
+        RemoteProposalItemField.DEADLINE_STRENGTH,
+        RemoteProposalItemField.DEADLINE_SOFT_WEIGHT,
+        RemoteProposalItemField.HAS_OWN_EFFORT,
+        RemoteProposalItemField.BLOCKED_REASON_KIND,
+        RemoteProposalItemField.BLOCKED_BY_ITEM_ID,
+        RemoteProposalItemField.BLOCKED_REASON,
+    )
+}
 private val REVIEW_HASH = Regex("^sha256:[0-9a-fA-F]{64}$")

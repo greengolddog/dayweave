@@ -1,5 +1,10 @@
 package com.greengolddog.dayweave.network
 
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import java.io.IOException
 import java.io.Reader
 import java.nio.charset.StandardCharsets
@@ -11,13 +16,21 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
@@ -31,7 +44,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-@Serializable
+@Serializable(with = RemoteCanonicalItemSerializer::class)
 data class RemoteCanonicalItem(
     val id: String,
     @SerialName("is_sensitive") val isSensitive: Boolean,
@@ -41,7 +54,15 @@ data class RemoteCanonicalItem(
     val notes: String? = null,
     @SerialName("timezone_name") val timezoneName: String,
     @SerialName("duration_seconds") val durationSeconds: Long? = null,
+    @SerialName("duration_kind") val durationKind: CanonicalDurationKind? = null,
+    @SerialName("duration_min_seconds") val durationMinSeconds: Long? = null,
+    @SerialName("duration_max_seconds") val durationMaxSeconds: Long? = null,
+    @SerialName("duration_source") val durationSource: CanonicalDurationSource? = null,
     @SerialName("deadline_at") val deadlineAt: String? = null,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind? = null,
+    @SerialName("deadline_date") val deadlineDate: String? = null,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalDeadlineStrength? = null,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: Long? = null,
     @SerialName("earliest_start_at") val earliestStartAt: String? = null,
     val recurrence: JsonElement? = null,
     @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
@@ -50,6 +71,11 @@ data class RemoteCanonicalItem(
     val urgency: Int,
     @SerialName("parent_id") val parentId: String? = null,
     @SerialName("sibling_order") val siblingOrder: Long,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean? = null,
+    @SerialName("blocked_reason_kind")
+    val blockedReasonKind: CanonicalBlockedReasonKind? = null,
+    @SerialName("blocked_by_item_id") val blockedByItemId: String? = null,
+    @SerialName("blocked_reason") val blockedReason: String? = null,
     @SerialName("is_executable") val isExecutable: Boolean,
     val revision: Long,
     @SerialName("created_at") val createdAt: String,
@@ -57,6 +83,175 @@ data class RemoteCanonicalItem(
     @SerialName("completed_at") val completedAt: String? = null,
     @SerialName("deleted_at") val deletedAt: String? = null,
 )
+
+/**
+ * Records structural-key presence before ordinary nullable decoding loses the absent-vs-null
+ * distinction. Canonical responses either omit the whole extension (legacy server) or emit every
+ * key, including explicit JSON null companions.
+ */
+internal object RemoteCanonicalItemSerializer : KSerializer<RemoteCanonicalItem> {
+    override val descriptor: SerialDescriptor = RemoteCanonicalItemWire.serializer().descriptor
+
+    override fun deserialize(decoder: Decoder): RemoteCanonicalItem {
+        val jsonDecoder = decoder as? JsonDecoder
+            ?: throw SerializationException("Remote canonical items require JSON")
+        val element = jsonDecoder.decodeJsonElement()
+        val objectValue = element as? JsonObject
+            ?: throw SerializationException("Remote canonical item must be an object")
+        val structuralKeys = objectValue.keys.intersect(CANONICAL_STRUCTURAL_WIRE_KEYS)
+        if (structuralKeys.isNotEmpty() && structuralKeys.size != CANONICAL_STRUCTURAL_WIRE_KEYS.size) {
+            throw SerializationException("Canonical structural metadata must be emitted atomically")
+        }
+        val wire = jsonDecoder.json.decodeFromJsonElement<RemoteCanonicalItemWire>(element)
+        if (
+            structuralKeys.isNotEmpty() &&
+            (wire.durationKind == null || wire.deadlineKind == null || wire.hasOwnEffort == null)
+        ) {
+            throw SerializationException("Canonical structural discriminators cannot be null")
+        }
+        return wire.toModel()
+    }
+
+    override fun serialize(encoder: Encoder, value: RemoteCanonicalItem) {
+        val jsonEncoder = encoder as? JsonEncoder
+            ?: throw SerializationException("Remote canonical items require JSON")
+        jsonEncoder.encodeJsonElement(
+            jsonEncoder.json.encodeToJsonElement(RemoteCanonicalItemWire.from(value)),
+        )
+    }
+}
+
+private val CANONICAL_STRUCTURAL_WIRE_KEYS = setOf(
+    "duration_kind",
+    "duration_min_seconds",
+    "duration_max_seconds",
+    "duration_source",
+    "deadline_kind",
+    "deadline_date",
+    "deadline_strength",
+    "deadline_soft_weight",
+    "has_own_effort",
+    "blocked_reason_kind",
+    "blocked_by_item_id",
+    "blocked_reason",
+)
+
+@Serializable
+private data class RemoteCanonicalItemWire(
+    val id: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
+    val kind: String,
+    val status: String,
+    val title: String,
+    val notes: String? = null,
+    @SerialName("timezone_name") val timezoneName: String,
+    @SerialName("duration_seconds") val durationSeconds: Long? = null,
+    @SerialName("duration_kind") val durationKind: CanonicalDurationKind? = null,
+    @SerialName("duration_min_seconds") val durationMinSeconds: Long? = null,
+    @SerialName("duration_max_seconds") val durationMaxSeconds: Long? = null,
+    @SerialName("duration_source") val durationSource: CanonicalDurationSource? = null,
+    @SerialName("deadline_at") val deadlineAt: String? = null,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind? = null,
+    @SerialName("deadline_date") val deadlineDate: String? = null,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalDeadlineStrength? = null,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: Long? = null,
+    @SerialName("earliest_start_at") val earliestStartAt: String? = null,
+    val recurrence: JsonElement? = null,
+    @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
+    @SerialName("split_policy") val splitPolicy: JsonObject,
+    val importance: Int,
+    val urgency: Int,
+    @SerialName("parent_id") val parentId: String? = null,
+    @SerialName("sibling_order") val siblingOrder: Long,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean? = null,
+    @SerialName("blocked_reason_kind") val blockedReasonKind: CanonicalBlockedReasonKind? = null,
+    @SerialName("blocked_by_item_id") val blockedByItemId: String? = null,
+    @SerialName("blocked_reason") val blockedReason: String? = null,
+    @SerialName("is_executable") val isExecutable: Boolean,
+    val revision: Long,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
+    @SerialName("completed_at") val completedAt: String? = null,
+    @SerialName("deleted_at") val deletedAt: String? = null,
+) {
+    fun toModel() = RemoteCanonicalItem(
+        id = id,
+        isSensitive = isSensitive,
+        kind = kind,
+        status = status,
+        title = title,
+        notes = notes,
+        timezoneName = timezoneName,
+        durationSeconds = durationSeconds,
+        durationKind = durationKind,
+        durationMinSeconds = durationMinSeconds,
+        durationMaxSeconds = durationMaxSeconds,
+        durationSource = durationSource,
+        deadlineAt = deadlineAt,
+        deadlineKind = deadlineKind,
+        deadlineDate = deadlineDate,
+        deadlineStrength = deadlineStrength,
+        deadlineSoftWeight = deadlineSoftWeight,
+        earliestStartAt = earliestStartAt,
+        recurrence = recurrence,
+        flexibleConstraints = flexibleConstraints,
+        splitPolicy = splitPolicy,
+        importance = importance,
+        urgency = urgency,
+        parentId = parentId,
+        siblingOrder = siblingOrder,
+        hasOwnEffort = hasOwnEffort,
+        blockedReasonKind = blockedReasonKind,
+        blockedByItemId = blockedByItemId,
+        blockedReason = blockedReason,
+        isExecutable = isExecutable,
+        revision = revision,
+        createdAt = createdAt,
+        updatedAt = updatedAt,
+        completedAt = completedAt,
+        deletedAt = deletedAt,
+    )
+
+    companion object {
+        fun from(value: RemoteCanonicalItem) = RemoteCanonicalItemWire(
+            id = value.id,
+            isSensitive = value.isSensitive,
+            kind = value.kind,
+            status = value.status,
+            title = value.title,
+            notes = value.notes,
+            timezoneName = value.timezoneName,
+            durationSeconds = value.durationSeconds,
+            durationKind = value.durationKind,
+            durationMinSeconds = value.durationMinSeconds,
+            durationMaxSeconds = value.durationMaxSeconds,
+            durationSource = value.durationSource,
+            deadlineAt = value.deadlineAt,
+            deadlineKind = value.deadlineKind,
+            deadlineDate = value.deadlineDate,
+            deadlineStrength = value.deadlineStrength,
+            deadlineSoftWeight = value.deadlineSoftWeight,
+            earliestStartAt = value.earliestStartAt,
+            recurrence = value.recurrence,
+            flexibleConstraints = value.flexibleConstraints,
+            splitPolicy = value.splitPolicy,
+            importance = value.importance,
+            urgency = value.urgency,
+            parentId = value.parentId,
+            siblingOrder = value.siblingOrder,
+            hasOwnEffort = value.hasOwnEffort,
+            blockedReasonKind = value.blockedReasonKind,
+            blockedByItemId = value.blockedByItemId,
+            blockedReason = value.blockedReason,
+            isExecutable = value.isExecutable,
+            revision = value.revision,
+            createdAt = value.createdAt,
+            updatedAt = value.updatedAt,
+            completedAt = value.completedAt,
+            deletedAt = value.deletedAt,
+        )
+    }
+}
 
 @Serializable
 data class RemoteItemTombstone(

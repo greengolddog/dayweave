@@ -62,6 +62,7 @@ fun CanonicalItemDraft.createsPlanningDemand(
     require(value.placement == CanonicalDraftPlacement.PLANNED)
     when (value.kind) {
         ItemKind.EVENT -> true
+        ItemKind.PROJECT -> false
         ItemKind.TASK,
         ItemKind.HABIT,
         ItemKind.BREAK,
