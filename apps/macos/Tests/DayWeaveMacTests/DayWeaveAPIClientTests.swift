@@ -287,6 +287,14 @@ struct DayWeaveAPIClientTests {
         #expect(!item.isSensitive)
         #expect(item.revision == 7)
         #expect(item.deadlineAt != nil)
+        #expect(item.durationKind == .exact)
+        #expect(item.durationMinimumSeconds == 3_600)
+        #expect(item.durationMaximumSeconds == 3_600)
+        #expect(item.durationSource == .user)
+        #expect(item.deadlineKind == .dateTime)
+        #expect(item.deadlineStrength == .hard)
+        #expect(!item.hasOwnEffort)
+        #expect(!item.hasExplicitStructuralMetadata)
         #expect(item.parentID == Self.parentID)
         #expect(item.recurrence == .object([
             "type": .string("weekly"),
@@ -310,6 +318,351 @@ struct DayWeaveAPIClientTests {
             URLQueryItem(name: "cursor", value: "opaque-cursor-6"),
             URLQueryItem(name: "limit", value: "37"),
         ]))
+    }
+
+    @Test("canonical structural metadata is typed, exact, and cache-stable")
+    func testCanonicalStructuralMetadataRoundTrip() async throws {
+        let blockerID = UUID(uuidString: "dddddddd-3333-4333-8333-eeeeeeeeeeee")!
+        let itemObject = Self.structuralCanonicalItemObject { object in
+            object["kind"] = "project"
+            object["status"] = "blocked"
+            object["duration_kind"] = "range"
+            object["duration_min_seconds"] = 1_800
+            object["duration_seconds"] = 3_600
+            object["duration_max_seconds"] = 7_200
+            object["duration_source"] = "assistant"
+            object["deadline_kind"] = "date_time"
+            object["deadline_at"] = "2026-09-01T19:00:00+02:00"
+            object["deadline_strength"] = "soft"
+            object["deadline_soft_weight"] = 75
+            object["has_own_effort"] = true
+            object["flexible_constraints"] = ["has_own_effort": true]
+            object["blocked_reason_kind"] = "dependency"
+            object["blocked_by_item_id"] = blockerID.uuidString.lowercased()
+            object["blocked_reason"] = "Waiting for the upstream milestone"
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("{\"items\":[\(itemObject)]}".utf8))
+        )
+
+        let item = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+
+        #expect(item.kind == .project)
+        #expect(item.status == .blocked)
+        #expect(item.durationKind == .range)
+        #expect(item.durationMinimumSeconds == 1_800)
+        #expect(item.durationSeconds == 3_600)
+        #expect(item.durationMaximumSeconds == 7_200)
+        #expect(item.durationSource == .assistant)
+        #expect(item.deadlineKind == .dateTime)
+        #expect(item.deadlineStrength == .soft)
+        #expect(item.deadlineSoftWeight == 75)
+        #expect(item.retainedCanonicalDeadlineAt == "2026-09-01T19:00:00+02:00")
+        #expect(item.hasOwnEffort)
+        #expect(item.blockedReasonKind == .dependency)
+        #expect(item.blockedByItemID == blockerID)
+        #expect(item.blockedReason == "Waiting for the upstream milestone")
+        #expect(item.hasExplicitStructuralMetadata)
+        #expect(!item.supportsLosslessReplacement)
+        #expect(!item.supportsCanonicalAuthoringReplacement)
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let cached = try encoder.encode(item)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] =
+            PlannerSnapshot.currentSchemaVersion
+        #expect(try decoder.decode(DayWeaveCanonicalItem.self, from: cached) == item)
+    }
+
+    @Test("future structural enum values remain exact and read-only")
+    func testFutureCanonicalStructuralEnumIsRetained() async throws {
+        let itemObject = Self.structuralCanonicalItemObject { object in
+            object["duration_source"] = "future_estimator_v2"
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("{\"items\":[\(itemObject)]}".utf8))
+        )
+
+        let item = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        #expect(item.durationSource == .unsupported("future_estimator_v2"))
+        #expect(item.hasUnsupportedStructuralMetadata)
+        #expect(!item.supportsLosslessReplacement)
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let cached = try encoder.encode(item)
+        let object = try #require(
+            JSONSerialization.jsonObject(with: cached) as? [String: Any]
+        )
+        #expect(object["duration_source"] as? String == "future_estimator_v2")
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] =
+            PlannerSnapshot.currentSchemaVersion
+        #expect(try decoder.decode(DayWeaveCanonicalItem.self, from: cached) == item)
+    }
+
+    @Test("explicit legacy-equivalent structure remains authorable")
+    func testLegacyEquivalentCanonicalStructureRemainsAuthorable() async throws {
+        let itemObject = Self.structuralCanonicalItemObject { object in
+            object["deadline_kind"] = "none"
+            object["deadline_at"] = NSNull()
+            object["deadline_strength"] = NSNull()
+            object["recurrence"] = NSNull()
+            object["flexible_constraints"] = [:]
+            object["split_policy"] = ["type": "indivisible"]
+            object["parent_id"] = NSNull()
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("{\"items\":[\(itemObject)]}".utf8))
+        )
+
+        let item = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        #expect(!item.hasExplicitStructuralMetadata)
+        #expect(item.supportsLosslessReplacement)
+        #expect(item.supportsCanonicalAuthoringReplacement)
+    }
+
+    @Test("future item semantics retain event ends and known blocker tuples")
+    func testFutureCanonicalItemSemanticsRemainReadable() async throws {
+        let futureStatus = Self.structuralCanonicalItemObject { object in
+            object["status"] = "waiting_for_review"
+            object["blocked_reason_kind"] = "manual"
+            object["blocked_reason"] = "Waiting for review"
+        }
+        let futureKind = Self.structuralCanonicalItemObject { object in
+            object["kind"] = "travel_reservation"
+            object["deadline_kind"] = "none"
+            object["deadline_strength"] = NSNull()
+        }
+        let project = Self.structuralCanonicalItemObject { object in
+            object["kind"] = "project"
+            object["deadline_kind"] = "none"
+            object["deadline_at"] = NSNull()
+            object["deadline_strength"] = NSNull()
+            object["recurrence"] = NSNull()
+            object["flexible_constraints"] = [:]
+            object["split_policy"] = ["type": "indivisible"]
+            object["parent_id"] = NSNull()
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("{\"items\":[\(futureStatus)]}".utf8)),
+            .init(statusCode: 200, body: Data("{\"items\":[\(futureKind)]}".utf8)),
+            .init(statusCode: 200, body: Data("{\"items\":[\(project)]}".utf8))
+        )
+
+        let statusItem = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        let kindItem = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        let projectItem = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        #expect(statusItem.status == .unknown("waiting_for_review"))
+        #expect(statusItem.blockedReasonKind == .manual)
+        #expect(statusItem.blockedReason == "Waiting for review")
+        #expect(!statusItem.supportsLosslessReplacement)
+        #expect(kindItem.kind == .unknown("travel_reservation"))
+        #expect(kindItem.deadlineKind == .none)
+        #expect(kindItem.deadlineAt != nil)
+        #expect(kindItem.retainedCanonicalDeadlineAt != nil)
+        #expect(!kindItem.supportsLosslessReplacement)
+        #expect(projectItem.kind == .project)
+        #expect(!projectItem.hasExplicitStructuralMetadata)
+        #expect(!projectItem.supportsLosslessReplacement)
+        #expect(!projectItem.supportsCanonicalAuthoringReplacement)
+    }
+
+    @Test("date-only deadlines remain exact while event ends are not deadlines")
+    func testCanonicalDateOnlyAndEventEndSemantics() async throws {
+        let dateOnly = Self.structuralCanonicalItemObject { object in
+            object["duration_kind"] = "range"
+            object["duration_min_seconds"] = 1_800
+            object["duration_seconds"] = 3_600
+            object["duration_max_seconds"] = 5_400
+            object["duration_source"] = "assistant"
+            object["deadline_kind"] = "date"
+            object["deadline_at"] = NSNull()
+            object["deadline_date"] = "2026-09-30"
+            object["deadline_strength"] = "soft"
+            object["deadline_soft_weight"] = 42
+        }
+        let event = Self.structuralCanonicalItemObject { object in
+            object["kind"] = "event"
+            object["deadline_kind"] = "none"
+            object["deadline_at"] = "2026-09-01T17:00:00Z"
+            object["deadline_date"] = NSNull()
+            object["deadline_strength"] = NSNull()
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("{\"items\":[\(dateOnly)]}".utf8)),
+            .init(statusCode: 200, body: Data("{\"items\":[\(event)]}".utf8))
+        )
+
+        let task = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+        let calendarEvent = try #require(
+            await makeClient(token: Self.apiToken).listCanonicalItems().first
+        )
+
+        #expect(task.deadlineKind == .date)
+        #expect(task.deadlineDate == "2026-09-30")
+        #expect(task.deadlineAt == nil)
+        #expect(task.deadlineStrength == .soft)
+        #expect(calendarEvent.kind == .event)
+        #expect(calendarEvent.deadlineKind == .none)
+        #expect(calendarEvent.deadlineAt != nil)
+
+        let taskRow = try #require(CanonicalInboxPresentation.build(
+            activeItems: [task],
+            pendingMutations: [],
+            trashEntries: []
+        ).active.first)
+        #expect(taskRow.durationDescription == "30 min–90 min · expected 60 min")
+        #expect(taskRow.timingTitle == "Due date")
+        #expect(taskRow.timingDescription(timezoneName: "Europe/Madrid")
+            == "2026-09-30 · Soft · weight 42")
+        let eventRow = try #require(CanonicalInboxPresentation.build(
+            activeItems: [calendarEvent],
+            pendingMutations: [],
+            trashEntries: []
+        ).active.first)
+        #expect(eventRow.timingTitle == "Ends")
+        #expect(
+            eventRow.timingDescription(timezoneName: "Europe/Madrid")?.contains("2026") == true
+        )
+
+        switch task.moveLaterDeadlineAssessment {
+        case let .valid(.some(boundary)):
+            #expect(!boundary.isHard)
+            #expect(boundary.isCanonicalField)
+            #expect(boundary.date == Self.date("2026-09-30T22:00:00Z"))
+        case .valid(nil), .invalid:
+            Issue.record("Date-only soft deadline did not resolve to its local-day boundary")
+        }
+        #expect(calendarEvent.moveLaterDeadlineAssessment == .valid(nil))
+    }
+
+    @Test("contradictory and incomplete canonical structural shapes fail closed")
+    func testCanonicalStructuralMetadataRejectsContradictions() async {
+        let invalidObjects = [
+            Self.structuralCanonicalItemObject { $0.removeValue(forKey: "duration_source") },
+            Self.structuralCanonicalItemObject { $0["duration_max_seconds"] = 31_622_401 },
+            Self.structuralCanonicalItemObject {
+                $0["duration_source"] = String(repeating: "x", count: 65)
+            },
+            Self.structuralCanonicalItemObject {
+                $0["duration_kind"] = "range"
+                $0["duration_min_seconds"] = 7_200
+                $0["duration_max_seconds"] = 7_200
+            },
+            Self.structuralCanonicalItemObject {
+                $0["deadline_strength"] = "soft"
+                $0["deadline_soft_weight"] = NSNull()
+            },
+            Self.structuralCanonicalItemObject {
+                $0["deadline_kind"] = "date"
+                $0["deadline_at"] = NSNull()
+                $0["deadline_date"] = "2026-02-30"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["deadline_kind"] = "date"
+                $0["deadline_at"] = NSNull()
+                $0["deadline_date"] = "0000-01-01"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["deadline_kind"] = "date"
+                $0["deadline_at"] = NSNull()
+                $0["deadline_date"] = "9999-12-31"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["kind"] = String(repeating: "x", count: 65)
+            },
+            Self.structuralCanonicalItemObject {
+                $0["kind"] = "event"
+                $0["deadline_kind"] = "date"
+                $0["deadline_at"] = NSNull()
+                $0["deadline_date"] = "2026-09-30"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["status"] = "blocked"
+                $0["blocked_reason_kind"] = "manual"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["blocked_reason_kind"] = "external"
+                $0["blocked_reason"] = "Provider unavailable"
+            },
+            Self.structuralCanonicalItemObject {
+                $0["has_own_effort"] = true
+                $0["flexible_constraints"] = ["has_own_effort": false]
+            },
+        ]
+        invalidObjects.forEach { object in
+            URLProtocolStub.storage.enqueue(
+                key: Self.apiToken,
+                .init(statusCode: 200, body: Data("{\"items\":[\(object)]}".utf8))
+            )
+        }
+
+        for _ in invalidObjects {
+            await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+                _ = try await makeClient(token: Self.apiToken).listCanonicalItems()
+            }
+        }
+    }
+
+    @Test("a current cache cannot relabel rich structure as legacy")
+    func testCanonicalStructuralCacheMarkerCannotDowngrade() throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let item = try decoder.decode(
+            DayWeaveCanonicalItem.self,
+            from: Data(Self.structuralCanonicalItemObject { object in
+                object["duration_kind"] = "range"
+                object["duration_min_seconds"] = 1_800
+                object["duration_max_seconds"] = 7_200
+            }.utf8)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var cacheObject = try #require(
+            JSONSerialization.jsonObject(with: encoder.encode(item)) as? [String: Any]
+        )
+        var missingExactDeadline = cacheObject
+        missingExactDeadline.removeValue(forKey: "_dayweave_exact_deadline_at")
+        let missingExactDeadlineData = try JSONSerialization.data(
+            withJSONObject: missingExactDeadline
+        )
+        let cacheDecoder = JSONDecoder()
+        cacheDecoder.dateDecodingStrategy = .millisecondsSince1970
+        cacheDecoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] =
+            PlannerSnapshot.currentSchemaVersion
+        #expect(throws: DecodingError.self) {
+            try cacheDecoder.decode(DayWeaveCanonicalItem.self, from: missingExactDeadlineData)
+        }
+
+        cacheObject["_dayweave_explicit_structural_metadata"] = false
+        let downgraded = try JSONSerialization.data(withJSONObject: cacheObject)
+
+        #expect(throws: DecodingError.self) {
+            try cacheDecoder.decode(DayWeaveCanonicalItem.self, from: downgraded)
+        }
     }
 
     @Test("canonical create and replacement are idempotent and revision guarded")
@@ -483,6 +836,8 @@ struct DayWeaveAPIClientTests {
         )
         let cacheDecoder = JSONDecoder()
         cacheDecoder.dateDecodingStrategy = .millisecondsSince1970
+        cacheDecoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] =
+            PlannerSnapshot.currentSchemaVersion
         let restored = try cacheDecoder.decode(DayWeaveCanonicalItem.self, from: cached)
         #expect(restored == retained)
         #expect(!restored.supportsCanonicalAuthoringReplacement)
@@ -991,6 +1346,29 @@ struct DayWeaveAPIClientTests {
           "deleted_at":\(deletedAt)\(futureField)
         }
         """
+    }
+
+    static func structuralCanonicalItemObject(
+        mutate: (inout [String: Any]) -> Void = { _ in }
+    ) -> String {
+        var object = try! JSONSerialization.jsonObject(
+            with: Data(canonicalItemObject(revision: 7).utf8)
+        ) as! [String: Any]
+        object["duration_kind"] = "exact"
+        object["duration_min_seconds"] = 3_600
+        object["duration_max_seconds"] = 3_600
+        object["duration_source"] = "user"
+        object["deadline_kind"] = "date_time"
+        object["deadline_date"] = NSNull()
+        object["deadline_strength"] = "hard"
+        object["deadline_soft_weight"] = NSNull()
+        object["has_own_effort"] = false
+        object["blocked_reason_kind"] = NSNull()
+        object["blocked_by_item_id"] = NSNull()
+        object["blocked_reason"] = NSNull()
+        mutate(&object)
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     static func listEnvelope() -> Data {

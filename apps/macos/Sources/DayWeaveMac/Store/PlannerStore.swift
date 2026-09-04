@@ -1765,9 +1765,7 @@ final class PlannerStore: ObservableObject {
                   .expectedRevision,
               item.revision > expectedRevision else { return }
         let mutation = pendingCanonicalAuthoringMutations[index]
-        if mutation.baseItem.map({
-            DayWeaveCanonicalItemDraft(item: $0).matches(item)
-        }) ?? true {
+        if mutation.baseItem.map({ $0.hasSameAuthoredContent(as: item) }) ?? true {
             pendingCanonicalAuthoringMutations.remove(at: index)
         } else {
             pendingCanonicalAuthoringMutations[index].disposition = .conflicted
@@ -2551,6 +2549,7 @@ final class PlannerStore: ObservableObject {
         case .create:
             minimumRevision = 1
             guard response.deletedAt == nil,
+                  response.supportsCanonicalAuthoringReplacement,
                   mutation.draft?.matches(response) == true else {
                 throw PlannerCanonicalAuthoringError.invalidRemoteResponse
             }
@@ -2558,6 +2557,7 @@ final class PlannerStore: ObservableObject {
             guard let expected = mutation.expectedRevision,
                   let draft = mutation.draft,
                   response.deletedAt == nil,
+                  response.supportsCanonicalAuthoringReplacement,
                   draft.matches(response) else {
                 throw PlannerCanonicalAuthoringError.invalidRemoteResponse
             }
@@ -2570,7 +2570,7 @@ final class PlannerStore: ObservableObject {
             guard let expected = mutation.expectedRevision,
                   response.deletedAt != nil,
                   mutation.baseItem.map({
-                      DayWeaveCanonicalItemDraft(item: $0).matches(response)
+                      $0.hasSameAuthoredContent(as: response)
                   }) ?? true else {
                 throw PlannerCanonicalAuthoringError.invalidRemoteResponse
             }
@@ -2583,7 +2583,7 @@ final class PlannerStore: ObservableObject {
             guard let expected = mutation.expectedRevision,
                   response.deletedAt == nil,
                   mutation.baseItem.map({
-                      DayWeaveCanonicalItemDraft(item: $0).matches(response)
+                      $0.hasSameAuthoredContent(as: response)
                   }) ?? true else {
                 throw PlannerCanonicalAuthoringError.invalidRemoteResponse
             }
@@ -3727,6 +3727,7 @@ final class PlannerStore: ObservableObject {
             let exactReviewedMutation = pendingCanonicalAuthoringMutations.contains {
                 mutation in
                 mutation.itemID == anchor.itemID
+                    && item.supportsCanonicalAuthoringReplacement
                     && (anchor.canonicalRevision == nil
                         ? mutation.operation == .create
                         : mutation.operation == .create || mutation.operation == .replace)
@@ -5427,6 +5428,7 @@ final class PlannerStore: ObservableObject {
         case .habit: .habit
         case .routine: .routine
         case .goal: .goal
+        case .project: .project
         case .breakTime: .breakTime
         case .unknown: .task
         }
@@ -5804,6 +5806,7 @@ final class PlannerStore: ObservableObject {
         case .scheduled: .scheduled
         case .inProgress: .active
         case .paused: .paused
+        case .blocked: .blocked
         case .completed: .completed
         case .skipped: .skipped
         case .cancelled: .canceled

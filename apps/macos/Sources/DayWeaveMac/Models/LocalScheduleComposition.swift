@@ -174,7 +174,9 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         // typed input. Unlike a server replacement, it does not claim to
         // reproduce arbitrary JSON tokens byte-for-byte, so decoded numeric
         // values in known recurrence/constraint fields remain usable.
-        guard item.unsupportedFields.isEmpty, item.revision > 0 else {
+        guard item.unsupportedFields.isEmpty,
+              !item.hasExplicitStructuralMetadata,
+              item.revision > 0 else {
             throw SchedulerHelperClientError.unsupportedCanonicalItem
         }
         if case .unknown = item.kind {

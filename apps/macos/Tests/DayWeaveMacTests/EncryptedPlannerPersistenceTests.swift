@@ -1091,6 +1091,324 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func schemaTwentyOneCanonicalStructureMigratesWithoutLoss() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 21,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [try canonicalItem()]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var root = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema 21 fixture was not an object"
+        )
+        var items = try requireValue(
+            root["canonicalItems"] as? [[String: Any]],
+            "Schema 21 fixture had no canonical item"
+        )
+        let newerItemKeys = [
+            "duration_kind", "duration_min_seconds", "duration_max_seconds",
+            "duration_source", "deadline_kind", "deadline_date", "deadline_strength",
+            "deadline_soft_weight", "has_own_effort", "blocked_reason_kind",
+            "blocked_by_item_id", "blocked_reason", "_dayweave_exact_deadline_at",
+            "_dayweave_explicit_structural_metadata",
+        ]
+        for key in newerItemKeys { items[0].removeValue(forKey: key) }
+        root["canonicalItems"] = items
+        let legacyData = try JSONSerialization.data(withJSONObject: root)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 21
+
+        let migrated = try decoder.decode(PlannerSnapshot.self, from: legacyData)
+            .migratedToCurrentSchema()
+        let item = try requireValue(
+            migrated.canonicalItems?.first,
+            "Schema 21 migration discarded its canonical item"
+        )
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema 21 did not migrate to the current schema"
+        )
+        try require(
+            item.durationKind == .exact
+                && item.durationMinimumSeconds == 3_600
+                && item.durationMaximumSeconds == 3_600
+                && item.durationSource == .user,
+            "Schema 21 duration was not inferred losslessly"
+        )
+        try require(
+            item.deadlineKind == .dateTime
+                && item.deadlineStrength == .hard
+                && item.retainedCanonicalDeadlineAt != nil,
+            "Schema 21 deadline was not retained through migration"
+        )
+        try require(
+            item.unsupportedFields["future_rule"] != nil,
+            "Schema 21 migration discarded a future canonical field"
+        )
+
+        let rewrittenRoot = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(migrated)) as? [String: Any],
+            "Migrated schema 22 fixture was not an object"
+        )
+        let rewrittenItem = try requireValue(
+            (rewrittenRoot["canonicalItems"] as? [[String: Any]])?.first,
+            "Migrated schema 22 fixture had no canonical item"
+        )
+        try require(
+            Set(newerItemKeys).isSubset(of: Set(rewrittenItem.keys)),
+            "Migrated schema 22 item did not persist its complete structural shape"
+        )
+    }
+
+    static func schemaTwentyOneForwardCapturedStructureMigratesWithoutLoss() throws {
+        let base = makeSnapshot()
+        let capturedItem = try canonicalItem()
+        let pendingMutation = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "52000000-0000-4000-8000-000000000052")!,
+            itemID: capturedItem.id,
+            operation: .trash,
+            expectedRevision: capturedItem.revision,
+            baseItem: capturedItem,
+            createdAt: base.savedAt
+        )
+        let legacy = PlannerSnapshot(
+            schemaVersion: 21,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [capturedItem],
+            pendingCanonicalAuthoringMutations: [pendingMutation]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var root = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema 21 forward-capture fixture was not an object"
+        )
+        let originalItem = try requireValue(
+            (root["canonicalItems"] as? [[String: Any]])?.first,
+            "Schema 21 forward-capture fixture had no canonical item"
+        )
+
+        func withoutCurrentMarkers(_ value: [String: Any]) -> [String: Any] {
+            var result = value
+            result.removeValue(forKey: "_dayweave_exact_deadline_at")
+            result.removeValue(forKey: "_dayweave_explicit_structural_metadata")
+            return result
+        }
+
+        var richProject = withoutCurrentMarkers(originalItem)
+        richProject.removeValue(forKey: "future_rule")
+        richProject["kind"] = "project"
+        richProject["title"] = "Forward-captured rich project"
+        richProject["duration_kind"] = "range"
+        richProject["duration_min_seconds"] = 1_800
+        richProject["duration_seconds"] = 3_600
+        richProject["duration_max_seconds"] = 7_200
+        richProject["duration_source"] = "assistant"
+        richProject["deadline_kind"] = "date"
+        richProject["deadline_at"] = NSNull()
+        richProject["deadline_date"] = "2026-09-30"
+        richProject["deadline_strength"] = "soft"
+        richProject["deadline_soft_weight"] = 75
+        richProject["has_own_effort"] = true
+        var constraints = try requireValue(
+            richProject["flexible_constraints"] as? [String: Any],
+            "Schema 21 rich item had no flexible constraints"
+        )
+        constraints["has_own_effort"] = true
+        richProject["flexible_constraints"] = constraints
+
+        var blocked = withoutCurrentMarkers(originalItem)
+        blocked.removeValue(forKey: "future_rule")
+        let blockedID = UUID(uuidString: "53000000-0000-4000-8000-000000000053")!
+        blocked["id"] = blockedID.uuidString.lowercased()
+        blocked["status"] = "blocked"
+        blocked["title"] = "Forward-captured blocked task"
+        blocked["blocked_reason_kind"] = "manual"
+        blocked["blocked_by_item_id"] = NSNull()
+        blocked["blocked_reason"] = "Waiting for review"
+        root["canonicalItems"] = [richProject, blocked]
+
+        var mutations = try requireValue(
+            root["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
+            "Schema 21 forward-capture fixture had no pending authoring mutation"
+        )
+        mutations[0]["baseItem"] = richProject
+        root["pendingCanonicalAuthoringMutations"] = mutations
+
+        let legacyData = try JSONSerialization.data(withJSONObject: root)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 21
+        let migrated = try decoder.decode(PlannerSnapshot.self, from: legacyData)
+            .migratedToCurrentSchema()
+
+        let items = try requireValue(
+            migrated.canonicalItems,
+            "Schema 21 forward capture discarded canonical items"
+        )
+        let project = try requireValue(
+            items.first(where: { $0.id == capturedItem.id }),
+            "Schema 21 forward capture discarded its rich project"
+        )
+        try require(
+            project.kind == .project
+                && project.status == .planned
+                && project.durationKind == .range
+                && project.durationMinimumSeconds == 1_800
+                && project.durationSeconds == 3_600
+                && project.durationMaximumSeconds == 7_200
+                && project.durationSource == .assistant
+                && project.deadlineKind == .date
+                && project.deadlineAt == nil
+                && project.deadlineDate == "2026-09-30"
+                && project.deadlineStrength == .soft
+                && project.deadlineSoftWeight == 75
+                && project.hasOwnEffort,
+            "Schema 21 migration normalized a complete rich structural shape"
+        )
+        try require(
+            project.hasExplicitStructuralMetadata && !project.supportsLosslessReplacement,
+            "Schema 21 rich project was not fenced from legacy full-item writes"
+        )
+        let blockedItem = try requireValue(
+            items.first(where: { $0.id == blockedID }),
+            "Schema 21 forward capture discarded its Blocked item"
+        )
+        try require(
+            blockedItem.status == .blocked
+                && blockedItem.blockedReasonKind == .manual
+                && blockedItem.blockedByItemID == nil
+                && blockedItem.blockedReason == "Waiting for review",
+            "Schema 21 migration normalized the Blocked reason tuple"
+        )
+        try require(
+            blockedItem.hasExplicitStructuralMetadata
+                && !blockedItem.supportsLosslessReplacement
+                && blockedItem.retainedCanonicalDeadlineAt
+                    == "2026-09-01T17:00:00.000Z",
+            "Schema 21 Blocked item was not retained exactly and fenced"
+        )
+
+        let pendingBase = try requireValue(
+            migrated.pendingCanonicalAuthoringMutations?.first?.baseItem,
+            "Schema 21 migration discarded a nested pending base item"
+        )
+        try require(
+            pendingBase.durationKind == .range
+                && pendingBase.deadlineKind == .date
+                && pendingBase.deadlineDate == "2026-09-30"
+                && pendingBase.hasExplicitStructuralMetadata
+                && !pendingBase.supportsLosslessReplacement,
+            "Schema 21 migration normalized or unfenced a nested pending base item"
+        )
+
+        let rewrittenRoot = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(migrated)) as? [String: Any],
+            "Migrated forward-capture fixture was not an object"
+        )
+        let rewrittenItems = try requireValue(
+            rewrittenRoot["canonicalItems"] as? [[String: Any]],
+            "Migrated forward-capture fixture had no canonical items"
+        )
+        let rewrittenProject = try requireValue(
+            rewrittenItems.first(where: {
+                ($0["id"] as? String)?.lowercased() == capturedItem.id.uuidString.lowercased()
+            }),
+            "Migrated forward-capture fixture had no rich project"
+        )
+        let rewrittenBlocked = try requireValue(
+            rewrittenItems.first(where: {
+                ($0["id"] as? String)?.lowercased() == blockedID.uuidString.lowercased()
+            }),
+            "Migrated forward-capture fixture had no Blocked item"
+        )
+        try require(
+            rewrittenProject["duration_kind"] as? String == "range"
+                && rewrittenProject["deadline_date"] as? String == "2026-09-30"
+                && rewrittenProject["_dayweave_explicit_structural_metadata"] as? Bool == true
+                && rewrittenBlocked["blocked_reason_kind"] as? String == "manual"
+                && rewrittenBlocked["blocked_reason"] as? String == "Waiting for review"
+                && rewrittenBlocked["_dayweave_exact_deadline_at"] as? String
+                    == "2026-09-01T17:00:00.000Z"
+                && rewrittenBlocked["_dayweave_explicit_structural_metadata"] as? Bool == true,
+            "Schema 22 rewrite did not durably preserve forward-captured structural values"
+        )
+    }
+
+    static func schemaTwentyOnePartialCanonicalStructureFailsClosed() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 21,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [try canonicalItem()]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var root = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema 21 partial-shape fixture was not an object"
+        )
+        var items = try requireValue(
+            root["canonicalItems"] as? [[String: Any]],
+            "Schema 21 partial-shape fixture had no canonical item"
+        )
+        items[0].removeValue(forKey: "blocked_reason")
+        items[0].removeValue(forKey: "_dayweave_exact_deadline_at")
+        items[0].removeValue(forKey: "_dayweave_explicit_structural_metadata")
+        root["canonicalItems"] = items
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 21
+        var rejected = false
+        do {
+            _ = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: root)
+            )
+        } catch is DecodingError {
+            rejected = true
+        }
+        try require(
+            rejected,
+            "Schema 21 partial structural shape was silently normalized"
+        )
+    }
+
     static func schemaSeventeenCannotAcquireCodexDraftAuthority() throws {
         let base = makeSnapshot()
         let injected = typedCodexSuggestion(createdAt: base.savedAt)
@@ -1496,6 +1814,20 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
         try EncryptedPlannerPersistenceScenarios.schemaSeventeenCannotAcquireCodexDraftAuthority()
     }
 
+    func testSchemaTwentyOneCanonicalStructureMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaTwentyOneCanonicalStructureMigratesWithoutLoss()
+    }
+
+    func testSchemaTwentyOneForwardCapturedCanonicalStructureMigration() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOneForwardCapturedStructureMigratesWithoutLoss()
+    }
+
+    func testSchemaTwentyOnePartialCanonicalStructureFailsClosed() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOnePartialCanonicalStructureFailsClosed()
+    }
+
     func testMalformedCodexSuggestionStateIsRejected() throws {
         try EncryptedPlannerPersistenceScenarios.malformedCodexSuggestionStateIsRejected()
     }
@@ -1625,6 +1957,23 @@ struct EncryptedPlannerPersistenceTests {
         try EncryptedPlannerPersistenceScenarios.schemaSeventeenCannotAcquireCodexDraftAuthority()
     }
 
+    @Test("Schema 21 canonical items gain lossless typed structural metadata")
+    func schemaTwentyOneCanonicalStructureMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaTwentyOneCanonicalStructureMigratesWithoutLoss()
+    }
+
+    @Test("Schema 21 complete forward-captured structural rows remain exact and read-only")
+    func schemaTwentyOneForwardCapturedCanonicalStructureMigration() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOneForwardCapturedStructureMigratesWithoutLoss()
+    }
+
+    @Test("Schema 21 partial forward-captured structural rows fail closed")
+    func schemaTwentyOnePartialCanonicalStructure() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOnePartialCanonicalStructureFailsClosed()
+    }
+
     @Test("Malformed Codex decision linkage fails closed")
     func malformedCodexSuggestionState() throws {
         try EncryptedPlannerPersistenceScenarios.malformedCodexSuggestionStateIsRejected()
@@ -1647,6 +1996,11 @@ private struct PersistenceManualTestRunner {
         try EncryptedPlannerPersistenceScenarios.corruptionFailure()
         try EncryptedPlannerPersistenceScenarios.storeRestore()
         try EncryptedPlannerPersistenceScenarios.canonicalCacheRoundTrip()
+        try EncryptedPlannerPersistenceScenarios.schemaTwentyOneCanonicalStructureMigratesWithoutLoss()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOneForwardCapturedStructureMigratesWithoutLoss()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyOnePartialCanonicalStructureFailsClosed()
         print("All encrypted planner persistence scenarios passed")
     }
 }

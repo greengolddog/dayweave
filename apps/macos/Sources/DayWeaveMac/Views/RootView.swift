@@ -55,6 +55,38 @@ private func scheduleDateTimeLabel(_ date: Date, timezoneName: String) -> String
     PlannerTimeZone.dateTimeLabel(date, timezoneName: timezoneName)
 }
 
+private func canonicalDeadlineDisplayValue(
+    _ base: String,
+    item: DayWeaveCanonicalItem
+) -> String {
+    let policy = switch item.deadlineStrength {
+    case .hard?: "Hard"
+    case .soft?: item.deadlineSoftWeight.map { "Soft · weight \($0)" } ?? "Soft"
+    case .unsupported?: "Newer deadline policy"
+    case nil: "Deadline policy unavailable"
+    }
+    return "\(base) · \(policy)"
+}
+
+private func canonicalBlockedDisplayValue(_ item: DayWeaveCanonicalItem) -> String? {
+    guard item.status == .blocked else { return nil }
+    switch item.blockedReasonKind {
+    case .dependency?:
+        let dependency = item.blockedByItemID.map {
+            "Waiting for item \($0.uuidString.lowercased().prefix(8))"
+        } ?? "Waiting for a dependency"
+        return item.blockedReason.map { "\(dependency) · \($0)" } ?? dependency
+    case .manual?:
+        return item.blockedReason.map { "Manually blocked · \($0)" } ?? "Manually blocked"
+    case .external?:
+        return item.blockedReason.map { "External blocker · \($0)" } ?? "External blocker"
+    case .unsupported?:
+        return "Blocked for a reason that requires a newer DayWeave version"
+    case nil:
+        return "Blocked reason unavailable"
+    }
+}
+
 private func scheduleDayLabel(_ date: Date, timezoneName: String) -> String {
     var style = Date.FormatStyle()
         .weekday(.wide)
@@ -2782,18 +2814,20 @@ private struct CanonicalInboxInspector: View {
                     InspectorSection(title: "Planning") {
                         LabeledContent(
                             "Duration",
-                            value: CanonicalItemEditorState.durationDescription(row.durationSeconds)
+                            value: row.durationDescription
                         )
-                        LabeledContent(
-                            "Deadline",
-                            value: row.deadlineAt.map {
-                                scheduleDateTimeLabel(
-                                    $0,
-                                    timezoneName: store.scheduleProfile.timezoneName
-                                )
-                            }
-                                ?? "None"
-                        )
+                        if let timingTitle = row.timingTitle,
+                           let timing = row.timingDescription(
+                               timezoneName: store.scheduleProfile.timezoneName
+                           ) {
+                            LabeledContent(timingTitle, value: timing)
+                        } else {
+                            LabeledContent("Deadline", value: "None")
+                        }
+                        if let blocker = row.blockedDescription {
+                            LabeledContent("Blocked", value: blocker)
+                                .privacySensitive(row.isSensitive)
+                        }
                         LabeledContent("Hierarchy level", value: String(row.depth + 1))
                         if !row.breadcrumb.isEmpty {
                             VStack(alignment: .leading, spacing: 4) {
@@ -3184,6 +3218,7 @@ private struct CanonicalInboxInspector: View {
         case .habit: "repeat"
         case .routine: "list.number"
         case .goal: "target"
+        case .project: "folder"
         case .breakTime: "cup.and.saucer"
         case .unknown: "questionmark.diamond"
         }
@@ -3612,14 +3647,35 @@ private struct BlockInspector: View {
                     if let itemID = block.sourceItemID,
                        let item = store.canonicalItem(id: itemID) {
                         LabeledContent("Revision", value: String(item.revision))
-                        if let deadline = item.deadlineAt {
+                        if item.kind == .event, let end = item.deadlineAt {
                             LabeledContent(
-                                "Deadline",
+                                "Ends",
                                 value: scheduleDateTimeLabel(
-                                    deadline,
+                                    end,
                                     timezoneName: store.schedulePresentationTimezoneName
                                 )
                             )
+                        } else if item.deadlineKind == .date, let date = item.deadlineDate {
+                            LabeledContent(
+                                "Due date",
+                                value: canonicalDeadlineDisplayValue(date, item: item)
+                            )
+                        } else if item.deadlineKind == .dateTime,
+                                  let deadline = item.deadlineAt {
+                            LabeledContent(
+                                "Deadline",
+                                value: canonicalDeadlineDisplayValue(
+                                    scheduleDateTimeLabel(
+                                        deadline,
+                                        timezoneName: store.schedulePresentationTimezoneName
+                                    ),
+                                    item: item
+                                )
+                            )
+                        }
+                        if let blocker = canonicalBlockedDisplayValue(item) {
+                            LabeledContent("Blocked", value: blocker)
+                                .privacySensitive(item.isSensitive)
                         }
                         LabeledContent("Split", value: splitDescription(item.splitPolicy))
                         LabeledContent(
@@ -4724,6 +4780,7 @@ private struct LocalPlanningSuggestionRow: View {
         case .habit: "repeat"
         case .routine: "list.number"
         case .goal: "target"
+        case .project: "folder"
         case .breakTime: "cup.and.saucer"
         case .unknown: "questionmark.diamond"
         }
@@ -5131,7 +5188,10 @@ private struct ProposalItemDiffCard: View {
                 Label(proposalFieldLabel(diff.operation), systemImage: operationSymbol)
                     .font(.headline)
                 Spacer()
-                Text("Item \(diff.itemID.uuidString.prefix(8))")
+                Text(proposalItemIdentityLabel(
+                    diff.itemID,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                ))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -5192,7 +5252,10 @@ private struct ProposalImplicitItemDiffCard: View {
                 Label("Hierarchy side effect", systemImage: "arrow.triangle.branch")
                     .font(.headline)
                 Spacer()
-                Text("Item \(diff.itemID.uuidString.prefix(8))")
+                Text(proposalItemIdentityLabel(
+                    diff.itemID,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                ))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -5247,11 +5310,17 @@ private struct ProposalItemSnapshotView: View {
                     ))
                         .fontWeight(.medium)
                 }
-                Text("\(proposalFieldLabel(item.kind.wireValue)) · \(proposalFieldLabel(item.status.wireValue)) · revision \(item.revision)")
+                Text(proposalItemSnapshotMetadata(
+                    item,
+                    hidesSensitiveContent: hidesSensitiveContent
+                ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if let duration = item.durationSeconds {
-                    Text("\(duration / 60) min · importance \(item.importance) · urgency \(item.urgency)")
+                if let metrics = proposalItemSnapshotMetrics(
+                    item,
+                    hidesSensitiveContent: hidesSensitiveContent
+                ) {
+                    Text(metrics)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -5271,6 +5340,30 @@ func proposalItemSnapshotTitle(
     hidesSensitiveContent: Bool
 ) -> String {
     hidesSensitiveContent ? "Sensitive item" : item.title
+}
+
+func proposalItemIdentityLabel(
+    _ itemID: UUID,
+    hidesSensitiveContent: Bool
+) -> String {
+    hidesSensitiveContent ? "Sensitive item" : "Item \(itemID.uuidString.prefix(8))"
+}
+
+func proposalItemSnapshotMetadata(
+    _ item: DayWeaveCanonicalItem,
+    hidesSensitiveContent: Bool
+) -> String {
+    if hidesSensitiveContent { return "Details hidden until reveal" }
+    return "\(proposalFieldLabel(item.kind.wireValue)) · "
+        + "\(proposalFieldLabel(item.status.wireValue)) · revision \(item.revision)"
+}
+
+func proposalItemSnapshotMetrics(
+    _ item: DayWeaveCanonicalItem,
+    hidesSensitiveContent: Bool
+) -> String? {
+    guard !hidesSensitiveContent, let duration = item.durationSeconds else { return nil }
+    return "\(duration / 60) min · importance \(item.importance) · urgency \(item.urgency)"
 }
 
 private struct ProposalChangedValuesView: View {
@@ -5330,14 +5423,13 @@ private struct ProposalChangedValuesView: View {
     }
 }
 
-private func proposalItemFieldValue(
+func proposalItemFieldValue(
     _ field: String,
     item: DayWeaveCanonicalItem?,
     hidesSensitiveContent: Bool
 ) -> String {
     guard let item else { return "Item absent" }
-    if hidesSensitiveContent,
-       ["title", "notes", "recurrence", "flexible_constraints"].contains(field) {
+    if hidesSensitiveContent, field != "is_sensitive" {
         return "Hidden — use Reveal sensitive before/after values"
     }
     return switch field {
@@ -5347,8 +5439,18 @@ private func proposalItemFieldValue(
     case "title": item.title
     case "notes": item.notes ?? "None"
     case "timezone_name": item.timezoneName
+    case "duration_kind": item.durationKind.wireValue
+    case "duration_min_seconds": proposalDurationValue(item.durationMinimumSeconds)
     case "duration_seconds": item.durationSeconds.map { "\($0) seconds" } ?? "None"
-    case "deadline_at": proposalDateValue(item.deadlineAt)
+    case "duration_max_seconds": proposalDurationValue(item.durationMaximumSeconds)
+    case "duration_source": item.durationSource?.wireValue ?? "None"
+    case "deadline_kind": item.deadlineKind.wireValue
+    case "deadline_at": item.retainedCanonicalDeadlineAt
+        ?? item.retainedUnrepresentableDeadlineAt
+        ?? proposalDateValue(item.deadlineAt)
+    case "deadline_date": item.deadlineDate ?? "None"
+    case "deadline_strength": item.deadlineStrength?.wireValue ?? "None"
+    case "deadline_soft_weight": item.deadlineSoftWeight.map(String.init) ?? "None"
     case "earliest_start_at": proposalDateValue(item.earliestStartAt)
     case "recurrence": item.recurrence.map(proposalJSONValue) ?? "None"
     case "flexible_constraints": proposalJSONValue(item.flexibleConstraints)
@@ -5357,12 +5459,20 @@ private func proposalItemFieldValue(
     case "urgency": String(item.urgency)
     case "parent_id": item.parentID?.uuidString.lowercased() ?? "None"
     case "sibling_order": String(item.siblingOrder)
+    case "has_own_effort": item.hasOwnEffort ? "Yes" : "No"
+    case "blocked_reason_kind": item.blockedReasonKind?.wireValue ?? "None"
+    case "blocked_by_item_id": item.blockedByItemID?.uuidString.lowercased() ?? "None"
+    case "blocked_reason": item.blockedReason ?? "None"
     case "is_executable": item.isExecutable ? "Yes" : "No"
     case "revision": String(item.revision)
     case "completed_at": proposalDateValue(item.completedAt)
     case "deleted_at": proposalDateValue(item.deletedAt)
     default: "Unsupported field"
     }
+}
+
+private func proposalDurationValue(_ seconds: UInt32?) -> String {
+    seconds.map { "\($0) seconds" } ?? "None"
 }
 
 private func proposalDateValue(_ date: Date?) -> String {

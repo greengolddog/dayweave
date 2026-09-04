@@ -64,31 +64,110 @@ struct ProposalApplicationStoreTests {
         #expect(URLProtocolStub.storage.requests(for: Self.testBearer).count == 2)
     }
 
-    @Test("sensitive before and after titles stay concealed until explicit reveal")
-    func testSensitiveSnapshotTitlesRequireReveal() async throws {
-        URLProtocolStub.storage.enqueue(
-            key: Self.testBearer,
-            .init(statusCode: 200, body: Self.typedListEnvelope()),
-            .init(
-                statusCode: 201,
-                body: ProposalApplicationAPIClientTests.previewBody(canApply: true)
-            )
-        )
-        let (suggestions, _, applications) = Self.makeWorkflow()
-        await suggestions.refresh()
-        let proposal = try #require(suggestions.proposals.first)
-        await applications.prepareReview(for: proposal)
-        var item = try #require(applications.preview(for: proposal)?.diffs.first?.after)
-        item.isSensitive = true
-        item.title = "Confidential hierarchy goal"
+    @Test("every material canonical field has an exact proposal representation")
+    func testExactProposalFieldRepresentations() throws {
+        let item = try Self.richProposalReviewItem()
+        let expected: [(String, String)] = [
+            ("is_sensitive", "Yes"),
+            ("kind", "project"),
+            ("status", "blocked"),
+            ("title", "Focus deeply"),
+            ("notes", "Line one\nLine two"),
+            ("timezone_name", "Europe/Madrid"),
+            ("duration_kind", "range"),
+            ("duration_min_seconds", "1800 seconds"),
+            ("duration_seconds", "3600 seconds"),
+            ("duration_max_seconds", "7200 seconds"),
+            ("duration_source", "assistant"),
+            ("deadline_kind", "date_time"),
+            ("deadline_at", "2026-09-01T19:00:00+02:00"),
+            ("deadline_date", "None"),
+            ("deadline_strength", "soft"),
+            ("deadline_soft_weight", "75"),
+            ("earliest_start_at", "2026-09-01T08:00:00.000Z"),
+            ("recurrence", #"{"frequency":"weekly"}"#),
+            ("flexible_constraints", #"{"has_own_effort":true,"window":"morning"}"#),
+            ("split_policy", "Indivisible"),
+            ("importance", "73"),
+            ("urgency", "61"),
+            ("parent_id", "22222222-2222-4222-8222-222222222222"),
+            ("sibling_order", "4"),
+            ("has_own_effort", "Yes"),
+            ("blocked_reason_kind", "dependency"),
+            ("blocked_by_item_id", "33333333-3333-4333-8333-333333333333"),
+            ("blocked_reason", "Waiting for upstream review"),
+            ("is_executable", "No"),
+            ("revision", "7"),
+            ("completed_at", "2026-09-01T18:00:00.000Z"),
+            ("deleted_at", "2026-09-02T18:00:00.000Z"),
+        ]
 
+        for (field, value) in expected {
+            #expect(
+                proposalItemFieldValue(
+                    field,
+                    item: item,
+                    hidesSensitiveContent: false
+                ) == value,
+                "Unexpected proposal rendering for \(field)"
+            )
+        }
+        #expect(item.retainedCanonicalDeadlineAt == "2026-09-01T19:00:00+02:00")
+    }
+
+    @Test("sensitive proposal review conceals every value except sensitivity until reveal")
+    func testSensitiveProposalValuesRequireReveal() throws {
+        let item = try Self.richProposalReviewItem()
+        let fields = [
+            "is_sensitive", "kind", "status", "title", "notes", "timezone_name",
+            "duration_kind", "duration_min_seconds", "duration_seconds",
+            "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
+            "deadline_date", "deadline_strength", "deadline_soft_weight",
+            "earliest_start_at", "recurrence", "flexible_constraints", "split_policy",
+            "importance", "urgency", "parent_id", "sibling_order", "has_own_effort",
+            "blocked_reason_kind", "blocked_by_item_id", "blocked_reason",
+            "is_executable", "revision", "completed_at", "deleted_at",
+        ]
+        for field in fields {
+            let expected = field == "is_sensitive"
+                ? "Yes"
+                : "Hidden — use Reveal sensitive before/after values"
+            #expect(
+                proposalItemFieldValue(
+                    field,
+                    item: item,
+                    hidesSensitiveContent: true
+                ) == expected,
+                "Sensitive proposal value leaked for \(field)"
+            )
+        }
+
+        #expect(proposalItemSnapshotTitle(item, hidesSensitiveContent: true) == "Sensitive item")
         #expect(
-            proposalItemSnapshotTitle(item, hidesSensitiveContent: true)
+            proposalItemIdentityLabel(item.id, hidesSensitiveContent: true)
                 == "Sensitive item"
         )
         #expect(
-            proposalItemSnapshotTitle(item, hidesSensitiveContent: false)
-                == "Confidential hierarchy goal"
+            proposalItemSnapshotMetadata(item, hidesSensitiveContent: true)
+                == "Details hidden until reveal"
+        )
+        #expect(proposalItemSnapshotMetrics(item, hidesSensitiveContent: true) == nil)
+        #expect(proposalItemSnapshotTitle(item, hidesSensitiveContent: false) == "Focus deeply")
+        #expect(
+            proposalItemIdentityLabel(item.id, hidesSensitiveContent: false)
+                == "Item 11111111"
+        )
+        #expect(
+            proposalItemSnapshotMetadata(item, hidesSensitiveContent: false)
+                == "Project · Blocked · revision 7"
+        )
+        #expect(
+            proposalItemSnapshotMetrics(item, hidesSensitiveContent: false)
+                == "60 min · importance 73 · urgency 61"
+        )
+        #expect(
+            proposalItemFieldValue("title", item: nil, hidesSensitiveContent: true)
+                == "Item absent"
         )
     }
 
@@ -346,6 +425,51 @@ struct ProposalApplicationStoreTests {
     static let trustedNoEffectBody = Data(
         #"{"error":{"code":"conflict","message":"Proposal application is stale or unsafe","details":{"conflict_code":"preview_expired"}}}"#.utf8
     )
+
+    static func richProposalReviewItem() throws -> DayWeaveCanonicalItem {
+        let data = Data(#"""
+        {
+          "id":"11111111-1111-4111-8111-111111111111",
+          "is_sensitive":true,
+          "kind":"project",
+          "status":"blocked",
+          "title":"Focus deeply",
+          "notes":"Line one\nLine two",
+          "timezone_name":"Europe/Madrid",
+          "duration_kind":"range",
+          "duration_min_seconds":1800,
+          "duration_seconds":3600,
+          "duration_max_seconds":7200,
+          "duration_source":"assistant",
+          "deadline_kind":"date_time",
+          "deadline_at":"2026-09-01T19:00:00+02:00",
+          "deadline_date":null,
+          "deadline_strength":"soft",
+          "deadline_soft_weight":75,
+          "earliest_start_at":"2026-09-01T08:00:00Z",
+          "recurrence":{"frequency":"weekly"},
+          "flexible_constraints":{"window":"morning","has_own_effort":true},
+          "split_policy":{"type":"indivisible"},
+          "importance":73,
+          "urgency":61,
+          "parent_id":"22222222-2222-4222-8222-222222222222",
+          "sibling_order":4,
+          "has_own_effort":true,
+          "blocked_reason_kind":"dependency",
+          "blocked_by_item_id":"33333333-3333-4333-8333-333333333333",
+          "blocked_reason":"Waiting for upstream review",
+          "is_executable":false,
+          "revision":7,
+          "created_at":"2026-08-30T10:00:00Z",
+          "updated_at":"2026-09-02T18:00:00Z",
+          "completed_at":"2026-09-01T18:00:00Z",
+          "deleted_at":"2026-09-02T18:00:00Z"
+        }
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(DayWeaveCanonicalItem.self, from: data)
+    }
 
     static func makeWorkflow() -> (
         SuggestionSyncStore,

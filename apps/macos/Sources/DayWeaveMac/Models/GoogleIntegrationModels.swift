@@ -575,6 +575,7 @@ extension DayWeaveCanonicalItem {
 
         let supportedStatus = switch status {
         case .inbox, .planned, .scheduled, .inProgress, .paused, .completed: true
+        case .blocked: false
         case .skipped, .cancelled, .unknown: false
         }
         return recurrence == nil

@@ -16,7 +16,7 @@ extension CodingUserInfoKey {
 }
 
 enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {
-    case event, task, habit, routine, goal, breakTime
+    case event, task, habit, routine, goal, project, breakTime
     case unknown(String)
 
     var wireValue: String {
@@ -26,6 +26,7 @@ enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {
         case .habit: "habit"
         case .routine: "routine"
         case .goal: "goal"
+        case .project: "project"
         case .breakTime: "break"
         case let .unknown(value): value
         }
@@ -39,6 +40,7 @@ enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {
         case "habit": .habit
         case "routine": .routine
         case "goal": .goal
+        case "project": .project
         case "break": .breakTime
         default: .unknown(value)
         }
@@ -51,7 +53,7 @@ enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {
 }
 
 enum DayWeaveCanonicalItemStatus: Codable, Equatable, Hashable, Sendable {
-    case inbox, planned, scheduled, inProgress, paused, completed, skipped, cancelled
+    case inbox, planned, scheduled, inProgress, paused, blocked, completed, skipped, cancelled
     case unknown(String)
 
     var wireValue: String {
@@ -61,6 +63,7 @@ enum DayWeaveCanonicalItemStatus: Codable, Equatable, Hashable, Sendable {
         case .scheduled: "scheduled"
         case .inProgress: "in_progress"
         case .paused: "paused"
+        case .blocked: "blocked"
         case .completed: "completed"
         case .skipped: "skipped"
         case .cancelled: "cancelled"
@@ -76,10 +79,156 @@ enum DayWeaveCanonicalItemStatus: Codable, Equatable, Hashable, Sendable {
         case "scheduled": .scheduled
         case "in_progress": .inProgress
         case "paused": .paused
+        case "blocked": .blocked
         case "completed": .completed
         case "skipped": .skipped
         case "cancelled": .cancelled
         default: .unknown(value)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wireValue)
+    }
+}
+
+enum DayWeaveDurationKind: Codable, Equatable, Sendable {
+    case unknown, exact, range
+    case unsupported(String)
+
+    var wireValue: String {
+        switch self {
+        case .unknown: "unknown"
+        case .exact: "exact"
+        case .range: "range"
+        case let .unsupported(value): value
+        }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = switch value {
+        case "unknown": .unknown
+        case "exact": .exact
+        case "range": .range
+        default: .unsupported(value)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wireValue)
+    }
+}
+
+enum DayWeaveDurationSource: Codable, Equatable, Sendable {
+    case user, assistant, learned, imported
+    case unsupported(String)
+
+    var wireValue: String {
+        switch self {
+        case .user: "user"
+        case .assistant: "assistant"
+        case .learned: "learned"
+        case .imported: "imported"
+        case let .unsupported(value): value
+        }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = switch value {
+        case "user": .user
+        case "assistant": .assistant
+        case "learned": .learned
+        case "imported": .imported
+        default: .unsupported(value)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wireValue)
+    }
+}
+
+enum DayWeaveDeadlineKind: Codable, Equatable, Sendable {
+    case none, date, dateTime
+    case unsupported(String)
+
+    var wireValue: String {
+        switch self {
+        case .none: "none"
+        case .date: "date"
+        case .dateTime: "date_time"
+        case let .unsupported(value): value
+        }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = switch value {
+        case "none": .none
+        case "date": .date
+        case "date_time": .dateTime
+        default: .unsupported(value)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wireValue)
+    }
+}
+
+enum DayWeaveDeadlineStrength: Codable, Equatable, Sendable {
+    case hard, soft
+    case unsupported(String)
+
+    var wireValue: String {
+        switch self {
+        case .hard: "hard"
+        case .soft: "soft"
+        case let .unsupported(value): value
+        }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = switch value {
+        case "hard": .hard
+        case "soft": .soft
+        default: .unsupported(value)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(wireValue)
+    }
+}
+
+enum DayWeaveBlockedReasonKind: Codable, Equatable, Sendable {
+    case dependency, manual, external
+    case unsupported(String)
+
+    var wireValue: String {
+        switch self {
+        case .dependency: "dependency"
+        case .manual: "manual"
+        case .external: "external"
+        case let .unsupported(value): value
+        }
+    }
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = switch value {
+        case "dependency": .dependency
+        case "manual": .manual
+        case "external": .external
+        default: .unsupported(value)
         }
     }
 
@@ -161,8 +310,16 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     var title: String
     var notes: String?
     var timezoneName: String
+    var durationKind: DayWeaveDurationKind
+    var durationMinimumSeconds: UInt32?
     var durationSeconds: UInt32?
+    var durationMaximumSeconds: UInt32?
+    var durationSource: DayWeaveDurationSource?
+    var deadlineKind: DayWeaveDeadlineKind
     var deadlineAt: Date?
+    var deadlineDate: String?
+    var deadlineStrength: DayWeaveDeadlineStrength?
+    var deadlineSoftWeight: UInt32?
     var earliestStartAt: Date?
     var recurrence: JSONValue?
     var flexibleConstraints: JSONValue
@@ -171,6 +328,10 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     var urgency: UInt8
     var parentID: UUID?
     var siblingOrder: UInt32
+    var hasOwnEffort: Bool
+    var blockedReasonKind: DayWeaveBlockedReasonKind?
+    var blockedByItemID: UUID?
+    var blockedReason: String?
     let isExecutable: Bool
     let revision: UInt64
     let createdAt: Date
@@ -188,6 +349,12 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     /// visible while permanently fencing full-item mutation.
     let retainedUnrepresentableDeadlineAt: String?
     let retainedUnrepresentableEarliestStartAt: String?
+    /// The exact canonical date-time spelling is retained separately from
+    /// Foundation `Date`, whose cache representation cannot preserve offsets.
+    let retainedCanonicalDeadlineAt: String?
+    /// Rich structural fields are read-only until full-item authoring learns
+    /// to send the same contract. Legacy inferred values keep the old path.
+    let hasExplicitStructuralMetadata: Bool
     /// Future server fields are retained in the encrypted cache and make the
     /// item read-only until this client understands how to round-trip them.
     let unsupportedFields: [String: JSONValue]
@@ -196,13 +363,25 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         case id, kind, status, title, notes, recurrence, importance, urgency, revision
         case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
+        case durationKind = "duration_kind"
+        case durationMinimumSeconds = "duration_min_seconds"
         case durationSeconds = "duration_seconds"
+        case durationMaximumSeconds = "duration_max_seconds"
+        case durationSource = "duration_source"
+        case deadlineKind = "deadline_kind"
         case deadlineAt = "deadline_at"
+        case deadlineDate = "deadline_date"
+        case deadlineStrength = "deadline_strength"
+        case deadlineSoftWeight = "deadline_soft_weight"
         case earliestStartAt = "earliest_start_at"
         case flexibleConstraints = "flexible_constraints"
         case splitPolicy = "split_policy"
         case parentID = "parent_id"
         case siblingOrder = "sibling_order"
+        case hasOwnEffort = "has_own_effort"
+        case blockedReasonKind = "blocked_reason_kind"
+        case blockedByItemID = "blocked_by_item_id"
+        case blockedReason = "blocked_reason"
         case isExecutable = "is_executable"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
@@ -213,15 +392,19 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             "_dayweave_unrepresentable_deadline_at"
         case retainedUnrepresentableEarliestStartAt =
             "_dayweave_unrepresentable_earliest_start_at"
+        case retainedCanonicalDeadlineAt = "_dayweave_exact_deadline_at"
+        case hasExplicitStructuralMetadata = "_dayweave_explicit_structural_metadata"
     }
 
     private struct DecodedOptionalCanonicalDate {
         let date: Date?
         let retainedUnrepresentableWireValue: String?
+        let exactWireValue: String?
     }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let snapshotSchemaVersion = decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] as? Int
         id = try container.decode(UUID.self, forKey: .id)
         if decoder.userInfo[.dayWeaveAllowsMissingSensitivity] as? Bool == true {
             isSensitive = try container.decodeIfPresent(Bool.self, forKey: .isSensitive) ?? false
@@ -233,7 +416,11 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         title = try container.decode(String.self, forKey: .title)
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
         timezoneName = try container.decode(String.self, forKey: .timezoneName)
-        durationSeconds = try container.decodeIfPresent(UInt32.self, forKey: .durationSeconds)
+        let decodedDurationSeconds = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .durationSeconds
+        )
+        durationSeconds = decodedDurationSeconds
         let decodedDeadline = try Self.decodeOptionalCanonicalDate(
             from: container,
             forKey: .deadlineAt
@@ -244,23 +431,6 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         )
         deadlineAt = decodedDeadline.date
         earliestStartAt = decodedEarliestStart.date
-        recurrence = try container.decodeIfPresent(JSONValue.self, forKey: .recurrence)
-        flexibleConstraints = try container.decode(JSONValue.self, forKey: .flexibleConstraints)
-        splitPolicy = try container.decode(DayWeaveSplitPolicy.self, forKey: .splitPolicy)
-        importance = try container.decode(UInt8.self, forKey: .importance)
-        urgency = try container.decode(UInt8.self, forKey: .urgency)
-        parentID = try container.decodeIfPresent(UUID.self, forKey: .parentID)
-        siblingOrder = try container.decode(UInt32.self, forKey: .siblingOrder)
-        isExecutable = try container.decode(Bool.self, forKey: .isExecutable)
-        revision = try container.decode(UInt64.self, forKey: .revision)
-        createdAt = try container.decode(Date.self, forKey: .createdAt)
-        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
-        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
-        deletedAt = try container.decodeIfPresent(Date.self, forKey: .deletedAt)
-        let persistedNumericMarker = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .hasNonRoundTrippableJSONNumber
-        ) ?? false
         retainedUnrepresentableDeadlineAt = try Self.retainedTimestampMarker(
             decoded: decodedDeadline,
             persisted: container.decodeIfPresent(
@@ -279,6 +449,211 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             key: .retainedUnrepresentableEarliestStartAt,
             in: container
         )
+        let persistedExactDeadline: String?
+        if snapshotSchemaVersion == 22 {
+            persistedExactDeadline = try container.decodeIfPresent(
+                String.self,
+                forKey: .retainedCanonicalDeadlineAt
+            )
+        } else if snapshotSchemaVersion.map({ $0 < 22 }) == true {
+            // Older encrypted caches retained only Foundation's instant. Its
+            // original offset spelling is unrecoverable, but a deterministic
+            // microsecond UTC spelling prevents migration from dropping the
+            // deadline or producing a schema-22 row that cannot be reloaded.
+            persistedExactDeadline = decodedDeadline.date.flatMap {
+                CanonicalRFC3339Instant(date: $0)?.canonicalUTCString
+            }
+        } else {
+            persistedExactDeadline = nil
+        }
+        retainedCanonicalDeadlineAt = try Self.retainedExactDeadlineMarker(
+            decoded: decodedDeadline,
+            persisted: persistedExactDeadline,
+            retainedUnrepresentable: retainedUnrepresentableDeadlineAt,
+            in: container
+        )
+        recurrence = try container.decodeIfPresent(JSONValue.self, forKey: .recurrence)
+        flexibleConstraints = try container.decode(JSONValue.self, forKey: .flexibleConstraints)
+        splitPolicy = try container.decode(DayWeaveSplitPolicy.self, forKey: .splitPolicy)
+        importance = try container.decode(UInt8.self, forKey: .importance)
+        urgency = try container.decode(UInt8.self, forKey: .urgency)
+        parentID = try container.decodeIfPresent(UUID.self, forKey: .parentID)
+        siblingOrder = try container.decode(UInt32.self, forKey: .siblingOrder)
+        let structuralKeys: Set<CodingKeys> = [
+            .durationKind, .durationMinimumSeconds, .durationMaximumSeconds, .durationSource,
+            .deadlineKind, .deadlineDate, .deadlineStrength, .deadlineSoftWeight,
+            .hasOwnEffort, .blockedReasonKind, .blockedByItemID, .blockedReason,
+        ]
+        let presentStructuralKeys = structuralKeys.filter(container.contains)
+        let hasCompleteStructuralWireShape = presentStructuralKeys.count == structuralKeys.count
+        let usesExplicitStructuralWireShape: Bool
+        if snapshotSchemaVersion.map({ $0 < 21 }) == true {
+            // A predecessor cache label cannot acquire newer typed authority
+            // from injected fields. Values are inferred from its old contract.
+            usesExplicitStructuralWireShape = false
+        } else if snapshotSchemaVersion == 21 {
+            // Schema 21 predates native typed fields, but its unknown-field
+            // retention could already have captured the complete server wire
+            // shape. Preserve that shape as authoritative and read-only. An
+            // incomplete shape is neither the legacy contract nor a lossless
+            // forward capture, so reject it instead of silently normalizing it.
+            guard presentStructuralKeys.isEmpty || hasCompleteStructuralWireShape else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationKind,
+                    in: container,
+                    debugDescription: "Canonical structural metadata must be emitted atomically"
+                )
+            }
+            usesExplicitStructuralWireShape = hasCompleteStructuralWireShape
+        } else if snapshotSchemaVersion == 22 {
+            guard hasCompleteStructuralWireShape,
+                  container.contains(.hasExplicitStructuralMetadata) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationKind,
+                    in: container,
+                    debugDescription: "Current snapshot is missing canonical structural metadata"
+                )
+            }
+            usesExplicitStructuralWireShape = true
+        } else if presentStructuralKeys.isEmpty {
+            usesExplicitStructuralWireShape = false
+        } else {
+            guard hasCompleteStructuralWireShape else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationKind,
+                    in: container,
+                    debugDescription: "Canonical structural metadata must be emitted atomically"
+                )
+            }
+            usesExplicitStructuralWireShape = true
+        }
+
+        if usesExplicitStructuralWireShape {
+            durationKind = try container.decode(DayWeaveDurationKind.self, forKey: .durationKind)
+            durationMinimumSeconds = try container.decodeIfPresent(
+                UInt32.self,
+                forKey: .durationMinimumSeconds
+            )
+            durationMaximumSeconds = try container.decodeIfPresent(
+                UInt32.self,
+                forKey: .durationMaximumSeconds
+            )
+            durationSource = try container.decodeIfPresent(
+                DayWeaveDurationSource.self,
+                forKey: .durationSource
+            )
+            deadlineKind = try container.decode(DayWeaveDeadlineKind.self, forKey: .deadlineKind)
+            deadlineDate = try container.decodeIfPresent(String.self, forKey: .deadlineDate)
+            deadlineStrength = try container.decodeIfPresent(
+                DayWeaveDeadlineStrength.self,
+                forKey: .deadlineStrength
+            )
+            deadlineSoftWeight = try container.decodeIfPresent(
+                UInt32.self,
+                forKey: .deadlineSoftWeight
+            )
+            hasOwnEffort = try container.decode(Bool.self, forKey: .hasOwnEffort)
+            blockedReasonKind = try container.decodeIfPresent(
+                DayWeaveBlockedReasonKind.self,
+                forKey: .blockedReasonKind
+            )
+            blockedByItemID = try container.decodeIfPresent(UUID.self, forKey: .blockedByItemID)
+            blockedReason = try container.decodeIfPresent(String.self, forKey: .blockedReason)
+        } else {
+            durationKind = decodedDurationSeconds == nil ? .unknown : .exact
+            durationMinimumSeconds = decodedDurationSeconds
+            durationMaximumSeconds = decodedDurationSeconds
+            durationSource = decodedDurationSeconds == nil ? nil : .user
+            deadlineKind = kind == .event
+                || decodedDeadline.exactWireValue == nil && decodedDeadline.date == nil
+                ? .none
+                : .dateTime
+            deadlineDate = nil
+            deadlineStrength = deadlineKind == .none ? nil : .hard
+            deadlineSoftWeight = nil
+            hasOwnEffort = Self.legacyHasOwnEffort(in: flexibleConstraints)
+            blockedReasonKind = nil
+            blockedByItemID = nil
+            blockedReason = nil
+        }
+        let deadlineIsPresent = decodedDeadline.exactWireValue != nil
+            || decodedDeadline.date != nil
+            || retainedUnrepresentableDeadlineAt != nil
+        try Self.validateStructuralMetadata(
+            id: id,
+            kind: kind,
+            status: status,
+            durationKind: durationKind,
+            durationMinimumSeconds: durationMinimumSeconds,
+            durationSeconds: durationSeconds,
+            durationMaximumSeconds: durationMaximumSeconds,
+            durationSource: durationSource,
+            deadlineKind: deadlineKind,
+            deadlineIsPresent: deadlineIsPresent,
+            deadlineDate: deadlineDate,
+            deadlineStrength: deadlineStrength,
+            deadlineSoftWeight: deadlineSoftWeight,
+            hasOwnEffort: hasOwnEffort,
+            flexibleConstraints: flexibleConstraints,
+            blockedReasonKind: blockedReasonKind,
+            blockedByItemID: blockedByItemID,
+            blockedReason: blockedReason,
+            in: container
+        )
+        isExecutable = try container.decode(Bool.self, forKey: .isExecutable)
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        deletedAt = try container.decodeIfPresent(Date.self, forKey: .deletedAt)
+        let persistedNumericMarker = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .hasNonRoundTrippableJSONNumber
+        ) ?? false
+        let inferredDurationKind: DayWeaveDurationKind = durationSeconds == nil
+            ? .unknown
+            : .exact
+        let inferredDeadlineKind: DayWeaveDeadlineKind = kind == .event || !deadlineIsPresent
+            ? .none
+            : .dateTime
+        let typedValuesAreLegacyEquivalent = durationKind == inferredDurationKind
+            && durationMinimumSeconds == durationSeconds
+            && durationMaximumSeconds == durationSeconds
+            && durationSource == (durationSeconds == nil ? nil : .user)
+            && deadlineKind == inferredDeadlineKind
+            && deadlineDate == nil
+            && deadlineStrength == (inferredDeadlineKind == .none ? nil : .hard)
+            && deadlineSoftWeight == nil
+            && hasOwnEffort == Self.legacyHasOwnEffort(in: flexibleConstraints)
+            && blockedReasonKind == nil
+            && blockedByItemID == nil
+            && blockedReason == nil
+            && status != .blocked
+        if snapshotSchemaVersion == 22 {
+            hasExplicitStructuralMetadata = try container.decode(
+                Bool.self,
+                forKey: .hasExplicitStructuralMetadata
+            )
+        } else {
+            hasExplicitStructuralMetadata = usesExplicitStructuralWireShape
+                && !typedValuesAreLegacyEquivalent
+        }
+        if snapshotSchemaVersion == 22 {
+            guard hasExplicitStructuralMetadata || typedValuesAreLegacyEquivalent else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hasExplicitStructuralMetadata,
+                    in: container,
+                    debugDescription: "Rich structural metadata cannot claim legacy authorability"
+                )
+            }
+            if deadlineIsPresent, retainedCanonicalDeadlineAt == nil {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .retainedCanonicalDeadlineAt,
+                    in: container,
+                    debugDescription: "Exact deadline_at spelling is missing its lossless cache value"
+                )
+            }
+        }
         let known = Set(CodingKeys.allCases.map(\.rawValue))
         let dynamic = try decoder.container(keyedBy: DynamicCodingKey.self)
         var future: [String: JSONValue] = [:]
@@ -310,8 +685,22 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         try container.encode(title, forKey: .title)
         try container.encodeIfPresent(notes, forKey: .notes)
         try container.encode(timezoneName, forKey: .timezoneName)
+        try container.encode(durationKind, forKey: .durationKind)
+        try container.encodeIfPresent(durationMinimumSeconds, forKey: .durationMinimumSeconds)
+        if durationMinimumSeconds == nil { try container.encodeNil(forKey: .durationMinimumSeconds) }
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
+        try container.encodeIfPresent(durationMaximumSeconds, forKey: .durationMaximumSeconds)
+        if durationMaximumSeconds == nil { try container.encodeNil(forKey: .durationMaximumSeconds) }
+        try container.encodeIfPresent(durationSource, forKey: .durationSource)
+        if durationSource == nil { try container.encodeNil(forKey: .durationSource) }
+        try container.encode(deadlineKind, forKey: .deadlineKind)
         try container.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
+        try container.encodeIfPresent(deadlineDate, forKey: .deadlineDate)
+        if deadlineDate == nil { try container.encodeNil(forKey: .deadlineDate) }
+        try container.encodeIfPresent(deadlineStrength, forKey: .deadlineStrength)
+        if deadlineStrength == nil { try container.encodeNil(forKey: .deadlineStrength) }
+        try container.encodeIfPresent(deadlineSoftWeight, forKey: .deadlineSoftWeight)
+        if deadlineSoftWeight == nil { try container.encodeNil(forKey: .deadlineSoftWeight) }
         try container.encodeIfPresent(earliestStartAt, forKey: .earliestStartAt)
         try container.encodeIfPresent(recurrence, forKey: .recurrence)
         try container.encode(flexibleConstraints, forKey: .flexibleConstraints)
@@ -320,6 +709,13 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         try container.encode(urgency, forKey: .urgency)
         try container.encodeIfPresent(parentID, forKey: .parentID)
         try container.encode(siblingOrder, forKey: .siblingOrder)
+        try container.encode(hasOwnEffort, forKey: .hasOwnEffort)
+        try container.encodeIfPresent(blockedReasonKind, forKey: .blockedReasonKind)
+        if blockedReasonKind == nil { try container.encodeNil(forKey: .blockedReasonKind) }
+        try container.encodeIfPresent(blockedByItemID, forKey: .blockedByItemID)
+        if blockedByItemID == nil { try container.encodeNil(forKey: .blockedByItemID) }
+        try container.encodeIfPresent(blockedReason, forKey: .blockedReason)
+        if blockedReason == nil { try container.encodeNil(forKey: .blockedReason) }
         try container.encode(isExecutable, forKey: .isExecutable)
         try container.encode(revision, forKey: .revision)
         try container.encode(createdAt, forKey: .createdAt)
@@ -338,6 +734,14 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             retainedUnrepresentableEarliestStartAt,
             forKey: .retainedUnrepresentableEarliestStartAt
         )
+        try container.encodeIfPresent(
+            retainedCanonicalDeadlineAt,
+            forKey: .retainedCanonicalDeadlineAt
+        )
+        try container.encode(
+            hasExplicitStructuralMetadata,
+            forKey: .hasExplicitStructuralMetadata
+        )
         var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
         for (key, value) in unsupportedFields {
             try dynamic.encode(value, forKey: .init(key))
@@ -345,7 +749,11 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     }
 
     var supportsLosslessReplacement: Bool {
-        guard splitPolicy.isSupportedForWrite, unsupportedFields.isEmpty else { return false }
+        guard splitPolicy.isSupportedForWrite,
+              unsupportedFields.isEmpty,
+              !hasExplicitStructuralMetadata,
+              !hasUnsupportedStructuralMetadata else { return false }
+        if kind == .project { return false }
         if case .unknown = kind { return false }
         if case .unknown = status { return false }
         // Status publication is a full-item replacement. We must never
@@ -358,6 +766,59 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
               recurrence?.supportsLosslessRoundTrip ?? true,
               flexibleConstraints.supportsLosslessRoundTrip else { return false }
         return true
+    }
+
+    var hasUnsupportedStructuralMetadata: Bool {
+        if case .unsupported = durationKind { return true }
+        if case .unsupported? = durationSource { return true }
+        if case .unsupported = deadlineKind { return true }
+        if case .unsupported? = deadlineStrength { return true }
+        if case .unsupported? = blockedReasonKind { return true }
+        return false
+    }
+
+    /// Compares every user-authored field, including structural values this
+    /// client only retains for read compatibility. Identity-only trash and
+    /// restore requests use this instead of projecting through the legacy
+    /// authoring draft, which would otherwise hide a concurrent rich-field
+    /// change from response reconciliation.
+    func hasSameAuthoredContent(as other: DayWeaveCanonicalItem) -> Bool {
+        id == other.id
+            && isSensitive == other.isSensitive
+            && kind == other.kind
+            && status == other.status
+            && title == other.title
+            && notes == other.notes
+            && timezoneName == other.timezoneName
+            && durationKind == other.durationKind
+            && durationMinimumSeconds == other.durationMinimumSeconds
+            && durationSeconds == other.durationSeconds
+            && durationMaximumSeconds == other.durationMaximumSeconds
+            && durationSource == other.durationSource
+            && deadlineKind == other.deadlineKind
+            && deadlineAt == other.deadlineAt
+            && retainedCanonicalDeadlineAt == other.retainedCanonicalDeadlineAt
+            && retainedUnrepresentableDeadlineAt == other.retainedUnrepresentableDeadlineAt
+            && deadlineDate == other.deadlineDate
+            && deadlineStrength == other.deadlineStrength
+            && deadlineSoftWeight == other.deadlineSoftWeight
+            && earliestStartAt == other.earliestStartAt
+            && retainedUnrepresentableEarliestStartAt
+                == other.retainedUnrepresentableEarliestStartAt
+            && recurrence == other.recurrence
+            && flexibleConstraints == other.flexibleConstraints
+            && splitPolicy == other.splitPolicy
+            && importance == other.importance
+            && urgency == other.urgency
+            && parentID == other.parentID
+            && siblingOrder == other.siblingOrder
+            && hasOwnEffort == other.hasOwnEffort
+            && blockedReasonKind == other.blockedReasonKind
+            && blockedByItemID == other.blockedByItemID
+            && blockedReason == other.blockedReason
+            && hasNonRoundTrippableJSONNumber == other.hasNonRoundTrippableJSONNumber
+            && hasExplicitStructuralMetadata == other.hasExplicitStructuralMetadata
+            && unsupportedFields == other.unsupportedFields
     }
 
     var retainedUnrepresentableTimestampDiagnostic: String? {
@@ -377,7 +838,11 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         forKey key: CodingKeys
     ) throws -> DecodedOptionalCanonicalDate {
         guard container.contains(key), try !container.decodeNil(forKey: key) else {
-            return .init(date: nil, retainedUnrepresentableWireValue: nil)
+            return .init(
+                date: nil,
+                retainedUnrepresentableWireValue: nil,
+                exactWireValue: nil
+            )
         }
         if let wireValue = try? container.decode(String.self, forKey: key) {
             guard let instant = CanonicalRFC3339Instant(wireValue),
@@ -389,13 +854,22 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
                 )
             }
             if let date = instant.exactlyRepresentableDate {
-                return .init(date: date, retainedUnrepresentableWireValue: nil)
+                return .init(
+                    date: date,
+                    retainedUnrepresentableWireValue: nil,
+                    exactWireValue: wireValue
+                )
             }
-            return .init(date: nil, retainedUnrepresentableWireValue: wireValue)
+            return .init(
+                date: nil,
+                retainedUnrepresentableWireValue: wireValue,
+                exactWireValue: wireValue
+            )
         }
         return .init(
             date: try container.decode(Date.self, forKey: key),
-            retainedUnrepresentableWireValue: nil
+            retainedUnrepresentableWireValue: nil,
+            exactWireValue: nil
         )
     }
 
@@ -419,6 +893,252 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             }
         }
         return decoded.retainedUnrepresentableWireValue ?? persisted
+    }
+
+    private static func retainedExactDeadlineMarker(
+        decoded: DecodedOptionalCanonicalDate,
+        persisted: String?,
+        retainedUnrepresentable: String?,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> String? {
+        guard let persisted else { return decoded.exactWireValue }
+        guard let instant = CanonicalRFC3339Instant(persisted),
+              instant.hasPostgresPrecision else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .retainedCanonicalDeadlineAt,
+                in: container,
+                debugDescription: "Invalid exact canonical deadline marker"
+            )
+        }
+        let matchesDecodedDate = decoded.date.map { date in
+            CanonicalRFC3339Instant(date: date)?.microsecondsSinceUnixEpoch
+                == instant.microsecondsSinceUnixEpoch
+        } ?? false
+        let matchesUnrepresentable = retainedUnrepresentable.map {
+            CanonicalRFC3339Instant($0)?.microsecondsSinceUnixEpoch
+                == instant.microsecondsSinceUnixEpoch
+        } ?? false
+        guard matchesDecodedDate || matchesUnrepresentable else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .retainedCanonicalDeadlineAt,
+                in: container,
+                debugDescription: "Exact canonical deadline marker does not match deadline_at"
+            )
+        }
+        return persisted
+    }
+
+    private static func legacyHasOwnEffort(in constraints: JSONValue) -> Bool {
+        guard case let .object(object) = constraints,
+              case let .bool(value)? = object["has_own_effort"] else { return false }
+        return value
+    }
+
+    private static func validateStructuralMetadata(
+        id: UUID,
+        kind: DayWeaveCanonicalItemKind,
+        status: DayWeaveCanonicalItemStatus,
+        durationKind: DayWeaveDurationKind,
+        durationMinimumSeconds: UInt32?,
+        durationSeconds: UInt32?,
+        durationMaximumSeconds: UInt32?,
+        durationSource: DayWeaveDurationSource?,
+        deadlineKind: DayWeaveDeadlineKind,
+        deadlineIsPresent: Bool,
+        deadlineDate: String?,
+        deadlineStrength: DayWeaveDeadlineStrength?,
+        deadlineSoftWeight: UInt32?,
+        hasOwnEffort: Bool,
+        flexibleConstraints: JSONValue,
+        blockedReasonKind: DayWeaveBlockedReasonKind?,
+        blockedByItemID: UUID?,
+        blockedReason: String?,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws {
+        let structuralEnumValues = [
+            kind.wireValue,
+            status.wireValue,
+            durationKind.wireValue,
+            durationSource?.wireValue,
+            deadlineKind.wireValue,
+            deadlineStrength?.wireValue,
+            blockedReasonKind?.wireValue,
+        ].compactMap { $0 }
+        guard structuralEnumValues.allSatisfy(Self.isValidStructuralWireValue) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .durationKind,
+                in: container,
+                debugDescription: "Invalid canonical structural discriminator"
+            )
+        }
+        let durationValuesAreBounded = [
+            durationMinimumSeconds,
+            durationSeconds,
+            durationMaximumSeconds,
+        ].compactMap { $0 }.allSatisfy { $0 <= 31_622_400 }
+        let durationShapeIsValid = switch durationKind {
+        case .unknown:
+            durationMinimumSeconds == nil && durationSeconds == nil
+                && durationMaximumSeconds == nil && durationSource == nil
+        case .exact:
+            durationSeconds.map { expected in
+                expected > 0 && durationMinimumSeconds == expected
+                    && durationMaximumSeconds == expected && durationSource != nil
+            } ?? false
+        case .range:
+            durationSeconds.map { expected in
+                guard let minimum = durationMinimumSeconds,
+                      let maximum = durationMaximumSeconds else { return false }
+                return minimum > 0 && minimum < maximum
+                    && minimum <= expected && expected <= maximum && durationSource != nil
+            } ?? false
+        case .unsupported:
+            // Preserve future server variants exactly. Explicit structural
+            // rows remain read-only, and scalar values are still bounded.
+            true
+        }
+        guard durationValuesAreBounded, durationShapeIsValid else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .durationKind,
+                in: container,
+                debugDescription: "Contradictory canonical duration metadata"
+            )
+        }
+
+        let deadlineShapeIsValid: Bool
+        switch deadlineKind {
+        case .none:
+            let mayCarryAnIntervalEnd: Bool
+            if kind == .event {
+                mayCarryAnIntervalEnd = true
+            } else if case .unknown = kind {
+                mayCarryAnIntervalEnd = true
+            } else {
+                mayCarryAnIntervalEnd = false
+            }
+            deadlineShapeIsValid = (!deadlineIsPresent || mayCarryAnIntervalEnd)
+                && deadlineDate == nil
+                && deadlineStrength == nil && deadlineSoftWeight == nil
+        case .date:
+            deadlineShapeIsValid = kind != .event && !deadlineIsPresent
+                && deadlineDate.map(isCanonicalDateOnly) == true
+                && deadlineStrength != nil
+        case .dateTime:
+            deadlineShapeIsValid = kind != .event && deadlineIsPresent && deadlineDate == nil
+                && deadlineStrength != nil
+        case .unsupported:
+            deadlineShapeIsValid = deadlineDate.map(isCanonicalDateOnly) ?? true
+        }
+        let strengthIsValid: Bool
+        if case .unsupported = deadlineKind {
+            strengthIsValid = deadlineSoftWeight.map { $0 <= 1_000_000 } ?? true
+        } else {
+            strengthIsValid = switch deadlineStrength {
+            case nil: deadlineKind == .none && deadlineSoftWeight == nil
+            case .hard?: deadlineKind != .none && deadlineSoftWeight == nil
+            case .soft?: deadlineKind != .none
+                && deadlineSoftWeight.map { $0 <= 1_000_000 } == true
+            case .unsupported?: deadlineKind != .none
+                && (deadlineSoftWeight.map { $0 <= 1_000_000 } ?? true)
+            }
+        }
+        guard deadlineShapeIsValid, strengthIsValid else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .deadlineKind,
+                in: container,
+                debugDescription: "Contradictory canonical deadline metadata"
+            )
+        }
+
+        guard case let .object(object) = flexibleConstraints else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .flexibleConstraints,
+                in: container,
+                debugDescription: "Canonical flexible_constraints must be an object"
+            )
+        }
+        if let legacyOwnEffort = object["has_own_effort"] {
+            guard case let .bool(value) = legacyOwnEffort, value == hasOwnEffort else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hasOwnEffort,
+                    in: container,
+                    debugDescription: "Conflicting has_own_effort authorities"
+                )
+            }
+        }
+
+        let reasonIsValid = blockedReason.map { value in
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+                && !value.isEmpty
+                && value.unicodeScalars.count <= 1_000
+                && value.unicodeScalars.allSatisfy {
+                    !CharacterSet.controlCharacters.contains($0)
+                }
+        } ?? false
+        let blockingIsValid: Bool
+        let validBlockerTuple = {
+            switch blockedReasonKind {
+            case .dependency?:
+                return blockedByItemID.map { $0 != id } == true
+                    && (blockedReason == nil || reasonIsValid)
+            case .manual?, .external?:
+                return blockedByItemID == nil && reasonIsValid
+            case .unsupported?:
+                return (blockedByItemID.map { $0 != id } ?? true)
+                    && (blockedReason == nil || reasonIsValid)
+            case nil:
+                return false
+            }
+        }
+        if status == .blocked {
+            blockingIsValid = validBlockerTuple()
+        } else if case .unknown = status {
+            blockingIsValid = blockedReasonKind == nil
+                ? blockedByItemID == nil && blockedReason == nil
+                : validBlockerTuple()
+        } else {
+            blockingIsValid = blockedReasonKind == nil
+                && blockedByItemID == nil && blockedReason == nil
+        }
+        guard blockingIsValid else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .blockedReasonKind,
+                in: container,
+                debugDescription: "Contradictory canonical blocked-state metadata"
+            )
+        }
+    }
+
+    private static func isCanonicalDateOnly(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 10,
+              bytes[4] == 0x2D,
+              bytes[7] == 0x2D,
+              let year = Int(value.prefix(4)),
+              let month = Int(value.dropFirst(5).prefix(2)),
+              let day = Int(value.suffix(2)),
+              (1...9_999).contains(year),
+              (year, month, day) != (9_999, 12, 31),
+              (1...12).contains(month) else { return false }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let date = calendar.date(from: DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: year,
+            month: month,
+            day: day
+        )) else { return false }
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return parts.year == year && parts.month == month && parts.day == day
+    }
+
+    private static func isValidStructuralWireValue(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.count <= 64
+            && value.unicodeScalars.allSatisfy {
+                $0.properties.generalCategory != .control
+            }
     }
 }
 
@@ -615,7 +1335,10 @@ private extension DayWeaveCanonicalItem {
         total = total.saturatingAdding(title.utf8.count)
         total = total.saturatingAdding(notes?.utf8.count ?? 0)
         total = total.saturatingAdding(timezoneName.utf8.count)
+        total = total.saturatingAdding(deadlineDate?.utf8.count ?? 0)
+        total = total.saturatingAdding(blockedReason?.utf8.count ?? 0)
         total = total.saturatingAdding(retainedUnrepresentableDeadlineAt?.utf8.count ?? 0)
+        total = total.saturatingAdding(retainedCanonicalDeadlineAt?.utf8.count ?? 0)
         total = total.saturatingAdding(
             retainedUnrepresentableEarliestStartAt?.utf8.count ?? 0
         )

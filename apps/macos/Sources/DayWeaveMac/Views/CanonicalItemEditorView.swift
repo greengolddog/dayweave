@@ -836,7 +836,7 @@ struct CanonicalItemEditorView: View {
                 }
                 Toggle("Mandatory break", isOn: $state.breakMandatory)
                 Toggle("Prompt me to resume", isOn: $state.breakPromptToResume)
-            case .task, .event, .unknown:
+            case .task, .project, .event, .unknown:
                 Text("No additional type-specific settings.")
                     .foregroundStyle(.secondary)
             }

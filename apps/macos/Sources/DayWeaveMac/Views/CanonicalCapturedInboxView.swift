@@ -540,6 +540,7 @@ private struct CanonicalCapturedInboxRow: View {
         privacyChip
         durationChip
         deadlineChip
+        blockedChip
     }
 
     private var statusChip: some View {
@@ -560,7 +561,7 @@ private struct CanonicalCapturedInboxRow: View {
 
     private var durationChip: some View {
         CanonicalInboxChip(
-            text: CanonicalItemEditorState.durationDescription(row.durationSeconds),
+            text: row.durationDescription,
             symbol: "timer",
             color: .secondary
         )
@@ -568,15 +569,27 @@ private struct CanonicalCapturedInboxRow: View {
 
     @ViewBuilder
     private var deadlineChip: some View {
-        if let deadline = row.deadlineAt {
+        if let title = row.timingTitle,
+           let timing = row.timingDescription(timezoneName: timezoneName) {
             CanonicalInboxChip(
-                text: PlannerTimeZone.dateTimeLabel(
-                    deadline,
-                    timezoneName: timezoneName
-                ),
-                symbol: "flag",
-                color: .red
+                text: "\(title) \(timing)",
+                symbol: row.kind == .event ? "clock" : "flag",
+                color: row.kind == .event
+                    ? .blue
+                    : (row.deadlineStrength == .soft ? .orange : .red)
             )
+        }
+    }
+
+    @ViewBuilder
+    private var blockedChip: some View {
+        if let blocker = row.blockedDescription {
+            CanonicalInboxChip(
+                text: blocker,
+                symbol: "pause.octagon.fill",
+                color: .orange
+            )
+            .privacySensitive(row.isSensitive)
         }
     }
 
@@ -602,6 +615,7 @@ private struct CanonicalCapturedInboxRow: View {
         case .habit: "repeat"
         case .routine: "list.number"
         case .goal: "target"
+        case .project: "folder"
         case .breakTime: "cup.and.saucer"
         case .unknown: "questionmark.diamond"
         }
@@ -614,6 +628,7 @@ private struct CanonicalCapturedInboxRow: View {
         case .habit: .green
         case .routine: .teal
         case .goal: .purple
+        case .project: .cyan
         case .breakTime: .orange
         case .unknown: .secondary
         }

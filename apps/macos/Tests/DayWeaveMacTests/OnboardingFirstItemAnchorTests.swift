@@ -61,6 +61,7 @@ struct OnboardingFirstItemAnchorTests {
         goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(false)])
         #expect(!goalLeaf.createsPlanningDemand)
         goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        goalLeaf.hasOwnEffort = true
         #expect(goalLeaf.createsPlanningDemand)
 
         let parent = try Self.canonicalItem(
@@ -84,6 +85,7 @@ struct OnboardingFirstItemAnchorTests {
             independentParent.flexibleConstraints = .object([
                 "has_own_effort": .bool(true),
             ])
+            independentParent.hasOwnEffort = true
             #expect(independentParent.createsPlanningDemand(
                 canonicalItems: [independentParent, child]
             ))
@@ -244,6 +246,7 @@ struct OnboardingFirstItemAnchorTests {
 
         var ownEffortItem = parentItem
         ownEffortItem.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        ownEffortItem.hasOwnEffort = true
         #expect(canonicalAnchor.hasExactPublishedPlanProof(
             canonicalItems: [ownEffortItem, child],
             pendingAuthoringMutations: [pendingChild],

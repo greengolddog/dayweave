@@ -317,7 +317,7 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         guard !hasActiveChildren || hasOwnEffort else { return false }
         guard value.durationSeconds.map({ $0 > 0 }) == true else { return false }
         switch value.kind {
-        case .goal, .routine:
+        case .goal, .project, .routine:
             return hasOwnEffort
         case .task, .habit, .breakTime:
             return true
@@ -563,17 +563,12 @@ extension DayWeaveCanonicalItem {
         // semantics below instead of suppressing eligible parents wholesale.
         guard isExecutable == !hasCanonicalChildren else { return false }
         if kind == .event { return true }
-        let hasOwnEffort: Bool
-        if case let .object(constraints) = flexibleConstraints {
-            hasOwnEffort = constraints["has_own_effort"] == .bool(true)
-        } else {
-            hasOwnEffort = false
-        }
+        let hasOwnEffort = self.hasOwnEffort
         let hasActiveChildren = hasPendingChildren || hasCanonicalChildren
         guard !hasActiveChildren || hasOwnEffort else { return false }
         guard durationSeconds.map({ $0 > 0 }) == true else { return false }
         switch kind {
-        case .goal, .routine:
+        case .goal, .project, .routine:
             return hasOwnEffort
         case .task, .habit, .breakTime:
             return true
@@ -589,9 +584,11 @@ extension DayWeaveCanonicalItem {
     /// intentionally keeps using the stricter lossless-replacement predicate.
     var supportsCanonicalAuthoringReplacement: Bool {
         guard unsupportedFields.isEmpty,
+              !hasExplicitStructuralMetadata,
               retainedUnrepresentableDeadlineAt == nil,
               retainedUnrepresentableEarliestStartAt == nil,
               splitPolicy.isSupportedForWrite else { return false }
+        if kind == .project { return false }
         if case .unknown = kind { return false }
         if case .unknown = status { return false }
         guard recurrence?.supportsCanonicalAuthoringRecurrence ?? true,

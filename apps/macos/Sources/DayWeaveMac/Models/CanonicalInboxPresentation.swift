@@ -35,8 +35,19 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         let depth: Int
         let breadcrumb: [String]
         let sensitivityPresentation: CanonicalSensitivityPresentation
+        let durationKind: DayWeaveDurationKind
+        let durationMinimumSeconds: UInt32?
         let durationSeconds: UInt32?
+        let durationMaximumSeconds: UInt32?
+        let durationSource: DayWeaveDurationSource?
+        let deadlineKind: DayWeaveDeadlineKind
         let deadlineAt: Date?
+        let deadlineDate: String?
+        let deadlineStrength: DayWeaveDeadlineStrength?
+        let deadlineSoftWeight: UInt32?
+        let blockedReasonKind: DayWeaveBlockedReasonKind?
+        let blockedByItemID: UUID?
+        let blockedReason: String?
         let source: Source
         let syncState: SyncState
         let mutationID: UUID?
@@ -50,6 +61,81 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
 
         var isSensitive: Bool { sensitivityPresentation != .standard }
 
+        var durationDescription: String {
+            switch durationKind {
+            case .unknown:
+                return "Unknown duration"
+            case .exact:
+                return Self.durationValue(durationSeconds)
+            case .range:
+                guard let minimum = durationMinimumSeconds,
+                      let expected = durationSeconds,
+                      let maximum = durationMaximumSeconds else {
+                    return "Duration metadata unavailable"
+                }
+                return "\(Self.durationValue(minimum))–\(Self.durationValue(maximum))"
+                    + " · expected \(Self.durationValue(expected))"
+            case .unsupported:
+                return "Duration requires a newer DayWeave version"
+            }
+        }
+
+        var timingTitle: String? {
+            if kind == .event, deadlineAt != nil { return "Ends" }
+            return switch deadlineKind {
+            case .none: nil
+            case .date: "Due date"
+            case .dateTime: "Deadline"
+            case .unsupported: "Deadline"
+            }
+        }
+
+        func timingDescription(timezoneName: String) -> String? {
+            if kind == .event, let deadlineAt {
+                return PlannerTimeZone.dateTimeLabel(deadlineAt, timezoneName: timezoneName)
+            }
+            let base: String?
+            switch deadlineKind {
+            case .none:
+                return nil
+            case .date:
+                base = deadlineDate
+            case .dateTime:
+                base = deadlineAt.map {
+                    PlannerTimeZone.dateTimeLabel($0, timezoneName: timezoneName)
+                }
+            case .unsupported:
+                return "Requires a newer DayWeave version"
+            }
+            guard let base else { return "Unavailable" }
+            let strength = switch deadlineStrength {
+            case .hard?: "Hard"
+            case .soft?: deadlineSoftWeight.map { "Soft · weight \($0)" } ?? "Soft"
+            case .unsupported?: "Newer deadline policy"
+            case nil: "Deadline policy unavailable"
+            }
+            return "\(base) · \(strength)"
+        }
+
+        var blockedDescription: String? {
+            guard status == .blocked else { return nil }
+            switch blockedReasonKind {
+            case .dependency?:
+                let dependency = blockedByItemID.map {
+                    "Waiting for item \($0.uuidString.lowercased().prefix(8))"
+                } ?? "Waiting for a dependency"
+                return blockedReason.map { "\(dependency) · \($0)" } ?? dependency
+            case .manual?:
+                return blockedReason.map { "Manually blocked · \($0)" } ?? "Manually blocked"
+            case .external?:
+                return blockedReason.map { "External blocker · \($0)" } ?? "External blocker"
+            case .unsupported?:
+                return "Blocked for a reason that requires a newer DayWeave version"
+            case nil:
+                return "Blocked reason unavailable"
+            }
+        }
+
         var accessibilitySummary: String {
             let kindName = kind.wireValue.replacingOccurrences(of: "_", with: " ")
             let state: String = switch syncState {
@@ -60,6 +146,14 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             }
             let privacy = isSensitive ? "sensitive" : "standard privacy"
             return "\(title), \(kindName), level \(depth + 1), \(privacy), \(state)"
+        }
+
+        private static func durationValue(_ seconds: UInt32?) -> String {
+            guard let seconds else { return "Unknown" }
+            if seconds.isMultiple(of: 60) {
+                return "\(seconds / 60) min"
+            }
+            return "\(seconds) sec"
         }
     }
 
@@ -114,7 +208,7 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             switch row.status {
             case .inbox: inbox.append(row)
             case .planned: planned.append(row)
-            case .scheduled, .inProgress, .paused: active.append(row)
+            case .scheduled, .inProgress, .paused, .blocked: active.append(row)
             case .completed: completed.append(row)
             case .skipped, .cancelled, .unknown: break
             }
@@ -135,8 +229,23 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 breadcrumb: [],
                 sensitivityPresentation: sensitivityPresentation?(mutation.itemID)
                     ?? ((item?.isSensitive ?? true) ? .own : .standard),
+                durationKind: item?.durationKind
+                    ?? (item?.durationSeconds == nil ? .unknown : .exact),
+                durationMinimumSeconds: item?.durationMinimumSeconds ?? item?.durationSeconds,
                 durationSeconds: item?.durationSeconds,
+                durationMaximumSeconds: item?.durationMaximumSeconds ?? item?.durationSeconds,
+                durationSource: item?.durationSource
+                    ?? (item?.durationSeconds == nil ? nil : .user),
+                deadlineKind: item?.deadlineKind
+                    ?? (item?.kind == .event || item?.deadlineAt == nil ? .none : .dateTime),
                 deadlineAt: item?.deadlineAt,
+                deadlineDate: item?.deadlineDate,
+                deadlineStrength: item?.deadlineStrength
+                    ?? (item?.kind == .event || item?.deadlineAt == nil ? nil : .hard),
+                deadlineSoftWeight: item?.deadlineSoftWeight,
+                blockedReasonKind: item?.blockedReasonKind,
+                blockedByItemID: item?.blockedByItemID,
+                blockedReason: item?.blockedReason,
                 source: .pendingTrash,
                 syncState: syncState(mutation),
                 mutationID: mutation.id,
@@ -168,8 +277,23 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 breadcrumb: [],
                 sensitivityPresentation: sensitivityPresentation?(entry.id)
                     ?? (entry.isSensitive ? .own : .standard),
+                durationKind: item?.durationKind
+                    ?? (item?.durationSeconds == nil ? .unknown : .exact),
+                durationMinimumSeconds: item?.durationMinimumSeconds ?? item?.durationSeconds,
                 durationSeconds: item?.durationSeconds,
+                durationMaximumSeconds: item?.durationMaximumSeconds ?? item?.durationSeconds,
+                durationSource: item?.durationSource
+                    ?? (item?.durationSeconds == nil ? nil : .user),
+                deadlineKind: item?.deadlineKind
+                    ?? (item?.kind == .event || item?.deadlineAt == nil ? .none : .dateTime),
                 deadlineAt: item?.deadlineAt,
+                deadlineDate: item?.deadlineDate,
+                deadlineStrength: item?.deadlineStrength
+                    ?? (item?.kind == .event || item?.deadlineAt == nil ? nil : .hard),
+                deadlineSoftWeight: item?.deadlineSoftWeight,
+                blockedReasonKind: item?.blockedReasonKind,
+                blockedByItemID: item?.blockedByItemID,
+                blockedReason: item?.blockedReason,
                 source: mutation?.operation == .restore ? .pendingRestore : .recentTrash,
                 syncState: mutation.map(syncState) ?? .synced,
                 mutationID: mutation?.id,
@@ -272,6 +396,10 @@ private extension CanonicalInboxPresentation {
                 source = .canonical
             }
             let syncState = mutation.map(CanonicalInboxPresentation.syncState) ?? .synced
+            let retainsCanonicalStructure = source == .canonical || source == .activeRestore
+            let structuralItem = retainsCanonicalStructure ? activeCanonicalItem : nil
+            let inferredDeadlineKind: DayWeaveDeadlineKind = draft.kind == .event
+                || draft.deadlineAt == nil ? .none : .dateTime
             return Row(
                 id: itemID,
                 itemID: itemID,
@@ -283,8 +411,24 @@ private extension CanonicalInboxPresentation {
                 depth: depth,
                 breadcrumb: breadcrumb,
                 sensitivityPresentation: sensitivityPresentation,
+                durationKind: structuralItem?.durationKind
+                    ?? (draft.durationSeconds == nil ? .unknown : .exact),
+                durationMinimumSeconds: structuralItem?.durationMinimumSeconds
+                    ?? draft.durationSeconds,
                 durationSeconds: draft.durationSeconds,
+                durationMaximumSeconds: structuralItem?.durationMaximumSeconds
+                    ?? draft.durationSeconds,
+                durationSource: structuralItem?.durationSource
+                    ?? (draft.durationSeconds == nil ? nil : .user),
+                deadlineKind: structuralItem?.deadlineKind ?? inferredDeadlineKind,
                 deadlineAt: draft.deadlineAt,
+                deadlineDate: structuralItem?.deadlineDate,
+                deadlineStrength: structuralItem?.deadlineStrength
+                    ?? (inferredDeadlineKind == .none ? nil : .hard),
+                deadlineSoftWeight: structuralItem?.deadlineSoftWeight,
+                blockedReasonKind: structuralItem?.blockedReasonKind,
+                blockedByItemID: structuralItem?.blockedByItemID,
+                blockedReason: structuralItem?.blockedReason,
                 source: source,
                 syncState: syncState,
                 mutationID: mutation?.id,

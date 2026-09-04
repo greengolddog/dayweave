@@ -677,9 +677,14 @@ final class ProposalApplicationStore: ObservableObject {
         let knownOperations = Set(["create_item", "replace_item", "trash_item", "restore_item"])
         let knownFields = Set([
             "is_sensitive", "kind", "status", "title", "notes", "timezone_name",
-            "duration_seconds", "deadline_at", "earliest_start_at", "recurrence",
+            "duration_kind", "duration_min_seconds", "duration_seconds",
+            "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
+            "deadline_date", "deadline_strength", "deadline_soft_weight",
+            "earliest_start_at", "recurrence",
             "flexible_constraints", "split_policy", "importance", "urgency", "parent_id",
-            "sibling_order", "is_executable", "revision", "completed_at", "deleted_at",
+            "sibling_order", "has_own_effort", "blocked_reason_kind",
+            "blocked_by_item_id", "blocked_reason", "is_executable", "revision",
+            "completed_at", "deleted_at",
         ])
         guard review.diffs.count <= 100,
               review.implicitDiffs.count <= 10_000,
@@ -692,7 +697,7 @@ final class ProposalApplicationStore: ObservableObject {
               review.diffs.allSatisfy({ diff in
                   commandIDs.contains(diff.commandID)
                       && knownOperations.contains(diff.operation)
-                      && (1...20).contains(diff.changedFields.count)
+                      && (1...knownFields.count).contains(diff.changedFields.count)
                       && Set(diff.changedFields).count == diff.changedFields.count
                       && Set(diff.changedFields).isSubset(of: knownFields)
                       && (diff.before?.id == nil || diff.before?.id == diff.itemID)
@@ -701,19 +706,25 @@ final class ProposalApplicationStore: ObservableObject {
                       && Self.hasValidDirectDiffShape(diff)
                       && diff.before.map(Self.hasSupportedReviewItem) ?? true
                       && diff.after.map(Self.hasSupportedReviewItem) ?? true
-                      && Set(diff.changedFields)
-                          == Self.changedProposalFields(before: diff.before, after: diff.after)
+                      && Self.hasValidChangedProposalFields(
+                          diff.changedFields,
+                          before: diff.before,
+                          after: diff.after
+                      )
               }), review.implicitDiffs.allSatisfy({ diff in
                   diff.reason == "hierarchy_refresh"
                       && diff.before.id == diff.itemID
                       && diff.after.id == diff.itemID
-                      && (1...20).contains(diff.changedFields.count)
+                      && (1...knownFields.count).contains(diff.changedFields.count)
                       && Set(diff.changedFields).count == diff.changedFields.count
                       && Set(diff.changedFields).isSubset(of: knownFields)
                       && Self.hasSupportedReviewItem(diff.before)
                       && Self.hasSupportedReviewItem(diff.after)
-                      && Set(diff.changedFields)
-                          == Self.changedProposalFields(before: diff.before, after: diff.after)
+                      && Self.hasValidChangedProposalFields(
+                          diff.changedFields,
+                          before: diff.before,
+                          after: diff.after
+                      )
               }) else {
             return false
         }
@@ -772,7 +783,8 @@ final class ProposalApplicationStore: ObservableObject {
     }
 
     private static func hasSupportedReviewItem(_ item: DayWeaveCanonicalItem) -> Bool {
-        guard item.unsupportedFields.isEmpty else { return false }
+        guard item.unsupportedFields.isEmpty,
+              !item.hasUnsupportedStructuralMetadata else { return false }
         if case .unknown = item.kind { return false }
         if case .unknown = item.status { return false }
         if case .unknown = item.splitPolicy { return false }
@@ -785,9 +797,14 @@ final class ProposalApplicationStore: ObservableObject {
     ) -> Set<String> {
         let everyField = Set([
             "is_sensitive", "kind", "status", "title", "notes", "timezone_name",
-            "duration_seconds", "deadline_at", "earliest_start_at", "recurrence",
+            "duration_kind", "duration_min_seconds", "duration_seconds",
+            "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
+            "deadline_date", "deadline_strength", "deadline_soft_weight",
+            "earliest_start_at", "recurrence",
             "flexible_constraints", "split_policy", "importance", "urgency", "parent_id",
-            "sibling_order", "is_executable", "revision", "completed_at", "deleted_at",
+            "sibling_order", "has_own_effort", "blocked_reason_kind",
+            "blocked_by_item_id", "blocked_reason", "is_executable", "revision",
+            "completed_at", "deleted_at",
         ])
         guard let before else { return after == nil ? [] : everyField }
         guard let after else { return ["deleted_at"] }
@@ -798,8 +815,24 @@ final class ProposalApplicationStore: ObservableObject {
         if before.title != after.title { changed.insert("title") }
         if before.notes != after.notes { changed.insert("notes") }
         if before.timezoneName != after.timezoneName { changed.insert("timezone_name") }
+        if before.durationKind != after.durationKind { changed.insert("duration_kind") }
+        if before.durationMinimumSeconds != after.durationMinimumSeconds {
+            changed.insert("duration_min_seconds")
+        }
         if before.durationSeconds != after.durationSeconds { changed.insert("duration_seconds") }
+        if before.durationMaximumSeconds != after.durationMaximumSeconds {
+            changed.insert("duration_max_seconds")
+        }
+        if before.durationSource != after.durationSource { changed.insert("duration_source") }
+        if before.deadlineKind != after.deadlineKind { changed.insert("deadline_kind") }
         if before.deadlineAt != after.deadlineAt { changed.insert("deadline_at") }
+        if before.deadlineDate != after.deadlineDate { changed.insert("deadline_date") }
+        if before.deadlineStrength != after.deadlineStrength {
+            changed.insert("deadline_strength")
+        }
+        if before.deadlineSoftWeight != after.deadlineSoftWeight {
+            changed.insert("deadline_soft_weight")
+        }
         if before.earliestStartAt != after.earliestStartAt {
             changed.insert("earliest_start_at")
         }
@@ -812,11 +845,42 @@ final class ProposalApplicationStore: ObservableObject {
         if before.urgency != after.urgency { changed.insert("urgency") }
         if before.parentID != after.parentID { changed.insert("parent_id") }
         if before.siblingOrder != after.siblingOrder { changed.insert("sibling_order") }
+        if before.hasOwnEffort != after.hasOwnEffort { changed.insert("has_own_effort") }
+        if before.blockedReasonKind != after.blockedReasonKind {
+            changed.insert("blocked_reason_kind")
+        }
+        if before.blockedByItemID != after.blockedByItemID {
+            changed.insert("blocked_by_item_id")
+        }
+        if before.blockedReason != after.blockedReason { changed.insert("blocked_reason") }
         if before.isExecutable != after.isExecutable { changed.insert("is_executable") }
         if before.revision != after.revision { changed.insert("revision") }
         if before.completedAt != after.completedAt { changed.insert("completed_at") }
         if before.deletedAt != after.deletedAt { changed.insert("deleted_at") }
         return changed
+    }
+
+    private static func hasValidChangedProposalFields(
+        _ fields: [String],
+        before: DayWeaveCanonicalItem?,
+        after: DayWeaveCanonicalItem?
+    ) -> Bool {
+        let actual = Set(fields)
+        let expected = changedProposalFields(before: before, after: after)
+        guard before == nil, let after, !after.hasExplicitStructuralMetadata else {
+            return actual == expected
+        }
+        // Pre-structural proposal previews did not list newly inferred fields
+        // for creates. Once decoded, that response is semantically identical
+        // to a current legacy-equivalent row, so accept only these two exact
+        // field sets and retain the rich-shape fence above.
+        let structuralFields = Set([
+            "duration_kind", "duration_min_seconds", "duration_max_seconds",
+            "duration_source", "deadline_kind", "deadline_date",
+            "deadline_strength", "deadline_soft_weight", "has_own_effort",
+            "blocked_reason_kind", "blocked_by_item_id", "blocked_reason",
+        ])
+        return actual == expected || actual == expected.subtracting(structuralFields)
     }
 
     private static func approval(

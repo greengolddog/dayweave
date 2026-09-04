@@ -433,12 +433,14 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// immutable accepted-item journal linkage. Version 19 adds the encrypted,
     /// content-free onboarding first-item identity and canonical revision, and
     /// version 20 durably upgrades legacy Google outbound recovery journals to
-    /// entity-bound version 2 records, and version 21 adds the encrypted,
-    /// schedule-revision-bound Google Calendar publication recovery journal.
+    /// entity-bound version 2 records, version 21 adds the encrypted,
+    /// schedule-revision-bound Google Calendar publication recovery journal,
+    /// and version 22 persists inferred or server-explicit typed duration,
+    /// deadline, own-effort, and blocker metadata without discarding v21 caches.
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 21
+    static let currentSchemaVersion = 22
 
     let schemaVersion: Int
     let savedAt: Date
@@ -704,6 +706,54 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 21:
+            // Canonical structural metadata was previously nested or implicit,
+            // while unknown-field retention could forward-capture the complete
+            // server wire shape. The schema-aware item decoder either infers a
+            // zero-key legacy row or preserves a complete captured shape (and
+            // rejects partial shapes); rewriting makes that decision durable.
+            return try PlannerSnapshot(
+                savedAt: savedAt,
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                localSuggestionDateHighWater: localSuggestionDateHighWater,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: pendingExecutionDeferIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                onboardingFirstItemAnchor: onboardingFirstItemAnchor,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                googleSchedulePublicationRecoveryJournal:
+                    googleSchedulePublicationRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 20:
             // Schema 20 predates generated-schedule Google Calendar authority.
             // Ignore any injected newer field so migration cannot invent a

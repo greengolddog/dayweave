@@ -3100,6 +3100,7 @@ final class CanonicalSyncStore: ObservableObject {
                 guard updated.id == item.id,
                       updated.revision == expectedRevision,
                       updated.deletedAt == nil,
+                      updated.supportsLosslessReplacement,
                       DayWeaveCanonicalItemFields(item: updated) == replacement else {
                     throw CanonicalSyncError.invalidMutationResponse
                 }
@@ -3227,6 +3228,7 @@ final class CanonicalSyncStore: ObservableObject {
                 try ensureOperationCurrent(operationID: operationID, generation: generation)
                 guard updated.id == item.id,
                       updated.revision == expectedRevision,
+                      updated.supportsLosslessReplacement,
                       DayWeaveCanonicalItemFields(item: updated) == replacement,
                       updated.deletedAt == nil else {
                     throw CanonicalSyncError.invalidMutationResponse
@@ -4013,6 +4015,7 @@ private func canonicalKind(_ kind: PlannerItemKind) -> DayWeaveCanonicalItemKind
     case .habit: .habit
     case .routine: .routine
     case .goal: .goal
+    case .project: .project
     case .breakTime: .breakTime
     }
 }
@@ -4024,6 +4027,7 @@ private func plannerKind(_ kind: DayWeaveCanonicalItemKind) -> PlannerItemKind {
     case .habit: .habit
     case .routine: .routine
     case .goal: .goal
+    case .project: .project
     case .breakTime: .breakTime
     case .unknown: .task
     }
@@ -4048,6 +4052,7 @@ private func plannerStatus(_ status: DayWeaveCanonicalItemStatus) -> PlannerItem
     case .scheduled: .scheduled
     case .inProgress: .active
     case .paused: .paused
+    case .blocked: .blocked
     case .completed: .completed
     case .skipped: .skipped
     case .cancelled: .canceled

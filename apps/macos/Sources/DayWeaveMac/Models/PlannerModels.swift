@@ -27,6 +27,7 @@ enum PlannerItemKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case habit
     case routine
     case goal
+    case project
     case breakTime = "break"
 
     var id: Self { self }
@@ -38,6 +39,7 @@ enum PlannerItemKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .habit: "Habit"
         case .routine: "Routine"
         case .goal: "Goal"
+        case .project: "Project"
         case .breakTime: "Break"
         }
     }
@@ -49,6 +51,7 @@ enum PlannerItemKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .habit: "repeat"
         case .routine: "list.number"
         case .goal: "scope"
+        case .project: "folder"
         case .breakTime: "cup.and.saucer"
         }
     }
@@ -60,6 +63,7 @@ enum PlannerItemKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .habit: .green
         case .routine: .orange
         case .goal: .purple
+        case .project: .cyan
         case .breakTime: .mint
         }
     }
@@ -125,8 +129,36 @@ extension DayWeaveCanonicalItem {
     /// Parses the scheduler's qualified latest-finish constraint without
     /// guessing through malformed or dual deadline metadata.
     var moveLaterDeadlineAssessment: DayWeaveMoveDeadlineAssessment {
-        let canonical = deadlineAt.map {
-            DayWeaveMoveDeadlineBoundary(date: $0, isHard: true, isCanonicalField: true)
+        let canonical: DayWeaveMoveDeadlineBoundary?
+        switch deadlineKind {
+        case .none:
+            // An Event retains its interval end in `deadlineAt`, but that value
+            // is not a deadline and must never trigger relaxation/warnings.
+            canonical = nil
+        case .date:
+            guard let deadlineDate,
+                  let boundary = dayWeaveDateDeadlineBoundary(
+                      deadlineDate,
+                      timezoneName: timezoneName
+                  ),
+                  let isHard = dayWeaveDeadlineIsHard(deadlineStrength)
+            else { return .invalid }
+            canonical = DayWeaveMoveDeadlineBoundary(
+                date: boundary,
+                isHard: isHard,
+                isCanonicalField: true
+            )
+        case .dateTime:
+            guard let deadlineAt,
+                  let isHard = dayWeaveDeadlineIsHard(deadlineStrength)
+            else { return .invalid }
+            canonical = DayWeaveMoveDeadlineBoundary(
+                date: deadlineAt,
+                isHard: isHard,
+                isCanonicalField: true
+            )
+        case .unsupported:
+            return .invalid
         }
         guard case let .object(root) = flexibleConstraints else { return .invalid }
         guard let constraintsValue = root["constraints"], constraintsValue != .null else {
@@ -159,6 +191,54 @@ extension DayWeaveCanonicalItem {
             return .invalid
         }
     }
+}
+
+private func dayWeaveDeadlineIsHard(_ strength: DayWeaveDeadlineStrength?) -> Bool? {
+    switch strength {
+    case .hard?: true
+    case .soft?: false
+    case .unsupported?, nil: nil
+    }
+}
+
+/// Resolves a date-only deadline to the same exclusive next-local-midnight
+/// boundary used by the server scheduler. Gaps fail closed instead of silently
+/// shifting the user's date.
+private func dayWeaveDateDeadlineBoundary(
+    _ value: String,
+    timezoneName: String
+) -> Date? {
+    guard value.utf8.count == 10,
+          value.utf8.enumerated().allSatisfy({ index, byte in
+              index == 4 || index == 7 ? byte == 45 : (48...57).contains(byte)
+          }),
+          let year = Int(value.prefix(4)),
+          let month = Int(value.dropFirst(5).prefix(2)),
+          let day = Int(value.suffix(2)),
+          let timezone = TimeZone(identifier: timezoneName)
+    else { return nil }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.locale = Locale(identifier: "en_US_POSIX")
+    calendar.timeZone = timezone
+    let components = DateComponents(
+        calendar: calendar,
+        timeZone: timezone,
+        year: year,
+        month: month,
+        day: day,
+        hour: 0,
+        minute: 0,
+        second: 0
+    )
+    guard let start = calendar.date(from: components) else { return nil }
+    let resolved = calendar.dateComponents([.year, .month, .day, .hour], from: start)
+    guard resolved.year == year,
+          resolved.month == month,
+          resolved.day == day,
+          resolved.hour == 0,
+          let boundary = calendar.date(byAdding: .day, value: 1, to: start),
+          calendar.component(.hour, from: boundary) == 0 else { return nil }
+    return boundary
 }
 
 struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
