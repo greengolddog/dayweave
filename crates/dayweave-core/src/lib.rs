@@ -6,9 +6,11 @@
 //! resolution reproducible.
 
 mod domain;
+mod habits;
 mod recurrence;
 mod scheduler;
 
 pub use domain::*;
+pub use habits::*;
 pub use recurrence::*;
 pub use scheduler::*;
