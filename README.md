@@ -21,6 +21,9 @@ suggestions; it cannot bypass safety or external-change confirmation rules.
 
 The complete agreed product scope is preserved in
 [`docs/discovery-answers.md`](docs/discovery-answers.md).
+Current implemented slices, active work, and all remaining feature areas are
+tracked in the maintained
+[`docs/feature-status.md`](docs/feature-status.md) ledger.
 The implemented controls and explicit production security gates are documented
 in [`docs/security.md`](docs/security.md).
 The deterministic preview, immutable publication/read-model contract, and
