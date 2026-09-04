@@ -7,7 +7,7 @@ use dayweave_compose::{
     MAX_SCHEDULING_METADATA_BYTES, SchedulingMetadataInput, is_canonical_rfc3339,
     validate_scheduling_metadata,
 };
-use dayweave_core::Dependency;
+use dayweave_core::{DayOfWeek, Dependency, Recurrence, validate_custom_rrule_for_anchor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -176,10 +176,8 @@ pub struct NewItem {
     /// Optional canonical earliest start in the portable RFC 3339 and microsecond contract.
     #[serde(default, deserialize_with = "deserialize_optional_canonical_datetime")]
     pub earliest_start_at: Option<DateTime<Utc>>,
-    /// Strict authorable daily, weekly, monthly, interval, or frequency recurrence object.
-    /// Custom RRULE values remain readable on legacy rows but cannot be created or replaced until
-    /// bounded RFC 5545 expansion is implemented. Counts default only for legacy daily, weekly,
-    /// and monthly forms.
+    /// Strict authorable daily, weekly, monthly, interval, frequency, or finite custom RRULE
+    /// recurrence object. Counts default only for legacy daily, weekly, and monthly forms.
     #[schema(value_type = Option<Object>)]
     pub recurrence: Option<Value>,
     #[serde(default = "empty_object")]
@@ -240,10 +238,8 @@ pub struct ReplaceItem {
     /// Optional canonical earliest start in the portable RFC 3339 and microsecond contract.
     #[serde(default, deserialize_with = "deserialize_optional_canonical_datetime")]
     pub earliest_start_at: Option<DateTime<Utc>>,
-    /// Strict authorable daily, weekly, monthly, interval, or frequency recurrence object.
-    /// An existing custom RRULE remains readable but cannot cross this replacement boundary until
-    /// bounded RFC 5545 expansion is implemented. Counts default only for legacy daily, weekly,
-    /// and monthly forms.
+    /// Strict authorable daily, weekly, monthly, interval, frequency, or finite custom RRULE
+    /// recurrence object. Counts default only for legacy daily, weekly, and monthly forms.
     #[schema(value_type = Option<Object>)]
     pub recurrence: Option<Value>,
     #[serde(default = "empty_object")]
@@ -474,7 +470,7 @@ impl Item {
     pub fn new(input: NewItem, now: DateTime<Utc>) -> Result<Self, ItemDomainError> {
         let now = canonical_storage_instant(now);
         let id = input.id;
-        let input = ItemFields::from(input).validate(id, None)?;
+        let input = ItemFields::from(input).validate(id, None, now)?;
         let duration_kind = input
             .duration_kind
             .ok_or(ItemDomainError::InvalidDurationShape)?;
@@ -529,7 +525,11 @@ impl Item {
         now: DateTime<Utc>,
     ) -> Result<Self, ItemDomainError> {
         let now = canonical_storage_instant(now);
-        let input = ItemFields::from(input).validate(self.id, Some(&self.flexible_constraints))?;
+        let input = ItemFields::from(input).validate(
+            self.id,
+            Some(&self.flexible_constraints),
+            self.created_at,
+        )?;
         let revision = self
             .revision
             .checked_add(1)
@@ -727,6 +727,14 @@ pub enum ItemDomainError {
     #[error("scheduling metadata is invalid: {0}")]
     InvalidSchedulingMetadata(String),
     #[error(
+        "custom recurrence is invalid for creation date {anchor_date} with a {week_starts_on} week start: {reason}"
+    )]
+    InvalidCustomRecurrenceAnchor {
+        anchor_date: String,
+        week_starts_on: String,
+        reason: String,
+    },
+    #[error(
         "split policy requires a duration and positive ordered chunk bounds within that duration"
     )]
     InvalidSplitPolicy,
@@ -779,6 +787,7 @@ impl ItemFields {
         mut self,
         item_id: Uuid,
         preserved_legacy_constraints: Option<&Value>,
+        created_at: DateTime<Utc>,
     ) -> Result<Self, ItemDomainError> {
         self.title = self.title.trim().to_owned();
         if self.title.is_empty() {
@@ -907,7 +916,7 @@ impl ItemFields {
         } else {
             &self.flexible_constraints
         };
-        validate_scheduling_metadata(SchedulingMetadataInput {
+        let validated = validate_scheduling_metadata(SchedulingMetadataInput {
             item_id,
             kind: canonical_kind(self.kind),
             status: canonical_status(self.status),
@@ -921,7 +930,75 @@ impl ItemFields {
             parent_id: self.parent_id,
         })
         .map_err(|error| ItemDomainError::InvalidSchedulingMetadata(error.to_string()))?;
+        if let Some(Recurrence::Custom { rrule }) = &validated.recurrence {
+            validate_custom_recurrence_anchor(rrule, created_at, timezone)?;
+        }
+        self.recurrence = validated
+            .recurrence
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| {
+                ItemDomainError::InvalidSchedulingMetadata(format!(
+                    "canonical recurrence could not be encoded: {error}"
+                ))
+            })?;
         Ok(self)
+    }
+}
+
+/// Custom RRULE does not carry `WKST`, while week-start is request-level planning context rather
+/// than item state. Requiring anchor validity for every supported setting prevents a later profile
+/// change from turning an accepted canonical item into an unexpandable one.
+fn validate_custom_recurrence_anchor(
+    rrule: &str,
+    created_at: DateTime<Utc>,
+    timezone: Tz,
+) -> Result<(), ItemDomainError> {
+    let local_creation = created_at.with_timezone(&timezone).date_naive();
+    let anchor = time::Date::from_ordinal_date(
+        local_creation.year(),
+        u16::try_from(local_creation.ordinal()).map_err(|_| {
+            ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date: local_creation.to_string(),
+                week_starts_on: "unknown".to_owned(),
+                reason: "item creation date is outside the supported calendar".to_owned(),
+            }
+        })?,
+    )
+    .map_err(|_| ItemDomainError::InvalidCustomRecurrenceAnchor {
+        anchor_date: local_creation.to_string(),
+        week_starts_on: "unknown".to_owned(),
+        reason: "item creation date is outside the supported calendar".to_owned(),
+    })?;
+    for week_starts_on in [
+        DayOfWeek::Monday,
+        DayOfWeek::Tuesday,
+        DayOfWeek::Wednesday,
+        DayOfWeek::Thursday,
+        DayOfWeek::Friday,
+        DayOfWeek::Saturday,
+        DayOfWeek::Sunday,
+    ] {
+        validate_custom_rrule_for_anchor(rrule, anchor, week_starts_on).map_err(|error| {
+            ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date: anchor.to_string(),
+                week_starts_on: weekday_name(week_starts_on).to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+const fn weekday_name(value: DayOfWeek) -> &'static str {
+    match value {
+        DayOfWeek::Monday => "monday",
+        DayOfWeek::Tuesday => "tuesday",
+        DayOfWeek::Wednesday => "wednesday",
+        DayOfWeek::Thursday => "thursday",
+        DayOfWeek::Friday => "friday",
+        DayOfWeek::Saturday => "saturday",
+        DayOfWeek::Sunday => "sunday",
     }
 }
 
@@ -1641,6 +1718,115 @@ mod tests {
             None,
             "legacy projection cannot remain true after the typed flag is cleared"
         );
+    }
+
+    #[test]
+    fn recurrence_storage_materializes_legacy_defaults_and_canonical_set_order() {
+        let mut input = task(Uuid::from_u128(189), json!({}));
+        input.recurrence = Some(json!({
+            "type": "weekly",
+            "weekdays": ["thursday", "monday"]
+        }));
+        let item = Item::new(input, "2026-09-03T10:00:00Z".parse().unwrap())
+            .expect("legacy recurrence defaults remain authorable");
+        assert_eq!(
+            item.recurrence,
+            Some(json!({
+                "type": "weekly",
+                "times_per_week": 2,
+                "weekdays": ["monday", "thursday"]
+            }))
+        );
+    }
+
+    #[test]
+    fn custom_recurrence_is_anchor_validated_and_persisted_canonically() {
+        let created_at: DateTime<Utc> = "2026-09-03T10:00:00Z".parse().unwrap();
+        let mut input = task(Uuid::from_u128(190), json!({}));
+        input.recurrence = Some(json!({
+            "type": "custom",
+            "rrule": "rrule:count=3;byday=fr,mo;freq=weekly"
+        }));
+        let item = Item::new(input, created_at).expect("anchor-valid custom recurrence");
+        assert_eq!(
+            item.recurrence,
+            Some(json!({
+                "type": "custom",
+                "rrule": "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=3"
+            }))
+        );
+
+        let mut expired = task(Uuid::from_u128(191), json!({}));
+        expired.recurrence = Some(json!({
+            "type": "custom",
+            "rrule": "FREQ=DAILY;UNTIL=20260902"
+        }));
+        assert!(matches!(
+            Item::new(expired, created_at),
+            Err(ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date,
+                week_starts_on,
+                reason,
+            }) if anchor_date == "2026-09-03"
+                && week_starts_on == "monday"
+                && reason.contains("UNTIL precedes")
+        ));
+
+        // With a Sunday week start, September 7 remains in the anchor week and would match.
+        // Monday starts a new, interval-skipped week, so the write must fail closed rather than
+        // becoming invalid after a planning-setting change.
+        let sunday_anchor: DateTime<Utc> = "2026-09-06T10:00:00Z".parse().unwrap();
+        let mut settings_sensitive = task(Uuid::from_u128(192), json!({}));
+        settings_sensitive.recurrence = Some(json!({
+            "type": "custom",
+            "rrule": "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;UNTIL=20260907"
+        }));
+        assert!(matches!(
+            Item::new(settings_sensitive, sunday_anchor),
+            Err(ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date,
+                week_starts_on,
+                reason,
+            }) if anchor_date == "2026-09-06"
+                && week_starts_on == "monday"
+                && reason.contains("no occurrence")
+        ));
+    }
+
+    #[test]
+    fn custom_recurrence_replacement_uses_the_original_creation_anchor() {
+        let created_at: DateTime<Utc> = "2026-09-01T10:00:00Z".parse().unwrap();
+        let current = Item::new(task(Uuid::from_u128(193), json!({})), created_at).unwrap();
+        let mut valid = replacement(&current, json!({}));
+        valid.recurrence = Some(json!({
+            "type": "custom",
+            "rrule": "until=20260905;freq=daily"
+        }));
+        let replacement_time: DateTime<Utc> = "2026-09-10T10:00:00Z".parse().unwrap();
+        let replaced = current
+            .replaced(valid, replacement_time)
+            .expect("replacement anchors recurrence to original creation, not replacement time");
+        assert_eq!(
+            replaced.recurrence,
+            Some(json!({
+                "type": "custom",
+                "rrule": "FREQ=DAILY;INTERVAL=1;UNTIL=20260905"
+            }))
+        );
+
+        let mut expired = replacement(&replaced, json!({}));
+        expired.recurrence = Some(json!({
+            "type": "custom",
+            "rrule": "FREQ=DAILY;UNTIL=20260831"
+        }));
+        assert!(matches!(
+            replaced.replaced(expired, replacement_time),
+            Err(ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date,
+                reason,
+                ..
+            }) if anchor_date == "2026-09-01" && reason.contains("UNTIL precedes")
+        ));
     }
 
     #[test]

@@ -365,6 +365,72 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
 }
 
 #[tokio::test]
+async fn custom_rrule_writes_are_canonical_and_anchor_errors_are_structured() {
+    let app = test_app();
+    let valid_id = Uuid::new_v4();
+    let mut valid = item_body(valid_id, "task", "Canonical custom recurrence", None, 0);
+    valid["recurrence"] = json!({
+        "type": "custom",
+        "rrule": "rrule:count=5;byday=fr,mo;freq=weekly"
+    });
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(valid),
+            true,
+            Some("custom-valid-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    assert_eq!(
+        created["item"]["recurrence"],
+        json!({
+            "type": "custom",
+            "rrule": "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=5"
+        })
+    );
+
+    let mut expired = item_body(Uuid::new_v4(), "task", "Expired custom recurrence", None, 0);
+    expired["recurrence"] = json!({
+        "type": "custom",
+        "rrule": "FREQ=DAILY;UNTIL=00010101"
+    });
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(expired),
+            true,
+            Some("custom-expired-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let error = body_json(response).await;
+    assert_eq!(error["error"]["code"], "validation_failed");
+    assert_eq!(
+        error["error"]["message"],
+        "custom recurrence is invalid for its item creation anchor"
+    );
+    assert_eq!(error["error"]["details"]["field"], "recurrence.rrule");
+    assert!(error["error"]["details"]["anchor_date"].is_string());
+    assert_eq!(error["error"]["details"]["week_starts_on"], "monday");
+    assert_eq!(
+        error["error"]["details"]["validation_scope"],
+        "all_supported_week_starts"
+    );
+    assert!(
+        error["error"]["details"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("UNTIL precedes"))
+    );
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One end-to-end strict JSON/idempotency boundary scenario.
 async fn strict_item_json_and_idempotency_conflicts_are_structured() {
     let app = test_app();

@@ -23,8 +23,8 @@ use uuid::Uuid;
 use crate::{AppState, error::ApiError};
 
 use super::{
-    DeltaChange, IdempotencyKey, Item, ItemQuery, ItemRepositoryError, ItemServiceError, NewItem,
-    ReplaceItem,
+    DeltaChange, IdempotencyKey, Item, ItemDomainError, ItemQuery, ItemRepositoryError,
+    ItemServiceError, NewItem, ReplaceItem,
     invalidation::{ItemInvalidationOpenError, ItemInvalidationSignal},
 };
 
@@ -474,6 +474,25 @@ fn mutation_response(status: StatusCode, item: Item, replayed: bool) -> Response
 
 fn map_item_error(error: ItemServiceError) -> ApiError {
     match error {
+        ItemServiceError::Domain(ItemDomainError::InvalidCustomRecurrenceAnchor {
+            anchor_date,
+            week_starts_on,
+            reason,
+        })
+        | ItemServiceError::Repository(ItemRepositoryError::InvalidItem(
+            ItemDomainError::InvalidCustomRecurrenceAnchor {
+                anchor_date,
+                week_starts_on,
+                reason,
+            },
+        )) => ApiError::validation("custom recurrence is invalid for its item creation anchor")
+            .with_details(json!({
+                "field": "recurrence.rrule",
+                "anchor_date": anchor_date,
+                "week_starts_on": week_starts_on,
+                "reason": reason,
+                "validation_scope": "all_supported_week_starts"
+            })),
         ItemServiceError::Domain(error)
         | ItemServiceError::Repository(ItemRepositoryError::InvalidItem(error)) => {
             ApiError::validation(error.to_string())
