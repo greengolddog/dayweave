@@ -61,6 +61,13 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V17 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+                requireCanonicalStructuralFields = true,
+                requireHabitLedgerField = true,
+            )
             PlannerSnapshotFormats.JSON_V16 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
                 requireGoogleSchedulePublicationField = true,
@@ -190,6 +197,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14 ||
@@ -203,6 +211,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14
@@ -222,7 +231,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V16 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V17 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -247,12 +256,13 @@ class RoomPlannerStateRepository(
         validateOnboardingFirstItemAnchor(retainedState)
         validateGoogleOutboundState(retainedState)
         validateGoogleSchedulePublicationState(retainedState)
+        retainedState.habitLedger.requireValid()
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V16,
+                payloadFormat = PlannerSnapshotFormats.JSON_V17,
             ),
         )
     }
@@ -292,6 +302,7 @@ class RoomPlannerStateRepository(
         requireGoogleSchedulePublicationField: Boolean = false,
         requireOnboardingFirstItemAnchorField: Boolean = false,
         requireCanonicalStructuralFields: Boolean = false,
+        requireHabitLedgerField: Boolean = false,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -355,14 +366,33 @@ class RoomPlannerStateRepository(
             // injecting a field that only the V15 binary understands.
             JsonObject(googleSchedulePublicationSafeRoot - "onboardingFirstItemAnchor")
         }
-        val root = if (requireCanonicalStructuralFields) {
+        val structuralSafeRoot = if (requireCanonicalStructuralFields) {
             onboardingSafeRoot
         } else {
             withoutCanonicalStructuralFields(onboardingSafeRoot)
         }
+        val root = if (requireHabitLedgerField) {
+            structuralSafeRoot
+        } else {
+            // V16 and predecessors cannot mint replay authority by injecting a newer outbox.
+            JsonObject(structuralSafeRoot - "habitLedger")
+        }
+        if (requireHabitLedgerField) {
+            val ledger = root["habitLedger"] as? JsonObject
+                ?: throw SerializationException("Current habit ledger is required")
+            if (!ledger.keys.containsAll(CURRENT_HABIT_LEDGER_FIELDS)) {
+                throw SerializationException("Current habit ledger fields are required")
+            }
+        }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
             throw SerializationException("Current schedule publication fields are required")
+        }
+        if (
+            requireHabitLedgerField &&
+            !root.containsKey("pendingSchedulePublicationInvalidated")
+        ) {
+            throw SerializationException("Current schedule publication invalidation is required")
         }
         if (requirePublicationProofField && !root.containsKey("publishedScheduleProof")) {
             throw SerializationException("Current exact schedule publication proof is required")
@@ -412,6 +442,9 @@ class RoomPlannerStateRepository(
         }
         if (requireCanonicalStructuralFields) {
             requireCanonicalStructuralItemFields(root)
+        }
+        if (requireHabitLedgerField && !root.containsKey("habitLedger")) {
+            throw SerializationException("Current habit ledger recovery state is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -465,6 +498,9 @@ class RoomPlannerStateRepository(
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
                 validateOnboardingFirstItemAnchor(it)
                 validateGoogleOutboundState(it)
+                runCatching(it.habitLedger::requireValid).getOrElse { error ->
+                    throw SerializationException("Habit ledger recovery state is invalid", error)
+                }
             }
     }
 
@@ -571,6 +607,7 @@ class RoomPlannerStateRepository(
                 "localScheduleCompositionProvenance",
                 "scheduleCompositionProfile",
                 "onboardingFirstItemAnchor",
+                "habitLedger",
             ),
         )
         requireExplicitSensitivity(root, "schedule")
@@ -621,6 +658,7 @@ class RoomPlannerStateRepository(
                     "localScheduleCompositionProvenance",
                     "scheduleCompositionProfile",
                     "onboardingFirstItemAnchor",
+                    "habitLedger",
                 ),
         )
         if (requireExistingSensitivity) {
@@ -802,6 +840,12 @@ class RoomPlannerStateRepository(
     }
 
     private fun validateSchedulePublicationState(state: DayWeaveUiState) {
+        if (
+            state.pendingSchedulePublicationInvalidated &&
+            state.pendingSchedulePublication == null
+        ) {
+            throw SerializationException("Schedule publication invalidation has no journal")
+        }
         state.pendingSchedulePublication?.let { pending ->
             if (pending.schemaVersion != 1) {
                 throw SerializationException("Unsupported schedule publication journal")
@@ -1152,6 +1196,17 @@ class RoomPlannerStateRepository(
             "blockedByItemId",
             "blockedReason",
             "hasExplicitStructuralMetadata",
+        )
+        val CURRENT_HABIT_LEDGER_FIELDS = setOf(
+            "schemaVersion",
+            "syncOrigin",
+            "configurationId",
+            "deltaCursor",
+            "deltaCaughtUp",
+            "occurrences",
+            "pauses",
+            "analytics",
+            "pendingMutations",
         )
         val SNAPSHOT_JSON = Json {
             encodeDefaults = true

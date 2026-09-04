@@ -149,14 +149,35 @@ class OkHttpHabitTransportTest {
     }
 
     @Test
+    fun pauseResponseAllowsAcceptedClientClockSkewAfterServerRecordTime() = runBlocking {
+        val futureStartedAt = "2026-09-02T08:04:00Z"
+        server.enqueue(
+            jsonResponse(
+                """{"pause":${pauseJson().replaceFirst("2026-09-02T08:00:00Z", futureStartedAt)},"replayed":false}""",
+                replayed = false,
+            ),
+        )
+
+        val mutation = transport.startPause(
+            configuration(),
+            HABIT_ID,
+            OPERATION_ID,
+            """{"operation_id":"$OPERATION_ID"}""",
+        )
+
+        assertEquals(futureStartedAt, mutation.value.startedAt)
+        assertEquals("2026-09-02T08:00:00Z", mutation.value.createdAt)
+    }
+
+    @Test
     fun analyticsDecodesFlattenedTotalsAndSupportiveFactCodes() = runBlocking {
         server.enqueue(jsonResponse("""{"analytics":${analyticsJson()}}"""))
 
         val analytics = transport.analytics(
             configuration(),
             HABIT_ID,
-            LocalDate.parse("2026-09-01"),
-            LocalDate.parse("2026-09-07"),
+            LocalDate.parse("2026-08-31"),
+            LocalDate.parse("2026-09-06"),
             RemoteHabitAnalyticsBucket.WEEK,
         )
 
@@ -166,6 +187,43 @@ class OkHttpHabitTransportTest {
         assertEquals(RemoteHabitSupportiveFactCode.ACTIVE_STREAK, analytics.supportiveFactCodes[0])
         val request = server.takeRequest()
         assertEquals("week", request.url.queryParameter("bucket"))
+    }
+
+    @Test
+    fun analyticsRejectsNonCalendarBucketsAndTrendAggregateMismatch() {
+        server.enqueue(
+            jsonResponse(
+                """{"analytics":${analyticsJson(trendStart = "2026-09-01")}}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.analytics(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-08-31"),
+                    LocalDate.parse("2026-09-06"),
+                    RemoteHabitAnalyticsBucket.WEEK,
+                )
+            }
+        }
+
+        server.enqueue(
+            jsonResponse(
+                """{"analytics":${analyticsJson(trendCompleted = 4, trendUnresolved = 1)}}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.analytics(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-08-31"),
+                    LocalDate.parse("2026-09-06"),
+                    RemoteHabitAnalyticsBucket.WEEK,
+                )
+            }
+        }
     }
 
     @Test
@@ -194,8 +252,8 @@ class OkHttpHabitTransportTest {
         val analytics = transport.analytics(
             configuration(),
             HABIT_ID,
-            LocalDate.parse("2026-09-01"),
-            LocalDate.parse("2026-09-07"),
+            LocalDate.parse("2026-08-31"),
+            LocalDate.parse("2026-09-06"),
             RemoteHabitAnalyticsBucket.WEEK,
         )
 
@@ -203,6 +261,27 @@ class OkHttpHabitTransportTest {
         assertEquals(2_500, occurrence.outcome?.progressBasisPoints)
         assertEquals(-7L, occurrence.outcome?.quantity)
         assertEquals(-105L, analytics.quantityTotals.single().amount)
+    }
+
+    @Test
+    fun responseTextLimitsCountUnicodeScalarsRatherThanUtf16CodeUnits() = runBlocking {
+        val note = "😀".repeat(10_000)
+        val occurrence = occurrenceJson(withOutcome = true)
+            .replace("\"note\":\"Good start\"", "\"note\":\"$note\"")
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$occurrence],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+
+        val page = transport.listOccurrences(
+            configuration(),
+            HABIT_ID,
+            LocalDate.parse("2026-09-01"),
+            LocalDate.parse("2026-09-07"),
+        )
+
+        assertEquals(note, page.occurrences.single().outcome?.note)
     }
 
     @Test
@@ -242,6 +321,125 @@ class OkHttpHabitTransportTest {
         server.enqueue(
             jsonResponse(
                 """{"occurrences":[${occurrenceJson(withOutcome = true).replace("\"progress_basis_points\":3500", "\"progress_basis_points\":10000")}],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun occurrenceEvidenceRequiresPlannerUuidV5ExactIdentityAndMicroseconds() {
+        val invalidOccurrences = listOf(
+            occurrenceJson().replace(
+                PLANNER_OCCURRENCE_ID,
+                "33333333-3333-4333-8333-333333333333",
+            ),
+            occurrenceJson().replace(
+                "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
+                "{\"type\":\"custom\"}",
+            ),
+            occurrenceJson().replace(
+                "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
+                "{\"type\":\"rolling_minutes\",\"index\":4294967296,\"anchor\":\"2026-09-01T07:00:00Z\"}",
+            ),
+            occurrenceJson().replace(
+                "{\"type\":\"calendar_day\",\"date\":\"2026-09-01\",\"bucket_ordinal\":0}",
+                "{\"type\":\"rolling_month\",\"cycle\":2147483648,\"index\":0,\"anchor\":\"2026-09-01T07:00:00Z\"}",
+            ),
+            occurrenceJson().replace(
+                "\"date\":\"2026-09-01\"",
+                "\"date\":\"2026-09-02\"",
+            ),
+            occurrenceJson(withOutcome = true).replace(
+                "\"updated_at\":\"2026-09-01T07:31:00Z\"",
+                "\"updated_at\":\"2026-09-01T07:31:00.000000001Z\"",
+            ),
+        )
+
+        invalidOccurrences.forEach { occurrence ->
+            server.enqueue(
+                jsonResponse(
+                    """{"occurrences":[$occurrence],"next_cursor":null,"has_more":false}""",
+                ),
+            )
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.listOccurrences(
+                        configuration(),
+                        HABIT_ID,
+                        LocalDate.parse("2026-09-01"),
+                        LocalDate.parse("2026-09-07"),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun malformedRemoteDatesAndInstantsAreTypedAsProtocolFailures() {
+        val malformedOccurrences = listOf(
+            occurrenceJson().replace(
+                "\"nominal_start\":\"2026-09-01T07:00:00Z\"",
+                "\"nominal_start\":\"not-an-instant\"",
+            ),
+            occurrenceJson().replace(
+                "\"local_date\":\"2026-09-01\"",
+                "\"local_date\":\"not-a-date\"",
+            ),
+        )
+
+        malformedOccurrences.forEach { occurrence ->
+            server.enqueue(
+                jsonResponse(
+                    """{"occurrences":[$occurrence],"next_cursor":null,"has_more":false}""",
+                ),
+            )
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.listOccurrences(
+                        configuration(),
+                        HABIT_ID,
+                        LocalDate.parse("2026-09-01"),
+                        LocalDate.parse("2026-09-07"),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun occurrencePageRejectsRowsOutsideRequestedWindowOrOutOfServerOrder() {
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[${occurrenceJson().replace("2026-09-01", "2026-09-08")}],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                )
+            }
+        }
+
+        val later = occurrenceJson()
+            .replace(OCCURRENCE_ID, SECOND_OCCURRENCE_ID)
+            .replace(PLANNER_OCCURRENCE_ID, SECOND_PLANNER_OCCURRENCE_ID)
+            .replace("2026-09-01", "2026-09-02")
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$later,${occurrenceJson()}],"next_cursor":null,"has_more":false}""",
             ),
         )
         assertThrows(HabitApiException.InvalidResponse::class.java) {
@@ -331,6 +529,27 @@ class OkHttpHabitTransportTest {
                 )
             }
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("1899-12-31"),
+                    LocalDate.parse("1900-01-01"),
+                )
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                transport.analytics(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2200-12-31"),
+                    LocalDate.parse("2201-01-01"),
+                    RemoteHabitAnalyticsBucket.DAY,
+                )
+            }
+        }
         assertEquals(0, server.requestCount)
     }
 
@@ -400,7 +619,7 @@ class OkHttpHabitTransportTest {
             "source_schedule_revision_id":"$SCHEDULE_REVISION_ID",
             "source_item_revision":7,
             "policy_fingerprint":"sha256:${"a".repeat(64)}",
-            "identity":{"type":"calendar_slot","local_date":"2026-09-01","ordinal":0},
+            "identity":{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":0},
             "nominal_start":"2026-09-01T07:00:00Z",
             "nominal_end":"2026-09-01T07:30:00Z",
             "window_start":"2026-09-01T06:00:00Z",
@@ -445,11 +664,15 @@ class OkHttpHabitTransportTest {
         }
     """.trimIndent()
 
-    private fun analyticsJson(): String = """
+    private fun analyticsJson(
+        trendStart: String = "2026-08-31",
+        trendCompleted: Long = 5,
+        trendUnresolved: Long = 0,
+    ): String = """
         {
           "habit_id":"$HABIT_ID",
-          "start_date":"2026-09-01",
-          "end_date":"2026-09-07",
+          "start_date":"2026-08-31",
+          "end_date":"2026-09-06",
           "bucket":"week",
           "expected":7,
           "eligible":7,
@@ -465,31 +688,33 @@ class OkHttpHabitTransportTest {
           "current_streak":4,
           "longest_streak":9,
           "trends":[{
-            "start_date":"2026-09-01",
-            "end_date":"2026-09-07",
+            "start_date":"$trendStart",
+            "end_date":"2026-09-06",
             "expected":7,
             "eligible":7,
-            "completed":5,
+            "completed":$trendCompleted,
             "partial":1,
             "skipped":0,
             "missed":1,
             "excused":0,
-            "unresolved":0,
+            "unresolved":$trendUnresolved,
             "adherence_basis_points":8571,
             "actual_seconds_total":9000,
             "quantity_totals":[{"unit":"pages","amount":105}]
           }],
-          "supportive_fact_codes":["active_streak"]
+          "supportive_fact_codes":["active_streak","strong_adherence","fresh_start_available"]
         }
     """.trimIndent()
 
     private companion object {
         const val HABIT_ID = "11111111-1111-4111-8111-111111111111"
         const val OCCURRENCE_ID = "22222222-2222-4222-8222-222222222222"
-        const val PLANNER_OCCURRENCE_ID = "33333333-3333-4333-8333-333333333333"
+        const val PLANNER_OCCURRENCE_ID = "33333333-3333-5333-8333-333333333333"
         const val SCHEDULE_REVISION_ID = "44444444-4444-4444-8444-444444444444"
         const val PAUSE_ID = "55555555-5555-4555-8555-555555555555"
         const val OPERATION_ID = "66666666-6666-4666-8666-666666666666"
         const val SECOND_OPERATION_ID = "77777777-7777-4777-8777-777777777777"
+        const val SECOND_OCCURRENCE_ID = "88888888-8888-4888-8888-888888888888"
+        const val SECOND_PLANNER_OCCURRENCE_ID = "99999999-9999-5999-8999-999999999999"
     }
 }

@@ -8,6 +8,8 @@ import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DayWeaveViewModelRoutingTest {
@@ -139,6 +141,62 @@ class DayWeaveViewModelRoutingTest {
 
         assertEquals(false, saved)
         assertEquals(false, syncScheduled)
+    }
+
+    @Test
+    fun durableHabitOutcomeSchedulesBestEffortBackgroundSync() = runBlocking {
+        val calls = mutableListOf<String>()
+
+        val saved = persistHabitOutcomeThenScheduleSync(
+            persist = {
+                calls += "persist-exact-outcome"
+                true
+            },
+            scheduleSync = { calls += "sync" },
+        )
+
+        assertTrue(saved)
+        assertEquals(listOf("persist-exact-outcome", "sync"), calls)
+    }
+
+    @Test
+    fun rejectedHabitOutcomePersistenceKeepsTheActionRetryableWithoutStartingSync() = runBlocking {
+        var syncScheduled = false
+
+        val saved = persistHabitOutcomeThenScheduleSync(
+            persist = { false },
+            scheduleSync = { syncScheduled = true },
+        )
+
+        assertFalse(saved)
+        assertFalse(syncScheduled)
+    }
+
+    @Test
+    fun habitActionAdmissionPropagatesBusyAndSharedGateRejection() {
+        var launchCalls = 0
+
+        assertFalse(
+            admitHabitAction(habitBusy = true) {
+                launchCalls += 1
+                true
+            },
+        )
+        assertEquals(0, launchCalls)
+        assertFalse(
+            admitHabitAction(habitBusy = false) {
+                launchCalls += 1
+                false
+            },
+        )
+        assertEquals(1, launchCalls)
+        assertTrue(
+            admitHabitAction(habitBusy = false) {
+                launchCalls += 1
+                true
+            },
+        )
+        assertEquals(2, launchCalls)
     }
 
     private fun block(id: String, canonicalItemId: String?) = ScheduleItem(

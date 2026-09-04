@@ -5,15 +5,27 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemDraft
+import com.greengolddog.dayweave.model.CanonicalRecurrenceDraft
+import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
 import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
 import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
+import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitOccurrenceEvidenceSnapshot
+import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeCommandSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingHabitMutation
+import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
+import com.greengolddog.dayweave.model.PendingHabitMutationKind
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
@@ -35,6 +47,7 @@ import com.greengolddog.dayweave.network.CanonicalItemRevisionRequest
 import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.PlannerApiException
+import com.greengolddog.dayweave.network.PlannerValidationReason
 import com.greengolddog.dayweave.network.RemoteCanonicalItem
 import com.greengolddog.dayweave.network.RemoteCurrentPublishedSchedule
 import com.greengolddog.dayweave.network.RemoteItemDeltaChange
@@ -51,6 +64,7 @@ import com.greengolddog.dayweave.network.RemoteSchedulePlan
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
 import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
 import com.greengolddog.dayweave.network.RemotePublishedScheduleRevision
+import com.greengolddog.dayweave.network.RemoteRejectedScheduleItem
 import com.greengolddog.dayweave.network.RemoteUnscheduledWork
 import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
@@ -89,6 +103,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -4344,6 +4359,131 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun authoritativeHabitPartialProgressUsesImmutableDurationAndIgnoresPendingCorrection() =
+        runBlocking {
+            val evidence = HabitOccurrenceEvidenceSnapshot(
+                id = HABIT_LEDGER_OCCURRENCE_ID,
+                habitId = TASK_ID,
+                plannerOccurrenceId = OCCURRENCE_ID,
+                sourceScheduleRevisionId = HABIT_SOURCE_SCHEDULE_ID,
+                sourceItemRevision = 7,
+                policyFingerprint = "sha256:${"a".repeat(64)}",
+                identity = dailyOccurrenceIdentity(),
+                nominalStart = "2026-09-01T07:00:00Z",
+                nominalEnd = "2026-09-01T07:30:01Z",
+                windowStart = "2026-09-01T06:00:00Z",
+                windowEnd = "2026-09-01T10:00:00Z",
+                localDate = "2026-09-01",
+                timezoneName = "Europe/Madrid",
+                expectedDurationSeconds = 1_801,
+                expectedQuantity = null,
+                expectedUnit = null,
+            )
+            val authoritative = HabitOutcomeSnapshot(
+                revision = 1,
+                status = HabitOutcomeStatusSnapshot.PARTIAL,
+                progressBasisPoints = 3_500,
+                quantity = null,
+                unit = null,
+                actualSeconds = 600,
+                note = null,
+                occurredAt = "2026-09-01T07:10:00Z",
+                updatedAt = "2026-09-01T07:11:00Z",
+            )
+            val pendingCommand = HabitOutcomeCommandSnapshot(
+                operationId = HABIT_OPERATION_ID,
+                expectedRevision = 1,
+                outcome = HabitOutcomeInputSnapshot(
+                    status = HabitOutcomeStatusSnapshot.PARTIAL,
+                    progressBasisPoints = 8_000,
+                    quantity = null,
+                    unit = null,
+                    actualSeconds = 1_400,
+                    note = null,
+                    occurredAt = "2026-09-01T07:20:00Z",
+                ),
+            )
+            val ledger = HabitLedgerSnapshot(
+                syncOrigin = "https://api.example.test/",
+                configurationId = "connection-1",
+                occurrences = mapOf(
+                    evidence.id to HabitOccurrenceSnapshot(evidence, authoritative),
+                ),
+                pendingMutations = listOf(
+                    PendingHabitMutation(
+                        schemaVersion = PendingHabitMutation.CURRENT_SCHEMA_VERSION,
+                        kind = PendingHabitMutationKind.OUTCOME,
+                        habitId = TASK_ID,
+                        targetId = evidence.id,
+                        expectedRevision = 1,
+                        idempotencyKey = HABIT_OPERATION_ID,
+                        requestJson = pendingCommand.encoded(),
+                        createdAt = "2026-09-01T07:20:00Z",
+                        syncOrigin = "https://api.example.test/",
+                        configurationId = "connection-1",
+                    ),
+                ),
+            ).also(HabitLedgerSnapshot::requireValid)
+            val plannerStore = PlannerStore(
+                DayWeaveUiState(
+                    canonicalSyncOrigin = "https://api.example.test/",
+                    canonicalConfigurationId = "connection-1",
+                    habitLedger = ledger,
+                ),
+            )
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(
+                        RemoteItemDeltaChange(
+                            type = "upsert",
+                            item = remoteItem(split = false).copy(
+                                kind = "habit",
+                                title = "Renamed without changing recurrence",
+                                durationSeconds = 1_801,
+                                deadlineAt = null,
+                                recurrence = dailyRecurrence(),
+                                revision = 8,
+                                updatedAt = "2026-08-29T11:00:00Z",
+                            ),
+                        ),
+                    ),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = preview().copy(
+                    sourceItemRevisions = mapOf(TASK_ID to 8),
+                    plan = preview().plan.copy(
+                        blocks = listOf(
+                            preview().plan.blocks.single().copy(
+                                title = "Renamed without changing recurrence",
+                            ),
+                        ),
+                    ),
+                )
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(plannerStore, transport).refreshAndCompose(),
+            )
+
+            val progress = requireNotNull(
+                transport.previewRequests.single().recurrenceContext["partial_progress"],
+            ).jsonObject
+            assertEquals(setOf(OCCURRENCE_ID), progress.keys)
+            val occurrenceProgress = progress.getValue(OCCURRENCE_ID).jsonObject
+            assertEquals(
+                "3500",
+                occurrenceProgress.getValue("progress_basis_points").jsonPrimitive.content,
+            )
+            assertEquals(
+                "31",
+                occurrenceProgress.getValue("expected_duration_minutes").jsonPrimitive.content,
+            )
+            assertEquals(null, occurrenceProgress["remaining_duration_minutes"])
+        }
+
+    @Test
     fun recurrenceMoveAcceptsLaterHorizonDaysAndRejectsOutsideTheExactHorizon() = runBlocking {
         suspend fun verify(dayOffset: Long, expectedSuccess: Boolean) {
             val recurringItem = remoteItem(split = false).copy(
@@ -5138,6 +5278,54 @@ class CanonicalSyncManagerTest {
         }
 
     @Test
+    fun customAnchorValidationPersistsAClientOwnedRruleRepairDiagnostic() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(
+                    RemoteItemDeltaChange(
+                        type = "upsert",
+                        item = authoredRemote(TASK_ID, revision = 7),
+                    ),
+                ),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val mutationId = "99999999-9999-4999-8999-999999999995"
+        val customDraft = authoredDraft().copy(
+            recurrence = CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.CUSTOM,
+                rrule = "FREQ=DAILY;UNTIL=20260905",
+            ),
+        )
+        requireNotNull(
+            plannerStore.enqueueCanonicalReplace(TASK_ID, customDraft, mutationId),
+        )
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+        transport.replacementError = PlannerApiException.Validation(
+            422,
+            PlannerValidationReason.CUSTOM_RECURRENCE_ANCHOR,
+        )
+        transport.queuedPreviews += preview()
+        transport.queuedPreviews += preview()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        val conflict = requireNotNull(plannerStore.canonicalAuthoringMutation(mutationId))
+        assertEquals(CanonicalAuthoringDisposition.CONFLICTED, conflict.disposition)
+        assertEquals(
+            "This custom RRULE cannot produce an occurrence from the server-assigned creation " +
+                "date under every week-start setting. Extend UNTIL or adjust INTERVAL, BYDAY, " +
+                "or BYMONTHDAY, then retry or discard the retained change.",
+            conflict.diagnostic,
+        )
+    }
+
+    @Test
     fun queuedTrashAndRestoreReconcileDeletedAndActiveResponses() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {
@@ -5405,6 +5593,168 @@ class CanonicalSyncManagerTest {
             assertEquals(0, composeCalls)
             assertEquals(initial, plannerStore.state.value)
         }
+    }
+
+    @Test
+    fun localHabitCompositionRequiresACompleteDurableHabitCheckpoint() = runBlocking {
+        val origin = "https://api.example.test/"
+        val configurationId = "connection-1"
+        val habit = localCanonicalItem().copy(kind = "habit")
+        val evidence = HabitOccurrenceEvidenceSnapshot(
+            id = HABIT_LEDGER_OCCURRENCE_ID,
+            habitId = habit.id,
+            plannerOccurrenceId = OCCURRENCE_ID,
+            sourceScheduleRevisionId = HABIT_SOURCE_SCHEDULE_ID,
+            sourceItemRevision = habit.revision,
+            policyFingerprint = "sha256:${"a".repeat(64)}",
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T07:00:00Z",
+            nominalEnd = "2026-09-01T07:30:00Z",
+            windowStart = "2026-09-01T06:00:00Z",
+            windowEnd = "2026-09-01T10:00:00Z",
+            localDate = "2026-09-01",
+            timezoneName = "Europe/Madrid",
+            expectedDurationSeconds = 1_800,
+            expectedQuantity = null,
+            expectedUnit = null,
+        )
+        val occurrence = HabitOccurrenceSnapshot(evidence, outcome = null)
+        val pendingCommand = HabitOutcomeCommandSnapshot(
+            operationId = HABIT_OPERATION_ID,
+            expectedRevision = 0,
+            outcome = HabitOutcomeInputSnapshot(
+                status = HabitOutcomeStatusSnapshot.PARTIAL,
+                progressBasisPoints = 5_000,
+                quantity = null,
+                unit = null,
+                actualSeconds = 900,
+                note = null,
+                occurredAt = "2026-09-01T07:20:00Z",
+            ),
+        )
+        val pending = PendingHabitMutation(
+            schemaVersion = PendingHabitMutation.CURRENT_SCHEMA_VERSION,
+            kind = PendingHabitMutationKind.OUTCOME,
+            habitId = habit.id,
+            targetId = evidence.id,
+            expectedRevision = 0,
+            idempotencyKey = HABIT_OPERATION_ID,
+            requestJson = pendingCommand.encoded(),
+            createdAt = "2026-09-01T07:20:00Z",
+            syncOrigin = origin,
+            configurationId = configurationId,
+        )
+        val incomplete = localCompositionReadyState().copy(
+            canonicalItems = listOf(habit),
+            habitLedger = HabitLedgerSnapshot(
+                syncOrigin = origin,
+                configurationId = configurationId,
+                deltaCursor = null,
+                occurrences = mapOf(evidence.id to occurrence),
+            ),
+        )
+        var composeCalls = 0
+        suspend fun compose(state: DayWeaveUiState): CanonicalRefreshOutcome =
+            manager(
+                PlannerStore(state),
+                FakeCanonicalTransport(),
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    composeCalls += 1
+                    emptyLocalComposition(request).copy(
+                        sourceItemCount = 1,
+                        sourceItemRevisions = mapOf(habit.id to habit.revision),
+                        rejectedItems = listOf(
+                            RemoteRejectedScheduleItem(
+                                itemId = habit.id,
+                                isSensitive = habit.isSensitive,
+                                title = habit.title,
+                                reason = "Synthetic unsupported habit",
+                            ),
+                        ),
+                    )
+                },
+            ).composeLocally()
+
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, compose(incomplete))
+        assertEquals(0, composeCalls)
+
+        val intermediate = incomplete.copy(
+            habitLedger = incomplete.habitLedger.copy(deltaCursor = "habit-cursor"),
+        )
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, compose(intermediate))
+        assertEquals(0, composeCalls)
+
+        val complete = intermediate.copy(
+            habitLedger = intermediate.habitLedger.copy(deltaCaughtUp = true),
+        )
+        val pendingState = complete.copy(
+            habitLedger = complete.habitLedger.copy(pendingMutations = listOf(pending))
+                .also(HabitLedgerSnapshot::requireValid),
+        )
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, compose(pendingState))
+        assertEquals(0, composeCalls)
+
+        val discardedConflictStore = PlannerStore(complete)
+        assertNotNull(discardedConflictStore.stageHabitMutation(pending))
+        assertNotNull(
+            discardedConflictStore.markHabitMutationForReview(
+                HABIT_OPERATION_ID,
+                PendingHabitMutationDisposition.CONFLICT,
+            ),
+        )
+        assertNotNull(discardedConflictStore.discardReviewedHabitMutation(HABIT_OPERATION_ID))
+        assertFalse(discardedConflictStore.state.value.habitLedger.deltaCaughtUp)
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            compose(discardedConflictStore.state.value),
+        )
+        assertEquals(0, composeCalls)
+
+        discardedConflictStore.applyHabitDeltaPage(
+            origin,
+            configurationId,
+            occurrences = emptyList(),
+            pauses = emptyList(),
+            nextCursor = "habit-cursor",
+            hasMore = false,
+        )
+        assertTrue(discardedConflictStore.state.value.habitLedger.deltaCaughtUp)
+
+        val completeStore = PlannerStore(complete)
+        val completeOutcome = manager(
+            completeStore,
+            FakeCanonicalTransport(),
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                composeCalls += 1
+                emptyLocalComposition(request).copy(
+                    sourceItemCount = 1,
+                    sourceItemRevisions = mapOf(habit.id to habit.revision),
+                    rejectedItems = listOf(
+                        RemoteRejectedScheduleItem(
+                            itemId = habit.id,
+                            isSensitive = habit.isSensitive,
+                            title = habit.title,
+                            reason = "Synthetic unsupported habit",
+                        ),
+                    ),
+                )
+            },
+        ).composeLocally()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, completeOutcome)
+        assertEquals(1, composeCalls)
+        assertNotNull(completeStore.state.value.localScheduleCompositionProvenance)
+
+        completeStore.applyHabitDeltaPage(
+            origin,
+            configurationId,
+            occurrences = emptyList(),
+            pauses = emptyList(),
+            nextCursor = "habit-cursor-next",
+            hasMore = true,
+        )
+        assertFalse(completeStore.state.value.habitLedger.deltaCaughtUp)
+        assertNull(completeStore.state.value.localScheduleCompositionProvenance)
     }
 
     @Test
@@ -6149,6 +6499,9 @@ class CanonicalSyncManagerTest {
         const val SECOND_BLOCK_ID = "33333333-3333-4333-8333-333333333333"
         const val THIRD_BLOCK_ID = "99999999-9999-4999-8999-999999999999"
         const val OCCURRENCE_ID = "44444444-4444-5444-8444-444444444444"
+        const val HABIT_LEDGER_OCCURRENCE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        const val HABIT_SOURCE_SCHEDULE_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        const val HABIT_OPERATION_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         const val EXECUTION_ID = "55555555-5555-4555-8555-555555555555"
         const val DEVICE_ID = "66666666-6666-4666-8666-666666666666"
         const val CALENDAR_ITEM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

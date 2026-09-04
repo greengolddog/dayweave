@@ -21,6 +21,7 @@ import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -315,20 +316,23 @@ class CanonicalAuthoringPresentationTest {
     }
 
     @Test
-    fun customRruleIsVisibleRetainedAndReadOnly() {
-        val custom = item(PARENT_ID, "Legacy recurrence", "inbox").copy(
+    fun finiteCustomRruleIsVisibleAndEditable() {
+        val custom = item(PARENT_ID, "Custom recurrence", "inbox").copy(
             recurrenceJson =
-                """{"type":"custom","rrule":"FREQ=MONTHLY;BYDAY=1MO,-1FR"}""",
+                """{"type":"custom","rrule":"FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=-1,1;COUNT=24"}""",
         )
 
         val row = CanonicalAuthoringPresentation.build(
             DayWeaveUiState(canonicalItems = listOf(custom)),
         ).inbox.single()
 
-        assertEquals("FREQ=MONTHLY;BYDAY=1MO,-1FR", row.draft?.recurrence?.rrule)
-        assertTrue(row.isReadOnly)
+        assertEquals(
+            "FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=-1,1;COUNT=24",
+            row.draft?.recurrence?.rrule,
+        )
+        assertFalse(row.isReadOnly)
         assertTrue(row.canTrash)
-        assertTrue(row.diagnostic.orEmpty().contains("Custom RRULE"))
+        assertNull(row.diagnostic)
     }
 
     private fun item(

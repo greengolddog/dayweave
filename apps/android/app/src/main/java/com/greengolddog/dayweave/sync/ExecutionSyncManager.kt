@@ -139,7 +139,10 @@ class ExecutionSyncManager(
         }
     }
 
-    suspend fun start(blockId: String): ExecutionSyncOutcome = command(blockId) { context ->
+    suspend fun start(blockId: String): ExecutionSyncOutcome = command(
+        blockId = blockId,
+        requireReconciledHabitOutbox = true,
+    ) { context ->
         if (
             context.snapshot.activeSession != null ||
             plannerStore.state.value.activeSession != null
@@ -889,9 +892,17 @@ class ExecutionSyncManager(
 
     private suspend fun command(
         blockId: String,
+        requireReconciledHabitOutbox: Boolean = false,
         build: (CommandContext) -> CommandSpec,
     ): ExecutionSyncOutcome = withReadyStore {
         operationMutex.withLock {
+            if (
+                requireReconciledHabitOutbox &&
+                plannerStore.state.value.habitLedger.pendingMutations.isNotEmpty()
+            ) {
+                updateError("Synchronize saved habit changes before starting canonical work.")
+                return@withLock ExecutionSyncOutcome.INVALID_LOCAL_STATE
+            }
             val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
             updateBusy("Checking the cross-device execution lease…")
             try {

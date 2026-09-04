@@ -1,6 +1,9 @@
 package com.greengolddog.dayweave.model
 
 import com.greengolddog.dayweave.network.RemotePlanOccurrence
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -16,7 +19,7 @@ class RecurrenceIdentityTest {
     fun everyTypedIdentityVariantIsAcceptedWithoutRewritingOffsets() {
         val identities = listOf(
             json("""{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":2}"""),
-            json("""{"type":"calendar_week","week_key":2460920,"bucket_ordinal":3}"""),
+            json("""{"type":"calendar_week","week_key":2461284,"bucket_ordinal":3}"""),
             json(
                 """{"type":"calendar_month","year":2026,"month":9,"bucket_ordinal":4}""",
             ),
@@ -24,12 +27,21 @@ class RecurrenceIdentityTest {
                 """{"type":"rolling_minutes","index":5,"anchor":"2026-08-31T23:00:00.123456+02:00"}""",
             ),
             json(
+                """{"type":"rolling_minutes","index":4294967295,"anchor":"2026-08-31T23:00:00Z"}""",
+            ),
+            json(
                 """{"type":"after_completion","anchor":"2026-08-31T23:00:00+02:00"}""",
             ),
             json(
                 """{"type":"rolling_month","cycle":6,"index":7,"anchor":"2026-08-31T23:00:00+02:00"}""",
             ),
+            json(
+                """{"type":"rolling_month","cycle":2147483647,"index":65535,"anchor":"2026-08-31T23:00:00Z"}""",
+            ),
             json("""{"type":"custom"}"""),
+            json(
+                """{"type":"custom_rule","rule_id":"aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa","sequence":8,"date":"2026-09-01"}""",
+            ),
         )
 
         identities.forEach { identity ->
@@ -49,7 +61,14 @@ class RecurrenceIdentityTest {
             """{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":65536}""",
             """{"type":"calendar_month","year":2026,"month":13,"bucket_ordinal":0}""",
             """{"type":"rolling_minutes","index":0,"anchor":"tomorrow"}""",
+            """{"type":"rolling_minutes","index":-1,"anchor":"2026-08-31T23:00:00Z"}""",
+            """{"type":"rolling_minutes","index":4294967296,"anchor":"2026-08-31T23:00:00Z"}""",
             """{"type":"after_completion","anchor":"2026-08-31T23:00:00.123456789+02:00"}""",
+            """{"type":"rolling_month","cycle":-1,"index":0,"anchor":"2026-08-31T23:00:00Z"}""",
+            """{"type":"rolling_month","cycle":2147483648,"index":0,"anchor":"2026-08-31T23:00:00Z"}""",
+            """{"type":"custom_rule","rule_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","sequence":8,"date":"2026-09-01"}""",
+            """{"type":"custom_rule","rule_id":"aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa","sequence":-1,"date":"2026-09-01"}""",
+            """{"type":"custom_rule","rule_id":"aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa","sequence":8,"date":"tomorrow"}""",
         ).forEach { raw ->
             assertNull(validatedRecurrenceIdentityJson(json(raw)))
         }
@@ -123,7 +142,7 @@ class RecurrenceIdentityTest {
             itemId = item.id,
             itemRevision = item.revision,
             identityJson =
-                """{"type":"calendar_week","week_key":2460920,"bucket_ordinal":3}""",
+                """{"type":"calendar_week","week_key":2461284,"bucket_ordinal":3}""",
             nominalStart = "2026-09-01T00:00:00Z",
             nominalEnd = "2026-09-01T01:00:00Z",
             localDate = "2026-09-01",
@@ -134,6 +153,69 @@ class RecurrenceIdentityTest {
         assertTrue(!source.copy(localDate = null).hasValidRecurrenceSourceFor(item))
         assertTrue(
             !source.copy(localDate = "2026-08-31").hasValidRecurrenceSourceFor(item),
+        )
+        assertTrue(
+            !source.copy(
+                identityJson =
+                    """{"type":"calendar_week","week_key":2461277,"bucket_ordinal":3}""",
+            ).hasValidRecurrenceSourceFor(item),
+        )
+    }
+
+    @Test
+    fun customRuleSourceRequiresItsExactGeneratedDate() {
+        val item = canonicalItem()
+        val source = RecurrenceOccurrenceSourceSnapshot(
+            itemId = item.id,
+            itemRevision = item.revision,
+            identityJson =
+                """{"type":"custom_rule","rule_id":"aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa","sequence":3,"date":"2026-09-01"}""",
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 3,
+        )
+
+        assertTrue(source.hasValidRecurrenceSourceFor(item))
+        assertTrue(
+            !source.copy(
+                identityJson = requireNotNull(source.identityJson)
+                    .replace("2026-09-01", "2026-09-02"),
+            ).hasValidRecurrenceSourceFor(item),
+        )
+    }
+
+    @Test
+    fun habitEvidenceContextUsesIanaCalendarDatesAcrossDstAndRejectsCrossMidnight() {
+        val identity = json(
+            """{"type":"calendar_day","date":"2026-03-29","bucket_ordinal":0}""",
+        )
+        val localDate = LocalDate.parse("2026-03-29")
+        val timezone = ZoneId.of("Europe/Paris")
+
+        assertTrue(
+            identity.matchesHabitEvidenceContext(
+                localDate,
+                timezone,
+                Instant.parse("2026-03-29T00:30:00Z"),
+                Instant.parse("2026-03-29T01:30:00Z"),
+            ),
+        )
+        assertTrue(
+            !identity.matchesHabitEvidenceContext(
+                localDate,
+                timezone,
+                Instant.parse("2026-03-29T00:30:00Z"),
+                Instant.parse("2026-03-29T22:30:00.000001Z"),
+            ),
+        )
+        assertTrue(
+            !json("""{"type":"custom"}""").matchesHabitEvidenceContext(
+                localDate,
+                timezone,
+                Instant.parse("2026-03-29T00:30:00Z"),
+                Instant.parse("2026-03-29T01:30:00Z"),
+            ),
         )
     }
 

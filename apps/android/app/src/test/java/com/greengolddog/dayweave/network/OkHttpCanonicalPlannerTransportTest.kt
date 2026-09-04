@@ -756,6 +756,91 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun customAnchorValidationMapsOnlyTheExactBoundedEnvelopeToATrustedReason() {
+        val untrustedServerText = "<script>do not display me</script>"
+        val exact = """{"error":{"code":"validation_failed","message":"custom recurrence is invalid for its item creation anchor","details":{"field":"recurrence.rrule","anchor_date":"2026-09-04","week_starts_on":"monday","reason":"$untrustedServerText","validation_scope":"all_supported_week_starts"}}}"""
+        server.enqueue(trustedError(422, exact))
+
+        val recognized = assertThrows(PlannerApiException.Validation::class.java) {
+            runBlocking {
+                transport.createItem(
+                    configuration(),
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    createRequest(),
+                )
+            }
+        }
+
+        assertEquals(422, recognized.statusCode)
+        assertEquals(PlannerValidationReason.CUSTOM_RECURRENCE_ANCHOR, recognized.reason)
+        assertFalse(requireNotNull(recognized.message).contains(untrustedServerText))
+
+        server.enqueue(trustedError(422, exact))
+        val recognizedReplacement = assertThrows(PlannerApiException.Validation::class.java) {
+            runBlocking {
+                transport.replaceItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    ReplaceCanonicalItemRequest(7, createRequest().toReplacement()),
+                )
+            }
+        }
+        assertEquals(
+            PlannerValidationReason.CUSTOM_RECURRENCE_ANCHOR,
+            recognizedReplacement.reason,
+        )
+
+        listOf(
+            exact.replace(
+                "\"validation_scope\":\"all_supported_week_starts\"",
+                "\"validation_scope\":\"all_supported_week_starts\",\"future\":true",
+            ),
+            exact.replace("\"anchor_date\":\"2026-09-04\"", "\"anchor_date\":\"09/04/2026\""),
+            exact.replace("\"field\":\"recurrence.rrule\"", "\"field\":{}"),
+            exact.replace(
+                "\"field\":\"recurrence.rrule\"",
+                "\"field\":\"recurrence.rrule\",\"field\":\"recurrence.rrule\"",
+            ),
+            exact.replace(
+                "custom recurrence is invalid for its item creation anchor",
+                "another validation failure",
+            ),
+        ).forEach { body ->
+            server.enqueue(trustedError(422, body))
+            val generic = assertThrows(PlannerApiException.Validation::class.java) {
+                runBlocking {
+                    transport.createItem(
+                        configuration(),
+                        "android-item-33333333-3333-4333-8333-333333333333",
+                        createRequest(),
+                    )
+                }
+            }
+            assertEquals(null, generic.reason)
+            assertFalse(requireNotNull(generic.message).contains(untrustedServerText))
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(422)
+                .addHeader("Content-Type", "application/json")
+                .body(exact)
+                .build(),
+        )
+        val missingTrustHeaders = assertThrows(PlannerApiException.Validation::class.java) {
+            runBlocking {
+                transport.createItem(
+                    configuration(),
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    createRequest(),
+                )
+            }
+        }
+        assertEquals(null, missingTrustHeaders.reason)
+    }
+
+    @Test
     fun missingCurrentSensitivityFieldFailsClosed() {
         val current = Json.parseToJsonElement(itemJson()) as JsonObject
         val missing = JsonObject(current - "is_sensitive").toString()

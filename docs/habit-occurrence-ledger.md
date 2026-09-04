@@ -110,8 +110,10 @@ Delta returns ordered full upserts and an opaque continuation:
 ```
 
 There are no destructive tombstones: clearing an outcome is an unresolved upsert and closing a
-pause is a higher-revision pause upsert. Clients should drain pages until `has_more` is false and
-persist the returned cursor atomically with applied changes.
+pause is a higher-revision pause upsert. Clients must persist every returned cursor atomically with
+its applied changes and a separate terminal-checkpoint bit: a page with `has_more: true` persists
+the bit as false, and only a page with `has_more: false` sets it true. An intermediate cursor may
+resume the drain efficiently, but it cannot authorize local composition or stream-only readiness.
 
 The SSE endpoint requires `Accept: text/event-stream` exactly and accepts an opaque cursor in
 `Last-Event-ID`. A `habit-invalidation` event contains only `{"cursor":"opaque"}`. Heartbeats are

@@ -6,10 +6,15 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.time.DateTimeException
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.util.Locale
 import java.util.UUID
+import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
+import com.greengolddog.dayweave.model.hasAtMostUnicodeScalars
+import com.greengolddog.dayweave.model.matchesHabitEvidenceContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -345,7 +350,25 @@ class OkHttpHabitTransport(
         return validatedHabitResponse {
             require(envelope.occurrences.size <= limit)
             require(envelope.hasMore == (envelope.nextCursor != null))
-            envelope.occurrences.forEach { it.requireValid(habitId) }
+            var previousOccurrence: RemoteHabitOccurrenceEvidence? = null
+            envelope.occurrences.forEach { occurrence ->
+                occurrence.requireValid(habitId)
+                val evidence = occurrence.evidence
+                val occurrenceDate = LocalDate.parse(evidence.localDate)
+                require(occurrenceDate in startDate..endDate)
+                previousOccurrence?.let { previous ->
+                    require(
+                        compareValuesBy(
+                            previous,
+                            evidence,
+                            { LocalDate.parse(it.localDate) },
+                            { Instant.parse(it.nominalStart) },
+                            RemoteHabitOccurrenceEvidence::id,
+                        ) < 0,
+                    )
+                }
+                previousOccurrence = evidence
+            }
             envelope.nextCursor?.requireCursor()
             RemoteHabitOccurrencePage(
                 occurrences = envelope.occurrences,
@@ -485,6 +508,7 @@ class OkHttpHabitTransport(
         ).analytics
         return validatedHabitResponse {
             value.requireValid(canonicalHabitId, startDate, endDate, bucket)
+            HabitAnalyticsSnapshot.fromRemote(value)
             value
         }
     }
@@ -696,7 +720,12 @@ private fun HabitErrorBody.requireValid() {
 
 private fun RemoteHabitOccurrence.requireValid(expectedHabitId: String) {
     evidence.requireValid(expectedHabitId)
-    outcome?.requireValid()
+    outcome?.let { recorded ->
+        recorded.requireValid()
+        if (recorded.quantity != null && evidence.expectedUnit != null) {
+            require(recorded.unit == evidence.expectedUnit)
+        }
+    }
 }
 
 private fun RemoteHabitOccurrenceEvidence.requireValid(expectedHabitId: String) {
@@ -704,6 +733,7 @@ private fun RemoteHabitOccurrenceEvidence.requireValid(expectedHabitId: String) 
     habitId.requireCanonicalUuid()
     require(habitId == expectedHabitId)
     plannerOccurrenceId.requireCanonicalUuid()
+    require(UUID.fromString(plannerOccurrenceId).version() == 5)
     sourceScheduleRevisionId.requireCanonicalUuid()
     require(sourceItemRevision > 0)
     require(policyFingerprint.matches(Regex("sha256:[0-9a-f]{64}")))
@@ -714,8 +744,20 @@ private fun RemoteHabitOccurrenceEvidence.requireValid(expectedHabitId: String) 
     val windowEndInstant = requireInstant(windowEnd)
     require(nominalStartInstant < nominalEndInstant)
     require(windowStartInstant < windowEndInstant)
-    require(LocalDate.parse(localDate).toString() == localDate)
+    require(nominalStartInstant >= windowStartInstant && nominalEndInstant <= windowEndInstant)
+    val occurrenceDate = LocalDate.parse(localDate)
+    require(occurrenceDate.toString() == localDate)
     require(timezoneName.length in 1..100 && timezoneName.none(Char::isISOControl))
+    val timezone = runCatching { ZoneId.of(timezoneName) }.getOrNull()
+    require(timezone != null)
+    require(
+        identity.matchesHabitEvidenceContext(
+            occurrenceDate,
+            timezone,
+            nominalStartInstant,
+            nominalEndInstant,
+        ),
+    )
     expectedDurationSeconds?.let { require(it in 1..MAX_EXPECTED_SECONDS) }
     expectedQuantity?.let { require(it in 1..MAX_QUANTITY) }
     require(expectedQuantity == null == (expectedUnit == null))
@@ -753,6 +795,8 @@ private fun RemoteHabitPause.requireValid(expectedHabitId: String) {
     val created = requireInstant(createdAt)
     val updated = requireInstant(updatedAt)
     require(end == null || end > start)
+    // Client mutation times may be up to five minutes ahead of the server clock. The server's
+    // created/updated timestamps are authoritative recording times, not bounds on those inputs.
     require(created <= updated)
 }
 
@@ -780,7 +824,7 @@ private fun RemoteHabitAnalytics.requireValid(
         actualSecondsTotal,
         quantityTotals,
     )
-    require(currentStreak >= 0 && longestStreak >= currentStreak)
+    require(currentStreak in 0..MAX_STREAK_DAYS && longestStreak in currentStreak..MAX_STREAK_DAYS)
     require(trends.size <= MAX_TREND_BUCKETS)
     var previousEnd: LocalDate? = null
     trends.forEach { trend ->
@@ -805,6 +849,14 @@ private fun RemoteHabitAnalytics.requireValid(
     }
     require(supportiveFactCodes.size <= RemoteHabitSupportiveFactCode.entries.size)
     require(supportiveFactCodes.distinct().size == supportiveFactCodes.size)
+    val expectedFacts = mutableSetOf<RemoteHabitSupportiveFactCode>()
+    if (expected == 0L) expectedFacts += RemoteHabitSupportiveFactCode.NO_DATA
+    if (currentStreak > 0) expectedFacts += RemoteHabitSupportiveFactCode.ACTIVE_STREAK
+    if (eligible > 0 && adherenceBasisPoints >= 8_000) {
+        expectedFacts += RemoteHabitSupportiveFactCode.STRONG_ADHERENCE
+    }
+    if (missed > 0) expectedFacts += RemoteHabitSupportiveFactCode.FRESH_START_AVAILABLE
+    require(supportiveFactCodes.toSet() == expectedFacts)
 }
 
 @Suppress("LongParameterList")
@@ -838,6 +890,7 @@ private fun requireTotalsValid(
 }
 
 private fun requireDateRange(startDate: LocalDate, endDate: LocalDate) {
+    require(startDate.year >= MIN_HABIT_DATE_YEAR && endDate.year <= MAX_HABIT_DATE_YEAR)
     require(!endDate.isBefore(startDate))
     require(endDate.toEpochDay() - startDate.toEpochDay() < 366)
 }
@@ -854,20 +907,26 @@ private inline fun <T> validatedHabitResponse(block: () -> T): T = try {
     block()
 } catch (error: HabitApiException) {
     throw error
+} catch (error: DateTimeException) {
+    throw HabitApiException.InvalidResponse(error)
 } catch (error: IllegalArgumentException) {
     throw HabitApiException.InvalidResponse(error)
 }
 
 private fun String.requireCursor(): String {
-    if (length !in 1..512 || any { it.isISOControl() || it.isWhitespace() }) {
+    if (length !in 1..MAX_HABIT_CURSOR_CHARS || any { !it.isAsciiBase64UrlCharacter() }) {
         throw HabitApiException.InvalidResponse()
     }
     return this
 }
 
+private fun Char.isAsciiBase64UrlCharacter(): Boolean =
+    this in 'a'..'z' || this in 'A'..'Z' || this in '0'..'9' || this == '-' || this == '_'
+
 private fun requireInstant(value: String): Instant {
     val parsed = Instant.parse(value)
     require(parsed.toString() == value)
+    require(parsed.nano % 1_000 == 0)
     return parsed
 }
 
@@ -878,11 +937,14 @@ private fun requireSignedQuantity(value: Long, maximum: Long = MAX_QUANTITY) {
 }
 
 private fun requireText(value: String, maxChars: Int, multiline: Boolean) {
-    require(value.isNotBlank() && value.length <= maxChars)
+    require(value.isNotBlank() && value.hasAtMostUnicodeScalars(maxChars))
     require(value.none { it.isISOControl() && !(multiline && it in setOf('\n', '\r', '\t')) })
 }
 
 private const val MAX_NOTE_CHARS = 10_000
+private const val MIN_HABIT_DATE_YEAR = 1900
+private const val MAX_HABIT_DATE_YEAR = 2200
+private const val MAX_HABIT_CURSOR_CHARS = 256
 private const val MAX_ERROR_MESSAGE_CHARS = 16_384
 private const val MAX_QUANTITY = 1_000_000_000_000L
 private const val MAX_EXPECTED_SECONDS = 366L * 24 * 60 * 60
@@ -890,6 +952,7 @@ private const val MAX_ANALYTICS_OCCURRENCES = 50_000L
 private const val MAX_ANALYTICS_SECONDS = MAX_ANALYTICS_OCCURRENCES * MAX_EXPECTED_SECONDS
 private const val MAX_ANALYTICS_QUANTITY = MAX_ANALYTICS_OCCURRENCES * MAX_QUANTITY
 private const val MAX_TREND_BUCKETS = 366
+private const val MAX_STREAK_DAYS = 366
 private const val MAX_QUANTITY_TOTALS = 200
 
 /** Detects duplicate object keys, including equivalent escaped spellings, before decoding. */

@@ -60,6 +60,7 @@ fun TodayScreen(
     onKeepLatestItem: (String) -> Unit,
     onEnergyCheckIn: (EnergyLevel) -> Unit,
     onClearManualEnergyCheckIn: () -> Unit,
+    habitContent: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent(reference, currentZone)
@@ -74,6 +75,8 @@ fun TodayScreen(
     val isLocalPlan = hasCurrentFirmHorizon && !isPublishedReplica
     val isReadOnlyPublishedReplica = isPublishedReplica && !isCurrentPlan
     val canonicalScheduleActionsEnabled = canonicalExecutionActionsEnabled && isCurrentPlan
+    val canonicalStartActionsEnabled = canonicalScheduleActionsEnabled &&
+        state.habitLedger.pendingMutations.isEmpty()
     val visibleTimeline = if (hasCurrentFirmHorizon) {
         state.visibleScheduleSlicesForDay(reference, currentZone)
     } else {
@@ -360,6 +363,12 @@ fun TodayScreen(
             }
         }
 
+        habitContent?.let { content ->
+            item {
+                content()
+            }
+        }
+
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -464,10 +473,16 @@ fun TodayScreen(
                 },
                 canStart = !terminalStartBlocked && (
                     item.canonicalItemId == null ||
+                        canonicalStartActionsEnabled && state.hasPublishedExecutionAuthority(item)
+                ),
+                canUseAlternatives = !terminalStartBlocked && (
+                    item.canonicalItemId == null ||
                         canonicalScheduleActionsEnabled && state.hasPublishedExecutionAuthority(item)
                 ),
                 unavailableLabel = when {
                     terminalStartBlocked -> "Needs review"
+                    item.canonicalItemId != null &&
+                        state.habitLedger.pendingMutations.isNotEmpty() -> "Habit sync pending"
                     isReadOnlyPublishedReplica -> "Read-only zone"
                     item.canonicalItemId != null && !state.hasPublishedExecutionAuthority(item) ->
                         "Sync to start"

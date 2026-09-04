@@ -16,6 +16,8 @@ import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationTarget
+import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
@@ -45,10 +47,14 @@ import com.greengolddog.dayweave.sync.GoogleSchedulePublicationCoordinator
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationState
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationTargetOption
 import com.greengolddog.dayweave.sync.GoogleImportConfigurationOutcome
+import com.greengolddog.dayweave.sync.HabitSyncOutcome
+import com.greengolddog.dayweave.sync.HabitSyncState
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
+import java.time.LocalDate
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -65,6 +71,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val proposalApplicationManager = dayWeaveApplication.proposalApplicationManager
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
+    private val habitSyncManager = dayWeaveApplication.habitSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
     private val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator =
         dayWeaveApplication.googleCalendarImportCoordinator
@@ -92,6 +99,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         proposalApplicationManager.state
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
+    val habitSyncState: StateFlow<HabitSyncState> = habitSyncManager.state
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
     val googleCalendarImportState: StateFlow<GoogleCalendarImportState> =
         googleCalendarImportCoordinator.state
@@ -124,7 +132,9 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun navigate(destination: AppDestination) = plannerStore.navigate(destination)
     fun startItem(id: String) {
         if (isCanonicalBlock(id)) {
-            if (!plannerStore.state.value.isCanonicalPlanCurrent()) {
+            val current = plannerStore.state.value
+            if (current.habitLedger.pendingMutations.isNotEmpty()) return
+            if (!current.isCanonicalPlanCurrent()) {
                 recompose()
                 return
             }
@@ -872,6 +882,75 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { energySignalManager.refresh() }
     }
 
+    fun refreshHabits(): Boolean = admitHabitAction(
+        habitBusy = habitSyncManager.state.value.isBusy,
+    ) {
+        dayWeaveApplication.launchCanonicalAction { habitSyncManager.refresh() }
+    }
+
+    fun loadHabit(habitId: String, startDate: LocalDate, endDate: LocalDate): Boolean =
+        admitHabitAction(habitSyncManager.state.value.isBusy) {
+            dayWeaveApplication.launchCanonicalAction {
+                habitSyncManager.loadHabit(habitId, startDate, endDate)
+            }
+        }
+
+    fun refreshHabitAnalytics(
+        habitId: String,
+        startDate: LocalDate,
+        endDate: LocalDate,
+        bucket: HabitAnalyticsBucketSnapshot,
+    ): Boolean = admitHabitAction(habitSyncManager.state.value.isBusy) {
+        dayWeaveApplication.launchCanonicalAction {
+            habitSyncManager.refreshAnalytics(habitId, startDate, endDate, bucket)
+        }
+    }
+
+    fun recordHabitOutcome(
+        habitId: String,
+        occurrenceId: String,
+        observedOutcomeRevision: Long,
+        outcome: HabitOutcomeInputSnapshot,
+    ): Deferred<Boolean> = dayWeaveApplication.launchDurableHabitAction {
+        try {
+            persistHabitOutcomeThenScheduleSync(
+                persist = {
+                    habitSyncManager.stageOutcome(
+                        habitId = habitId,
+                        occurrenceId = occurrenceId,
+                        observedOutcomeRevision = observedOutcomeRevision,
+                        outcome = outcome,
+                    ) == HabitSyncOutcome.SUCCESS
+                },
+                scheduleSync = {
+                    dayWeaveApplication.launchCanonicalAction { habitSyncManager.refresh() }
+                },
+            )
+        } catch (error: RuntimeException) {
+            if (error is CancellationException) throw error
+            false
+        }
+    }
+
+    fun startHabitPause(habitId: String): Boolean =
+        admitHabitAction(habitSyncManager.state.value.isBusy) {
+            dayWeaveApplication.launchCanonicalAction { habitSyncManager.startPause(habitId) }
+        }
+
+    fun resumeHabitPause(habitId: String, pauseId: String): Boolean =
+        admitHabitAction(habitSyncManager.state.value.isBusy) {
+            dayWeaveApplication.launchCanonicalAction {
+                habitSyncManager.resumePause(habitId, pauseId)
+            }
+        }
+
+    fun discardReviewedHabitMutation(idempotencyKey: String): Boolean =
+        admitHabitAction(habitSyncManager.state.value.isBusy) {
+            dayWeaveApplication.launchCanonicalAction {
+                habitSyncManager.discardReviewedMutation(idempotencyKey)
+            }
+        }
+
     fun recompose() {
         if (isCanonicalBusy()) return
         dayWeaveApplication.launchCanonicalAction { dayWeaveApplication.refreshCanonicalState() }
@@ -914,6 +993,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     /** The caller owns the unlocked STARTED lifecycle and therefore the schedule GET/SSE sockets. */
     suspend fun collectForegroundScheduleInvalidations() {
         dayWeaveApplication.runForegroundScheduleInvalidations()
+    }
+
+    /** The caller owns the unlocked STARTED lifecycle and therefore the habit SSE socket. */
+    suspend fun collectForegroundHabitInvalidations() {
+        dayWeaveApplication.runForegroundHabitInvalidations()
     }
 
     fun keepLatestItemAfterTerminalConflict(sessionId: String) {
@@ -976,6 +1060,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         includeGoogleAuthorizationRecovery: Boolean = true,
     ): Boolean =
         canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
+            habitSyncManager.state.value.isBusy ||
             proposalApplicationManager.state.value.isBusy ||
             googleCalendarOutboundCoordinator.state.value.isBusy ||
             googleSchedulePublicationCoordinator.state.value.isBusy ||
@@ -1099,6 +1184,22 @@ internal suspend fun persistCanonicalAuthoringThenScheduleSync(
     if (persisted) scheduleSync()
     return persisted
 }
+
+/** The outcome editor may close only after its exact encrypted outbox entry is durable. */
+internal suspend fun persistHabitOutcomeThenScheduleSync(
+    persist: suspend () -> Boolean,
+    scheduleSync: () -> Unit,
+): Boolean {
+    val persisted = persist()
+    if (persisted) scheduleSync()
+    return persisted
+}
+
+/** Propagates process-wide action-gate rejection instead of presenting a dropped habit action. */
+internal inline fun admitHabitAction(
+    habitBusy: Boolean,
+    launch: () -> Boolean,
+): Boolean = !habitBusy && launch()
 
 /** Terminal execution success immediately enters the application projection/recompose sequence. */
 internal suspend fun finishCanonicalExecution(

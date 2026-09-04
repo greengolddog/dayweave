@@ -44,7 +44,7 @@ class ScheduleProfilePersistenceTest {
         assertFalse(legacyProfileJson.containsKey("sleep"))
         assertFalse(legacyProfileJson.containsKey("protectedTime"))
         assertEquals(legacy, requireNotNull(repository.load()).scheduleCompositionProfile)
-        assertEquals(PlannerSnapshotFormats.JSON_V16, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V17, dao.snapshot?.payloadFormat)
     }
 
     @Test

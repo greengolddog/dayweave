@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
+import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
@@ -40,6 +41,7 @@ import com.greengolddog.dayweave.network.CanonicalPlannerTransport
 import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.PlannerApiException
+import com.greengolddog.dayweave.network.PlannerValidationReason
 import com.greengolddog.dayweave.network.PreviousScheduleAssignmentRequest
 import com.greengolddog.dayweave.network.PreviousScheduleBlockRequest
 import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
@@ -601,6 +603,7 @@ class CanonicalSyncManager(
                         syncOrigin = origin,
                         configurationId = configurationId,
                         cachedState = expected,
+                        requireCompleteHabitLedger = true,
                     )
                     mutableState.value = CanonicalSyncState(
                         phase = CanonicalSyncPhase.SYNCING,
@@ -733,6 +736,23 @@ class CanonicalSyncManager(
         ) {
             throw LocalCompositionUnavailableException(
                 "The encrypted canonical cache does not match the current API connection.",
+            )
+        }
+        val hasActiveHabit = expected.canonicalItems.any { item ->
+            item.kind == "habit" && item.deletedAt == null
+        }
+        val habitHistoryIncomplete = hasActiveHabit && (
+            expected.habitLedger.syncOrigin != origin ||
+                expected.habitLedger.configurationId != configurationId ||
+                !expected.habitLedger.deltaCaughtUp ||
+                expected.habitLedger.deltaCursor.isNullOrBlank()
+        )
+        if (
+            expected.habitLedger.pendingMutations.isNotEmpty() ||
+            habitHistoryIncomplete
+        ) {
+            throw LocalCompositionUnavailableException(
+                "Synchronize the complete habit history before composing on this device.",
             )
         }
         if (
@@ -1016,9 +1036,7 @@ class CanonicalSyncManager(
                 ensureConfigurationCurrent(configuration)
                 persistCanonicalAuthoringConflict(
                     mutation,
-                    "The server rejected this saved canonical item contract (HTTP " +
-                        "${error.statusCode}). Review the retained change before copying or " +
-                        "discarding it.",
+                    canonicalAuthoringValidationDiagnostic(error),
                 )
                 conflictedCount += 1
                 break
@@ -1119,6 +1137,17 @@ class CanonicalSyncManager(
             throw CanonicalConfigurationChangedException()
         } ?: throw LocalPlannerStorageException()
         if (!receipt.persistence.awaitDurable()) throw LocalPlannerStorageException()
+    }
+
+    private fun canonicalAuthoringValidationDiagnostic(
+        error: PlannerApiException.Validation,
+    ): String = when (error.reason) {
+        PlannerValidationReason.CUSTOM_RECURRENCE_ANCHOR ->
+            "This custom RRULE cannot produce an occurrence from the server-assigned creation " +
+                "date under every week-start setting. Extend UNTIL or adjust INTERVAL, BYDAY, " +
+                "or BYMONTHDAY, then retry or discard the retained change."
+        null -> "The server rejected this saved canonical item contract (HTTP " +
+            "${error.statusCode}). Review the retained change before copying or discarding it."
     }
 
     private suspend fun sendCanonicalAuthoringMutation(
@@ -1341,6 +1370,13 @@ class CanonicalSyncManager(
             return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
         }
         val block = current.schedule.firstOrNull { it.id == blockId }
+        if (
+            block?.canonicalItemId != null &&
+            current.habitLedger.pendingMutations.isNotEmpty()
+        ) {
+            updateError("Synchronize saved habit changes before starting canonical work.")
+            return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
         if (block?.canonicalItemId != null && !current.hasPublishedExecutionAuthority(block)) {
             updateError("This block has no durable exact publication proof. Recompose first.")
             return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
@@ -2870,6 +2906,7 @@ class CanonicalSyncManager(
         configurationId: String?,
         cachedState: com.greengolddog.dayweave.model.DayWeaveUiState =
             plannerStore.state.value,
+        requireCompleteHabitLedger: Boolean = false,
     ): SchedulePreviewRequest {
         val date = instant.atZone(planningZone).toLocalDate()
         val cached = cachedState
@@ -2932,6 +2969,70 @@ class CanonicalSyncManager(
                 validateUuid(itemId)
                 parseTimestamp(timestamp)
             }
+        val habitLedger = cached.habitLedger.takeIf {
+            sameOrigin && it.syncOrigin == syncOrigin && it.configurationId == configurationId &&
+                (
+                    !requireCompleteHabitLedger ||
+                        it.deltaCaughtUp && !it.deltaCursor.isNullOrBlank() &&
+                        it.pendingMutations.isEmpty()
+                )
+        }
+        val partialProgress = habitLedger?.occurrences?.values.orEmpty()
+            .asSequence()
+            .mapNotNull { occurrence ->
+                val evidence = occurrence.evidence
+                val outcome = occurrence.outcome?.takeIf {
+                    it.status == HabitOutcomeStatusSnapshot.PARTIAL
+                } ?: return@mapNotNull null
+                val item = itemsById[evidence.habitId]?.takeIf {
+                    it.kind == "habit" && it.deletedAt == null &&
+                        it.revision >= evidence.sourceItemRevision
+                } ?: return@mapNotNull null
+                val expectedSeconds = evidence.expectedDurationSeconds
+                    ?: return@mapNotNull null
+                val windowStart = parseTimestamp(evidence.windowStart).toInstant()
+                val windowEnd = parseTimestamp(evidence.windowEnd).toInstant()
+                val occursInHorizon = windowStart < horizonEnd.toInstant() &&
+                    windowEnd > horizonStart.toInstant()
+                val restoredMoveInHorizon = cached.recurrenceMoves[evidence.plannerOccurrenceId]
+                    ?.takeIf { move ->
+                        move.itemId == item.id && move.source?.itemId == item.id &&
+                            move.source?.itemRevision == item.revision
+                    }
+                    ?.let { move ->
+                        val start = parseTimestamp(move.startAt).toInstant()
+                        val end = parseTimestamp(move.endAt).toInstant()
+                        start >= horizonStart.toInstant() && end <= horizonEnd.toInstant() &&
+                            start < end
+                    } == true
+                if (!occursInHorizon && !restoredMoveInHorizon) return@mapNotNull null
+                validateUuid(evidence.plannerOccurrenceId)
+                val expectedMinutes = (expectedSeconds + 59L) / 60L
+                Triple(evidence.plannerOccurrenceId, outcome.progressBasisPoints, expectedMinutes)
+            }
+            .sortedBy { it.first }
+            .toList()
+        val recurrencePauses = habitLedger?.pauses?.values.orEmpty()
+            .asSequence()
+            .filter { pause ->
+                itemsById[pause.habitId]?.let { item ->
+                    item.kind == "habit" && item.deletedAt == null
+                } == true
+            }
+            .mapNotNull { pause ->
+                val start = parseTimestamp(pause.startedAt).toInstant()
+                val end = pause.endedAt?.let { parseTimestamp(it).toInstant() }
+                    ?: horizonEnd.toInstant()
+                val clippedStart = maxOf(start, horizonStart.toInstant())
+                val clippedEnd = minOf(end, horizonEnd.toInstant())
+                if (clippedStart >= clippedEnd) {
+                    null
+                } else {
+                    Triple(pause.habitId, clippedStart, clippedEnd)
+                }
+            }
+            .sortedWith(compareBy({ it.first }, { it.second }, { it.third }))
+            .toList()
         val recurrenceMoves = (if (sameOrigin) cached.recurrenceMoves else emptyMap()).entries
             .sortedBy { it.key }
             .filter { (occurrenceId, _) ->
@@ -2973,7 +3074,8 @@ class CanonicalSyncManager(
                 }
             }
         if (
-            recurrenceOutcomes.size + completionAnchors.size + recurrenceMoves.size >
+            recurrenceOutcomes.size + completionAnchors.size + partialProgress.size +
+            recurrencePauses.size + recurrenceMoves.size >
             MAX_RECURRENCE_CONTEXT_IDS
         ) {
             throw RecurrenceContextCapacityException()
@@ -3070,6 +3172,36 @@ class CanonicalSyncManager(
                     buildJsonObject {
                         completionAnchors.forEach { (itemId, timestamp) ->
                             put(itemId, timestamp)
+                        }
+                    },
+                )
+                if (partialProgress.isNotEmpty()) {
+                    put(
+                        "partial_progress",
+                        buildJsonObject {
+                            partialProgress.forEach { (occurrenceId, basisPoints, expectedMinutes) ->
+                                put(
+                                    occurrenceId,
+                                    buildJsonObject {
+                                        put("progress_basis_points", basisPoints)
+                                        put("expected_duration_minutes", expectedMinutes)
+                                    },
+                                )
+                            }
+                        },
+                    )
+                }
+                put(
+                    "pauses",
+                    buildJsonArray {
+                        recurrencePauses.forEach { (habitId, start, end) ->
+                            add(
+                                buildJsonObject {
+                                    put("item_id", habitId)
+                                    put("start", start.toString())
+                                    put("end", end.toString())
+                                },
+                            )
                         }
                     },
                 )

@@ -107,10 +107,12 @@ import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
 import com.greengolddog.dayweave.ui.screens.CalendarScreen
+import com.greengolddog.dayweave.ui.screens.HabitStatisticsSection
 import com.greengolddog.dayweave.ui.screens.InboxScreen
 import com.greengolddog.dayweave.ui.screens.MoreScreen
 import com.greengolddog.dayweave.ui.screens.PlanningProfileEditorDialog
 import com.greengolddog.dayweave.ui.screens.planningProfileEditBlockedMessage
+import com.greengolddog.dayweave.ui.screens.TodayHabitsSection
 import com.greengolddog.dayweave.ui.screens.TodayScreen
 import com.greengolddog.dayweave.ui.onboarding.DayWeaveOnboardingShell
 import com.greengolddog.dayweave.ui.onboarding.OnboardingCallbacks
@@ -440,6 +442,7 @@ private fun DayWeaveRoot(
     val proposalApplicationState by viewModel.proposalApplicationState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
+    val habitSyncState by viewModel.habitSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val googleCalendarImportState by
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
@@ -476,7 +479,7 @@ private fun DayWeaveRoot(
         canonicalSyncState
     }
     val canonicalExecutionActionsEnabled =
-        !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
+        !canonicalSyncState.isBusy && !executionSyncState.isBusy && !habitSyncState.isBusy &&
             !proposalApplicationState.isBusy && !googleCalendarOutboundState.isBusy &&
             !googleSchedulePublicationState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
@@ -635,6 +638,11 @@ private fun DayWeaveRoot(
                     },
                     scheduleInvalidations = if (deviceAuthState.isConfigured) {
                         viewModel::collectForegroundScheduleInvalidations
+                    } else {
+                        null
+                    },
+                    habitInvalidations = if (deviceAuthState.isConfigured) {
+                        viewModel::collectForegroundHabitInvalidations
                     } else {
                         null
                     },
@@ -1022,6 +1030,20 @@ private fun DayWeaveRoot(
                 onKeepLatestItem = viewModel::keepLatestItemAfterTerminalConflict,
                 onEnergyCheckIn = viewModel::recordManualEnergyCheckIn,
                 onClearManualEnergyCheckIn = viewModel::clearManualEnergyCheckIn,
+                habitContent = {
+                    TodayHabitsSection(
+                        state = state,
+                        syncState = habitSyncState,
+                        reference = plannerClockReference,
+                        currentZone = plannerClockZone,
+                        onRefresh = viewModel::refreshHabits,
+                        onRecordOutcome = viewModel::recordHabitOutcome,
+                        onStartPause = viewModel::startHabitPause,
+                        onResumePause = viewModel::resumeHabitPause,
+                        onDiscardReviewedMutation =
+                            viewModel::discardReviewedHabitMutation,
+                    )
+                },
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.CALENDAR -> CalendarScreen(
@@ -1168,8 +1190,19 @@ private fun DayWeaveRoot(
                     effectiveCanonicalSyncState.phase in setOf(
                         CanonicalSyncPhase.READY,
                         CanonicalSyncPhase.CONNECTED,
-                    ),
+                ),
                 onSetCanonicalItemSensitive = viewModel::setCanonicalItemSensitive,
+                habitStatisticsContent = {
+                    HabitStatisticsSection(
+                        state = state,
+                        syncState = habitSyncState,
+                        reference = plannerClockReference,
+                        currentZone = plannerClockZone,
+                        onRefreshAnalytics = viewModel::refreshHabitAnalytics,
+                        onStartPause = viewModel::startHabitPause,
+                        onResumePause = viewModel::resumeHabitPause,
+                    )
+                },
                 modifier = Modifier.padding(innerPadding),
             )
             }
@@ -1790,12 +1823,14 @@ internal suspend fun runForegroundInvalidationWorkers(
     executionInvalidationStream: (suspend () -> Unit)?,
     canonicalItemInvalidations: (suspend () -> Unit)?,
     scheduleInvalidations: (suspend () -> Unit)? = null,
+    habitInvalidations: (suspend () -> Unit)? = null,
     polling: suspend () -> Unit,
 ) = supervisorScope {
     listOfNotNull(
         executionInvalidationStream,
         canonicalItemInvalidations,
         scheduleInvalidations,
+        habitInvalidations,
     ).forEach {
         collectInvalidations ->
         launch {

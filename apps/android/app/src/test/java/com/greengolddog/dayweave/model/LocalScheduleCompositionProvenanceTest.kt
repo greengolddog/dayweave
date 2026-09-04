@@ -171,6 +171,62 @@ class LocalScheduleCompositionProvenanceTest {
     }
 
     @Test
+    fun `habit delta completeness and mutation readiness cannot inherit a composition memo`() {
+        val generatedAt = "2026-09-01T07:00:00Z"
+        val readyLedger = HabitLedgerSnapshot(
+            syncOrigin = ORIGIN,
+            configurationId = CONFIGURATION_ID,
+            deltaCursor = "habit-cursor",
+            deltaCaughtUp = true,
+        ).also(HabitLedgerSnapshot::requireValid)
+        val ready = baseState(generatedAt, "UTC").copy(habitLedger = readyLedger)
+        val before = localScheduleCompositionFingerprintComputationCount()
+        val readyFingerprint = ready.localScheduleCompositionStateFingerprint()
+        assertEquals(before + 1, localScheduleCompositionFingerprintComputationCount())
+
+        val intermediate = ready.copy(
+            habitLedger = readyLedger.copy(deltaCaughtUp = false),
+        )
+        intermediate.inheritLocalScheduleCompositionMemo(ready)
+        assertFalse(readyFingerprint == intermediate.localScheduleCompositionStateFingerprint())
+        assertEquals(before + 2, localScheduleCompositionFingerprintComputationCount())
+
+        val command = HabitOutcomeCommandSnapshot(
+            operationId = "11111111-1111-4111-8111-111111111111",
+            expectedRevision = 0,
+            outcome = HabitOutcomeInputSnapshot(
+                status = HabitOutcomeStatusSnapshot.SKIPPED,
+                progressBasisPoints = 0,
+                quantity = null,
+                unit = null,
+                actualSeconds = null,
+                note = null,
+                occurredAt = generatedAt,
+            ),
+        )
+        val reviewedMutation = PendingHabitMutation(
+            schemaVersion = PendingHabitMutation.CURRENT_SCHEMA_VERSION,
+            kind = PendingHabitMutationKind.OUTCOME,
+            habitId = "22222222-2222-4222-8222-222222222222",
+            targetId = "33333333-3333-4333-8333-333333333333",
+            expectedRevision = 0,
+            idempotencyKey = "11111111-1111-4111-8111-111111111111",
+            requestJson = command.encoded(),
+            createdAt = generatedAt,
+            syncOrigin = ORIGIN,
+            configurationId = CONFIGURATION_ID,
+            disposition = PendingHabitMutationDisposition.CONFLICT,
+        )
+        val mutationBlocked = ready.copy(
+            habitLedger = readyLedger.copy(pendingMutations = listOf(reviewedMutation))
+                .also(HabitLedgerSnapshot::requireValid),
+        )
+        mutationBlocked.inheritLocalScheduleCompositionMemo(ready)
+        assertFalse(readyFingerprint == mutationBlocked.localScheduleCompositionStateFingerprint())
+        assertEquals(before + 3, localScheduleCompositionFingerprintComputationCount())
+    }
+
+    @Test
     fun `configured horizon crossing Sunday stays current on each intersecting day`() {
         val zone = ZoneId.of("Europe/Paris")
         val date = LocalDate.parse("2026-09-04")

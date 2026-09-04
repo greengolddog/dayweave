@@ -735,28 +735,41 @@ class CanonicalItemEditorFormTest {
     }
 
     @Test
-    fun retainedCustomRruleCannotBeCreatedChangedOrConvertedInTheForm() {
-        val custom = newCanonicalDetailedDraft("Legacy recurrence", ItemKind.ROUTINE).copy(
+    fun finiteCustomRruleCanBeCreatedChangedAndConvertedInTheForm() {
+        val custom = newCanonicalDetailedDraft("Custom recurrence", ItemKind.ROUTINE).copy(
             recurrence = CanonicalRecurrenceDraft(
                 CanonicalRecurrenceKind.CUSTOM,
-                rrule = "FREQ=MONTHLY;BYDAY=1MO,-1FR",
+                rrule = "FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=-1,1;COUNT=24",
             ),
         )
-        val retained = CanonicalItemEditorForm.from(custom)
+        val form = CanonicalItemEditorForm.from(custom)
 
-        assertEquals(custom, retained.draft(ITEM_ID).getOrThrow())
-        assertTrue(retained.copy(recurrenceRrule = "FREQ=DAILY").draft(ITEM_ID).isFailure)
-        assertTrue(
-            retained.copy(recurrenceKind = CanonicalRecurrenceKind.DAILY)
-                .draft(ITEM_ID).isFailure,
+        assertEquals(custom, form.draft(ITEM_ID).getOrThrow())
+        assertEquals(
+            "FREQ=DAILY;INTERVAL=1;COUNT=10",
+            form.copy(recurrenceRrule = "count=10;freq=daily")
+                .draft(ITEM_ID).getOrThrow().recurrence?.rrule,
+        )
+        assertEquals(
+            CanonicalRecurrenceKind.DAILY,
+            form.copy(recurrenceKind = CanonicalRecurrenceKind.DAILY)
+                .draft(ITEM_ID).getOrThrow().recurrence?.kind,
         )
         val fresh = CanonicalItemEditorForm.from(
             newCanonicalDetailedDraft("New", ItemKind.TASK),
         ).copy(
             recurrenceKind = CanonicalRecurrenceKind.CUSTOM,
-            recurrenceRrule = "FREQ=DAILY",
+            recurrenceRrule = "FREQ=WEEKLY;BYDAY=MO,FR;COUNT=12",
         )
-        assertTrue(fresh.draft(ITEM_ID).isFailure)
+        assertEquals(
+            "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=12",
+            fresh.draft(ITEM_ID).getOrThrow().recurrence?.rrule,
+        )
+        assertTrue(
+            fresh.copy(recurrenceRrule = "FREQ=MONTHLY;BYDAY=1MO;COUNT=2")
+                .draft(ITEM_ID).isFailure,
+        )
+        assertTrue(fresh.copy(recurrenceRrule = "FREQ=DAILY").draft(ITEM_ID).isFailure)
     }
 
     @Test

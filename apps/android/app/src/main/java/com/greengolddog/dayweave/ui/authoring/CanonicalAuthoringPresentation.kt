@@ -13,7 +13,6 @@ import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
-import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
@@ -505,17 +504,10 @@ private data class AuthoringNode(
                 mutation = mutation,
                 draft = decoded,
                 revision = item.revision,
-                unsupported = decoded == null ||
-                    decoded.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM,
-                unsupportedDiagnostic = if (
-                    decoded?.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM
-                ) {
-                    "Custom RRULE recurrence is retained but read-only until bounded expansion is available."
-                } else {
-                    decodedAttempt.exceptionOrNull()?.message
-                        ?.takeIf(String::isNotBlank)
-                        ?: if (decoded == null) "This scheduling metadata is read-only." else null
-                },
+                unsupported = decoded == null,
+                unsupportedDiagnostic = decodedAttempt.exceptionOrNull()?.message
+                    ?.takeIf(String::isNotBlank)
+                    ?: if (decoded == null) "This scheduling metadata is read-only." else null,
             )
         }
 

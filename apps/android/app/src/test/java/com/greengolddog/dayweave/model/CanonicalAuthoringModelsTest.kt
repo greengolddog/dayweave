@@ -226,11 +226,84 @@ class CanonicalAuthoringModelsTest {
         val custom = draft.copy(
             recurrence = CanonicalRecurrenceDraft(
                 kind = CanonicalRecurrenceKind.CUSTOM,
-                rrule = "FREQ=MONTHLY;BYDAY=1MO,-1FR",
+                rrule = "FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=-1,1;COUNT=24",
             ),
         )
         custom.requireValid(ITEM_ID)
         assertEquals(custom, canonicalItem(custom).toCanonicalDraft())
+    }
+
+    @Test
+    fun customRruleUsesTheSharedFiniteGrammarAndCanonicalSpelling() {
+        val equivalent = CanonicalRecurrenceDraft(
+            kind = CanonicalRecurrenceKind.CUSTOM,
+            rrule = "rrule:count=5;byday=fr,mo;freq=weekly",
+        )
+        assertEquals(
+            "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=5",
+            equivalent.toCanonicalJson().getValue("rrule").jsonPrimitive.content,
+        )
+        assertEquals(
+            "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=5",
+            taskDraft().copy(recurrence = equivalent).normalized().recurrence?.rrule,
+        )
+        val customDraft = taskDraft().copy(recurrence = equivalent).normalized()
+        PendingCanonicalAuthoringMutation(
+            id = MUTATION_ID,
+            itemId = ITEM_ID,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = customDraft,
+            createdAt = "2026-09-03T07:00:00Z",
+        ).requireValid()
+        val customBase = canonicalItem(customDraft)
+        PendingCanonicalAuthoringMutation(
+            id = MUTATION_ID,
+            itemId = ITEM_ID,
+            operation = CanonicalAuthoringOperation.REPLACE,
+            draft = customDraft.copy(
+                recurrence = CanonicalRecurrenceDraft(
+                    kind = CanonicalRecurrenceKind.CUSTOM,
+                    rrule = "FREQ=DAILY;COUNT=10",
+                ),
+            ),
+            expectedRevision = customBase.revision,
+            baseItem = customBase,
+            createdAt = "2026-09-03T07:00:00Z",
+        ).requireValid()
+
+        val invalid = listOf(
+            "FREQ=DAILY",
+            "FREQ=YEARLY;COUNT=2",
+            "FREQ=DAILY;COUNT=2;UNTIL=20260930",
+            "FREQ=MONTHLY;BYDAY=1MO;COUNT=2",
+            "FREQ=MONTHLY;BYSETPOS=1;COUNT=2",
+            "FREQ=DAILY;BYHOUR=9;COUNT=2",
+            "FREQ=WEEKLY;BYMONTHDAY=1;COUNT=2",
+            "FREQ=DAILY;INTERVAL=1201;COUNT=2",
+            "FREQ=DAILY;COUNT=10001",
+            "FREQ=DAILY;UNTIL=20260230",
+            "FREQ=DAILY;COUNT=2 ",
+            "FREQ=DAILY;FREQ=WEEKLY;COUNT=2",
+        )
+        invalid.forEach { rrule ->
+            assertThrows(rrule, IllegalArgumentException::class.java) {
+                CanonicalRecurrenceDraft(
+                    kind = CanonicalRecurrenceKind.CUSTOM,
+                    rrule = rrule,
+                ).requireValid()
+            }
+        }
+
+        val malformedDraft = taskDraft().copy(
+            recurrence = CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.CUSTOM,
+                rrule = "FREQ=DAILY",
+            ),
+        )
+        assertFalse(
+            "Malformed custom recurrence must make semantic matching fail closed",
+            malformedDraft.matches(canonicalItem(taskDraft())),
+        )
     }
 
     @Test
@@ -401,12 +474,10 @@ class CanonicalAuthoringModelsTest {
     }
 
     @Test
-    fun everySharedInvalidFixtureIsRejectedExceptTheIntentionalReadOnlyRrule() {
-        val retainedReadOnly = "custom_rrule_is_retained_but_not_authorable"
+    fun everySharedInvalidFixtureIsRejected() {
         val invalid = fixtureCaseNames(valid = false)
-        assertTrue(retainedReadOnly in invalid)
         val eventTimingInvariant = "planned_event_without_timing"
-        (invalid - retainedReadOnly - eventTimingInvariant).forEach { name ->
+        (invalid - eventTimingInvariant).forEach { name ->
             assertThrows("Expected shared fixture $name to fail", IllegalArgumentException::class.java) {
                 fixtureItem(name, valid = false).toCanonicalDraft()
             }
@@ -419,22 +490,6 @@ class CanonicalAuthoringModelsTest {
                 .toCanonicalDraft()
         }
         assertTrue(eventFailure.message.orEmpty().contains("requires timing metadata"))
-
-        val retainedItem = fixtureItem(retainedReadOnly, valid = false)
-        val retained = retainedItem.toCanonicalDraft()
-        assertEquals(CanonicalRecurrenceKind.CUSTOM, retained.recurrence?.kind)
-        assertEquals("FREQ=MONTHLY;BYDAY=1MO,-1FR", retained.recurrence?.rrule)
-        assertThrows(IllegalArgumentException::class.java) {
-            PendingCanonicalAuthoringMutation(
-                id = MUTATION_ID,
-                itemId = retainedItem.id,
-                operation = CanonicalAuthoringOperation.REPLACE,
-                draft = retained,
-                expectedRevision = 1,
-                baseItem = retainedItem,
-                createdAt = "2026-09-03T07:00:00Z",
-            ).requireValid()
-        }
     }
 
     @Test

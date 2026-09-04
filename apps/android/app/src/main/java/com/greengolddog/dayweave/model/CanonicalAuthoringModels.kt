@@ -3,9 +3,11 @@ package com.greengolddog.dayweave.model
 import java.net.URI
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -77,6 +79,14 @@ data class CanonicalRecurrenceDraft(
     val anchorAt: String? = null,
     val rrule: String? = null,
 ) {
+    fun normalized(): CanonicalRecurrenceDraft = if (
+        kind == CanonicalRecurrenceKind.CUSTOM && rrule != null
+    ) {
+        copy(rrule = canonicalizeCustomRrule(rrule))
+    } else {
+        this
+    }
+
     fun requireValid() {
         require(weekdays.distinct().size == weekdays.size) { "Recurrence weekdays repeat" }
         when (kind) {
@@ -147,11 +157,14 @@ data class CanonicalRecurrenceDraft(
                 }
             }
 
-            CanonicalRecurrenceKind.CUSTOM -> require(
-                occurrencesPerPeriod == null && weekdays.isEmpty() && intervalSeconds == null &&
-                    period == null && semantics == null && minimumSpacingMinutes == null &&
-                    anchorAt == null && !rrule.isNullOrBlank(),
-            ) { "Custom recurrence requires only a non-empty RRULE" }
+            CanonicalRecurrenceKind.CUSTOM -> {
+                require(
+                    occurrencesPerPeriod == null && weekdays.isEmpty() &&
+                        intervalSeconds == null && period == null && semantics == null &&
+                        minimumSpacingMinutes == null && anchorAt == null && rrule != null,
+                ) { "Custom recurrence requires only one RRULE" }
+                canonicalizeCustomRrule(requireNotNull(rrule))
+            }
         }
     }
 
@@ -185,7 +198,8 @@ data class CanonicalRecurrenceDraft(
                     put("minimum_spacing", minimumSpacingMinutes ?: 0)
                     if (anchorAt == null) put("anchor", JsonNull) else put("anchor", anchorAt)
                 }
-                CanonicalRecurrenceKind.CUSTOM -> put("rrule", requireNotNull(rrule))
+                CanonicalRecurrenceKind.CUSTOM ->
+                    put("rrule", canonicalizeCustomRrule(requireNotNull(rrule)))
             }
         }
     }
@@ -195,6 +209,153 @@ data class CanonicalRecurrenceDraft(
         const val MINUTES_PER_DAY = 24 * 60
     }
 }
+
+/**
+ * Mirrors the finite custom-RRULE subset in `dayweave-core/custom_recurrence.rs`.
+ *
+ * Android validates and emits the same canonical spelling before a draft enters the durable
+ * authoring journal. Authoritative server item writes validate the actual creation anchor under
+ * every supported week-start setting. An offline draft can still be rejected at sync because its
+ * server-owned creation instant does not exist while Android performs this static validation.
+ */
+internal fun canonicalizeCustomRrule(rrule: String): String {
+    val bytes = rrule.toByteArray(Charsets.UTF_8)
+    require(bytes.isNotEmpty()) { "Custom RRULE cannot be empty" }
+    require(bytes.size <= MAX_CUSTOM_RRULE_BYTES) {
+        "Custom RRULE exceeds $MAX_CUSTOM_RRULE_BYTES bytes"
+    }
+    require(bytes.all { byte -> (byte.toInt() and 0xff) in 0x21..0x7e }) {
+        "Custom RRULE must contain printable ASCII without whitespace"
+    }
+    val body = if (rrule.startsWith("RRULE:", ignoreCase = true)) rrule.drop(6) else rrule
+    require(body.isNotEmpty()) { "Custom RRULE cannot be empty" }
+
+    var frequency: String? = null
+    var interval: Long? = null
+    var byDay: Set<String>? = null
+    var byMonthDay: Set<Int>? = null
+    var count: Long? = null
+    var until: String? = null
+    val seen = mutableSetOf<String>()
+    body.split(';').forEach { part ->
+        val separator = part.indexOf('=')
+        require(
+            separator > 0 && separator == part.lastIndexOf('=') && separator < part.lastIndex,
+        ) { "Custom RRULE contains a malformed part" }
+        val name = part.substring(0, separator).uppercase()
+        val value = part.substring(separator + 1).uppercase()
+        require(seen.add(name)) { "Custom RRULE contains duplicate part $name" }
+        when (name) {
+            "FREQ" -> {
+                require(value in CUSTOM_RRULE_FREQUENCIES) {
+                    "Custom RRULE frequency $value is unsupported"
+                }
+                frequency = value
+            }
+            "INTERVAL" -> interval = value.requireCustomRruleNumber(
+                "INTERVAL",
+                MAX_CUSTOM_RRULE_INTERVAL,
+            )
+            "BYDAY" -> {
+                val values = value.split(',')
+                require(values.isNotEmpty() && values.none(String::isEmpty)) {
+                    "Custom RRULE BYDAY is invalid"
+                }
+                require(values.none { token ->
+                    token.any { it.isDigit() || it == '+' || it == '-' }
+                }) { "Custom RRULE does not support ordinal BYDAY entries" }
+                require(values.all(CUSTOM_RRULE_WEEKDAYS::contains)) {
+                    "Custom RRULE BYDAY is invalid"
+                }
+                require(values.distinct().size == values.size) {
+                    "Custom RRULE BYDAY contains duplicates"
+                }
+                byDay = values.toSet()
+            }
+            "BYMONTHDAY" -> {
+                val values = value.split(',')
+                require(values.isNotEmpty() && values.none(String::isEmpty)) {
+                    "Custom RRULE BYMONTHDAY is invalid"
+                }
+                val parsed = values.map { token ->
+                    val digits = token.removePrefix("-")
+                    require(
+                        digits.isNotEmpty() && digits.all(Char::isDigit) &&
+                            (token.first() != '+' && token.count { it == '-' } <= 1 &&
+                                ('-' !in token || token.first() == '-')),
+                    ) { "Custom RRULE BYMONTHDAY is invalid" }
+                    token.toIntOrNull()?.takeIf { it != 0 && it in -31..31 }
+                        ?: throw IllegalArgumentException("Custom RRULE BYMONTHDAY is invalid")
+                }
+                require(parsed.distinct().size == parsed.size) {
+                    "Custom RRULE BYMONTHDAY contains duplicates"
+                }
+                byMonthDay = parsed.toSet()
+            }
+            "COUNT" -> count = value.requireCustomRruleNumber(
+                "COUNT",
+                MAX_CUSTOM_RRULE_OCCURRENCES,
+            )
+            "UNTIL" -> {
+                require(value.length == 8 && value.all(Char::isDigit)) {
+                    "Custom RRULE UNTIL must be a valid date-only YYYYMMDD value"
+                }
+                val date = runCatching {
+                    LocalDate.parse(value, DateTimeFormatter.BASIC_ISO_DATE)
+                }.getOrNull()
+                require(date != null && date.year != 0) {
+                    "Custom RRULE UNTIL must be a valid date-only YYYYMMDD value"
+                }
+                until = value
+            }
+            "BYSETPOS" -> throw IllegalArgumentException(
+                "Custom RRULE does not support BYSETPOS",
+            )
+            "BYHOUR", "BYMINUTE", "BYSECOND" ->
+                throw IllegalArgumentException(
+                    "Custom RRULE does not support time component $name",
+                )
+            else -> throw IllegalArgumentException("Custom RRULE part $name is unsupported")
+        }
+    }
+
+    val parsedFrequency = requireNotNull(frequency) { "Custom RRULE requires FREQ" }
+    require((count == null) != (until == null)) {
+        if (count == null && until == null) {
+            "Custom RRULE must define exactly one finite COUNT or UNTIL"
+        } else {
+            "Custom RRULE cannot combine COUNT and UNTIL"
+        }
+    }
+    require(parsedFrequency != "WEEKLY" || byMonthDay.isNullOrEmpty()) {
+        "Custom weekly RRULE cannot combine FREQ=WEEKLY with BYMONTHDAY"
+    }
+
+    return buildList {
+        add("FREQ=$parsedFrequency")
+        add("INTERVAL=${interval ?: 1}")
+        byDay?.let { days ->
+            add("BYDAY=${CUSTOM_RRULE_WEEKDAYS.filter(days::contains).joinToString(",")}")
+        }
+        byMonthDay?.let { days -> add("BYMONTHDAY=${days.sorted().joinToString(",")}") }
+        count?.let { add("COUNT=$it") }
+        until?.let { add("UNTIL=$it") }
+    }.joinToString(";")
+}
+
+private fun String.requireCustomRruleNumber(label: String, maximum: Long): Long {
+    require(isNotEmpty() && all(Char::isDigit)) {
+        "Custom RRULE $label must be in 1..=$maximum"
+    }
+    return toLongOrNull()?.takeIf { it in 1..maximum }
+        ?: throw IllegalArgumentException("Custom RRULE $label must be in 1..=$maximum")
+}
+
+private const val MAX_CUSTOM_RRULE_BYTES = 1_024
+private const val MAX_CUSTOM_RRULE_INTERVAL = 1_200L
+private const val MAX_CUSTOM_RRULE_OCCURRENCES = 10_000L
+private val CUSTOM_RRULE_FREQUENCIES = setOf("DAILY", "WEEKLY", "MONTHLY")
+private val CUSTOM_RRULE_WEEKDAYS = listOf("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 
 @Serializable
 enum class CanonicalSplitKind {
@@ -891,6 +1052,7 @@ data class CanonicalItemDraft(
     fun normalized(): CanonicalItemDraft = copy(
         title = title.trim(),
         notes = notes?.takeUnless(String::isBlank),
+        recurrence = recurrence?.normalized(),
         constraints = constraints.normalized(),
     )
 
@@ -1072,36 +1234,34 @@ data class CanonicalItemDraft(
 
     internal fun requireValidCanonicalRead(itemId: String) = requireValid(itemId)
 
-    fun matches(item: CanonicalItemSnapshot): Boolean {
+    fun matches(item: CanonicalItemSnapshot): Boolean = runCatching {
         val value = normalized()
-        return runCatching {
-            value.requireValid(item.id)
-            item.requireCanonicalAuthoringShape()
-            val decodedConstraints = decodeCanonicalConstraints(
-                item.flexibleConstraintsJson,
-                value.kind,
-                value.timezoneName,
-                value.durationSeconds,
-            )
-            !item.hasExplicitStructuralMetadata && item.deletedAt == null &&
-                item.kind == value.kind.name.lowercase() &&
-                item.status == value.placement.wireValue &&
-                item.isSensitive == value.isSensitive &&
-                item.title == value.title &&
-                item.notes == value.notes &&
-                item.timezoneName == value.timezoneName &&
-                item.durationSeconds == value.durationSeconds &&
-                sameInstant(item.deadlineAt, value.deadlineAt) &&
-                sameInstant(item.earliestStartAt, value.earliestStartAt) &&
-                normalizedRecurrenceJson(item.recurrenceJson) ==
-                value.recurrence?.toCanonicalJson() &&
-                decodedConstraints.first == value.constraints &&
-                decodedConstraints.second == value.eventTiming &&
-                decodeCanonicalSplit(item.splitPolicyJson) == value.split &&
-                item.importance == value.importance && item.urgency == value.urgency &&
-                item.parentId == value.parentId && item.siblingOrder == value.siblingOrder
-        }.getOrDefault(false)
-    }
+        value.requireValid(item.id)
+        item.requireCanonicalAuthoringShape()
+        val decodedConstraints = decodeCanonicalConstraints(
+            item.flexibleConstraintsJson,
+            value.kind,
+            value.timezoneName,
+            value.durationSeconds,
+        )
+        !item.hasExplicitStructuralMetadata && item.deletedAt == null &&
+            item.kind == value.kind.name.lowercase() &&
+            item.status == value.placement.wireValue &&
+            item.isSensitive == value.isSensitive &&
+            item.title == value.title &&
+            item.notes == value.notes &&
+            item.timezoneName == value.timezoneName &&
+            item.durationSeconds == value.durationSeconds &&
+            sameInstant(item.deadlineAt, value.deadlineAt) &&
+            sameInstant(item.earliestStartAt, value.earliestStartAt) &&
+            normalizedRecurrenceJson(item.recurrenceJson) ==
+            value.recurrence?.toCanonicalJson() &&
+            decodedConstraints.first == value.constraints &&
+            decodedConstraints.second == value.eventTiming &&
+            decodeCanonicalSplit(item.splitPolicyJson) == value.split &&
+            item.importance == value.importance && item.urgency == value.urgency &&
+            item.parentId == value.parentId && item.siblingOrder == value.siblingOrder
+    }.getOrDefault(false)
 
     internal fun matchesCanonicalRead(item: CanonicalItemSnapshot): Boolean = matches(item)
 
@@ -1215,9 +1375,6 @@ data class PendingCanonicalAuthoringMutation(
         }
         require(expectedRevision == null || expectedRevision > 0)
         draft?.requireValid(itemId)
-        require(draft?.recurrence?.kind != CanonicalRecurrenceKind.CUSTOM) {
-            "Custom RRULE recurrence is retained for read compatibility but is read-only on Android"
-        }
         baseItem?.requireCanonicalAuthoringShape()
         require(
             canonicalAuthoringMutationBytes(this) <=
@@ -1349,9 +1506,6 @@ internal fun CanonicalItemSnapshot.requireCanonicalReplacementSupport(): Canonic
         "Typed structural metadata is read-only until full-item authoring supports it"
     }
     val roundTripped = toCanonicalDraft()
-    require(roundTripped.recurrence?.kind != CanonicalRecurrenceKind.CUSTOM) {
-        "Custom RRULE recurrence is retained for read compatibility but is read-only on Android"
-    }
     require(roundTripped.matches(this)) {
         "Canonical item cannot be replaced without losing unsupported authoring fields"
     }
@@ -1436,7 +1590,7 @@ private fun decodeCanonicalRecurrence(raw: String): CanonicalRecurrenceDraft {
         else -> throw IllegalArgumentException("Unsupported recurrence")
     }
     result.requireValid()
-    return result
+    return result.normalized()
 }
 
 private fun decodeCanonicalSplit(raw: String): CanonicalSplitDraft {

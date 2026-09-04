@@ -54,22 +54,24 @@ is complete.
 | Shared habit recurrence and lifecycle core: bounded custom rules, rolling and completion-relative cadence, stable occurrence identity and move proof, missed/spacing policies, corrections, partial-progress demand, pauses, streaks, analytics, and scheduler-helper budgets; plus strict Android habit API transport | Core of `HAB-001`–`HAB-009`, parts of `CON` and `SCH` | [habit domain](../crates/dayweave-core/src/habits.rs), [recurrence engine](../crates/dayweave-core/src/recurrence.rs), [custom recurrence](../crates/dayweave-core/src/custom_recurrence.rs), [scheduler tests](../crates/dayweave-core/tests/scheduler.rs), and [habit ledger design](habit-occurrence-ledger.md) |
 | Authoritative habit backend with published-schedule evidence admission, immutable PostgreSQL occurrence/correction/pause history, idempotent mutations, ordered delta and content-free invalidation, private analytics, and lifecycle hydration that preserves non-habit recurrence state while rejecting spoofed or obsolete habit IDs | Server slice of `HAB-006`–`HAB-009`, `SYNC`, and `SEC` | [habit service](../server/dayweave-api/src/habits), [PostgreSQL repository](../server/dayweave-api/src/persistence/habit_repository.rs), [migration 0026](../server/dayweave-api/migrations/0026_habit_occurrence_ledger.sql), [API tests](../server/dayweave-api/tests/habits_api.rs), and [PostgreSQL tests](../server/dayweave-api/tests/habits_postgres.rs) |
 | macOS habit occurrence and statistics experience with strict transport, encrypted origin-bound offline persistence, exact replay, conflict review, done/partial/skipped corrections, pause/resume, trends, streaks, quantities, content-free invalidation/catch-up with polling fallback, and privacy scrubbing | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC` and `SEC` | [habit models](../apps/macos/Sources/DayWeaveMac/Models/HabitModels.swift), [habit sync store](../apps/macos/Sources/DayWeaveMac/Store/HabitSyncStore.swift), [habit invalidation stream](../apps/macos/Sources/DayWeaveMac/Store/HabitInvalidationStream.swift), and adjacent tests |
+| Android habit occurrence and statistics experience with strict origin-bound transport, an encrypted Room V17 offline ledger, exact replay and reviewed failures, terminal delta checkpoints, content-free invalidation with polling fallback, observed-revision and durability-first done/partial/skipped corrections, pause/resume, bounded analytics, habit-aware local composition, and finite custom-RRULE authoring | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC`, `SEC`, `SCH`, and `UX` | [habit models](../apps/android/app/src/main/java/com/greengolddog/dayweave/model/HabitModels.kt), [habit sync manager](../apps/android/app/src/main/java/com/greengolddog/dayweave/sync/HabitSyncManager.kt), [habit UI](../apps/android/app/src/main/java/com/greengolddog/dayweave/ui/screens/HabitSections.kt), [Room migration test](../apps/android/app/src/androidTest/java/com/greengolddog/dayweave/HabitLedgerMigrationTest.kt), and adjacent unit tests |
 
 ## Active implementation
 
-The current milestone is the complete habit path across the shared core,
-authoritative backend, scheduling input, and Android, followed by
-cross-platform end-to-end closure. The macOS client slice is implemented and
-covered; it remains part of the final integrated verification:
+The current milestone is macOS habit-integrity closure followed by
+cross-platform end-to-end verification. The shared core, authoritative backend,
+and Android client slices are implemented and covered; these remaining checks
+keep the broader habit path in progress:
 
-- persist and synchronize occurrence outcomes, partial progress, corrections,
-  missed behavior, and streak-neutral pauses;
-- make habit duration and remaining demand participate in deterministic day
-  composition without double-counting;
-- add polished Today/Habits controls on Android for done, partial, skipped,
-  correct, pause, resume, and analytics;
-- finish invalidation/catch-up, offline replay, conflict review, and end-to-end
-  PostgreSQL/client coverage.
+- add a durable terminal-page checkpoint to macOS habit catch-up and require it
+  before the ledger can authorize local composition;
+- feed authoritative macOS habit outcomes, partial progress, completion
+  anchors, and pauses into deterministic local composition with an in-flight
+  mutation fence;
+- bind every macOS mutation response and restored outbox command to its exact
+  ledger identity before removing or replaying the durable journal;
+- run the complete macOS wrapper and cross-platform client/server verification,
+  then close controlled real-device and seven-day acceptance gates.
 
 These items remain **in progress** until the complete slice passes the Rust,
 backend, macOS, Android, persistence, and protocol test gates and is committed.
@@ -80,28 +82,33 @@ Every requirement remains mandatory unless the owner explicitly changes
 [product-requirements.md](product-requirements.md). This table summarizes the
 remaining work without pretending that partially implemented areas are done.
 
-| Product area | Status | Work still required for full acceptance |
-| --- | --- | --- |
-| Identity and accounts (`ID`) | **In progress** | Finish session inventory/revocation UI, recovery flow, integration disconnect/reconnect parity, and final managed Codex login verification on both platforms. |
-| Common item model (`DOM`) | **In progress** | Complete every rich field, template, bulk operation, progress mode, audit/undo presentation, and cross-platform editing path. |
-| Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
-| Scheduling restrictions and profiles (`CON`) | **In progress** | Close every per-item hard/soft restriction, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence case. |
-| Scheduler intelligence (`SCH`) | **In progress** | Complete configurable objective ordering, movement-cost tuning, alternatives/what-if, overload resolution, fragile-deadline warnings, “Why here?”, learned preference controls, and 90-day performance proof. |
-| Habits (`HAB`) | **In progress** | Finish the active milestone described above, then verify all nine habit requirements end to end. |
-| Active execution (`EXE`) | **In progress** | Add Focus/DND mappings, inactivity correction, duration-learning controls, Pomodoro/mandatory-break settings, and full cross-device/UI coverage. |
-| Google Calendar (`GCAL`) | **In progress** | Complete full bidirectional parity for series scopes, attendees/RSVP, conferencing, attachments, flexible-event moves, birthdays/observances, OOO/free/tentative policy, conflicts, travel, density, and notification ownership. |
-| Google Tasks (`GTASK`) | **In progress** | Finish bidirectional field/list parity, external completion/deletion/due-date reactions, shared conflict/undo behavior, and controlled real-account tests. |
-| Capture, Inbox, files, and search (`CAP`, `SEA`) | **In progress** | Add voice, global/menu/share/shortcut/drag capture, attachment storage/OCR, URL snapshots, duplicate review, full-text/history search, and privacy-preserving semantic search. |
-| Embedded assistant (`AI`) | **In progress** | Complete universal and goal/project chats, all-item natural-language operations, overload/review workflows, visible memory/model/privacy controls, sourced web search, grounded explanations, offline queueing, and proactive limits. |
-| External MCP, Codex skill, Suggestions Inbox (`MCP`) | **In progress** | Complete permission configuration UI, all proposal kinds, proposal editing/bulk handling/expiry, per-client revocation, conversation continuation, and end-to-end ChatGPT/Codex verification. |
-| Offline synchronization and conflicts (`SYNC`) | **In progress** | Extend the proven journal/invalidation pattern to every entity, finish field-level conflict UI and safe synchronized undo, and meet the ten-second convergence target. |
-| Time, travel, location, health, weather (`CTX`) | **In progress** | Add travel-zone profiles, absolute/floating time UX, Maps travel modes, location/geofences, manual energy correction, weather suggestions, and the planned WHOOP provider extension. |
-| Notifications and platform integration (`NOT`) | **In progress** | Complete synchronized notification actions, privacy-safe lock presentation, macOS menu bar/widgets/Spotlight/Shortcuts/share/login helper, Android timer notification/tile/widgets/share/shortcuts/actions, and Focus/DND mappings. |
-| Client polish and accessibility (`UX`) | **In progress** | Complete every primary view, adaptive macOS inspector, Android More destinations, theming, timeline zoom, dim/hide completed work, drag/resize/pin/multi-select, command palette/shortcuts, accessibility, and demo workspace. |
-| Export, backup, and recovery (`DATA`) | **In progress** | Add encrypted full backup plus JSON/CSV/ICS/Markdown export, attachment object storage, production-shaped migration checks, and timed restore/RPO/RTO evidence. |
-| Security and privacy (`SEC`) | **In progress** | Close production key separation, session/client revocation, telemetry controls, runtime scanning, automatic security maintenance, alert delivery, and full adversarial security tests. |
-| Operations and distribution (`OPS`) | **In progress** | Provision only after approval, configure private HTTPS/monitoring/alerts, exercise dev/beta/stable release and rollback paths, and produce final local macOS and signed Android artifacts with provenance. |
-| Performance, reliability, and complete verification (`PERF`, `REL`, `TEST`) | **Planned** | Run all explicit launch/UI/scheduler/sync budgets, property and provider suites, production-shaped migrations, destructive restore rehearsal, security tests, and complete end-to-end acceptance. |
+“Approx. complete” is a coarse, evidence-based estimate of implemented agreed
+scope. It is not elapsed-time progress, remaining effort, or a delivery promise;
+areas differ greatly in size and the values must not be averaged into an app-wide
+percentage.
+
+| Product area | Status | Approx. complete | Work still required for full acceptance |
+| --- | --- | ---: | --- |
+| Identity and accounts (`ID`) | **In progress** | **60%** | Finish session inventory/revocation UI, recovery flow, integration disconnect/reconnect parity, and final managed Codex login verification on both platforms. |
+| Common item model (`DOM`) | **In progress** | **65%** | Complete every rich field, template, bulk operation, progress mode, audit/undo presentation, and cross-platform editing path. |
+| Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
+| Scheduling restrictions and profiles (`CON`) | **In progress** | **60%** | Close every per-item hard/soft restriction, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence case. |
+| Scheduler intelligence (`SCH`) | **In progress** | **55%** | Complete configurable objective ordering, movement-cost tuning, alternatives/what-if, overload resolution, fragile-deadline warnings, “Why here?”, learned preference controls, and 90-day performance proof. |
+| Habits (`HAB`) | **In progress** | **85%** | Finish the macOS integrity work above, then run cross-platform, real-device, and seven-day verification of all nine habit requirements. |
+| Active execution (`EXE`) | **In progress** | **65%** | Add Focus/DND mappings, inactivity correction, duration-learning controls, Pomodoro/mandatory-break settings, and full cross-device/UI coverage. |
+| Google Calendar (`GCAL`) | **In progress** | **45%** | Complete full bidirectional parity for series scopes, attendees/RSVP, conferencing, attachments, flexible-event moves, birthdays/observances, OOO/free/tentative policy, conflicts, travel, density, and notification ownership. |
+| Google Tasks (`GTASK`) | **In progress** | **45%** | Finish bidirectional field/list parity, external completion/deletion/due-date reactions, shared conflict/undo behavior, and controlled real-account tests. |
+| Capture, Inbox, files, and search (`CAP`, `SEA`) | **In progress** | **25%** | Add voice, global/menu/share/shortcut/drag capture, attachment storage/OCR, URL snapshots, duplicate review, full-text/history search, and privacy-preserving semantic search. |
+| Embedded assistant (`AI`) | **In progress** | **40%** | Complete universal and goal/project chats, all-item natural-language operations, overload/review workflows, visible memory/model/privacy controls, sourced web search, grounded explanations, offline queueing, and proactive limits. |
+| External MCP, Codex skill, Suggestions Inbox (`MCP`) | **In progress** | **55%** | Complete permission configuration UI, all proposal kinds, proposal editing/bulk handling/expiry, per-client revocation, conversation continuation, and end-to-end ChatGPT/Codex verification. |
+| Offline synchronization and conflicts (`SYNC`) | **In progress** | **55%** | Extend the proven journal/invalidation pattern to every entity, finish field-level conflict UI and safe synchronized undo, and meet the ten-second convergence target. |
+| Time, travel, location, health, weather (`CTX`) | **In progress** | **25%** | Add travel-zone profiles, absolute/floating time UX, Maps travel modes, location/geofences, manual energy correction, weather suggestions, and the planned WHOOP provider extension. |
+| Notifications and platform integration (`NOT`) | **In progress** | **20%** | Complete synchronized notification actions, privacy-safe lock presentation, macOS menu bar/widgets/Spotlight/Shortcuts/share/login helper, Android timer notification/tile/widgets/share/shortcuts/actions, and Focus/DND mappings. |
+| Client polish and accessibility (`UX`) | **In progress** | **35%** | Complete every primary view, adaptive macOS inspector, Android More destinations, theming, timeline zoom, dim/hide completed work, drag/resize/pin/multi-select, command palette/shortcuts, accessibility, and demo workspace. |
+| Export, backup, and recovery (`DATA`) | **In progress** | **30%** | Add encrypted full backup plus JSON/CSV/ICS/Markdown export, attachment object storage, production-shaped migration checks, and timed restore/RPO/RTO evidence. |
+| Security and privacy (`SEC`) | **In progress** | **60%** | Close production key separation, session/client revocation, telemetry controls, runtime scanning, automatic security maintenance, alert delivery, and full adversarial security tests. |
+| Operations and distribution (`OPS`) | **In progress** | **40%** | Provision only after approval, configure private HTTPS/monitoring/alerts, exercise dev/beta/stable release and rollback paths, and produce final local macOS and signed Android artifacts with provenance. |
+| Performance, reliability, and complete verification (`PERF`, `REL`, `TEST`) | **Planned** | — | Run all explicit launch/UI/scheduler/sync budgets, property and provider suites, production-shaped migrations, destructive restore rehearsal, security tests, and complete end-to-end acceptance. |
 
 ## External verification gates
 
@@ -129,3 +136,6 @@ separately because final acceptance needs owner-controlled resources:
 5. Credentials, tokens, private endpoints, tenant identifiers, signing keys,
    personal calendar content, and other private data must never be recorded in
    this public ledger.
+6. Approximate percentages change only when implementation or agreed scope
+   materially changes. They describe scope completeness, never elapsed time or
+   a delivery commitment, and do not trigger unsolicited chat estimates.

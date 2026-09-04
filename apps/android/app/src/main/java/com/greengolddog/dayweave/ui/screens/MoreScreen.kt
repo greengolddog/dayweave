@@ -126,6 +126,7 @@ fun MoreScreen(
     onOpenDeviceSecuritySettings: () -> Unit,
     canonicalPrivacyActionsEnabled: Boolean,
     onSetCanonicalItemSensitive: (String, Long, Boolean) -> Unit,
+    habitStatisticsContent: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var pendingSensitivityRemoval by remember {
@@ -290,6 +291,11 @@ fun MoreScreen(
                         )
                     },
                 )
+            }
+        }
+        habitStatisticsContent?.let { content ->
+            item {
+                content()
             }
         }
 

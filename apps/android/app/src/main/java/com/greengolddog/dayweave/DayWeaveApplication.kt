@@ -26,6 +26,8 @@ import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleCalendarInboundTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleCalendarOutboundTransport
+import com.greengolddog.dayweave.network.OkHttpHabitInvalidationStreamTransport
+import com.greengolddog.dayweave.network.OkHttpHabitTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationCoordinator
@@ -60,7 +62,9 @@ import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
 import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.DurableScheduleInvalidationCursor
+import com.greengolddog.dayweave.sync.DurableHabitInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundScheduleInvalidationManager
+import com.greengolddog.dayweave.sync.ForegroundHabitInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.GoogleAuthorizationAction
 import com.greengolddog.dayweave.sync.GoogleAuthorizationJournalLoadResult
@@ -70,6 +74,8 @@ import com.greengolddog.dayweave.sync.GoogleCalendarImportJournalLoadResult
 import com.greengolddog.dayweave.sync.GoogleCalendarImportPersistenceReceipt
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundCoordinator
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationCoordinator
+import com.greengolddog.dayweave.sync.HabitSyncManager
+import com.greengolddog.dayweave.sync.HabitSyncOutcome
 import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -79,10 +85,13 @@ import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateCoordinat
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.filterNotNull
@@ -207,6 +216,9 @@ class DayWeaveApplication : Application() {
                     if (scheduleInvalidationManagerDelegate.isInitialized()) {
                         scheduleInvalidationManager.cancelAndDrainActiveSession()
                     }
+                    if (habitInvalidationManagerDelegate.isInitialized()) {
+                        habitInvalidationManager.cancelAndDrainActiveSession()
+                    }
                     val quarantined = try {
                         plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
                     } finally {
@@ -246,6 +258,9 @@ class DayWeaveApplication : Application() {
                         }
                         if (executionSyncManagerDelegate.isInitialized()) {
                             executionSyncManager.quarantineBindingState()
+                        }
+                        if (habitSyncManagerDelegate.isInitialized()) {
+                            habitSyncManager.quarantineBindingState()
                         }
                         if (googleAccountManagerDelegate.isInitialized()) {
                             googleAccountManager.quarantineBindingState()
@@ -361,6 +376,36 @@ class DayWeaveApplication : Application() {
         )
     }
     val executionSyncManager: ExecutionSyncManager get() = executionSyncManagerDelegate.value
+
+    private val habitSyncManagerDelegate = lazy {
+        HabitSyncManager(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpHabitTransport(),
+        )
+    }
+    val habitSyncManager: HabitSyncManager get() = habitSyncManagerDelegate.value
+
+    private val habitInvalidationManagerDelegate = lazy {
+        ForegroundHabitInvalidationManager(
+            credentialStore = apiCredentialStore,
+            streamTransport = OkHttpHabitInvalidationStreamTransport(),
+            durableCursor = {
+                val ledger = plannerStore.durableState.value?.habitLedger
+                DurableHabitInvalidationCursor(
+                    syncOrigin = ledger?.syncOrigin,
+                    configurationId = ledger?.configurationId,
+                    cursor = ledger?.deltaCursor,
+                )
+            },
+            tryLaunchAuthoritativeRefresh = ::launchCanonicalResultAction,
+            authoritativeRefresh = {
+                habitSyncManager.refresh() in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES
+            },
+        )
+    }
+    private val habitInvalidationManager: ForegroundHabitInvalidationManager
+        get() = habitInvalidationManagerDelegate.value
 
     private val executionInvalidationManagerDelegate = lazy {
         ForegroundExecutionInvalidationManager(
@@ -752,6 +797,59 @@ class DayWeaveApplication : Application() {
     fun onboardingBackgroundWorkAllowed(): Boolean =
         onboardingRuntimeGate.backgroundWorkAllowed()
 
+    /**
+     * Starts a local encrypted habit write in process scope, outside the shared network gate.
+     * A screen may cancel its await without cancelling the write that owns the durable receipt.
+     */
+    fun launchDurableHabitAction(action: suspend () -> Boolean): Deferred<Boolean> {
+        if (
+            !onboardingRuntimeGate.backgroundWorkAllowed() ||
+            hasGoogleAuthorizationRecoveryBlocker()
+        ) {
+            return CompletableDeferred(false)
+        }
+        return persistenceScope.launchDurableBooleanAction {
+            if (
+                !onboardingRuntimeGate.backgroundWorkAllowed() ||
+                hasGoogleAuthorizationRecoveryBlocker()
+            ) {
+                false
+            } else {
+                action()
+            }
+        }
+    }
+
+    /**
+     * Result-bearing shared-gate launch for workers that must distinguish rejection from a later
+     * recovery-fence suppression. A non-null handle always reaches a Boolean result unless the
+     * application scope itself is cancelled.
+     */
+    fun launchCanonicalResultAction(
+        action: suspend () -> Boolean,
+    ): Deferred<Boolean>? {
+        if (
+            !onboardingRuntimeGate.backgroundWorkAllowed() ||
+            hasGoogleAuthorizationRecoveryBlocker()
+        ) {
+            return null
+        }
+        if (!canonicalActionGate.tryEnter()) return null
+        return persistenceScope.async {
+            try {
+                try {
+                    if (hasGoogleAuthorizationRecoveryBlocker()) false else action()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    false
+                }
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+    }
+
     /** Canonical actions outlive a transient screen/ViewModel so responses are always reconciled. */
     fun launchCanonicalAction(action: suspend () -> Unit): Boolean {
         if (
@@ -906,6 +1004,9 @@ class DayWeaveApplication : Application() {
         if (scheduleInvalidationManagerDelegate.isInitialized()) {
             scheduleInvalidationManager.cancelActiveSession()
         }
+        if (habitInvalidationManagerDelegate.isInitialized()) {
+            habitInvalidationManager.cancelActiveSession()
+        }
         if (proposalApplicationManagerDelegate.isInitialized()) {
             proposalApplicationManager.discardReviewForPrivacyBoundary()
         }
@@ -973,12 +1074,19 @@ class DayWeaveApplication : Application() {
         scheduleInvalidationManager.runForegroundActivation()
     }
 
+    /** Content-free habit hints accelerate the independent 30-second authoritative fallback. */
+    suspend fun runForegroundHabitInvalidations() {
+        if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
+        habitInvalidationManager.runForegroundActivation()
+    }
+
     /** Startup recovery installs the immutable head without creating a competing publication. */
     suspend fun recoverCurrentPublishedSchedule(): CanonicalRefreshOutcome? {
         if (!onboardingRuntimeGate.backgroundWorkAllowed()) return null
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
+        if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return null
         return recoverCurrentPublishedScheduleSequence(
             requiresWriteRecovery = plannerStore.state.value.requiresStartupWriteRecovery(),
             canonicalWriteRecovery = {
@@ -998,6 +1106,7 @@ class DayWeaveApplication : Application() {
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
+        if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return null
         return refreshCanonicalStateSequence(
             executionRefresh = executionSyncManager::refresh,
             canonicalRefresh = canonicalSyncManager::refreshAndCompose,
@@ -1008,6 +1117,7 @@ class DayWeaveApplication : Application() {
     suspend fun refreshForegroundExecution() {
         if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return
+        if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,
             canonicalRefreshNeeded = {
@@ -1034,8 +1144,19 @@ class DayWeaveApplication : Application() {
         const val LOG_TAG = "DayWeavePersistence"
         const val CONSENT_BOUNDARY_RETRY_DELAY_MILLIS = 5_000L
         val CANONICAL_TERMINAL_EXECUTION_STATUSES = setOf("completed", "skipped")
+        val HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES = setOf(
+            HabitSyncOutcome.SUCCESS,
+            HabitSyncOutcome.CONFLICT,
+            HabitSyncOutcome.NOT_FOUND,
+            HabitSyncOutcome.VALIDATION_FAILURE,
+        )
     }
 }
+
+/** The returned handle may be awaited by a shorter-lived UI job without adopting its lifetime. */
+internal fun CoroutineScope.launchDurableBooleanAction(
+    action: suspend () -> Boolean,
+): Deferred<Boolean> = async { action() }
 
 /** Pure orchestration seam: execution truth brackets composition and its terminal projection. */
 internal suspend fun refreshCanonicalStateSequence(

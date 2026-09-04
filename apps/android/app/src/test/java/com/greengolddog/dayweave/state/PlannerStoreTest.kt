@@ -10,11 +10,22 @@ import com.greengolddog.dayweave.model.ChatMessage
 import com.greengolddog.dayweave.model.ChatRole
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
+import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitOccurrenceEvidenceSnapshot
+import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeCommandSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeSnapshot
+import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
+import com.greengolddog.dayweave.model.PendingHabitMutation
+import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
+import com.greengolddog.dayweave.model.PendingHabitMutationKind
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
@@ -56,6 +67,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -353,6 +366,264 @@ class PlannerStoreTest {
     }
 
     @Test
+    fun habitDeltaPreservesAmbiguousPublicationJournalButRevokesItsLaterAuthority() {
+        val item = canonicalItem("planned", 7)
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7)
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(item),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+                schedule = listOf(block),
+                scheduleInputDigest = "sha256:${"0".repeat(64)}",
+                scheduleGeneratedAt = "1970-01-01T00:00:00Z",
+                schedulePlanningZoneId = "UTC",
+            ),
+        )
+        store.bindHabitLedger(CANONICAL_ORIGIN, "connection-1")
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            listOf(habitOccurrenceForPublication()),
+            emptyList(),
+            "habit_cursor_0",
+        )
+        val candidate = canonicalUpdate(item, block, cursor = "cursor-1")
+        val pending = publication(candidate)
+        assertNotNull(store.stageSchedulePublication(pending))
+
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            listOf(
+                habitOccurrenceForPublication(
+                    HabitOutcomeSnapshot(
+                        revision = 1,
+                        status = HabitOutcomeStatusSnapshot.COMPLETED,
+                        progressBasisPoints = 10_000,
+                        quantity = null,
+                        unit = null,
+                        actualSeconds = 1_800,
+                        note = null,
+                        occurredAt = "1970-01-01T01:30:00Z",
+                        updatedAt = "1970-01-01T01:31:00Z",
+                    ),
+                ),
+            ),
+            emptyList(),
+            "habit_cursor_1",
+        )
+
+        assertEquals(pending, store.state.value.pendingSchedulePublication)
+        assertTrue(store.state.value.pendingSchedulePublicationInvalidated)
+        assertNotNull(store.commitSchedulePublication(pending, publishedRevision(), replayed = false))
+        assertNull(store.state.value.pendingSchedulePublication)
+        assertFalse(store.state.value.pendingSchedulePublicationInvalidated)
+        assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.publishedScheduleProof)
+        assertNull(store.state.value.scheduleInputDigest)
+        assertEquals(
+            HabitOutcomeStatusSnapshot.COMPLETED,
+            store.state.value.habitLedger.occurrences.values.single().outcome?.status,
+        )
+    }
+
+    @Test
+    fun canonicalHabitToTaskTransitionPurgesOnlyHabitDerivedRecurrenceAuthority() {
+        val habit = canonicalItem("planned", 7).copy(
+            kind = "habit",
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(habit),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            ),
+        )
+        store.bindHabitLedger(CANONICAL_ORIGIN, "connection-1")
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            occurrences = listOf(
+                habitOccurrenceForPublication(
+                    HabitOutcomeSnapshot(
+                        revision = 1,
+                        status = HabitOutcomeStatusSnapshot.COMPLETED,
+                        progressBasisPoints = 10_000,
+                        quantity = null,
+                        unit = null,
+                        actualSeconds = 1_800,
+                        note = null,
+                        occurredAt = "1970-01-01T01:30:00Z",
+                        updatedAt = "1970-01-01T01:31:00Z",
+                    ),
+                ),
+            ),
+            pauses = emptyList(),
+            nextCursor = "habit_cursor_1",
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isNotEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isNotEmpty())
+
+        val task = canonicalItem("planned", 8)
+        store.replaceCanonicalPlan(
+            canonicalUpdate(
+                item = task,
+                block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                cursor = "cursor-1",
+            ),
+        )
+
+        assertTrue(store.state.value.habitLedger.occurrences.isNotEmpty())
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+    }
+
+    @Test
+    fun deletedCanonicalHabitCannotBeResurrectedByLaterHabitDeltaOrWindowMerge() {
+        val habit = canonicalItem("planned", 7).copy(
+            kind = "habit",
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(habit),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            ),
+        )
+        store.bindHabitLedger(CANONICAL_ORIGIN, "connection-1")
+        val completed = habitOccurrenceForPublication(
+            HabitOutcomeSnapshot(
+                revision = 1,
+                status = HabitOutcomeStatusSnapshot.COMPLETED,
+                progressBasisPoints = 10_000,
+                quantity = null,
+                unit = null,
+                actualSeconds = 1_800,
+                note = null,
+                occurredAt = "1970-01-01T01:30:00Z",
+                updatedAt = "1970-01-01T01:31:00Z",
+            ),
+        )
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            listOf(completed),
+            emptyList(),
+            "habit_cursor_1",
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isNotEmpty())
+
+        store.replaceCanonicalPlan(
+            canonicalUpdate(
+                item = habit.copy(revision = 8),
+                block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                cursor = "cursor-1",
+            ).copy(items = emptyList(), schedule = emptyList()),
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+
+        val skipped = completed.copy(
+            outcome = completed.outcome?.copy(
+                revision = 2,
+                status = HabitOutcomeStatusSnapshot.SKIPPED,
+                progressBasisPoints = 0,
+                actualSeconds = null,
+                updatedAt = "1970-01-01T01:32:00Z",
+            ),
+        )
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            listOf(skipped),
+            emptyList(),
+            "habit_cursor_2",
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+
+        val completedAgain = skipped.copy(
+            outcome = skipped.outcome?.copy(
+                revision = 3,
+                status = HabitOutcomeStatusSnapshot.COMPLETED,
+                progressBasisPoints = 10_000,
+                actualSeconds = 1_700,
+                updatedAt = "1970-01-01T01:33:00Z",
+            ),
+        )
+        store.mergeHabitOccurrencePage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            CANONICAL_ITEM_ID,
+            listOf(completedAgain),
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+        assertEquals(3L, store.state.value.habitLedger.occurrences.values.single().outcome?.revision)
+    }
+
+    @Test
+    fun canonicalHabitAdmissionProjectsLedgerRowsThatArrivedDuringBootstrap() {
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            ),
+        )
+        store.bindHabitLedger(CANONICAL_ORIGIN, "connection-1")
+        val completed = habitOccurrenceForPublication(
+            HabitOutcomeSnapshot(
+                revision = 1,
+                status = HabitOutcomeStatusSnapshot.COMPLETED,
+                progressBasisPoints = 10_000,
+                quantity = null,
+                unit = null,
+                actualSeconds = 1_800,
+                note = null,
+                occurredAt = "1970-01-01T01:30:00Z",
+                updatedAt = "1970-01-01T01:31:00Z",
+            ),
+        )
+        store.applyHabitDeltaPage(
+            CANONICAL_ORIGIN,
+            "connection-1",
+            listOf(completed),
+            emptyList(),
+            "habit_cursor_1",
+        )
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+
+        val habit = canonicalItem("planned", 7).copy(
+            kind = "habit",
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        store.replaceCanonicalPlan(
+            canonicalUpdate(
+                item = habit,
+                block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(kind = ItemKind.HABIT),
+                cursor = "cursor-1",
+            ),
+        )
+
+        assertEquals(
+            ItemStatus.COMPLETED,
+            store.state.value.recurrenceOutcomes.values.single().status,
+        )
+        assertEquals(
+            "1970-01-01T01:30:00Z",
+            store.state.value.recurrenceCompletionAnchors[CANONICAL_ITEM_ID],
+        )
+    }
+
+    @Test
     fun currentScheduleReplicaInstallsExactProofThenClearsOnlyFromDurableExpectedState() =
         runBlocking {
             val initial = DayWeaveUiState(
@@ -620,6 +891,72 @@ class PlannerStoreTest {
         assertTrue(
             PlannerStore(planSetMismatch).isCanonicalExecutionStartBlocked(block.id),
         )
+
+        val operationId = "66666666-6666-4666-8666-666666666666"
+        val habitId = "77777777-7777-4777-8777-777777777778"
+        val occurrenceId = "88888888-8888-4888-8888-888888888889"
+        val outcome = HabitOutcomeCommandSnapshot(
+            operationId = operationId,
+            expectedRevision = 0,
+            outcome = HabitOutcomeInputSnapshot(
+                status = HabitOutcomeStatusSnapshot.SKIPPED,
+                progressBasisPoints = 0,
+                quantity = null,
+                unit = null,
+                actualSeconds = null,
+                note = null,
+                occurredAt = "1970-01-01T00:00:00Z",
+            ),
+        )
+        val reviewedMutation = PendingHabitMutation(
+            schemaVersion = PendingHabitMutation.CURRENT_SCHEMA_VERSION,
+            kind = PendingHabitMutationKind.OUTCOME,
+            habitId = habitId,
+            targetId = occurrenceId,
+            expectedRevision = 0,
+            idempotencyKey = operationId,
+            requestJson = outcome.encoded(),
+            createdAt = "1970-01-01T00:00:00Z",
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            disposition = PendingHabitMutationDisposition.CONFLICT,
+        )
+        val habitBlocked = actionable.copy(
+            habitLedger = HabitLedgerSnapshot(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                pendingMutations = listOf(reviewedMutation),
+            ),
+        )
+        val habitBlockedStore = PlannerStore(habitBlocked)
+        assertTrue(habitBlockedStore.isCanonicalExecutionStartBlocked(block.id))
+        assertThrows(IllegalArgumentException::class.java) {
+            habitBlockedStore.stageCanonicalMutation(
+                canonicalMutation("in_progress", ItemStatus.ACTIVE),
+            )
+        }
+        assertNull(habitBlockedStore.state.value.pendingCanonicalMutation)
+        assertThrows(IllegalArgumentException::class.java) {
+            habitBlockedStore.stageExecutionCommand(
+                PendingExecutionCommand(
+                    idempotencyKey = "99999999-9999-4999-8999-999999999998",
+                    syncOrigin = CANONICAL_ORIGIN,
+                    configurationId = "connection-1",
+                    expectedRevision = 0,
+                    sessionId = EXECUTION_ID,
+                    itemId = CANONICAL_ITEM_ID,
+                    itemRevision = 7,
+                    sessionIndex = 0,
+                    plannedBlockId = block.id,
+                    sourceDeviceId = DEVICE_ID,
+                    commandType = "start",
+                    requestJson = "{}",
+                    focusedBlockId = block.id,
+                    startedAt = "1970-01-01T00:00:00Z",
+                ),
+            )
+        }
+        assertNull(habitBlockedStore.state.value.pendingExecutionCommand)
     }
 
     @Test
@@ -2795,6 +3132,36 @@ class PlannerStoreTest {
             candidate = candidate,
         )
     }
+
+    private fun habitOccurrenceForPublication(
+        outcome: HabitOutcomeSnapshot? = null,
+    ) = HabitOccurrenceSnapshot(
+        evidence = HabitOccurrenceEvidenceSnapshot(
+            id = "12121212-1212-4121-8121-121212121212",
+            habitId = CANONICAL_ITEM_ID,
+            plannerOccurrenceId = "13131313-1313-5131-8131-131313131313",
+            sourceScheduleRevisionId = "14141414-1414-4141-8141-141414141414",
+            sourceItemRevision = 7,
+            policyFingerprint = "sha256:${"b".repeat(64)}",
+            identity = JsonObject(
+                mapOf(
+                    "type" to JsonPrimitive("calendar_day"),
+                    "date" to JsonPrimitive("1970-01-01"),
+                    "bucket_ordinal" to JsonPrimitive(0),
+                ),
+            ),
+            nominalStart = "1970-01-01T01:00:00Z",
+            nominalEnd = "1970-01-01T01:30:00Z",
+            windowStart = "1970-01-01T00:30:00Z",
+            windowEnd = "1970-01-01T02:00:00Z",
+            localDate = "1970-01-01",
+            timezoneName = "UTC",
+            expectedDurationSeconds = 1_800,
+            expectedQuantity = null,
+            expectedUnit = null,
+        ),
+        outcome = outcome,
+    )
 
     private fun publishedRevision() = PublishedScheduleRevisionSnapshot(
         id = "77777777-7777-4777-8777-777777777777",

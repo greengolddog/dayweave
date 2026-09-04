@@ -137,7 +137,7 @@ class OkHttpCanonicalItemInvalidationStreamTransport(
                     input = response.body.byteStream(),
                     onInvalidation = onInvalidation,
                 )
-            } catch (error: CanonicalItemInvalidationProtocolException) {
+            } catch (error: OpaqueCursorInvalidationProtocolException) {
                 throw CanonicalItemInvalidationStreamException.Protocol(error)
             } catch (error: IllegalArgumentException) {
                 throw CanonicalItemInvalidationStreamException.Protocol(error)
@@ -188,7 +188,10 @@ class OkHttpCanonicalItemInvalidationStreamTransport(
 }
 
 /** Strict parser for exact opaque-cursor invalidations and heartbeat comments. */
-internal class CanonicalItemInvalidationSseParser {
+internal class CanonicalItemInvalidationSseParser(
+    private val expectedInvalidationEvent: String = INVALIDATION_EVENT,
+    private val cursorValidator: (String) -> Boolean = ::isCanonicalItemCursor,
+) {
     private var eventCount = 0
     private var frameCount = 0
 
@@ -225,7 +228,7 @@ internal class CanonicalItemInvalidationSseParser {
         }
     }
 
-    private class Frame {
+    private inner class Frame {
         private var commentSeen = false
         private var id: String? = null
         private var event: String? = null
@@ -264,7 +267,7 @@ internal class CanonicalItemInvalidationSseParser {
                 return null
             }
             val cursor = id ?: protocolFailure()
-            if (!isCanonicalItemCursor(cursor) || event != INVALIDATION_EVENT) protocolFailure()
+            if (!cursorValidator(cursor) || event != expectedInvalidationEvent) protocolFailure()
             val expectedData = "{\"cursor\":" + CURSOR_JSON.encodeToString(cursor) + "}"
             if (data != expectedData) protocolFailure()
             return cursor
@@ -299,7 +302,7 @@ internal class CanonicalItemInvalidationSseParser {
             .decode(ByteBuffer.wrap(this))
             .toString()
     } catch (error: Exception) {
-        throw CanonicalItemInvalidationProtocolException(error)
+        throw OpaqueCursorInvalidationProtocolException(error)
     }
 
     private fun checkedAdd(left: Int, right: Int): Int = try {
@@ -333,7 +336,7 @@ internal fun isCanonicalItemCursor(value: String): Boolean =
 
 internal const val MAX_CANONICAL_ITEM_CURSOR_BYTES = 256
 
-private class CanonicalItemInvalidationProtocolException(cause: Throwable? = null) :
-    IOException("Invalid canonical item invalidation frame", cause)
+internal class OpaqueCursorInvalidationProtocolException(cause: Throwable? = null) :
+    IOException("Invalid opaque-cursor invalidation frame", cause)
 
-private fun protocolFailure(): Nothing = throw CanonicalItemInvalidationProtocolException()
+private fun protocolFailure(): Nothing = throw OpaqueCursorInvalidationProtocolException()

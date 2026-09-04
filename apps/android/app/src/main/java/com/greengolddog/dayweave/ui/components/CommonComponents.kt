@@ -83,6 +83,7 @@ fun ScheduleItemCard(
     onSkip: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     canStart: Boolean = true,
+    canUseAlternatives: Boolean = canStart,
     unavailableLabel: String = "Needs review",
     displayStartLabel: String = item.timeRange().substringBefore('–'),
     displayDurationLabel: String = "${item.durationMinutes}m",
@@ -192,7 +193,7 @@ fun ScheduleItemCard(
                         onLater?.let { later ->
                             AssistChip(
                                 onClick = later,
-                                enabled = canStart,
+                                enabled = canUseAlternatives,
                                 label = { Text("Later") },
                                 leadingIcon = {
                                     Icon(Icons.Outlined.Schedule, contentDescription = null)
@@ -202,7 +203,7 @@ fun ScheduleItemCard(
                         onSkip?.let { skip ->
                             AssistChip(
                                 onClick = skip,
-                                enabled = canStart,
+                                enabled = canUseAlternatives,
                                 label = { Text("Skip") },
                             )
                         }

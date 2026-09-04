@@ -1175,6 +1175,12 @@ private data class LocalScheduleMutableInputSnapshot(
     val recurrenceCompletionAnchors: Map<String, String>,
     val occurrenceSeriesItemIds: Map<String, String>,
     val recurrenceOccurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot>,
+    val habitLedgerSyncOrigin: String?,
+    val habitLedgerConfigurationId: String?,
+    val habitLedgerDeltaCaughtUp: Boolean,
+    val habitOccurrences: Map<String, HabitOccurrenceSnapshot>,
+    val habitPauses: Map<String, HabitPauseSnapshot>,
+    val hasPendingHabitMutation: Boolean,
     val canonicalExecutionSyncOrigin: String?,
     val canonicalExecutionConfigurationId: String?,
     val canonicalExecutionRevision: Long,
@@ -1204,6 +1210,12 @@ fun DayWeaveUiState.localScheduleCompositionStateFingerprint(): String {
         recurrenceCompletionAnchors = recurrenceCompletionAnchors.toSortedMap(),
         occurrenceSeriesItemIds = occurrenceSeriesItemIds.toSortedMap(),
         recurrenceOccurrenceSources = recurrenceOccurrenceSources.toSortedMap(),
+        habitLedgerSyncOrigin = habitLedger.syncOrigin,
+        habitLedgerConfigurationId = habitLedger.configurationId,
+        habitLedgerDeltaCaughtUp = habitLedger.deltaCaughtUp,
+        habitOccurrences = habitLedger.occurrences.toSortedMap(),
+        habitPauses = habitLedger.pauses.toSortedMap(),
+        hasPendingHabitMutation = habitLedger.pendingMutations.isNotEmpty(),
         canonicalExecutionSyncOrigin = canonicalExecutionSyncOrigin,
         canonicalExecutionConfigurationId = canonicalExecutionConfigurationId,
         canonicalExecutionRevision = canonicalExecutionRevision,
@@ -1724,6 +1736,8 @@ data class DayWeaveUiState(
     val canonicalDeltaCursor: String? = null,
     /** Non-null only between durable staging and a strictly validated publish receipt. */
     val pendingSchedulePublication: PendingSchedulePublication? = null,
+    /** A persisted dirty bit keeps an exact in-flight publish replayable but never authoritative. */
+    val pendingSchedulePublicationInvalidated: Boolean = false,
     /** Exact reviewed Google Calendar/Tasks authority; retained until enqueue is accepted. */
     val pendingGoogleCalendarOutbound: GoogleCalendarOutboundJournal? = null,
     /** Encrypted generated-schedule review, one-shot authority, and accepted status recovery. */
@@ -1753,6 +1767,8 @@ data class DayWeaveUiState(
     val recurrenceMoves: Map<String, RecurrenceMoveSnapshot> = emptyMap(),
     /** Last real completion instant by recurring canonical item. */
     val recurrenceCompletionAnchors: Map<String, String> = emptyMap(),
+    /** Authoritative, origin-bound habit ledger cache plus exact encrypted offline replay outbox. */
+    val habitLedger: HabitLedgerSnapshot = HabitLedgerSnapshot(),
     /** Local create/edit/delete/restore queue; submitted entries are remote uncertainty fences. */
     val pendingCanonicalAuthoringMutations: List<PendingCanonicalAuthoringMutation> = emptyList(),
     /** Bounded full-item/tombstone records supporting reviewable restore after deletion. */
@@ -1848,6 +1864,13 @@ data class DayWeaveUiState(
             recurrenceCompletionAnchors === previous.recurrenceCompletionAnchors &&
             occurrenceSeriesItemIds === previous.occurrenceSeriesItemIds &&
             recurrenceOccurrenceSources === previous.recurrenceOccurrenceSources &&
+            habitLedger.syncOrigin == previous.habitLedger.syncOrigin &&
+            habitLedger.configurationId == previous.habitLedger.configurationId &&
+            habitLedger.deltaCaughtUp == previous.habitLedger.deltaCaughtUp &&
+            habitLedger.occurrences === previous.habitLedger.occurrences &&
+            habitLedger.pauses === previous.habitLedger.pauses &&
+            habitLedger.pendingMutations.isEmpty() ==
+                previous.habitLedger.pendingMutations.isEmpty() &&
             canonicalExecutionSyncOrigin == previous.canonicalExecutionSyncOrigin &&
             canonicalExecutionConfigurationId == previous.canonicalExecutionConfigurationId &&
             canonicalExecutionRevision == previous.canonicalExecutionRevision &&
@@ -1874,6 +1897,8 @@ data class DayWeaveUiState(
             scheduleGeneratedAt == previous.scheduleGeneratedAt &&
             schedulePlanningZoneId == previous.schedulePlanningZoneId &&
             pendingSchedulePublication === previous.pendingSchedulePublication &&
+            pendingSchedulePublicationInvalidated ==
+            previous.pendingSchedulePublicationInvalidated &&
             publishedScheduleRevision === previous.publishedScheduleRevision &&
             publishedScheduleProof === previous.publishedScheduleProof &&
             scheduleInputDigest == previous.scheduleInputDigest &&

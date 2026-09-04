@@ -771,12 +771,6 @@ internal data class CanonicalItemEditorForm(
             else -> null
         }
         val duration = if (event == null) ordinaryDuration else eventDuration
-        val retainedCustomRecurrence = source.recurrence?.takeIf {
-            it.kind == CanonicalRecurrenceKind.CUSTOM
-        }
-        require(retainedCustomRecurrence == null || recurrenceKind == CanonicalRecurrenceKind.CUSTOM) {
-            "Custom RRULE recurrence is read-only"
-        }
         val recurrence = recurrenceKind?.let { recurrenceType ->
             when (recurrenceType) {
                 CanonicalRecurrenceKind.DAILY,
@@ -817,11 +811,10 @@ internal data class CanonicalItemEditorForm(
                         null
                     },
                 )
-                CanonicalRecurrenceKind.CUSTOM -> requireNotNull(retainedCustomRecurrence) {
-                    "Custom RRULE recurrence cannot be authored on Android"
-                }.also {
-                    require(recurrenceRrule == it.rrule) { "Custom RRULE recurrence is read-only" }
-                }
+                CanonicalRecurrenceKind.CUSTOM -> CanonicalRecurrenceDraft(
+                    kind = recurrenceType,
+                    rrule = recurrenceRrule.required("Custom RRULE"),
+                )
             }
         }
         val schedulingValue = CanonicalSchedulingConstraintsDraft(
@@ -1107,9 +1100,6 @@ internal fun CanonicalItemEditorSheet(
     val issue = currentDraft.exceptionOrNull()?.let {
         it.message?.takeIf(String::isNotBlank) ?: "Review the highlighted item details."
     } ?: currentDraft.getOrNull()?.let(dependencyContext::cycleWarning)
-    val hasRetainedCustomRecurrence =
-        form.source.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM
-
     ModalBottomSheet(onDismissRequest = { if (!isSaving) onDismiss() }) {
         Column(
             modifier = Modifier
@@ -1263,23 +1253,15 @@ internal fun CanonicalItemEditorSheet(
                     ChoiceRow {
                         FilterChip(
                             selected = form.recurrenceKind == null,
-                            onClick = {
-                                if (!hasRetainedCustomRecurrence) {
-                                    form = form.copy(recurrenceKind = null)
-                                }
-                            },
-                            enabled = !hasRetainedCustomRecurrence &&
-                                (form.kind != ItemKind.HABIT ||
-                                    form.placement == CanonicalDraftPlacement.INBOX),
+                            onClick = { form = form.copy(recurrenceKind = null) },
+                            enabled = form.kind != ItemKind.HABIT ||
+                                form.placement == CanonicalDraftPlacement.INBOX,
                             label = { Text("None") },
                         )
-                        CanonicalRecurrenceKind.entries
-                            .filter { it != CanonicalRecurrenceKind.CUSTOM || hasRetainedCustomRecurrence }
-                            .forEach { option ->
+                        CanonicalRecurrenceKind.entries.forEach { option ->
                             FilterChip(
                                 selected = form.recurrenceKind == option,
                                 onClick = { form = form.copy(recurrenceKind = option) },
-                                enabled = !hasRetainedCustomRecurrence,
                                 label = { Text(option.editorLabel()) },
                                 modifier = Modifier.testTag(
                                     "canonical_editor_recurrence_${option.wireValue}",
@@ -1352,10 +1334,22 @@ internal fun CanonicalItemEditorSheet(
                             }
                         }
                         CanonicalRecurrenceKind.CUSTOM -> {
-                            Text("Retained RRULE", style = MaterialTheme.typography.labelLarge)
-                            Text(form.recurrenceRrule, style = MaterialTheme.typography.bodyMedium)
+                            OutlinedTextField(
+                                value = form.recurrenceRrule,
+                                onValueChange = { form = form.copy(recurrenceRrule = it) },
+                                label = { Text("Finite RRULE") },
+                                supportingText = {
+                                    Text(
+                                        "Daily, weekly, or monthly; requires COUNT or date-only UNTIL.",
+                                    )
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("canonical_editor_recurrence_rrule"),
+                                singleLine = true,
+                            )
                             Text(
-                                "Read-only until bounded RFC 5545 expansion is available.",
+                                "Supports INTERVAL, BYDAY, and BYMONTHDAY without ordinal weekdays.",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }

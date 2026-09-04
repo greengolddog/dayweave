@@ -10,6 +10,7 @@ import java.io.Reader
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
+import java.time.LocalDate
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
@@ -28,6 +29,7 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
@@ -605,7 +607,10 @@ sealed class PlannerApiException(message: String, cause: Throwable? = null) :
         "The validated schedule preview became stale before publication",
     )
 
-    class Validation(val statusCode: Int) : PlannerApiException(
+    class Validation(
+        val statusCode: Int,
+        val reason: PlannerValidationReason? = null,
+    ) : PlannerApiException(
         "The DayWeave API rejected planner input with HTTP $statusCode",
     )
 
@@ -617,6 +622,11 @@ sealed class PlannerApiException(message: String, cause: Throwable? = null) :
         "The DayWeave API returned an unreadable planner response",
         cause,
     )
+}
+
+/** Closed client-owned reasons recognized from exact authenticated validation envelopes. */
+enum class PlannerValidationReason {
+    CUSTOM_RECURRENCE_ANCHOR,
 }
 
 interface CanonicalPlannerTransport {
@@ -1000,8 +1010,72 @@ class OkHttpCanonicalPlannerTransport(
         401 -> PlannerApiException.Authentication()
         404 -> strictCanonicalMutationNotFound() ?: PlannerApiException.Http(code)
         409 -> strictCanonicalMutationConflict() ?: PlannerApiException.Conflict()
-        400, 422 -> PlannerApiException.Validation(code)
+        400, 422 -> PlannerApiException.Validation(code, strictCanonicalValidationReason())
         else -> PlannerApiException.Http(code)
+    }
+
+    /**
+     * Maps only a complete, bounded item-write envelope to a client-owned repair reason. Dynamic
+     * server text is checked for shape but is deliberately neither retained nor displayed.
+     */
+    private fun Response.strictCanonicalValidationReason(): PlannerValidationReason? {
+        if (code != 422) return null
+        if (canonicalMutationEndpoint() !in setOf(
+                CanonicalMutationEndpoint.CREATE,
+                CanonicalMutationEndpoint.REPLACE,
+            )
+        ) {
+            return null
+        }
+        if (!hasStrictNoStoreHeaders() || !hasJsonMediaType()) return null
+        val responseText = runCatching {
+            body.charStream().use { reader ->
+                reader.readBoundedPlannerText(MAX_ERROR_RESPONSE_CHARS)
+            }
+        }.getOrNull() ?: return null
+        if (runCatching { StrictJsonObjectKeyScanner(responseText, json).hasDuplicateKeys() }
+                .getOrElse { return null }
+        ) {
+            return null
+        }
+        val root = runCatching { json.parseToJsonElement(responseText).jsonObject }
+            .getOrNull() ?: return null
+        if (root.keys != setOf("error")) return null
+        val error = runCatching { root.getValue("error").jsonObject }.getOrNull() ?: return null
+        if (error.keys != setOf("code", "message", "details")) return null
+        if (
+            error.strictString("code") != CUSTOM_RECURRENCE_ANCHOR_CODE ||
+            error.strictString("message") != CUSTOM_RECURRENCE_ANCHOR_MESSAGE
+        ) {
+            return null
+        }
+        val details = runCatching { error.getValue("details").jsonObject }.getOrNull()
+            ?: return null
+        if (
+            details.keys != setOf(
+                "field",
+                "anchor_date",
+                "week_starts_on",
+                "reason",
+                "validation_scope",
+            ) ||
+            details.strictString("field") != "recurrence.rrule" ||
+            details.strictString("validation_scope") != "all_supported_week_starts"
+        ) {
+            return null
+        }
+        val anchorDate = details.strictString("anchor_date") ?: return null
+        if (
+            anchorDate.length != 10 ||
+            runCatching { LocalDate.parse(anchorDate).toString() }.getOrNull() != anchorDate
+        ) {
+            return null
+        }
+        val weekStartsOn = details.strictString("week_starts_on") ?: return null
+        if (weekStartsOn !in CANONICAL_WEEK_START_NAMES) return null
+        val serverReason = details.strictString("reason") ?: return null
+        if (serverReason.isBlank() || serverReason.length > MAX_ERROR_MESSAGE_CHARS) return null
+        return PlannerValidationReason.CUSTOM_RECURRENCE_ANCHOR
     }
 
     /** A trusted item-route 404 proves that a replace/trash/restore request changed nothing. */
@@ -1137,7 +1211,19 @@ class OkHttpCanonicalPlannerTransport(
         private const val MAX_ERROR_RESPONSE_CHARS = 8 * 1024
         private const val MAX_ERROR_MESSAGE_CHARS = 500
         private const val SCHEDULE_PUBLICATION_STALE_CODE = "schedule_publication_stale"
+        private const val CUSTOM_RECURRENCE_ANCHOR_CODE = "validation_failed"
+        private const val CUSTOM_RECURRENCE_ANCHOR_MESSAGE =
+            "custom recurrence is invalid for its item creation anchor"
         private val CANONICAL_ITEM_IDEMPOTENCY_KEY = Regex("^[A-Za-z0-9._:-]{8,128}$")
+        private val CANONICAL_WEEK_START_NAMES = setOf(
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+        )
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         private enum class CanonicalMutationEndpoint {
@@ -1192,6 +1278,9 @@ class OkHttpCanonicalPlannerTransport(
         }
     }
 }
+
+private fun JsonObject.strictString(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
 
 /** Detects duplicate object keys (including equivalent escaped spellings) before typed decoding. */
 private class StrictJsonObjectKeyScanner(

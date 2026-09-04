@@ -60,11 +60,13 @@ object PlannerSnapshotFormats {
     const val JSON_V15 = "json-v15-onboarding-first-item-anchor"
     /** Typed canonical structure with exact future-value retention and a rollback write fence. */
     const val JSON_V16 = "json-v16-canonical-structural-metadata"
+    /** Habit cache, terminal delta checkpoint, and exact encrypted offline replay authority. */
+    const val JSON_V17 = "json-v17-authoritative-habit-ledger"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 16,
+    version = 17,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -193,6 +195,15 @@ object PlannerDatabaseMigrations {
     val MIGRATION_15_16 = object : Migration(15, 16) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains an origin-bound authoritative
+     * habit ledger, terminal delta checkpoint, and exact offline mutation journal; the version
+     * prevents rollback to a binary that could accept incomplete history or ignore pending writes.
+     */
+    val MIGRATION_16_17 = object : Migration(16, 17) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -248,6 +259,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_13_14,
                 PlannerDatabaseMigrations.MIGRATION_14_15,
                 PlannerDatabaseMigrations.MIGRATION_15_16,
+                PlannerDatabaseMigrations.MIGRATION_16_17,
             )
             .build()
     }
