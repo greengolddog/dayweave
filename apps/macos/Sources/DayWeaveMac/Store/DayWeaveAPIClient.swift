@@ -711,6 +711,47 @@ protocol GoogleSchedulePublicationTransport: Sendable {
     ) async throws -> GoogleSchedulePublicationStatus
 }
 
+protocol DayWeaveHabitTransport: Sendable {
+    var configurationIdentifier: String { get }
+
+    func habitOccurrences(
+        habitID: UUID,
+        startDate: DayWeaveLocalDate,
+        endDate: DayWeaveLocalDate,
+        cursor: String?,
+        limit: Int
+    ) async throws -> DayWeaveHabitOccurrencePage
+
+    func putHabitOutcome(
+        habitID: UUID,
+        occurrenceID: UUID,
+        command: DayWeaveHabitOutcomeCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitOccurrenceMutationResponse
+
+    func startHabitPause(
+        habitID: UUID,
+        command: DayWeaveHabitPauseStartCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitPauseMutationResponse
+
+    func resumeHabitPause(
+        habitID: UUID,
+        pauseID: UUID,
+        command: DayWeaveHabitPauseResumeCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitPauseMutationResponse
+
+    func habitDelta(cursor: String?, limit: Int) async throws -> DayWeaveHabitDeltaPage
+
+    func habitAnalytics(
+        habitID: UUID,
+        startDate: DayWeaveLocalDate,
+        endDate: DayWeaveLocalDate,
+        bucket: DayWeaveHabitAnalyticsBucket
+    ) async throws -> DayWeaveHabitAnalytics
+}
+
 struct DayWeaveAPIClient: Sendable {
     static let maximumResponseBytes = 16 * 1_048_576
     static let maximumRequestBytes = 16 * 1_048_576
@@ -2454,6 +2495,246 @@ struct DayWeaveAPIClient: Sendable {
             }
     }
 
+    func habitOccurrences(
+        habitID: UUID,
+        startDate: DayWeaveLocalDate,
+        endDate: DayWeaveLocalDate,
+        cursor: String? = nil,
+        limit: Int = 100
+    ) async throws -> DayWeaveHabitOccurrencePage {
+        guard habitID != Self.nilUUID,
+              Self.isValidHabitDateRange(startDate, endDate),
+              (1...200).contains(limit),
+              cursor.map(Self.isValidHabitCursor) ?? true else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        var queryItems = [
+            URLQueryItem(name: "start_date", value: startDate.rawValue),
+            URLQueryItem(name: "end_date", value: endDate.rawValue),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        if let cursor {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        let page: DayWeaveHabitOccurrencePage = try await send(
+            method: "GET",
+            pathComponents: ["v1", "habits", habitID.uuidString.lowercased(), "occurrences"],
+            queryItems: queryItems,
+            requiredStatusCode: 200
+        )
+        guard page.occurrences.allSatisfy({ occurrence in
+            occurrence.evidence.habitID == habitID
+                && occurrence.evidence.localDate >= startDate
+                && occurrence.evidence.localDate <= endDate
+        }) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return page
+    }
+
+    func putHabitOutcome(
+        habitID: UUID,
+        occurrenceID: UUID,
+        command: DayWeaveHabitOutcomeCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitOccurrenceMutationResponse {
+        guard habitID != Self.nilUUID,
+              occurrenceID != Self.nilUUID,
+              command.expectedRevision < UInt64.max,
+              command.hasValidShape,
+              Self.isValidHabitIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let response: DayWeaveHabitOccurrenceMutationResponse = try await send(
+            method: "PUT",
+            pathComponents: [
+                "v1", "habits", habitID.uuidString.lowercased(), "occurrences",
+                occurrenceID.uuidString.lowercased(),
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(command),
+            requiredStatusCode: 200
+        )
+        guard response.occurrence.evidence.habitID == habitID,
+              response.occurrence.id == occurrenceID,
+              response.occurrence.outcome?.revision == command.expectedRevision + 1,
+              response.occurrence.outcome.map({
+                  Self.hasSameHabitOutcomeWireValue($0.input, command.outcome)
+              }) == true else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return response
+    }
+
+    func startHabitPause(
+        habitID: UUID,
+        command: DayWeaveHabitPauseStartCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitPauseMutationResponse {
+        guard habitID != Self.nilUUID,
+              command.hasValidShape,
+              Self.isValidHabitIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let response: DayWeaveHabitPauseMutationResponse = try await send(
+            method: "POST",
+            pathComponents: ["v1", "habits", habitID.uuidString.lowercased(), "pauses"],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(command),
+            requiredStatusCode: 200
+        )
+        guard response.pause.habitID == habitID,
+              response.pause.id == command.pauseID,
+              response.pause.revision == 1,
+              Self.hasSameHabitInstant(response.pause.startedAt, command.startedAt),
+              response.pause.endedAt == nil else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return response
+    }
+
+    func resumeHabitPause(
+        habitID: UUID,
+        pauseID: UUID,
+        command: DayWeaveHabitPauseResumeCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitPauseMutationResponse {
+        guard habitID != Self.nilUUID,
+              pauseID != Self.nilUUID,
+              command.expectedRevision < UInt64.max,
+              command.hasValidShape,
+              Self.isValidHabitIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let response: DayWeaveHabitPauseMutationResponse = try await send(
+            method: "POST",
+            pathComponents: [
+                "v1", "habits", habitID.uuidString.lowercased(), "pauses",
+                pauseID.uuidString.lowercased(), "resume",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(command),
+            requiredStatusCode: 200
+        )
+        guard response.pause.habitID == habitID,
+              response.pause.id == pauseID,
+              response.pause.revision == command.expectedRevision + 1,
+              response.pause.endedAt.map({
+                  Self.hasSameHabitInstant($0, command.endedAt)
+              }) == true else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return response
+    }
+
+    func habitDelta(cursor: String? = nil, limit: Int = 100) async throws
+        -> DayWeaveHabitDeltaPage
+    {
+        guard (1...200).contains(limit), cursor.map(Self.isValidHabitCursor) ?? true else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        return try await send(
+            method: "GET",
+            pathComponents: ["v1", "habits", "occurrences", "delta"],
+            queryItems: queryItems,
+            requiredStatusCode: 200
+        )
+    }
+
+    func habitAnalytics(
+        habitID: UUID,
+        startDate: DayWeaveLocalDate,
+        endDate: DayWeaveLocalDate,
+        bucket: DayWeaveHabitAnalyticsBucket
+    ) async throws -> DayWeaveHabitAnalytics {
+        guard habitID != Self.nilUUID,
+              Self.isValidHabitDateRange(startDate, endDate) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let envelope: DayWeaveHabitAnalyticsEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "habits", habitID.uuidString.lowercased(), "analytics"],
+            queryItems: [
+                URLQueryItem(name: "start_date", value: startDate.rawValue),
+                URLQueryItem(name: "end_date", value: endDate.rawValue),
+                URLQueryItem(name: "bucket", value: bucket.rawValue),
+            ],
+            requiredStatusCode: 200
+        )
+        guard envelope.analytics.habitID == habitID,
+              envelope.analytics.startDate == startDate,
+              envelope.analytics.endDate == endDate,
+              envelope.analytics.bucket == bucket else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return envelope.analytics
+    }
+
+    private static let nilUUID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
+
+    private static func isValidHabitIdempotencyKey(_ value: String) -> Bool {
+        (8...128).contains(value.utf8.count) && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                || [45, 46, 58, 95].contains(byte)
+        }
+    }
+
+    private static func isValidHabitCursor(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 256 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                || byte == 45 || byte == 95
+        }
+    }
+
+    private static func isValidHabitDateRange(
+        _ startDate: DayWeaveLocalDate,
+        _ endDate: DayWeaveLocalDate
+    ) -> Bool {
+        guard startDate <= endDate,
+              let start = startDate.date(in: "UTC"),
+              let end = endDate.date(in: "UTC") else { return false }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let elapsedDays = calendar.dateComponents(
+            [.day],
+            from: start,
+            to: end
+        ).day else { return false }
+        // Both endpoints are inclusive, so a difference of 365 is the
+        // service's maximum 366-day projection.
+        return (0..<366).contains(elapsedDays)
+    }
+
+    /// Requests are serialized at PostgreSQL's six-digit precision. `Date`
+    /// can retain finer binary fractions in memory, so response-echo checks
+    /// compare the exact transmitted instant instead of the pre-encoding bit
+    /// pattern.
+    private static func hasSameHabitInstant(_ left: Date, _ right: Date) -> Bool {
+        guard let left = CanonicalRFC3339Instant(date: left),
+              let right = CanonicalRFC3339Instant(date: right) else { return false }
+        return left.microsecondsSinceUnixEpoch == right.microsecondsSinceUnixEpoch
+    }
+
+    private static func hasSameHabitOutcomeWireValue(
+        _ left: DayWeaveHabitOutcomeInput,
+        _ right: DayWeaveHabitOutcomeInput
+    ) -> Bool {
+        left.status == right.status
+            && left.progressBasisPoints == right.progressBasisPoints
+            && left.quantity == right.quantity
+            && left.unit == right.unit
+            && left.actualSeconds == right.actualSeconds
+            && left.note == right.note
+            && hasSameHabitInstant(left.occurredAt, right.occurredAt)
+    }
+
     func previewSchedule(
         _ request: DayWeaveSchedulePreviewRequest
     ) async throws -> DayWeaveSchedulePreview {
@@ -2670,6 +2951,15 @@ struct DayWeaveAPIClient: Sendable {
             httpResponse.statusCode == $0
         } ?? (200..<300).contains(httpResponse.statusCode)
         guard hasAcceptedStatus else {
+            if Self.isHabitEndpoint(pathComponents),
+               !Self.isValidHabitJSONErrorResponse(
+                   contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                   cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                   pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                   body: data
+               ) {
+                throw DayWeaveAPIError.responseDecodingFailed
+            }
             if pathComponents == ["v1", "schedule", "current"],
                Self.isTrustedCurrentScheduleAbsent(
                    statusCode: httpResponse.statusCode,
@@ -2741,6 +3031,18 @@ struct DayWeaveAPIClient: Sendable {
         }
 
         do {
+            if Self.isHabitEndpoint(pathComponents),
+               !Self.isValidHabitJSONResponse(
+                   method: method,
+                   pathComponents: pathComponents,
+                   contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                   cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                   pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                   replayHeader: httpResponse.value(forHTTPHeaderField: "idempotency-replayed"),
+                   body: data
+               ) {
+                throw DayWeaveAPIError.responseDecodingFailed
+            }
             if pathComponents == ["v1", "schedule", "current"],
                !Self.isValidCurrentScheduleResponse(
                    contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
@@ -2768,6 +3070,67 @@ struct DayWeaveAPIClient: Sendable {
         case lookup
         case apply
         case undo
+    }
+
+    private static func isHabitEndpoint(_ pathComponents: [String]) -> Bool {
+        pathComponents.count >= 2
+            && pathComponents[0] == "v1"
+            && pathComponents[1] == "habits"
+    }
+
+    private static func isValidHabitJSONResponse(
+        method: String,
+        pathComponents: [String],
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        replayHeader: String?,
+        body: Data
+    ) -> Bool {
+        guard !body.isEmpty,
+              body.count <= Self.maximumResponseBytes,
+              isStrictJSONMediaType(contentType),
+              cacheControl?.lowercased() == "no-store, max-age=0",
+              pragma?.lowercased() == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body) else { return false }
+
+        let isMutation = method == "PUT"
+            || (method == "POST" && pathComponents.contains("pauses"))
+        guard isMutation else { return replayHeader == nil }
+        guard let replayHeader = replayHeader?.lowercased(),
+              replayHeader == "true" || replayHeader == "false",
+              let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let replayed = object["replayed"] as? Bool else { return false }
+        return replayed == (replayHeader == "true")
+    }
+
+    private static func isValidHabitJSONErrorResponse(
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> Bool {
+        guard !body.isEmpty,
+              body.count <= Self.maximumResponseBytes,
+              isStrictJSONMediaType(contentType),
+              cacheControl?.lowercased() == "no-store, max-age=0",
+              pragma?.lowercased() == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body),
+              let root = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(root.keys) == ["error"],
+              let error = root["error"] as? [String: Any],
+              Set(["code", "message"]).isSubset(of: Set(error.keys)),
+              Set(error.keys).isSubset(of: ["code", "message", "details"]),
+              let code = error["code"] as? String,
+              !code.isEmpty,
+              code.utf8.count <= 128,
+              code.utf8.allSatisfy({
+                  (97...122).contains($0) || (48...57).contains($0) || $0 == 95
+              }),
+              let message = error["message"] as? String,
+              !message.isEmpty,
+              message.utf8.count <= 16_384 else { return false }
+        return true
     }
 
     private enum CanonicalMutationEndpoint: Equatable {
@@ -3988,7 +4351,8 @@ extension DayWeaveAPIClient:
     GoogleSchedulePublicationTransport,
     DayWeaveExecutionStreamTransport,
     DayWeaveItemStreamTransport,
-    DayWeaveScheduleStreamTransport {}
+    DayWeaveScheduleStreamTransport,
+    DayWeaveHabitTransport {}
 
 private enum DayWeaveExecutionStreamAttemptResult: Sendable {
     case endOfStream(wasLive: Bool)

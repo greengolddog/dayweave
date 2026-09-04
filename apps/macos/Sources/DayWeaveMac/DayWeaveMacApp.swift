@@ -51,6 +51,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var proposalApplications: ProposalApplicationStore
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
+    @StateObject private var habitSync: HabitSyncStore
     @StateObject private var googleIntegration: GoogleIntegrationStore
     @StateObject private var googleOutbound: GoogleOutboundStore
     @StateObject private var googleSchedulePublication: GoogleSchedulePublicationStore
@@ -96,6 +97,8 @@ struct DayWeaveMacApp: App {
             await canonicalSync.syncThroughFreshComposition()
         }
         _executionSync = StateObject(wrappedValue: executionSync)
+        let habitSync = HabitSyncStore(authCoordinator: authCoordinator)
+        _habitSync = StateObject(wrappedValue: habitSync)
         let googleIntegration = GoogleIntegrationStore(
             authCoordinator: authCoordinator
         )
@@ -142,7 +145,8 @@ struct DayWeaveMacApp: App {
             googleOutbound: googleOutbound,
             googleSchedulePublication: googleSchedulePublication,
             executionSync: executionSync,
-            canonicalSync: canonicalSync
+            canonicalSync: canonicalSync,
+            habitSync: habitSync
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
@@ -165,6 +169,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(proposalApplications)
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
+                .environmentObject(habitSync)
                 .environmentObject(googleIntegration)
                 .environmentObject(googleOutbound)
                 .environmentObject(googleSchedulePublication)
@@ -353,6 +358,7 @@ struct DayWeaveMacApp: App {
                         .environmentObject(store)
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
+                        .environmentObject(habitSync)
                         .environmentObject(durableAuth)
                 } else if appLock.isContentAvailable {
                     DayWeaveOnboardingPrivacyMenuView(

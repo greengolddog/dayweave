@@ -54,6 +54,17 @@ protocol ExecutionServiceSynchronizing: AnyObject {
 
 extension ExecutionSyncStore: ExecutionServiceSynchronizing {}
 
+@MainActor
+protocol HabitServiceSynchronizing: AnyObject {
+    @discardableResult
+    func activate() async -> HabitSyncOutcome
+    func startForegroundPolling(every interval: Duration)
+    func stopForegroundPolling()
+    func suspendForPrivacyBoundary()
+}
+
+extension HabitSyncStore: HabitServiceSynchronizing {}
+
 /// Owns the foreground-service lifecycle so automatic and user-requested
 /// proposal recovery resume the same execution -> canonical -> polling order.
 /// A failed startup recovery releases the activation state instead of leaving
@@ -67,6 +78,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     private let googleSchedulePublication: (any GoogleSchedulePublicationRecovering)?
     private let executionSync: any ExecutionServiceSynchronizing
     private let canonicalSync: any CanonicalServiceSynchronizing
+    private let habitSync: (any HabitServiceSynchronizing)?
     private var activationTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
 
@@ -75,13 +87,15 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         googleOutbound: (any GoogleOutboundRecovering)? = nil,
         googleSchedulePublication: (any GoogleSchedulePublicationRecovering)? = nil,
         executionSync: any ExecutionServiceSynchronizing,
-        canonicalSync: any CanonicalServiceSynchronizing
+        canonicalSync: any CanonicalServiceSynchronizing,
+        habitSync: (any HabitServiceSynchronizing)? = nil
     ) {
         self.proposalApplications = proposalApplications
         self.googleOutbound = googleOutbound
         self.googleSchedulePublication = googleSchedulePublication
         self.executionSync = executionSync
         self.canonicalSync = canonicalSync
+        self.habitSync = habitSync
     }
 
     func activate() {
@@ -101,6 +115,8 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         activationTask = nil
         canonicalSync.stopForegroundItemInvalidations()
         executionSync.stopForegroundPolling()
+        habitSync?.stopForegroundPolling()
+        habitSync?.suspendForPrivacyBoundary()
     }
 
     /// Resolves a user-visible pending journal and resumes the full foreground
@@ -190,6 +206,12 @@ final class DayWeaveServiceCoordinator: ObservableObject {
             // configuration transition remains fail-closed while an existing
             // exact binding can recover during this foreground activation.
             canonicalSync.startForegroundItemInvalidations(every: .seconds(30))
+        }
+        guard operationIsCurrent(generation) else { return false }
+        if let habitSync {
+            _ = await habitSync.activate()
+            guard operationIsCurrent(generation) else { return false }
+            habitSync.startForegroundPolling(every: .seconds(30))
         }
         guard operationIsCurrent(generation) else { return false }
         executionSync.startForegroundPolling(every: .seconds(30))

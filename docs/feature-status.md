@@ -2,7 +2,7 @@
 
 Last updated: **2026-09-04**
 
-Tracking baseline: `main` through commit `dc71285`
+Tracking baseline: the `main` commit containing this ledger revision
 
 This is the maintained implementation ledger for DayWeave. It answers two
 questions: what exists in the repository now, and what still has to be added
@@ -52,11 +52,14 @@ is complete.
 | Health Connect energy-signal provider on Android with explicit permissions, private projection, and manual-safe fallback boundaries | `CTX-006`, future boundary for `CTX-008` | [Health Connect integration](../apps/android/app/src/main/java/com/greengolddog/dayweave/health) |
 | Reproducible local macOS and signed-APK build paths, guarded signing boundaries, CI security scans, container builds, encrypted backup scripts, and a cost-guarded Nebius Terraform plan | Parts of `OPS`, `SEC-004`, `SEC-011`, and `DATA-003`–`DATA-006` | [release workflow](../.github/workflows/release.yml), [local build scripts](../scripts), and [deployment assets](../deploy) |
 | Foundational habit occurrence domain and strict Android habit API transport: recurrence identities, lifecycle evidence, pause-aware analytics, bounded wire validation, and correction revisions | Parts of `HAB-001`–`HAB-009` | commit `1f5f722`, commit `dc71285`, and [habit ledger design](habit-occurrence-ledger.md) |
+| macOS habit occurrence and statistics experience with strict transport, encrypted origin-bound offline persistence, exact replay, conflict review, done/partial/skipped corrections, pause/resume, trends, streaks, quantities, and privacy scrubbing | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC` and `SEC` | [habit models](../apps/macos/Sources/DayWeaveMac/Models/HabitModels.swift), [habit sync store](../apps/macos/Sources/DayWeaveMac/Store/HabitSyncStore.swift), [habit persistence](../apps/macos/Sources/DayWeaveMac/Store/EncryptedHabitPersistence.swift), and their adjacent tests |
 
 ## Active implementation
 
 The current milestone is the complete habit path across the shared core,
-authoritative backend, scheduling input, macOS, and Android:
+authoritative backend, scheduling input, and Android, followed by
+cross-platform end-to-end closure. The macOS client slice is implemented and
+covered; it remains part of the final integrated verification:
 
 - harden every recurrence mode, including rolling frequencies,
   completion-relative rules, custom rules, spacing, time zones, and DST;
@@ -64,8 +67,8 @@ authoritative backend, scheduling input, macOS, and Android:
   missed behavior, and streak-neutral pauses;
 - make habit duration and remaining demand participate in deterministic day
   composition without double-counting;
-- add polished Today/Habits controls on both platforms for done, partial,
-  skipped, correct, pause, resume, and analytics;
+- add polished Today/Habits controls on Android for done, partial, skipped,
+  correct, pause, resume, and analytics;
 - finish invalidation/catch-up, offline replay, conflict review, and end-to-end
   PostgreSQL/client coverage.
 

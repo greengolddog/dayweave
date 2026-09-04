@@ -703,7 +703,7 @@ struct CanonicalAuthoringModelsTests {
             "metadata_earliest_after_canonical_deadline",
             "canonical_timestamp_exceeds_database_precision",
             "fractional_event_duration_cannot_match_integral_seconds",
-            "custom_rrule_is_retained_but_not_authorable",
+            "custom_rrule_rejects_ordinal_byday",
             "minimum_notice_exceeds_safe_offset", "frequency_spacing_exceeds_safe_offset",
             "zero_maximum_chunk_is_rejected_without_panicking",
             "metadata_timestamp_rejects_noncanonical_separator",

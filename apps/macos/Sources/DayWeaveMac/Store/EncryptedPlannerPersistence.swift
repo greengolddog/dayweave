@@ -85,7 +85,10 @@ struct PlannerPersistenceRevision: Equatable, Sendable {
 struct PlannerEncryptionKey: Equatable, Sendable {
     static let byteCount = 32
 
-    fileprivate let data: Data
+    /// Module-internal so independently authenticated private stores can reuse
+    /// the same validated key-provider contract without exposing key bytes
+    /// outside the executable target.
+    let data: Data
 
     init(data: Data) throws(PlannerPersistenceError) {
         guard data.count == Self.byteCount else {

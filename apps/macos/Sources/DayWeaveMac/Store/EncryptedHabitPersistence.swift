@@ -1,0 +1,612 @@
+import CryptoKit
+import Darwin
+import Foundation
+
+enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
+    case outcome(PendingOutcome)
+    case pauseStart(PendingPauseStart)
+    case pauseResume(PendingPauseResume)
+
+    struct PendingOutcome: Codable, Equatable, Sendable {
+        let habitID: UUID
+        let occurrenceID: UUID
+        let idempotencyKey: String
+        let command: DayWeaveHabitOutcomeCommand
+        let createdAt: Date
+        var conflictDetected: Bool
+    }
+
+    struct PendingPauseStart: Codable, Equatable, Sendable {
+        let habitID: UUID
+        let idempotencyKey: String
+        let command: DayWeaveHabitPauseStartCommand
+        let createdAt: Date
+        var conflictDetected: Bool
+    }
+
+    struct PendingPauseResume: Codable, Equatable, Sendable {
+        let habitID: UUID
+        let pauseID: UUID
+        let idempotencyKey: String
+        let command: DayWeaveHabitPauseResumeCommand
+        let createdAt: Date
+        var conflictDetected: Bool
+    }
+
+    var id: UUID {
+        switch self {
+        case let .outcome(value): value.command.operationID
+        case let .pauseStart(value): value.command.operationID
+        case let .pauseResume(value): value.command.operationID
+        }
+    }
+
+    var habitID: UUID {
+        switch self {
+        case let .outcome(value): value.habitID
+        case let .pauseStart(value): value.habitID
+        case let .pauseResume(value): value.habitID
+        }
+    }
+
+    var idempotencyKey: String {
+        switch self {
+        case let .outcome(value): value.idempotencyKey
+        case let .pauseStart(value): value.idempotencyKey
+        case let .pauseResume(value): value.idempotencyKey
+        }
+    }
+
+    var conflictDetected: Bool {
+        switch self {
+        case let .outcome(value): value.conflictDetected
+        case let .pauseStart(value): value.conflictDetected
+        case let .pauseResume(value): value.conflictDetected
+        }
+    }
+
+    func markingConflict() -> Self {
+        switch self {
+        case var .outcome(value):
+            value.conflictDetected = true
+            return .outcome(value)
+        case var .pauseStart(value):
+            value.conflictDetected = true
+            return .pauseStart(value)
+        case var .pauseResume(value):
+            value.conflictDetected = true
+            return .pauseResume(value)
+        }
+    }
+
+    var hasValidShape: Bool {
+        let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        guard id != nilID,
+              habitID != nilID,
+              Self.isValidIdempotencyKey(idempotencyKey) else { return false }
+        switch self {
+        case let .outcome(value):
+            return value.occurrenceID != nilID
+                && value.command.operationID == id
+                && value.command.hasValidShape
+                && value.createdAt.timeIntervalSinceReferenceDate.isFinite
+        case let .pauseStart(value):
+            return value.command.operationID == id
+                && value.command.hasValidShape
+                && value.createdAt.timeIntervalSinceReferenceDate.isFinite
+        case let .pauseResume(value):
+            return value.pauseID != nilID
+                && value.command.operationID == id
+                && value.command.hasValidShape
+                && value.createdAt.timeIntervalSinceReferenceDate.isFinite
+        }
+    }
+
+    private static func isValidIdempotencyKey(_ value: String) -> Bool {
+        (8...128).contains(value.utf8.count) && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                || [45, 46, 58, 95].contains(byte)
+        }
+    }
+}
+
+struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
+    static let currentSchemaVersion = 1
+    static let maximumOccurrences = 20_000
+    static let maximumPauses = 2_000
+    static let maximumAnalytics = 2_000
+    static let maximumPendingMutations = 500
+
+    let schemaVersion: Int
+    let savedAt: Date
+    let configurationIdentifier: String?
+    let deltaCursor: String?
+    let occurrences: [DayWeaveHabitOccurrence]
+    let pauses: [DayWeaveHabitPause]
+    let analytics: [DayWeaveHabitAnalytics]
+    let pendingMutations: [DayWeavePendingHabitMutation]
+
+    init(
+        schemaVersion: Int = Self.currentSchemaVersion,
+        savedAt: Date,
+        configurationIdentifier: String?,
+        deltaCursor: String?,
+        occurrences: [DayWeaveHabitOccurrence],
+        pauses: [DayWeaveHabitPause],
+        analytics: [DayWeaveHabitAnalytics],
+        pendingMutations: [DayWeavePendingHabitMutation]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.savedAt = savedAt
+        self.configurationIdentifier = configurationIdentifier
+        self.deltaCursor = deltaCursor
+        self.occurrences = occurrences
+        self.pauses = pauses
+        self.analytics = analytics
+        self.pendingMutations = pendingMutations
+    }
+
+    static func empty(at date: Date) -> Self {
+        .init(
+            savedAt: date,
+            configurationIdentifier: nil,
+            deltaCursor: nil,
+            occurrences: [],
+            pauses: [],
+            analytics: [],
+            pendingMutations: []
+        )
+    }
+
+    var hasValidShape: Bool {
+        guard schemaVersion == Self.currentSchemaVersion,
+              savedAt.timeIntervalSinceReferenceDate.isFinite,
+              occurrences.count <= Self.maximumOccurrences,
+              pauses.count <= Self.maximumPauses,
+              analytics.count <= Self.maximumAnalytics,
+              pendingMutations.count <= Self.maximumPendingMutations,
+              configurationIdentifier.map(Self.isValidBinding) ?? isEmpty,
+              deltaCursor.map(Self.isValidCursor) ?? true,
+              occurrences.allSatisfy({ $0.evidence.hasValidShape }),
+              pauses.allSatisfy(\.hasValidShape),
+              analytics.allSatisfy(\.hasValidShape),
+              pendingMutations.allSatisfy(\.hasValidShape),
+              Set(occurrences.map(\.id)).count == occurrences.count,
+              Set(pauses.map(\.id)).count == pauses.count,
+              Set(pendingMutations.map(\.id)).count == pendingMutations.count,
+              Set(pendingMutations.map(\.idempotencyKey)).count == pendingMutations.count else {
+            return false
+        }
+        return true
+    }
+
+    private var isEmpty: Bool {
+        deltaCursor == nil && occurrences.isEmpty && pauses.isEmpty && analytics.isEmpty
+            && pendingMutations.isEmpty
+    }
+
+    private static func isValidBinding(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 4_096
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
+    private static func isValidCursor(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 256 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                || byte == 45 || byte == 95
+        }
+    }
+}
+
+enum HabitPersistenceError: Error, Equatable, LocalizedError, Sendable {
+    case storageUnavailable
+    case keyUnavailable
+    case malformedEnvelope
+    case unsupportedVersion
+    case authenticationFailed
+    case invalidSnapshot
+    case snapshotTooLarge
+    case readFailed
+    case writeFailed
+    case lockUnavailable
+    case concurrentModification
+
+    var errorDescription: String? {
+        switch self {
+        case .storageUnavailable: "Private habit storage is unavailable."
+        case .keyUnavailable: "The habit encryption key is unavailable."
+        case .malformedEnvelope: "The encrypted habit cache is malformed."
+        case .unsupportedVersion: "The encrypted habit cache version is unsupported."
+        case .authenticationFailed: "The encrypted habit cache failed authentication."
+        case .invalidSnapshot: "The private habit cache contains invalid data."
+        case .snapshotTooLarge: "The private habit cache exceeds its safe size limit."
+        case .readFailed: "The encrypted habit cache could not be read safely."
+        case .writeFailed: "The encrypted habit cache could not be saved safely."
+        case .lockUnavailable: "The private habit cache is busy."
+        case .concurrentModification: "Another DayWeave process changed the private habit cache."
+        }
+    }
+}
+
+struct HabitPersistenceRevision: Equatable, Sendable {
+    static let missing = Self(digest: nil)
+    fileprivate let digest: Data?
+}
+
+struct EncryptedHabitPersistence: Sendable {
+    static let maximumPlaintextBytes = 8 * 1_048_576
+    static let maximumEnvelopeBytes = 12 * 1_048_576
+    private static let version = 1
+    private static let cipher = "AES.GCM.256"
+    private static let magic = "DAYWEAVE-ENCRYPTED-HABITS"
+
+    let fileURL: URL
+    private let keyProvider: any PlannerEncryptionKeyProviding
+
+    init(fileURL: URL, keyProvider: any PlannerEncryptionKeyProviding) {
+        self.fileURL = fileURL
+        self.keyProvider = keyProvider
+    }
+
+    init(fileURL: URL, key: PlannerEncryptionKey) {
+        self.init(fileURL: fileURL, keyProvider: HabitFixedKeyProvider(key: key))
+    }
+
+    static func applicationDefault() throws -> Self {
+        guard let root = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { throw HabitPersistenceError.storageUnavailable }
+        return Self(
+            fileURL: root
+                .appendingPathComponent("DayWeave", isDirectory: true)
+                .appendingPathComponent("habits.snapshot.encrypted"),
+            keyProvider: KeychainPlannerKeyProvider(
+                service: "com.greengolddog.dayweave.habit-encryption",
+                account: "device-key-v1"
+            )
+        )
+    }
+
+    func loadRevisioned() throws -> (
+        snapshot: DayWeaveHabitClientSnapshot?,
+        revision: HabitPersistenceRevision
+    ) {
+        try prepareDirectory()
+        return try withLock {
+            try removeOrphanedTemporaryFiles()
+            guard let data = try readData() else { return (nil, .missing) }
+            return (try decode(data), Self.revision(data))
+        }
+    }
+
+    @discardableResult
+    func save(
+        _ snapshot: DayWeaveHabitClientSnapshot,
+        expectedRevision: HabitPersistenceRevision
+    ) throws -> HabitPersistenceRevision {
+        let data = try encode(snapshot)
+        try prepareDirectory()
+        return try withLock {
+            try removeOrphanedTemporaryFiles()
+            let current = try readData()
+            guard Self.revision(current) == expectedRevision else {
+                throw HabitPersistenceError.concurrentModification
+            }
+            try writeData(data)
+            return Self.revision(data)
+        }
+    }
+
+    func preflightSave(_ snapshot: DayWeaveHabitClientSnapshot) throws {
+        _ = try Self.plaintext(snapshot)
+    }
+
+    private func encode(_ snapshot: DayWeaveHabitClientSnapshot) throws -> Data {
+        let plaintext = try Self.plaintext(snapshot)
+        let key: PlannerEncryptionKey
+        do { key = try keyProvider.loadOrCreateKey() } catch { throw HabitPersistenceError.keyUnavailable }
+        let sealed: AES.GCM.SealedBox
+        do {
+            sealed = try AES.GCM.seal(
+                plaintext,
+                using: SymmetricKey(data: key.data),
+                authenticating: Self.authenticatedHeader
+            )
+        } catch { throw HabitPersistenceError.writeFailed }
+        guard let combined = sealed.combined else { throw HabitPersistenceError.writeFailed }
+        let envelope = HabitEncryptedEnvelope(
+            magic: Self.magic,
+            version: Self.version,
+            cipher: Self.cipher,
+            payload: combined
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(envelope), data.count <= Self.maximumEnvelopeBytes else {
+            throw HabitPersistenceError.snapshotTooLarge
+        }
+        return data
+    }
+
+    private func decode(_ data: Data) throws -> DayWeaveHabitClientSnapshot {
+        guard data.count <= Self.maximumEnvelopeBytes,
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: data),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == ["cipher", "magic", "payload", "version"],
+              let envelope = try? JSONDecoder().decode(HabitEncryptedEnvelope.self, from: data),
+              envelope.magic == Self.magic else { throw HabitPersistenceError.malformedEnvelope }
+        guard envelope.version == Self.version, envelope.cipher == Self.cipher else {
+            throw HabitPersistenceError.unsupportedVersion
+        }
+        let sealed: AES.GCM.SealedBox
+        do { sealed = try AES.GCM.SealedBox(combined: envelope.payload) }
+        catch { throw HabitPersistenceError.malformedEnvelope }
+        let key: PlannerEncryptionKey
+        do { key = try keyProvider.loadOrCreateKey() } catch { throw HabitPersistenceError.keyUnavailable }
+        let plaintext: Data
+        do {
+            plaintext = try AES.GCM.open(
+                sealed,
+                using: SymmetricKey(data: key.data),
+                authenticating: Self.authenticatedHeader
+            )
+        } catch { throw HabitPersistenceError.authenticationFailed }
+        guard plaintext.count <= Self.maximumPlaintextBytes else {
+            throw HabitPersistenceError.snapshotTooLarge
+        }
+        guard StrictJSONObjectKeyScanner.hasUniqueKeys(in: plaintext),
+              let root = try? JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
+              Set([
+                  "schemaVersion", "savedAt", "occurrences", "pauses", "analytics",
+                  "pendingMutations",
+              ]).isSubset(of: Set(root.keys)),
+              Set(root.keys).isSubset(of: [
+                  "schemaVersion", "savedAt", "configurationIdentifier", "deltaCursor",
+                  "occurrences", "pauses", "analytics", "pendingMutations",
+              ]) else { throw HabitPersistenceError.invalidSnapshot }
+        let snapshot: DayWeaveHabitClientSnapshot
+        do { snapshot = try Self.decoder().decode(DayWeaveHabitClientSnapshot.self, from: plaintext) }
+        catch { throw HabitPersistenceError.invalidSnapshot }
+        guard snapshot.hasValidShape else { throw HabitPersistenceError.invalidSnapshot }
+        return snapshot
+    }
+
+    private static func plaintext(_ snapshot: DayWeaveHabitClientSnapshot) throws -> Data {
+        guard snapshot.hasValidShape else { throw HabitPersistenceError.invalidSnapshot }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            guard let instant = CanonicalRFC3339Instant(date: date) else {
+                throw EncodingError.invalidValue(
+                    date,
+                    .init(codingPath: encoder.codingPath, debugDescription: "Invalid date")
+                )
+            }
+            var container = encoder.singleValueContainer()
+            try container.encode(instant.canonicalUTCString)
+        }
+        encoder.outputFormatting = [.sortedKeys]
+        let data: Data
+        do { data = try encoder.encode(snapshot) }
+        catch { throw HabitPersistenceError.invalidSnapshot }
+        guard data.count <= Self.maximumPlaintextBytes else {
+            throw HabitPersistenceError.snapshotTooLarge
+        }
+        return data
+    }
+
+    private static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let text = try container.decode(String.self)
+            guard let instant = CanonicalRFC3339Instant(text),
+                  instant.hasPostgresPrecision,
+                  let date = instant.exactlyRepresentableDate else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Invalid timestamp"
+                )
+            }
+            return date
+        }
+        return decoder
+    }
+
+    private func prepareDirectory() throws {
+        let directory = fileURL.deletingLastPathComponent()
+        var metadata = stat()
+        let status = directory.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.lstat(path, &metadata)
+        }
+        if status == 0 {
+            guard metadata.st_mode & S_IFMT == S_IFDIR,
+                  metadata.st_uid == geteuid(),
+                  Darwin.chmod(directory.path, mode_t(S_IRWXU)) == 0 else {
+                throw HabitPersistenceError.storageUnavailable
+            }
+            return
+        }
+        guard errno == ENOENT else { throw HabitPersistenceError.storageUnavailable }
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+            )
+        } catch { throw HabitPersistenceError.storageUnavailable }
+        var createdMetadata = stat()
+        let createdStatus = directory.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.lstat(path, &createdMetadata)
+        }
+        guard createdStatus == 0,
+              createdMetadata.st_mode & S_IFMT == S_IFDIR,
+              createdMetadata.st_uid == geteuid(),
+              Darwin.chmod(directory.path, mode_t(S_IRWXU)) == 0 else {
+            throw HabitPersistenceError.storageUnavailable
+        }
+    }
+
+    /// Remove only regular, owned siblings matching this writer's exact UUID
+    /// temporary-file spelling. This runs under the same process lock as load
+    /// and save, bounding encrypted copies left by a crash before rename.
+    private func removeOrphanedTemporaryFiles() throws {
+        let directory = fileURL.deletingLastPathComponent()
+        let prefix = ".\(fileURL.lastPathComponent)."
+        let suffix = ".tmp"
+        let names: [String]
+        do { names = try FileManager.default.contentsOfDirectory(atPath: directory.path) }
+        catch { throw HabitPersistenceError.writeFailed }
+
+        for name in names where name.hasPrefix(prefix) && name.hasSuffix(suffix) {
+            let identifierStart = name.index(name.startIndex, offsetBy: prefix.count)
+            let identifierEnd = name.index(name.endIndex, offsetBy: -suffix.count)
+            let identifierText = String(name[identifierStart..<identifierEnd])
+            guard let identifier = UUID(uuidString: identifierText),
+                  identifier.uuidString == identifierText else { continue }
+            let orphan = directory.appendingPathComponent(name, isDirectory: false)
+            var metadata = stat()
+            let status = orphan.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return -1 }
+                return Darwin.lstat(path, &metadata)
+            }
+            if status != 0 {
+                if errno == ENOENT { continue }
+                throw HabitPersistenceError.writeFailed
+            }
+            guard metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_uid == geteuid() else { continue }
+            let unlinkStatus = orphan.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return -1 }
+                return Darwin.unlink(path)
+            }
+            if unlinkStatus != 0, errno != ENOENT { throw HabitPersistenceError.writeFailed }
+        }
+    }
+
+    private func readData() throws -> Data? {
+        let descriptor = fileURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        if descriptor < 0 {
+            if errno == ENOENT { return nil }
+            throw HabitPersistenceError.readFailed
+        }
+        defer { _ = Darwin.close(descriptor) }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & mode_t(S_IRWXG | S_IRWXO) == 0,
+              metadata.st_size >= 0,
+              metadata.st_size <= off_t(Self.maximumEnvelopeBytes) else {
+            throw HabitPersistenceError.readFailed
+        }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count < 0, errno == EINTR { continue }
+            guard count >= 0 else { throw HabitPersistenceError.readFailed }
+            if count == 0 { break }
+            result.append(buffer, count: count)
+            guard result.count <= Self.maximumEnvelopeBytes else {
+                throw HabitPersistenceError.snapshotTooLarge
+            }
+        }
+        return result
+    }
+
+    private func writeData(_ data: Data) throws {
+        let directory = fileURL.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp"
+        )
+        let descriptor = temporary.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        }
+        guard descriptor >= 0 else { throw HabitPersistenceError.writeFailed }
+        var shouldRemove = true
+        defer {
+            _ = Darwin.close(descriptor)
+            if shouldRemove { _ = Darwin.unlink(temporary.path) }
+        }
+        do {
+            guard Darwin.fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+                throw HabitPersistenceError.writeFailed
+            }
+            try data.withUnsafeBytes { bytes in
+                guard let address = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    let count = Darwin.write(descriptor, address.advanced(by: offset), bytes.count - offset)
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else { throw HabitPersistenceError.writeFailed }
+                    offset += count
+                }
+            }
+            guard fsync(descriptor) == 0,
+                  Darwin.rename(temporary.path, fileURL.path) == 0 else {
+                throw HabitPersistenceError.writeFailed
+            }
+            shouldRemove = false
+            _ = chmod(fileURL.path, mode_t(S_IRUSR | S_IWUSR))
+            let directoryDescriptor = Darwin.open(
+                directory.path,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+            )
+            guard directoryDescriptor >= 0 else { throw HabitPersistenceError.writeFailed }
+            defer { _ = Darwin.close(directoryDescriptor) }
+            guard fsync(directoryDescriptor) == 0 else { throw HabitPersistenceError.writeFailed }
+        } catch let error as HabitPersistenceError { throw error }
+        catch { throw HabitPersistenceError.writeFailed }
+    }
+
+    private func withLock<T>(_ body: () throws -> T) throws -> T {
+        let lockURL = fileURL.appendingPathExtension("lock")
+        let descriptor = lockURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        }
+        guard descriptor >= 0 else { throw HabitPersistenceError.lockUnavailable }
+        defer { _ = Darwin.close(descriptor) }
+        guard Darwin.fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw HabitPersistenceError.lockUnavailable
+        }
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & mode_t(S_IRWXG | S_IRWXO) == 0 else {
+            throw HabitPersistenceError.lockUnavailable
+        }
+        guard flock(descriptor, LOCK_EX) == 0 else { throw HabitPersistenceError.lockUnavailable }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
+    }
+
+    private static func revision(_ data: Data?) -> HabitPersistenceRevision {
+        guard let data else { return .missing }
+        return .init(digest: Data(SHA256.hash(data: data)))
+    }
+
+    private static var authenticatedHeader: Data {
+        Data("DayWeave.HabitSnapshot|\(version)|\(cipher)".utf8)
+    }
+}
+
+private struct HabitFixedKeyProvider: PlannerEncryptionKeyProviding {
+    let key: PlannerEncryptionKey
+    func loadOrCreateKey() throws(PlannerPersistenceError) -> PlannerEncryptionKey { key }
+}
+
+private struct HabitEncryptedEnvelope: Codable {
+    let magic: String
+    let version: Int
+    let cipher: String
+    let payload: Data
+}

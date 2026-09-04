@@ -208,6 +208,43 @@ struct DayWeaveServiceCoordinatorTests {
             "execution.poll",
         ])
     }
+
+    @Test("habit sync starts after canonical bootstrap and is scrubbed at the privacy boundary")
+    func habitLifecycleIsOrderedAndPrivate() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(
+            hasPendingRecovery: false,
+            resolvesRecovery: false,
+            reportedResult: false,
+            events: events
+        )
+        let execution = ExecutionServiceDouble(events: events)
+        let canonical = CanonicalServiceDouble(events: events)
+        let habits = HabitServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: proposals,
+            executionSync: execution,
+            canonicalSync: canonical,
+            habitSync: habits
+        )
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        coordinator.deactivate()
+
+        #expect(events.values == [
+            "execution.refresh",
+            "canonical.bootstrap",
+            "canonical.poll",
+            "habit.activate",
+            "habit.poll",
+            "execution.poll",
+            "canonical.stop",
+            "execution.stop",
+            "habit.stop",
+            "habit.suspend",
+        ])
+    }
 }
 
 @MainActor
@@ -320,6 +357,32 @@ private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
 
     func stopForegroundItemInvalidations() {
         events.values.append("canonical.stop")
+    }
+}
+
+@MainActor
+private final class HabitServiceDouble: HabitServiceSynchronizing {
+    private let events: ServiceEventLog
+
+    init(events: ServiceEventLog) {
+        self.events = events
+    }
+
+    func activate() async -> HabitSyncOutcome {
+        events.values.append("habit.activate")
+        return .success
+    }
+
+    func startForegroundPolling(every _: Duration) {
+        events.values.append("habit.poll")
+    }
+
+    func stopForegroundPolling() {
+        events.values.append("habit.stop")
+    }
+
+    func suspendForPrivacyBoundary() {
+        events.values.append("habit.suspend")
     }
 }
 #endif
