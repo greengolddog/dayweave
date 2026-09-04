@@ -63,16 +63,24 @@ core, authoritative backend, macOS client, and Android client slices are
 implemented and covered; a scoped device now exercises item creation, schedule
 publication, the PostgreSQL habit ledger, corrections, stale fencing,
 recomposition, analytics, pause/resume, and delta catch-up through the real HTTP
-router. These remaining items keep the broader habit path in progress:
+router.
 
-- preserve exact/ranged/unknown duration shape and provenance through both
-  native editors, expose general habit minimum spacing, and complete the
-  skip/carry/reduce/ask missed-occurrence workflow;
-- run the macOS and Android transports against one controlled service and keep
-  the shared Rust/macOS/Android contract gates green;
-- exercise the complete occurrence, correction, pause, analytics, invalidation,
-  offline replay, conflict, and recomposition path on both native clients;
-- verify the local macOS build and signed APK on the owner's Mac and Pixel 11;
+Every feature slice whose status is **In progress** has its own approximate
+completion value below. These are evidence-based scope estimates, not elapsed
+time or delivery forecasts. A percentage advances only after a material code,
+integration, or verification checkpoint; the notes state what prevents 100%.
+
+| In-progress feature slice | Approx. complete | Evidence and next checkpoint |
+| --- | ---: | --- |
+| Native rich duration shape and provenance | **90%** | Exact, ranged, and unknown durations are implemented across both native editors and persistence migrations; complete the full macOS and Android regression gates and commit the verified slice. |
+| General habit minimum spacing | **90%** | Shared stricter-floor scheduling semantics and both native authoring paths are implemented; complete cross-platform contract/build verification and commit the slice. |
+| Missed-occurrence skip/carry/reduce/ask workflow | **55%** | Core policies and lifecycle primitives exist and the durable server resolution path is under integration; finish contextual validation, scheduling effects, native review/action surfaces, and end-to-end tests. |
+| Controlled native-client/service habit integration | **35%** | The real HTTP/PostgreSQL service path is covered independently and native transports have contract coverage; run both native clients against the same controlled service and prove convergence. |
+| Full habit lifecycle on macOS and Android | **65%** | Occurrence, correction, pause, analytics, invalidation, offline replay, conflict, and recomposition behavior has broad automated coverage; close the controlled-service and native UI acceptance matrix. |
+| Final macOS build and Pixel 11 APK verification | **45%** | Reproducible local-build and signed-APK paths exist; finish release gates, produce final artifacts, install them, and verify them on the owner's devices. |
+
+The following remaining checkpoints are not yet marked in progress:
+
 - complete the required seven-consecutive-day trial, fix every critical or
   major issue, and rerun affected acceptance paths.
 
@@ -142,3 +150,7 @@ separately because final acceptance needs owner-controlled resources:
 6. Approximate percentages change only when implementation or agreed scope
    materially changes. They describe scope completeness, never elapsed time or
    a delivery commitment, and do not trigger unsolicited chat estimates.
+7. Every individual feature slice marked **In progress** must have its own
+   approximate completion percentage and a concrete next checkpoint. Broad
+   product-area percentages remain separate and are never calculated by simply
+   averaging feature rows.
