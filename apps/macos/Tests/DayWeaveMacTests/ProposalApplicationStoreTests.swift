@@ -87,6 +87,7 @@ struct ProposalApplicationStoreTests {
             ("earliest_start_at", "2026-09-01T08:00:00.000Z"),
             ("recurrence", #"{"frequency":"weekly"}"#),
             ("flexible_constraints", #"{"has_own_effort":true,"window":"morning"}"#),
+            ("dependencies", #"[{"item_id":"33333333-3333-4333-8333-333333333333","minimum_lag":30,"relation":"finish_to_start","strength":{"level":"hard"}}]"#),
             ("split_policy", "Indivisible"),
             ("importance", "73"),
             ("urgency", "61"),
@@ -123,7 +124,8 @@ struct ProposalApplicationStoreTests {
             "duration_kind", "duration_min_seconds", "duration_seconds",
             "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
             "deadline_date", "deadline_strength", "deadline_soft_weight",
-            "earliest_start_at", "recurrence", "flexible_constraints", "split_policy",
+            "earliest_start_at", "recurrence", "flexible_constraints", "dependencies",
+            "split_policy",
             "importance", "urgency", "parent_id", "sibling_order", "has_own_effort",
             "blocked_reason_kind", "blocked_by_item_id", "blocked_reason",
             "is_executable", "revision", "completed_at", "deleted_at",
@@ -235,6 +237,46 @@ struct ProposalApplicationStoreTests {
         )))
         #expect(journal.pendingProposalApplicationMutation == nil)
         #expect(URLProtocolStub.storage.requests(for: Self.testBearer).count == 2)
+    }
+
+    @Test("dependency proposal risk uses the exact protected wire code")
+    func testDependencyRiskCodeIsSupported() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.testBearer,
+            .init(statusCode: 200, body: Self.typedListEnvelope()),
+            .init(statusCode: 201, body: Self.dependencyRiskPreviewBody())
+        )
+        let (suggestions, _, applications) = Self.makeWorkflow()
+        await suggestions.refresh()
+        let proposal = try #require(suggestions.proposals.first)
+
+        await applications.prepareReview(for: proposal)
+
+        let review = try #require(applications.preview(for: proposal))
+        #expect(review.risks.map(\.code) == ["changes_dependencies"])
+        #expect(review.maximumRisk == "high")
+        #expect(review.requiresExplicitApproval)
+    }
+
+    @Test("dependency preview conflicts use the exact protected wire codes")
+    func testDependencyConflictCodesAreSupported() async throws {
+        for code in ["dependency_not_found", "dependency_cycle"] {
+            URLProtocolStub.storage.reset(key: Self.testBearer)
+            URLProtocolStub.storage.enqueue(
+                key: Self.testBearer,
+                .init(statusCode: 200, body: Self.typedListEnvelope()),
+                .init(statusCode: 201, body: Self.dependencyConflictPreviewBody(code: code))
+            )
+            let (suggestions, _, applications) = Self.makeWorkflow()
+            await suggestions.refresh()
+            let proposal = try #require(suggestions.proposals.first)
+
+            await applications.prepareReview(for: proposal)
+
+            let review = try #require(applications.preview(for: proposal))
+            #expect(review.conflicts.map(\.code) == [code])
+            #expect(!review.canApply)
+        }
     }
 
     @Test("a malformed apply response recovers by proposal without duplicating the mutation")
@@ -448,7 +490,12 @@ struct ProposalApplicationStoreTests {
           "deadline_soft_weight":75,
           "earliest_start_at":"2026-09-01T08:00:00Z",
           "recurrence":{"frequency":"weekly"},
-          "flexible_constraints":{"window":"morning","has_own_effort":true},
+          "flexible_constraints":{"window":"morning","has_own_effort":true,
+            "constraints":{"dependencies":[{
+              "item_id":"33333333-3333-4333-8333-333333333333",
+              "relation":"finish_to_start","minimum_lag":30,
+              "strength":{"level":"hard"}
+            }]}},
           "split_policy":{"type":"indivisible"},
           "importance":73,
           "urgency":61,
@@ -520,6 +567,39 @@ struct ProposalApplicationStoreTests {
                 with: alternateReviewHash
             )
             .utf8)
+    }
+
+    static func dependencyRiskPreviewBody() -> Data {
+        let original = String(
+            decoding: ProposalApplicationAPIClientTests.previewBody(canApply: true),
+            as: UTF8.self
+        )
+        return Data(original
+            .replacingOccurrences(
+                of: #""maximum_risk":"low""#,
+                with: #""maximum_risk":"high""#
+            )
+            .replacingOccurrences(
+                of: #""requires_explicit_approval":false"#,
+                with: #""requires_explicit_approval":true"#
+            )
+            .replacingOccurrences(of: #""level":"low""#, with: #""level":"high""#)
+            .replacingOccurrences(
+                of: #""code":"creates_item""#,
+                with: #""code":"changes_dependencies""#
+            )
+            .utf8)
+    }
+
+    static func dependencyConflictPreviewBody(code: String) -> Data {
+        let original = String(
+            decoding: ProposalApplicationAPIClientTests.previewBody(canApply: false),
+            as: UTF8.self
+        )
+        return Data(original.replacingOccurrences(
+            of: #""code":"item_not_found""#,
+            with: #""code":"\#(code)""#
+        ).utf8)
     }
 
     static func pendingApplyMutation(

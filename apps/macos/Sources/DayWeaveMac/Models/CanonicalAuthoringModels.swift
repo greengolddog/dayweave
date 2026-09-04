@@ -125,6 +125,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         if copy.notes?.isEmpty == true { copy.notes = nil }
         copy.deadlineAt = copy.deadlineAt.map(Self.wireCanonicalDate)
         copy.earliestStartAt = copy.earliestStartAt.map(Self.wireCanonicalDate)
+        if let constraints = CanonicalDependencyEdge.canonicalizedFlexibleConstraints(
+            copy.flexibleConstraints
+        ) {
+            copy.flexibleConstraints = constraints
+        }
         return copy
     }
 
@@ -169,6 +174,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         }
         guard value.flexibleConstraints.supportsCanonicalAuthoringConstraints else {
             return "These advanced constraints are read-only in this version of DayWeave."
+        }
+        if CanonicalDependencyEdge.decode(
+            fromFlexibleConstraints: value.flexibleConstraints
+        )?.contains(where: { $0.predecessorID == itemID }) == true {
+            return "An item cannot depend on itself."
         }
         if value.flexibleConstraints.hasNestedEarliestStart,
            value.earliestStartAt != nil {
@@ -890,7 +900,7 @@ extension JSONValue {
                     candidate.canonicalNonemptyString
                 }) else { return false }
             case "dependencies":
-                guard value == .array([]) else { return false }
+                guard CanonicalDependencyEdge.decodeArray(value) != nil else { return false }
             case "buffers":
                 guard case let .object(buffer) = value,
                       Set(buffer.keys) == ["before", "after", "strength"],

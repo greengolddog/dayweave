@@ -681,7 +681,8 @@ final class ProposalApplicationStore: ObservableObject {
             "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
             "deadline_date", "deadline_strength", "deadline_soft_weight",
             "earliest_start_at", "recurrence",
-            "flexible_constraints", "split_policy", "importance", "urgency", "parent_id",
+            "flexible_constraints", "dependencies", "split_policy", "importance", "urgency",
+            "parent_id",
             "sibling_order", "has_own_effort", "blocked_reason_kind",
             "blocked_by_item_id", "blocked_reason", "is_executable", "revision",
             "completed_at", "deleted_at",
@@ -733,6 +734,7 @@ final class ProposalApplicationStore: ObservableObject {
         let knownRiskCodes = Set([
             "creates_item", "replaces_item", "trashes_item", "restores_item",
             "changes_deadline", "relaxes_deadline", "changes_hierarchy",
+            "changes_dependencies",
             "changes_sensitivity", "changes_recurrence", "changes_execution_state",
             "sensitive_content", "bulk_change",
         ])
@@ -755,6 +757,7 @@ final class ProposalApplicationStore: ObservableObject {
             "proposal_not_pending", "proposal_expired", "proposal_revision_mismatch",
             "item_already_exists", "item_not_found", "item_revision_mismatch",
             "parent_not_found", "hierarchy_cycle", "invalid_parent_state",
+            "dependency_not_found", "dependency_cycle",
             "non_leaf_executable", "has_children", "deleted_parent", "invalid_item",
             "provider_managed_item", "preview_expired", "preview_mismatch",
             "preview_not_applicable", "already_applied", "undo_expired", "undo_diverged",
@@ -801,7 +804,8 @@ final class ProposalApplicationStore: ObservableObject {
             "duration_max_seconds", "duration_source", "deadline_kind", "deadline_at",
             "deadline_date", "deadline_strength", "deadline_soft_weight",
             "earliest_start_at", "recurrence",
-            "flexible_constraints", "split_policy", "importance", "urgency", "parent_id",
+            "flexible_constraints", "dependencies", "split_policy", "importance", "urgency",
+            "parent_id",
             "sibling_order", "has_own_effort", "blocked_reason_kind",
             "blocked_by_item_id", "blocked_reason", "is_executable", "revision",
             "completed_at", "deleted_at",
@@ -837,8 +841,17 @@ final class ProposalApplicationStore: ObservableObject {
             changed.insert("earliest_start_at")
         }
         if before.recurrence != after.recurrence { changed.insert("recurrence") }
-        if before.flexibleConstraints != after.flexibleConstraints {
+        let beforeScheduling = CanonicalDependencyEdge.proposalProjection(
+            fromFlexibleConstraints: before.flexibleConstraints
+        )
+        let afterScheduling = CanonicalDependencyEdge.proposalProjection(
+            fromFlexibleConstraints: after.flexibleConstraints
+        )
+        if beforeScheduling?.metadata != afterScheduling?.metadata {
             changed.insert("flexible_constraints")
+        }
+        if beforeScheduling?.dependencies != afterScheduling?.dependencies {
+            changed.insert("dependencies")
         }
         if before.splitPolicy != after.splitPolicy { changed.insert("split_policy") }
         if before.importance != after.importance { changed.insert("importance") }

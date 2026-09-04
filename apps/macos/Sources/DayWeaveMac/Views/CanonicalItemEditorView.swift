@@ -137,6 +137,7 @@ struct CanonicalItemEditorView: View {
                     if state.supportsRecurrence { recurrenceSection }
                     if state.kind != .event || state.hasEventFlexibleMetadata {
                         constraintsSection
+                        dependenciesSection
                     }
                     if state.kind != .event { kindMetadataSection }
                     hierarchySection
@@ -843,6 +844,217 @@ struct CanonicalItemEditorView: View {
         }
     }
 
+    private var dependenciesSection: some View {
+        CanonicalEditorSection(title: "Dependencies", symbol: "arrow.triangle.branch") {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Order work by what must happen first")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Required edges constrain the schedule. Preferred edges influence it when possible.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    state.dependencies.append(.init())
+                } label: {
+                    Label("Add dependency", systemImage: "plus.circle")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("canonical-editor.dependencies.add")
+            }
+            Text(
+                "Predecessors from other recurring subtrees, or whose ownership cannot be verified locally, are excluded."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if state.dependencies.isEmpty {
+                Label(
+                    "No predecessors. This item can be placed independently.",
+                    systemImage: "checkmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+            } else {
+                ForEach($state.dependencies) { dependency in
+                    dependencyEditor(dependency)
+                }
+            }
+
+            if let dependencyGraphWarning {
+                Label(dependencyGraphWarning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("canonical-editor.dependencies.cycle-warning")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dependencyEditor(
+        _ dependency: Binding<CanonicalItemEditorDependency>
+    ) -> some View {
+        let value = dependency.wrappedValue
+        let selected = value.predecessorID.flatMap(dependencyReference)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "arrow.down.right.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(value.strength == .hard ? Color.orange : Color.blue)
+                    .padding(.top, 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    if let selected {
+                        Text(dependencyDisplayTitle(selected))
+                            .font(.subheadline.weight(.semibold))
+                            .privacySensitive(selected.isSensitive)
+                        Text(
+                            "\(kindTitle(selected.kind)) · \(dependencyStatusTitle(selected.status))"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    } else {
+                        Text("Choose a predecessor")
+                            .font(.subheadline.weight(.semibold))
+                        Text("Search the active or completed items below.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button(role: .destructive) {
+                    state.dependencies.removeAll { $0.id == value.id }
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .help("Remove dependency")
+                .accessibilityIdentifier("canonical-editor.dependencies.remove")
+            }
+
+            TextField("Search predecessor by title, type, or ID", text: dependency.searchText)
+                .textFieldStyle(.roundedBorder)
+                .privacySensitive()
+                .accessibilityIdentifier("canonical-editor.dependencies.search")
+
+            let candidates = dependencyCandidates(for: value)
+            if value.predecessorID == nil || !value.searchText.isEmpty {
+                if candidates.isEmpty {
+                    Text("No available predecessor matches this search.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(candidates.prefix(6)) { candidate in
+                            Button {
+                                dependency.predecessorID.wrappedValue = candidate.id
+                                dependency.searchText.wrappedValue = ""
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: dependencyKindSymbol(candidate.kind))
+                                        .foregroundStyle(.tint)
+                                        .frame(width: 18)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(dependencyDisplayTitle(candidate))
+                                            .lineLimit(1)
+                                        Text(
+                                            "\(kindTitle(candidate.kind)) · "
+                                                + dependencyStatusTitle(candidate.status)
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if candidate.id == value.predecessorID {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(.tint)
+                                    }
+                                }
+                                .contentShape(Rectangle())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 7)
+                            }
+                            .buttonStyle(.plain)
+                            .privacySensitive(candidate.isSensitive)
+                            .accessibilityIdentifier(
+                                "canonical-editor.dependencies.candidate."
+                                    + candidate.id.uuidString.lowercased()
+                            )
+                            if candidate.id != candidates.prefix(6).last?.id { Divider() }
+                        }
+                    }
+                    .background(
+                        Color(nsColor: .controlBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    }
+                }
+            }
+
+            if let selected, !selected.isAvailable {
+                Label(
+                    "This historical predecessor is unavailable. Keep it for history or remove the edge.",
+                    systemImage: "archivebox"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                GridRow {
+                    Text("Relationship")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("Relationship", selection: dependency.relation) {
+                        ForEach(CanonicalDependencyRelation.allCases) { relation in
+                            Text(relation.shortTitle).tag(relation)
+                        }
+                    }
+                    .labelsHidden()
+                    .accessibilityIdentifier("canonical-editor.dependencies.relation")
+                }
+                GridRow {
+                    Text("Lag")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Stepper(
+                        value: intBinding(dependency.minimumLagMinutes),
+                        in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                        step: 5
+                    ) {
+                        Text(CanonicalItemEditorState.minuteDescription(
+                            dependency.wrappedValue.minimumLagMinutes
+                        ))
+                    }
+                    .accessibilityIdentifier("canonical-editor.dependencies.lag")
+                }
+            }
+            Text(value.relation.guidance)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            strengthEditor(
+                strength: dependency.strength,
+                softWeight: dependency.softWeight
+            )
+            .accessibilityIdentifier("canonical-editor.dependencies.strength")
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("canonical-editor.dependencies.edge")
+    }
+
     private var hierarchySection: some View {
         CanonicalEditorSection(title: "Hierarchy", symbol: "point.3.connected.trianglepath.dotted") {
             Picker("Parent", selection: $state.parentID) {
@@ -892,6 +1104,122 @@ struct CanonicalItemEditorView: View {
         )
     }
 
+    private var dependencyReferences: [CanonicalDependencyReference] {
+        CanonicalDependencyCatalog.references(
+            canonicalItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            excluding: mode.itemID,
+            sensitivity: { store.canonicalItemRequiresSensitivePresentation(itemID: $0) }
+        )
+    }
+
+    private func dependencyReference(_ id: UUID) -> CanonicalDependencyReference? {
+        if let reference = dependencyReferences.first(where: { $0.id == id }) {
+            return reference
+        }
+        guard state.mayRetainUnavailableDependency(id) else { return nil }
+        return CanonicalDependencyReference(
+            id: id,
+            title: "Unavailable item · \(id.uuidString.lowercased().prefix(8))",
+            kind: .unknown("unavailable"),
+            status: .unknown("unavailable"),
+            isSensitive: false,
+            isAvailable: false,
+            hasOpaqueDependencies: false
+        )
+    }
+
+    private var dependencyGraphWarning: String? {
+        guard state.dependencies.allSatisfy({ $0.predecessorID != nil }) else { return nil }
+        return CanonicalDependencyCatalog.cycleWarning(
+            canonicalItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            replacing: mode.itemID,
+            with: state.draft
+        )
+    }
+
+    private var dependencySelectionIssue: String? {
+        let knownIDs = Set(dependencyReferences.map(\.id))
+        if state.dependencies.compactMap(\.predecessorID).contains(where: {
+            !knownIDs.contains($0) && !state.mayRetainUnavailableDependency($0)
+        }) {
+            return "A selected predecessor is no longer available on this Mac. Sync, remove it, or choose another item."
+        }
+        return nil
+    }
+
+    private func dependencyCandidates(
+        for dependency: CanonicalItemEditorDependency
+    ) -> [CanonicalDependencyReference] {
+        let used = Set(state.dependencies.compactMap { edge in
+            edge.id == dependency.id ? nil : edge.predecessorID
+        })
+        let recurringBoundaryWarnings = CanonicalDependencyCatalog.recurringBoundaryCandidateWarnings(
+            canonicalItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            replacing: mode.itemID,
+            with: state.draft,
+            predecessorIDs: dependencyReferences.map(\.id)
+        )
+        let query = dependency.searchText.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).localizedLowercase
+        return dependencyReferences.filter { candidate in
+            guard candidate.isSelectableDependencyCandidate,
+                  !used.contains(candidate.id),
+                  recurringBoundaryWarnings[candidate.id] == nil else { return false }
+            guard !query.isEmpty else { return true }
+            let presentedTitle = dependencyDisplayTitle(candidate).localizedLowercase
+            let searchable = [
+                presentedTitle,
+                candidate.kind.wireValue,
+                candidate.status.wireValue,
+                candidate.id.uuidString.lowercased(),
+            ].joined(separator: " ")
+            return searchable.localizedStandardContains(query)
+        }
+    }
+
+    private func dependencyDisplayTitle(_ reference: CanonicalDependencyReference) -> String {
+        if reference.isSensitive, !requiresSensitivePresentation {
+            return "Sensitive item · \(reference.identifierHint)"
+        }
+        return reference.title
+    }
+
+    private func dependencyStatusTitle(_ status: DayWeaveCanonicalItemStatus) -> String {
+        switch status {
+        case .inProgress: "In progress"
+        case .unknown: "Newer status"
+        default: status.wireValue.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    private func kindTitle(_ kind: DayWeaveCanonicalItemKind) -> String {
+        switch kind {
+        case .breakTime: "Break"
+        case .unknown: "Item"
+        default: kind.wireValue.capitalized
+        }
+    }
+
+    private func dependencyKindSymbol(_ kind: DayWeaveCanonicalItemKind) -> String {
+        switch kind {
+        case .event: "calendar"
+        case .task: "checkmark.circle"
+        case .habit: "repeat"
+        case .routine: "list.number"
+        case .goal: "target"
+        case .project: "folder"
+        case .breakTime: "cup.and.saucer"
+        case .unknown: "questionmark.diamond"
+        }
+    }
+
     private var parentSelectionIsValid: Bool {
         guard let parentID = state.parentID else { return true }
         return parentOptions.contains { $0.id == parentID }
@@ -920,7 +1248,9 @@ struct CanonicalItemEditorView: View {
         if !parentSelectionIsValid {
             return "Choose an available Inbox or Planned parent, or remove the parent."
         }
-        return state.validationIssue
+        if let issue = state.validationIssue { return issue }
+        if let dependencySelectionIssue { return dependencySelectionIssue }
+        return dependencyGraphWarning
     }
 
     private var canSave: Bool {

@@ -141,6 +141,62 @@ struct CanonicalItemEditorTag: Identifiable, Equatable, Sendable {
     }
 }
 
+struct CanonicalItemEditorDependency: Identifiable, Equatable, Sendable {
+    let id: UUID
+    var predecessorID: UUID?
+    var relation: CanonicalDependencyRelation
+    var minimumLagMinutes: UInt32
+    var strength: CanonicalItemEditorConstraintStrength
+    var softWeight: UInt32
+    /// Search is transient editor state and is deliberately absent from the
+    /// canonical aggregate emitted by `draft`.
+    var searchText: String
+
+    init(
+        id: UUID = UUID(),
+        predecessorID: UUID? = nil,
+        relation: CanonicalDependencyRelation = .finishToStart,
+        minimumLagMinutes: UInt32 = 0,
+        strength: CanonicalItemEditorConstraintStrength = .hard,
+        softWeight: UInt32 = 100,
+        searchText: String = ""
+    ) {
+        self.id = id
+        self.predecessorID = predecessorID
+        self.relation = relation
+        self.minimumLagMinutes = minimumLagMinutes
+        self.strength = strength
+        self.softWeight = softWeight
+        self.searchText = searchText
+    }
+
+    init(edge: CanonicalDependencyEdge) {
+        id = UUID()
+        predecessorID = edge.predecessorID
+        relation = edge.relation
+        minimumLagMinutes = edge.minimumLagMinutes
+        switch edge.strength {
+        case .hard:
+            strength = .hard
+            softWeight = 100
+        case let .soft(weight):
+            strength = .soft
+            softWeight = weight
+        }
+        searchText = ""
+    }
+
+    var edge: CanonicalDependencyEdge? {
+        guard let predecessorID else { return nil }
+        return CanonicalDependencyEdge(
+            predecessorID: predecessorID,
+            relation: relation,
+            minimumLagMinutes: minimumLagMinutes,
+            strength: strength == .hard ? .hard : .soft(weight: softWeight)
+        )
+    }
+}
+
 struct CanonicalItemEditorGoalMeasure: Identifiable, Equatable, Sendable {
     let id: UUID
     var name: String
@@ -283,6 +339,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     var preferredAbsoluteWindows: [CanonicalItemEditorAbsoluteWindow]
     var forbiddenWindows: [CanonicalItemEditorAbsoluteWindow]
     var requiredContexts: [CanonicalItemEditorQualifiedText]
+    var dependencies: [CanonicalItemEditorDependency]
     var hasRequiredLocation: Bool
     var requiredLocation: String
     var requiredLocationStrength: CanonicalItemEditorConstraintStrength
@@ -347,6 +404,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     private var hadBreakMandatoryConstraint: Bool
     private var hadBreakPromptConstraint: Bool
     private var hadExplicitNullOccurrenceWindow: Bool
+    private var retainedDependencyIDs: Set<UUID>
     private var retainedReadOnlyDraft: DayWeaveCanonicalItemDraft?
     private(set) var readOnlyDiagnostic: String?
 
@@ -411,6 +469,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         preferredAbsoluteWindows = []
         forbiddenWindows = []
         requiredContexts = []
+        dependencies = []
         hasRequiredLocation = false
         requiredLocation = ""
         requiredLocationStrength = .hard
@@ -471,6 +530,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         hadBreakMandatoryConstraint = false
         hadBreakPromptConstraint = false
         hadExplicitNullOccurrenceWindow = false
+        retainedDependencyIDs = []
         retainedReadOnlyDraft = nil
         readOnlyDiagnostic = nil
 
@@ -694,6 +754,8 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         preferredAbsoluteWindows = []
         forbiddenWindows = []
         requiredContexts = []
+        dependencies = []
+        retainedDependencyIDs = []
         hasRequiredLocation = false
         requiredLocation = ""
         hasBuffers = false
@@ -890,6 +952,10 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         return "\(seconds)s"
     }
 
+    func mayRetainUnavailableDependency(_ predecessorID: UUID) -> Bool {
+        retainedDependencyIDs.contains(predecessorID)
+    }
+
     static func minuteDescription(_ minutes: UInt32) -> String {
         guard minutes <= UInt32.max / 60 else { return "\(minutes)m" }
         return durationDescription(minutes * 60)
@@ -1030,6 +1096,12 @@ struct CanonicalItemEditorState: Equatable, Sendable {
                     softWeight: context.softWeight
                 )
             })
+        schedulingConstraints["dependencies"] = dependencies.isEmpty
+            ? nil
+            : .array(dependencies.compactMap(\.edge).sorted {
+                $0.predecessorID.uuidString.lowercased()
+                    < $1.predecessorID.uuidString.lowercased()
+            }.map(\.jsonValue))
         if hasRequiredLocation {
             schedulingConstraints["required_location"] = qualified(
                 .string(requiredLocation),
@@ -1230,6 +1302,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             + preferredAbsoluteWindows.map { ($0.strength, $0.softWeight) }
             + forbiddenWindows.map { ($0.strength, $0.softWeight) }
             + requiredContexts.map { ($0.strength, $0.softWeight) }
+            + dependencies.map { ($0.strength, $0.softWeight) }
             + (hasBuffers && bufferHasStrength ? [(bufferStrength, bufferSoftWeight)] : [])
         if weightedValues.contains(where: { invalidWeight($0.0, $0.1) }) {
             return "Soft constraint weights must be at most \(Self.maximumSoftWeight)."
@@ -1254,6 +1327,24 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             $0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }) {
             return "Required contexts cannot be empty."
+        }
+        if dependencies.contains(where: { $0.predecessorID == nil }) {
+            return "Choose a predecessor for every dependency."
+        }
+        let predecessorIDs = dependencies.compactMap(\.predecessorID)
+        if predecessorIDs.contains(CanonicalDependencyEdge.nilID) {
+            return "A dependency cannot reference a nil item."
+        }
+        if predecessorIDs.contains(itemID) {
+            return "An item cannot depend on itself."
+        }
+        if Set(predecessorIDs).count != predecessorIDs.count {
+            return "Each predecessor can appear only once."
+        }
+        if dependencies.contains(where: {
+            $0.minimumLagMinutes > Self.maximumSchedulingOffsetMinutes
+        }) {
+            return "Dependency lag must be at most \(Self.maximumSchedulingOffsetMinutes) minutes."
         }
         if hasRequiredLocation,
            requiredLocation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1977,9 +2068,13 @@ struct CanonicalItemEditorState: Equatable, Sendable {
                 markReadOnly("A materialized occurrence window is scheduler-owned and read-only.")
             }
         }
-        if let dependencies = object.removeValue(forKey: "dependencies"),
-           dependencies != .array([]) {
-            markReadOnly("Dependencies are preserved until graph editing is available.")
+        if let dependencyValue = object.removeValue(forKey: "dependencies") {
+            guard let parsed = CanonicalDependencyEdge.decodeArray(dependencyValue) else {
+                markReadOnly("These dependencies cannot be represented safely.")
+                return
+            }
+            dependencies = parsed.map(CanonicalItemEditorDependency.init(edge:))
+            retainedDependencyIDs.formUnion(parsed.map(\.predecessorID))
         }
         if !object.isEmpty {
             markReadOnly("These scheduling constraints include fields this editor cannot author.")

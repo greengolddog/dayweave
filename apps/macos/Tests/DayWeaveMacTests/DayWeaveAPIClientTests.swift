@@ -1017,6 +1017,55 @@ struct DayWeaveAPIClientTests {
         }
     }
 
+    @Test("canonical aggregate writes trust the exact dependency-cycle conflict")
+    func testCanonicalWritesTrustExactDependencyCycleConflict() async throws {
+        let headers = [
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        ]
+        let body = Data(
+            #"{"error":{"code":"conflict","message":"item dependency graph would contain a cycle"}}"#.utf8
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 409, headers: headers, body: body),
+            .init(statusCode: 409, headers: headers, body: body)
+        )
+        let client = makeClient(token: Self.apiToken)
+        let fields = DayWeaveCanonicalItemFields(
+            kind: .task,
+            status: .inbox,
+            title: "Cycle candidate",
+            notes: nil,
+            timezoneName: "UTC",
+            durationSeconds: nil
+        )
+
+        await #expect(
+            throws: DayWeaveAPIError.trustedCanonicalMutationNoEffect(
+                conflictCode: "dependency_cycle"
+            )
+        ) {
+            _ = try await client.createCanonicalItem(
+                .init(id: Self.itemID, fields: fields),
+                idempotencyKey: "mac:dependency-cycle-create"
+            )
+        }
+        await #expect(
+            throws: DayWeaveAPIError.trustedCanonicalMutationNoEffect(
+                conflictCode: "dependency_cycle"
+            )
+        ) {
+            _ = try await client.replaceCanonicalItem(
+                Self.itemID,
+                expectedRevision: 1,
+                item: fields,
+                idempotencyKey: "mac:dependency-cycle-replace"
+            )
+        }
+    }
+
     @Test("canonical revision conflicts require strict positive integer details")
     func testCanonicalRevisionConflictRequiresStrictIntegerDetails() async throws {
         let headers = [

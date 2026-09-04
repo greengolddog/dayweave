@@ -128,7 +128,7 @@ struct ProposalApplicationAPIClientTests {
           "item_id":"\(itemID.uuidString.lowercased())","changed_fields":[
             "is_sensitive","kind","status","title","notes","timezone_name",
             "duration_seconds","deadline_at","earliest_start_at","recurrence",
-            "flexible_constraints","split_policy","importance","urgency","parent_id",
+            "flexible_constraints","dependencies","split_policy","importance","urgency","parent_id",
             "sibling_order","is_executable","revision","completed_at","deleted_at"
           ],
           "before":null,"after":\(DayWeaveAPIClientTests.canonicalItemObject(revision: 1))}]

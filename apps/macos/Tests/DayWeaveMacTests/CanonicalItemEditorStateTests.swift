@@ -719,7 +719,7 @@ struct CanonicalItemEditorStateTests {
         #expect(Set(metadata.keys) == ["dayweave_firm_block"])
     }
 
-    @Test("shared scheduling metadata fixtures drive editable defaults and read-only graph fields")
+    @Test("shared scheduling metadata fixtures expose dependencies while retaining goal associations")
     func testSharedSchedulingMetadataFixtures() throws {
         let daily = try Self.fixtureFields(named: "legacy_daily_default_count")
         let dailyDraft = DayWeaveCanonicalItemDraft(
@@ -765,6 +765,9 @@ struct CanonicalItemEditorStateTests {
         )
         let richState = CanonicalItemEditorState(itemID: Self.id(61), draft: richDraft)
         #expect(richState.readOnlyDiagnostic != nil)
+        #expect(richState.dependencies.map(\.predecessorID) == [
+            UUID(uuidString: "00000000-0000-0000-0000-000000000199")!,
+        ])
         #expect(richState.draft == richDraft)
     }
 
@@ -1064,6 +1067,237 @@ struct CanonicalItemEditorStateTests {
         #expect(Set(options.map(\.id)) == Set([inboxID, plannedID]))
     }
 
+    @Test("typed dependencies round-trip every relation and validate their edge identity")
+    func testTypedDependencyContract() throws {
+        let ownerID = Self.id(31_000)
+        let predecessorIDs = (31_001...31_004).map(Self.id)
+        let source = DayWeaveCanonicalItemDraft(
+            title: "Ship release",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([
+                        Self.dependencyValue(
+                            predecessorID: predecessorIDs[0],
+                            relation: .finishToStart,
+                            lag: 15,
+                            strength: .hard
+                        ),
+                        Self.dependencyValue(
+                            predecessorID: predecessorIDs[1],
+                            relation: .startToStart,
+                            lag: 0,
+                            strength: .soft(weight: 75)
+                        ),
+                        Self.dependencyValue(
+                            predecessorID: predecessorIDs[2],
+                            relation: .finishToFinish,
+                            lag: 30,
+                            strength: .hard
+                        ),
+                        Self.dependencyValue(
+                            predecessorID: predecessorIDs[3],
+                            relation: .startToFinish,
+                            lag: CanonicalItemEditorState.maximumSchedulingOffsetMinutes,
+                            strength: .soft(weight: CanonicalItemEditorState.maximumSoftWeight)
+                        ),
+                    ]),
+                ]),
+            ])
+        )
+
+        var state = CanonicalItemEditorState(itemID: ownerID, draft: source)
+        #expect(state.readOnlyDiagnostic == nil)
+        #expect(state.validationIssue == nil)
+        #expect(state.dependencies.map(\.relation) == CanonicalDependencyRelation.allCases)
+        #expect(state.draft == source)
+
+        state.dependencies.append(.init())
+        #expect(state.validationIssue == "Choose a predecessor for every dependency.")
+        state.dependencies.removeLast()
+
+        state.dependencies[0].predecessorID = ownerID
+        #expect(state.validationIssue == "An item cannot depend on itself.")
+        state.dependencies[0].predecessorID = predecessorIDs[1]
+        #expect(state.validationIssue == "Each predecessor can appear only once.")
+        state.dependencies[0].predecessorID = predecessorIDs[0]
+        state.dependencies[0].minimumLagMinutes =
+            CanonicalItemEditorState.maximumSchedulingOffsetMinutes + 1
+        #expect(state.validationIssue?.contains("Dependency lag") == true)
+        state.dependencies[0].minimumLagMinutes = 0
+        state.dependencies[0].strength = .soft
+        state.dependencies[0].softWeight = CanonicalItemEditorState.maximumSoftWeight + 1
+        #expect(state.validationIssue?.contains("Soft constraint weights") == true)
+    }
+
+    @Test("dependency graph warning catches explicit and ordered-routine cycles locally")
+    func testDependencyCycleWarning() {
+        let firstID = Self.id(32_001)
+        let secondID = Self.id(32_002)
+        let first = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: firstID,
+            operation: .create,
+            draft: .init(
+                title: "First",
+                timezoneName: "UTC",
+                flexibleConstraints: .object([
+                    "constraints": .object([
+                        "dependencies": .array([Self.dependencyValue(
+                            predecessorID: secondID,
+                            relation: .finishToStart,
+                            lag: 0,
+                            strength: .hard
+                        )]),
+                    ]),
+                ])
+            )
+        )
+        let secondDraft = DayWeaveCanonicalItemDraft(
+            title: "Second",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([Self.dependencyValue(
+                        predecessorID: firstID,
+                        relation: .startToStart,
+                        lag: 5,
+                        strength: .soft(weight: 40)
+                    )]),
+                ]),
+            ])
+        )
+        #expect(CanonicalDependencyCatalog.cycleWarning(
+            canonicalItems: [],
+            pendingMutations: [first],
+            replacing: secondID,
+            with: secondDraft
+        ) != nil)
+
+        let routineID = Self.id(32_010)
+        let earlierID = Self.id(32_011)
+        let laterID = Self.id(32_012)
+        let routine = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: routineID,
+            operation: .create,
+            draft: .init(
+                kind: .routine,
+                title: "Ordered routine",
+                timezoneName: "UTC",
+                flexibleConstraints: .object(["routine_ordered": .bool(true)])
+            )
+        )
+        let earlier = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: earlierID,
+            operation: .create,
+            draft: .init(
+                title: "Earlier",
+                timezoneName: "UTC",
+                parentID: routineID,
+                siblingOrder: 0
+            )
+        )
+        let later = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: laterID,
+            operation: .create,
+            draft: .init(
+                title: "Later",
+                timezoneName: "UTC",
+                parentID: routineID,
+                siblingOrder: 1
+            )
+        )
+        let cyclicEarlier = DayWeaveCanonicalItemDraft(
+            title: "Earlier",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([Self.dependencyValue(
+                        predecessorID: laterID,
+                        relation: .finishToStart,
+                        lag: 0,
+                        strength: .hard
+                    )]),
+                ]),
+            ]),
+            parentID: routineID,
+            siblingOrder: 0
+        )
+        #expect(CanonicalDependencyCatalog.cycleWarning(
+            canonicalItems: [],
+            pendingMutations: [routine, earlier, later],
+            replacing: earlierID,
+            with: cyclicEarlier
+        ) != nil)
+
+        let opaqueID = Self.id(32_020)
+        let bridgeID = Self.id(32_021)
+        let editedID = Self.id(32_022)
+        let opaque = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: opaqueID,
+            operation: .create,
+            draft: .init(
+                title: "Newer dependency metadata",
+                timezoneName: "UTC",
+                flexibleConstraints: .object([
+                    "constraints": .object([
+                        "dependencies": .string("newer-format"),
+                    ]),
+                ])
+            )
+        )
+        let bridge = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: bridgeID,
+            operation: .create,
+            draft: .init(
+                title: "Known bridge",
+                timezoneName: "UTC",
+                flexibleConstraints: .object([
+                    "constraints": .object([
+                        "dependencies": .array([Self.dependencyValue(
+                            predecessorID: opaqueID,
+                            relation: .finishToStart,
+                            lag: 0,
+                            strength: .hard
+                        )]),
+                    ]),
+                ])
+            )
+        )
+        let edited = DayWeaveCanonicalItemDraft(
+            title: "Edited item",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([Self.dependencyValue(
+                        predecessorID: bridgeID,
+                        relation: .finishToStart,
+                        lag: 0,
+                        strength: .hard
+                    )]),
+                ]),
+            ])
+        )
+        let opaqueReference = CanonicalDependencyCatalog.references(
+            canonicalItems: [],
+            pendingMutations: [opaque, bridge]
+        ).first { $0.id == opaqueID }
+        #expect(opaqueReference?.hasOpaqueDependencies == true)
+        #expect(opaqueReference?.isSelectableDependencyCandidate == false)
+        let opaqueRow = CanonicalInboxPresentation.build(
+            activeItems: [],
+            pendingMutations: [opaque],
+            trashEntries: []
+        ).inbox.first
+        #expect(opaqueRow?.hasOpaqueDependencies == true)
+        #expect(opaqueRow?.isReadOnly == true)
+        #expect(CanonicalDependencyCatalog.cycleWarning(
+            canonicalItems: [],
+            pendingMutations: [opaque, bridge],
+            replacing: editedID,
+            with: edited
+        ) == "Dependency safety cannot be verified because a related item uses newer metadata.")
+    }
+
     @Test("local validation rejects impossible bounds")
     func testLocalValidation() {
         var state = CanonicalItemEditorState(itemID: Self.id(7), timezoneName: "UTC")
@@ -1108,6 +1342,20 @@ struct CanonicalItemEditorStateTests {
 
     private static func date(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value)!
+    }
+
+    private static func dependencyValue(
+        predecessorID: UUID,
+        relation: CanonicalDependencyRelation,
+        lag: UInt32,
+        strength: CanonicalDependencyStrength
+    ) -> JSONValue {
+        CanonicalDependencyEdge(
+            predecessorID: predecessorID,
+            relation: relation,
+            minimumLagMinutes: lag,
+            strength: strength
+        ).jsonValue
     }
 
     private static func fixtureFields(named name: String) throws -> [String: JSONValue] {

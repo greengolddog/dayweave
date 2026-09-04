@@ -68,14 +68,24 @@ private func canonicalDeadlineDisplayValue(
     return "\(base) · \(policy)"
 }
 
-private func canonicalBlockedDisplayValue(_ item: DayWeaveCanonicalItem) -> String? {
+private func canonicalBlockedDisplayValue(
+    _ item: DayWeaveCanonicalItem,
+    dependencyCauses: [CanonicalDependencyCause] = []
+) -> String? {
     guard item.status == .blocked else { return nil }
     switch item.blockedReasonKind {
     case .dependency?:
+        let blockers = dependencyCauses.filter(\.isBlocking)
+        if blockers.count == 1, let blocker = blockers.first {
+            return "Waiting for \(blocker.title)"
+        }
+        if blockers.count > 1 { return "Waiting on \(blockers.count) prerequisites" }
         let dependency = item.blockedByItemID.map {
             "Waiting for item \($0.uuidString.lowercased().prefix(8))"
         } ?? "Waiting for a dependency"
-        return item.blockedReason.map { "\(dependency) · \($0)" } ?? dependency
+        // Legacy dependency reasons may embed a private predecessor title.
+        // Without a resolved cause, only show the opaque relationship.
+        return dependency
     case .manual?:
         return item.blockedReason.map { "Manually blocked · \($0)" } ?? "Manually blocked"
     case .external?:
@@ -2843,6 +2853,31 @@ private struct CanonicalInboxInspector: View {
                         }
                     }
 
+                    if !row.dependencyCauses.isEmpty {
+                        InspectorSection(title: row.blockingDependencyCauses.isEmpty
+                            ? "Dependencies"
+                            : "Dependency blockers") {
+                            ForEach(row.dependencyCauses) { cause in
+                                CanonicalDependencyCauseRow(
+                                    cause: cause,
+                                    open: cause.isAvailable
+                                        ? { store.selectCanonicalItem(cause.predecessorID) }
+                                        : nil
+                                )
+                            }
+                        }
+                    }
+
+                    if row.hasOpaqueDependencies {
+                        Label(
+                            "Dependency details require a newer DayWeave version and remain read-only.",
+                            systemImage: "lock.shield"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("canonical-dependency-opaque")
+                    }
+
                     if row.kind == .event || row.kind == .task {
                         InspectorSection(
                             title: row.kind == .event ? "Google Calendar" : "Google Tasks"
@@ -3604,6 +3639,57 @@ struct GoogleExpiredRecoveryDiscardButton: View {
     }
 }
 
+private struct CanonicalDependencyCauseRow: View {
+    let cause: CanonicalDependencyCause
+    let open: (() -> Void)?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: statusSymbol)
+                .foregroundStyle(statusColor)
+                .frame(width: 18)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(cause.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                Text("\(cause.statusDescription) · \(cause.strength.title)")
+                    .font(.caption)
+                    .foregroundStyle(statusColor)
+                Text(cause.requirementDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if let open {
+                Button("Open", action: open)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Open predecessor \(cause.title)")
+            }
+        }
+        .padding(.vertical, 3)
+        .privacySensitive(cause.isSensitive && !cause.isTitleRedacted)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(
+            "canonical-dependency-cause.\(cause.predecessorID.uuidString.lowercased())"
+        )
+    }
+
+    private var statusSymbol: String {
+        if cause.isSatisfied { return "checkmark.circle.fill" }
+        if cause.isBlocking { return "pause.circle.fill" }
+        return "arrow.triangle.branch"
+    }
+
+    private var statusColor: Color {
+        if cause.isSatisfied { return .green }
+        if cause.isBlocking { return .orange }
+        return .blue
+    }
+}
+
 private struct BlockInspector: View {
     @EnvironmentObject private var store: PlannerStore
     let block: ScheduleBlock
@@ -3673,7 +3759,10 @@ private struct BlockInspector: View {
                                 )
                             )
                         }
-                        if let blocker = canonicalBlockedDisplayValue(item) {
+                        if let blocker = canonicalBlockedDisplayValue(
+                            item,
+                            dependencyCauses: dependencyCauses
+                        ) {
                             LabeledContent("Blocked", value: blocker)
                                 .privacySensitive(item.isSensitive)
                         }
@@ -3687,6 +3776,22 @@ private struct BlockInspector: View {
                         }
                         if item.recurrence != nil {
                             LabeledContent("Recurrence", value: "Canonical rule cached; outcome context applied on preview")
+                        }
+                    }
+                }
+
+
+                if !dependencyCauses.isEmpty {
+                    InspectorSection(title: dependencyBlockersAreActive
+                        ? "Dependency blockers"
+                        : "Dependencies") {
+                        ForEach(dependencyCauses) { cause in
+                            CanonicalDependencyCauseRow(
+                                cause: cause,
+                                open: cause.isAvailable
+                                    ? { store.selectCanonicalItem(cause.predecessorID) }
+                                    : nil
+                            )
                         }
                     }
                 }
@@ -3791,6 +3896,33 @@ private struct BlockInspector: View {
             .padding(18)
         }
         .privacySensitive(block.isSensitive)
+    }
+
+    private var dependencyCauses: [CanonicalDependencyCause] {
+        guard let itemID = block.sourceItemID,
+              let item = store.canonicalItem(id: itemID) else { return [] }
+        let references = CanonicalDependencyCatalog.references(
+            canonicalItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            sensitivity: { store.canonicalItemRequiresSensitivePresentation(itemID: $0) }
+        )
+        return CanonicalDependencyCatalog.causes(
+            for: .init(item: item),
+            ownerIsSensitive: store.canonicalItemRequiresSensitivePresentation(itemID: itemID),
+            references: references,
+            reportedBlockerID: item.blockedReasonKind == .dependency
+                ? item.blockedByItemID
+                : nil
+        )
+    }
+
+    private var dependencyBlockersAreActive: Bool {
+        guard let itemID = block.sourceItemID,
+              let item = store.canonicalItem(id: itemID),
+              item.status == .blocked,
+              item.blockedReasonKind == .dependency else { return false }
+        return dependencyCauses.contains(where: \.isBlocking)
     }
 
     private var isExternalFixed: Bool {
@@ -5453,7 +5585,12 @@ func proposalItemFieldValue(
     case "deadline_soft_weight": item.deadlineSoftWeight.map(String.init) ?? "None"
     case "earliest_start_at": proposalDateValue(item.earliestStartAt)
     case "recurrence": item.recurrence.map(proposalJSONValue) ?? "None"
-    case "flexible_constraints": proposalJSONValue(item.flexibleConstraints)
+    case "flexible_constraints": CanonicalDependencyEdge.proposalProjection(
+        fromFlexibleConstraints: item.flexibleConstraints
+    ).map { proposalJSONValue($0.metadata) } ?? "Unsupported value"
+    case "dependencies": CanonicalDependencyEdge.proposalProjection(
+        fromFlexibleConstraints: item.flexibleConstraints
+    ).map { proposalJSONValue($0.dependencies) } ?? "Unsupported value"
     case "split_policy": proposalSplitPolicyValue(item.splitPolicy)
     case "importance": String(item.importance)
     case "urgency": String(item.urgency)

@@ -48,6 +48,8 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         let blockedReasonKind: DayWeaveBlockedReasonKind?
         let blockedByItemID: UUID?
         let blockedReason: String?
+        let dependencyCauses: [CanonicalDependencyCause]
+        let hasOpaqueDependencies: Bool
         let source: Source
         let syncState: SyncState
         let mutationID: UUID?
@@ -121,10 +123,19 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             guard status == .blocked else { return nil }
             switch blockedReasonKind {
             case .dependency?:
+                let blockers = blockingDependencyCauses
+                if blockers.count == 1, let blocker = blockers.first {
+                    return "Waiting for \(blocker.title)"
+                }
+                if blockers.count > 1 {
+                    return "Waiting on \(blockers.count) prerequisites"
+                }
                 let dependency = blockedByItemID.map {
                     "Waiting for item \($0.uuidString.lowercased().prefix(8))"
                 } ?? "Waiting for a dependency"
-                return blockedReason.map { "\(dependency) · \($0)" } ?? dependency
+                // Legacy dependency reasons may embed a private predecessor title.
+                // Without a resolved cause, only show the opaque relationship.
+                return dependency
             case .manual?:
                 return blockedReason.map { "Manually blocked · \($0)" } ?? "Manually blocked"
             case .external?:
@@ -134,6 +145,11 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             case nil:
                 return "Blocked reason unavailable"
             }
+        }
+
+        var blockingDependencyCauses: [CanonicalDependencyCause] {
+            guard status == .blocked, blockedReasonKind == .dependency else { return [] }
+            return dependencyCauses.filter(\.isBlocking)
         }
 
         var accessibilitySummary: String {
@@ -186,6 +202,17 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         }
 
         let hierarchy = Hierarchy(nodes: nodes)
+        let dependencyReferences = CanonicalDependencyCatalog.references(
+            canonicalItems: activeItems,
+            pendingMutations: pendingMutations,
+            trashEntries: trashEntries,
+            sensitivity: { id in
+                if let sensitivityPresentation {
+                    return sensitivityPresentation(id) != .standard
+                }
+                return hierarchy.sensitivityPresentationByID[id] != .standard
+            }
+        )
         var inbox: [Row] = []
         var planned: [Row] = []
         var active: [Row] = []
@@ -201,6 +228,7 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 sensitivityPresentation: sensitivityPresentation?(id)
                     ?? hierarchy.sensitivityPresentationByID[id]
                     ?? .inherited,
+                dependencyReferences: dependencyReferences,
                 hasMissingParent: hierarchy.missingParentIDs.contains(id),
                 hasHierarchyCycle: hierarchy.cyclicIDs.contains(id)
             )
@@ -246,6 +274,12 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 blockedReasonKind: item?.blockedReasonKind,
                 blockedByItemID: item?.blockedByItemID,
                 blockedReason: item?.blockedReason,
+                dependencyCauses: [],
+                hasOpaqueDependencies: item.map {
+                    CanonicalDependencyEdge.decode(
+                        fromFlexibleConstraints: $0.flexibleConstraints
+                    ) == nil
+                } ?? false,
                 source: .pendingTrash,
                 syncState: syncState(mutation),
                 mutationID: mutation.id,
@@ -294,6 +328,12 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 blockedReasonKind: item?.blockedReasonKind,
                 blockedByItemID: item?.blockedByItemID,
                 blockedReason: item?.blockedReason,
+                dependencyCauses: [],
+                hasOpaqueDependencies: item.map {
+                    CanonicalDependencyEdge.decode(
+                        fromFlexibleConstraints: $0.flexibleConstraints
+                    ) == nil
+                } ?? false,
                 source: mutation?.operation == .restore ? .pendingRestore : .recentTrash,
                 syncState: mutation.map(syncState) ?? .synced,
                 mutationID: mutation?.id,
@@ -382,6 +422,7 @@ private extension CanonicalInboxPresentation {
             depth: Int,
             breadcrumb: [String],
             sensitivityPresentation: CanonicalSensitivityPresentation,
+            dependencyReferences: [CanonicalDependencyReference],
             hasMissingParent: Bool,
             hasHierarchyCycle: Bool
         ) -> Row {
@@ -400,6 +441,9 @@ private extension CanonicalInboxPresentation {
             let structuralItem = retainsCanonicalStructure ? activeCanonicalItem : nil
             let inferredDeadlineKind: DayWeaveDeadlineKind = draft.kind == .event
                 || draft.deadlineAt == nil ? .none : .dateTime
+            let hasOpaqueDependencies = CanonicalDependencyEdge.decode(
+                fromFlexibleConstraints: draft.flexibleConstraints
+            ) == nil
             return Row(
                 id: itemID,
                 itemID: itemID,
@@ -429,12 +473,22 @@ private extension CanonicalInboxPresentation {
                 blockedReasonKind: structuralItem?.blockedReasonKind,
                 blockedByItemID: structuralItem?.blockedByItemID,
                 blockedReason: structuralItem?.blockedReason,
+                dependencyCauses: CanonicalDependencyCatalog.causes(
+                    for: draft,
+                    ownerIsSensitive: sensitivityPresentation != .standard,
+                    references: dependencyReferences,
+                    reportedBlockerID: structuralItem?.blockedReasonKind == .dependency
+                        ? structuralItem?.blockedByItemID
+                        : nil
+                ),
+                hasOpaqueDependencies: hasOpaqueDependencies,
                 source: source,
                 syncState: syncState,
                 mutationID: mutation?.id,
                 revision: revision,
                 activeCanonicalItem: activeCanonicalItem,
-                isReadOnly: readOnly || hasMissingParent || hasHierarchyCycle,
+                isReadOnly: readOnly || hasOpaqueDependencies
+                    || hasMissingParent || hasHierarchyCycle,
                 hasMissingParent: hasMissingParent,
                 hasHierarchyCycle: hasHierarchyCycle
             )

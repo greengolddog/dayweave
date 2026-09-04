@@ -2826,12 +2826,14 @@ struct DayWeaveAPIClient: Sendable {
                 "item already exists": "item_already_exists",
                 "item cannot be its own parent": "self_parent",
                 "item hierarchy would contain a cycle": "hierarchy_cycle",
+                "item dependency graph would contain a cycle": "dependency_cycle",
                 "an executing or terminal item cannot become a parent": "invalid_parent_state",
             ]
         case .replace:
             [
                 "item cannot be its own parent": "self_parent",
                 "item hierarchy would contain a cycle": "hierarchy_cycle",
+                "item dependency graph would contain a cycle": "dependency_cycle",
                 "an executing or terminal item cannot become a parent": "invalid_parent_state",
                 "only leaf items can enter an executable state": "non_leaf_executable",
             ]
@@ -2966,6 +2968,7 @@ struct DayWeaveAPIClient: Sendable {
             "proposal_not_pending", "proposal_expired", "proposal_revision_mismatch",
             "item_already_exists", "item_not_found", "item_revision_mismatch",
             "parent_not_found", "hierarchy_cycle", "invalid_parent_state",
+            "dependency_not_found", "dependency_cycle",
             "non_leaf_executable", "has_children", "deleted_parent", "invalid_item",
             "provider_managed_item", "preview_expired", "preview_mismatch",
             "preview_not_applicable",

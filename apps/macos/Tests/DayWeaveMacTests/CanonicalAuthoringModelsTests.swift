@@ -370,6 +370,23 @@ struct CanonicalAuthoringModelsTests {
             "strength": .object(["level": .string("hard")]),
         ])])
         root["constraints"] = .object(nested)
+        #expect(JSONValue.object(root).supportsCanonicalAuthoringConstraints)
+
+        nested["dependencies"] = .array([
+            .object([
+                "item_id": .string("00000000-0000-0000-0000-000000000199"),
+                "relation": .string("finish_to_start"),
+                "minimum_lag": .number(JSONNumber(UInt64(15))),
+                "strength": .object(["level": .string("hard")]),
+            ]),
+            .object([
+                "item_id": .string("00000000-0000-0000-0000-000000000199"),
+                "relation": .string("start_to_start"),
+                "minimum_lag": .number(JSONNumber(UInt64(0))),
+                "strength": .object(["level": .string("hard")]),
+            ]),
+        ])
+        root["constraints"] = .object(nested)
         #expect(!JSONValue.object(root).supportsCanonicalAuthoringConstraints)
 
         nested.removeValue(forKey: "dependencies")
@@ -379,6 +396,47 @@ struct CanonicalAuthoringModelsTests {
         ])
         root["constraints"] = .object(nested)
         #expect(!JSONValue.object(root).supportsCanonicalAuthoringConstraints)
+    }
+
+    @Test("dependency normalization mirrors the authoritative graph projection")
+    func dependencyProjectionNormalization() {
+        let earlier = UUID(uuidString: "00000000-0000-4000-8000-000000000199")!
+        let later = UUID(uuidString: "00000000-0000-4000-8000-000000000200")!
+        let draft = DayWeaveCanonicalItemDraft(
+            title: "Ordered dependencies",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([
+                        CanonicalDependencyEdge(
+                            predecessorID: later,
+                            relation: .startToStart,
+                            minimumLagMinutes: 5,
+                            strength: .soft(weight: 25)
+                        ).jsonValue,
+                        CanonicalDependencyEdge(
+                            predecessorID: earlier,
+                            relation: .finishToStart,
+                            minimumLagMinutes: 0,
+                            strength: .hard
+                        ).jsonValue,
+                    ]),
+                ]),
+            ])
+        ).normalized
+
+        #expect(CanonicalDependencyEdge.decode(
+            fromFlexibleConstraints: draft.flexibleConstraints
+        )?.map(\.predecessorID) == [earlier, later])
+
+        let cleared = DayWeaveCanonicalItemDraft(
+            title: "No dependencies",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object(["dependencies": .array([])]),
+            ])
+        ).normalized
+        #expect(cleared.flexibleConstraints == .object([:]))
     }
 
     @Test("Rust default spellings and inactive buffers remain writable")
@@ -1217,6 +1275,338 @@ struct CanonicalInboxPresentationTests {
         #expect(try #require(rows[missingChildID]).isSensitive)
     }
 
+    @Test("dependency causes resolve multiple titles and redact cross-privacy blockers")
+    func dependencyCausePresentation() throws {
+        let ordinaryID = UUID()
+        let sensitiveID = UUID()
+        let completedID = UUID()
+        let compatibilityBlockerID = UUID()
+        let draft = DayWeaveCanonicalItemDraft(
+            title: "Dependent work",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([
+                        CanonicalDependencyEdge(
+                            predecessorID: ordinaryID,
+                            relation: .finishToStart,
+                            minimumLagMinutes: 15,
+                            strength: .hard
+                        ).jsonValue,
+                        CanonicalDependencyEdge(
+                            predecessorID: sensitiveID,
+                            relation: .startToStart,
+                            minimumLagMinutes: 0,
+                            strength: .hard
+                        ).jsonValue,
+                        CanonicalDependencyEdge(
+                            predecessorID: completedID,
+                            relation: .finishToFinish,
+                            minimumLagMinutes: 5,
+                            strength: .hard
+                        ).jsonValue,
+                    ]),
+                ]),
+            ])
+        )
+        let references = [
+            CanonicalDependencyReference(
+                id: ordinaryID,
+                title: "Write release notes",
+                kind: .task,
+                status: .planned,
+                isSensitive: false,
+                isAvailable: true,
+                hasOpaqueDependencies: false
+            ),
+            CanonicalDependencyReference(
+                id: sensitiveID,
+                title: "Secret medical appointment",
+                kind: .event,
+                status: .blocked,
+                isSensitive: true,
+                isAvailable: true,
+                hasOpaqueDependencies: false
+            ),
+            CanonicalDependencyReference(
+                id: completedID,
+                title: "Approve design",
+                kind: .task,
+                status: .completed,
+                isSensitive: false,
+                isAvailable: true,
+                hasOpaqueDependencies: false
+            ),
+            CanonicalDependencyReference(
+                id: compatibilityBlockerID,
+                title: "Legacy vendor approval",
+                kind: .task,
+                status: .planned,
+                isSensitive: false,
+                isAvailable: true,
+                hasOpaqueDependencies: false
+            ),
+        ]
+
+        let causes = CanonicalDependencyCatalog.causes(
+            for: draft,
+            ownerIsSensitive: false,
+            references: references
+        )
+        #expect(causes.count == 3)
+        #expect(causes.filter(\.isBlocking).count == 2)
+        #expect(causes[0].title == "Write release notes")
+        #expect(causes[0].requirementDescription.contains("15m lag"))
+        #expect(causes[1].isTitleRedacted)
+        #expect(causes[1].title.hasPrefix("Sensitive item"))
+        #expect(!causes[1].title.contains("medical"))
+        #expect(causes[2].isSatisfied)
+
+        let privateCauses = CanonicalDependencyCatalog.causes(
+            for: draft,
+            ownerIsSensitive: true,
+            references: references
+        )
+        #expect(privateCauses[1].title == "Secret medical appointment")
+        #expect(!privateCauses[1].isTitleRedacted)
+
+        let causesWithCompatibilityBlocker = CanonicalDependencyCatalog.causes(
+            for: draft,
+            ownerIsSensitive: false,
+            references: references,
+            reportedBlockerID: compatibilityBlockerID
+        )
+        #expect(causesWithCompatibilityBlocker.count == 4)
+        let compatibilityCause = try #require(causesWithCompatibilityBlocker.last)
+        #expect(compatibilityCause.predecessorID == compatibilityBlockerID)
+        #expect(compatibilityCause.title == "Legacy vendor approval")
+        #expect(compatibilityCause.relation == nil)
+        #expect(compatibilityCause.isReportedBlocker)
+        #expect(compatibilityCause.isBlocking)
+
+        let opaqueDraft = DayWeaveCanonicalItemDraft(
+            title: "Opaque dependency owner",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object(["dependencies": .string("newer-format")]),
+            ])
+        )
+        let opaqueCauses = CanonicalDependencyCatalog.causes(
+            for: opaqueDraft,
+            ownerIsSensitive: false,
+            references: references,
+            reportedBlockerID: compatibilityBlockerID
+        )
+        #expect(opaqueCauses.count == 1)
+        #expect(opaqueCauses[0].predecessorID == compatibilityBlockerID)
+        #expect(opaqueCauses[0].isReportedBlocker)
+    }
+
+    @Test("recurring dependency ownership projects canonical, live, and pending hierarchy")
+    func recurringDependencyOwnership() throws {
+        let recurringRootID = UUID()
+        let otherRecurringRootID = UUID()
+        let predecessorID = UUID()
+        let successorID = UUID()
+        let ordinaryID = UUID()
+        let pendingRootID = UUID()
+        let pendingChildID = UUID()
+        let recurrenceJSON = #"{"type":"daily","times_per_day":1}"#
+        let recurringRoot = try decodeItem(
+            id: recurringRootID,
+            revision: 1,
+            deleted: false,
+            kind: "routine",
+            recurrenceJSON: recurrenceJSON
+        )
+        let otherRecurringRoot = try decodeItem(
+            id: otherRecurringRootID,
+            revision: 1,
+            deleted: false,
+            kind: "routine",
+            recurrenceJSON: recurrenceJSON
+        )
+        // A nested recurrence retains the highest recurring ancestor as its
+        // materialization owner, matching the server's root-to-leaf projection.
+        let recurringPredecessor = try decodeItem(
+            id: predecessorID,
+            revision: 1,
+            deleted: false,
+            recurrenceJSON: recurrenceJSON,
+            parentID: recurringRootID
+        )
+        let ordinaryPredecessor = try decodeItem(
+            id: ordinaryID,
+            revision: 1,
+            deleted: false
+        )
+        let dependencyJSON = """
+        {"constraints":{"dependencies":[{"item_id":"\(predecessorID.uuidString.lowercased())",\
+        "relation":"finish_to_start","minimum_lag":0,"strength":{"level":"hard"}}]}}
+        """
+        let canonicalSuccessor = try decodeItem(
+            id: successorID,
+            revision: 1,
+            deleted: false,
+            flexibleConstraintsJSON: dependencyJSON,
+            parentID: recurringRootID
+        )
+        let canonicalItems = [
+            recurringRoot,
+            otherRecurringRoot,
+            recurringPredecessor,
+            ordinaryPredecessor,
+            canonicalSuccessor,
+        ]
+        let sameOwnerDraft = DayWeaveCanonicalItemDraft(
+            title: "Successor",
+            timezoneName: "UTC",
+            parentID: recurringRootID
+        )
+
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [],
+            replacing: successorID,
+            with: sameOwnerDraft,
+            predecessorID: predecessorID
+        ) == nil)
+        let externalDraft = DayWeaveCanonicalItemDraft(
+            title: "External successor",
+            timezoneName: "UTC"
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [],
+            replacing: successorID,
+            with: externalDraft,
+            predecessorID: predecessorID
+        ) != nil)
+        let otherOwnerDraft = DayWeaveCanonicalItemDraft(
+            title: "Cross-series successor",
+            timezoneName: "UTC",
+            parentID: otherRecurringRootID
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [],
+            replacing: successorID,
+            with: otherOwnerDraft,
+            predecessorID: predecessorID
+        ) != nil)
+        let recurringSuccessor = DayWeaveCanonicalItemDraft(
+            title: "Recurring successor",
+            timezoneName: "UTC",
+            recurrence: .object([
+                "type": .string("daily"),
+                "times_per_day": .number(JSONNumber(UInt64(1))),
+            ])
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [],
+            replacing: successorID,
+            with: recurringSuccessor,
+            predecessorID: ordinaryID
+        ) == nil)
+        let unresolvedPredecessor = try decodeItem(
+            id: UUID(),
+            revision: 1,
+            deleted: false,
+            parentID: UUID()
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems + [unresolvedPredecessor],
+            pendingMutations: [],
+            replacing: successorID,
+            with: externalDraft,
+            predecessorID: unresolvedPredecessor.id
+        ) == "Dependency recurrence safety cannot be verified because related hierarchy metadata is unavailable.")
+
+        let retainedCrossBoundaryDraft = DayWeaveCanonicalItemDraft(
+            title: "Moved successor",
+            timezoneName: "UTC",
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "dependencies": .array([
+                        CanonicalDependencyEdge(
+                            predecessorID: predecessorID,
+                            relation: .finishToStart,
+                            minimumLagMinutes: 0,
+                            strength: .hard
+                        ).jsonValue,
+                    ]),
+                ]),
+            ])
+        )
+        #expect(CanonicalDependencyCatalog.cycleWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [],
+            replacing: successorID,
+            with: retainedCrossBoundaryDraft
+        ) == "A recurring predecessor can only be linked from within the same recurring subtree.")
+
+        var reparentedPredecessor = DayWeaveCanonicalItemDraft(item: ordinaryPredecessor)
+        reparentedPredecessor.parentID = recurringRootID
+        reparentedPredecessor.siblingOrder = 9
+        let pendingReparent = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: ordinaryID,
+            operation: .replace,
+            draft: reparentedPredecessor,
+            expectedRevision: ordinaryPredecessor.revision,
+            baseItem: ordinaryPredecessor
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: canonicalItems,
+            pendingMutations: [pendingReparent],
+            replacing: successorID,
+            with: externalDraft,
+            predecessorID: ordinaryID
+        ) != nil)
+
+        let pendingRoot = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: pendingRootID,
+            operation: .create,
+            draft: .init(
+                kind: .routine,
+                title: "Pending recurring routine",
+                timezoneName: "UTC",
+                recurrence: .object([
+                    "type": .string("daily"),
+                    "times_per_day": .number(JSONNumber(UInt64(1))),
+                ])
+            )
+        )
+        let pendingChild = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: pendingChildID,
+            operation: .create,
+            draft: .init(
+                title: "Pending recurring step",
+                timezoneName: "UTC",
+                parentID: pendingRootID,
+                siblingOrder: 4
+            )
+        )
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: [],
+            pendingMutations: [pendingRoot, pendingChild],
+            replacing: successorID,
+            with: .init(
+                title: "Matching pending step",
+                timezoneName: "UTC",
+                parentID: pendingRootID
+            ),
+            predecessorID: pendingChildID
+        ) == nil)
+        #expect(CanonicalDependencyCatalog.recurringBoundaryCandidateWarning(
+            canonicalItems: [],
+            pendingMutations: [pendingRoot, pendingChild],
+            replacing: successorID,
+            with: externalDraft,
+            predecessorID: pendingChildID
+        ) != nil)
+    }
+
     private func decodeItem(
         id: UUID,
         revision: UInt64,
@@ -1224,6 +1614,9 @@ struct CanonicalInboxPresentationTests {
         status: String = "inbox",
         flexibleConstraintsJSON: String = "{}",
         kind: String = "task",
+        recurrenceJSON: String = "null",
+        parentID: UUID? = nil,
+        siblingOrder: UInt32 = 0,
         durationJSON: String = "null",
         deadlineJSON: String = "null",
         earliestStartJSON: String = "null"
@@ -1238,9 +1631,10 @@ struct CanonicalInboxPresentationTests {
         {"id":"\(id.uuidString.lowercased())","is_sensitive":true,"kind":"\(kind)",
         "status":"\(status)","title":"Lifecycle task","notes":null,"timezone_name":"Europe/Madrid",
         "duration_seconds":\(durationJSON),"deadline_at":\(deadlineJSON),
-        "earliest_start_at":\(earliestStartJSON),"recurrence":null,
+        "earliest_start_at":\(earliestStartJSON),"recurrence":\(recurrenceJSON),
         "flexible_constraints":\(flexibleConstraintsJSON),"split_policy":{"type":"indivisible"},"importance":50,
-        "urgency":50,"parent_id":null,"sibling_order":0,"is_executable":false,"revision":\(revision),
+        "urgency":50,"parent_id":\(parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"),
+        "sibling_order":\(siblingOrder),"is_executable":false,"revision":\(revision),
         "created_at":"2026-08-30T09:00:00Z","updated_at":"2026-08-30T10:00:00Z",
         "completed_at":\(completedAt)\(deletedAt)}
         """
