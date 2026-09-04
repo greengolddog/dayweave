@@ -172,4 +172,7 @@ and invalid sets, and invalid acceptance means either decoding or semantic valid
 and analytics behavior against the in-memory adapter. `tests/habits_postgres.rs` exercises atomic
 publication admission, durable replay, concurrent compare-and-swap, preview invalidation,
 recomposition, audit/outbox privacy, append-only guards, DST-local dates, and workspace isolation
-when `DAYWEAVE_TEST_DATABASE_URL` is configured.
+when `DAYWEAVE_TEST_DATABASE_URL` is configured. Its scoped-device HTTP scenario also drives the
+real router and PostgreSQL adapters from item creation through preview/publication, evidence read,
+partial outcome and exact replay, stale-publication rejection, reduced and terminal recomposition,
+analytics, pause/resume, and ordered delta catch-up.

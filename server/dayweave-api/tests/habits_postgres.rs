@@ -1,25 +1,45 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, Response, StatusCode, header},
+};
 use chrono::{DateTime, Duration, Timelike as _, Utc};
 use dayweave_api::{
+    AppState,
+    auth::{Authenticator, RuntimeAuthenticator, Scope},
+    config::AuthMode,
+    credential_auth::{
+        CredentialKind, CredentialRepository, DEVICE_CLIENT_CONTRACT_VERSION, DeviceClientKind,
+        DeviceEnrollmentSpec, GeneratedCredential,
+    },
     habits::{
         HabitAnalyticsBucket, HabitDeltaChange, HabitIdempotency, HabitIdempotencyKey,
-        HabitOutcomeCommand, HabitOutcomeInput, HabitOutcomeStatus, HabitPauseResumeCommand,
-        HabitPauseStartCommand, HabitRepository, HabitRepositoryError, HabitService,
+        HabitOccurrence, HabitOutcomeCommand, HabitOutcomeInput, HabitOutcomeStatus,
+        HabitPauseResumeCommand, HabitPauseStartCommand, HabitRepository, HabitRepositoryError,
+        HabitService,
     },
+    http::router,
     items::{IdempotencyKey, ItemKind, ItemService, ItemStatus, NewItem, SplitPolicy},
-    persistence::{DatabaseScope, MIGRATOR, PostgresHabitRepository, PostgresItemRepository},
-    proposals::SystemClock,
+    persistence::{
+        DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresHabitRepository,
+        PostgresItemRepository,
+    },
+    proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock},
+    readiness::Readiness,
     scheduling::{
         ComposeScheduleError, ComposeScheduleRequest, PostgresSchedulingRepository,
         PublishScheduleSpec, ScheduleAccess, SchedulePublicationError, compose_canonical_schedule,
     },
 };
-use serde_json::json;
+use http_body_util::BodyExt as _;
+use serde_json::{Value, json};
 use sqlx::{
     AssertSqlSafe, ConnectOptions as _, Executor as _, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tower::ServiceExt as _;
 use uuid::Uuid;
 
 const PRIVATE_NOTE: &str = "SYNTHETIC-PRIVATE-POSTGRES-HABIT-NOTE";
@@ -670,6 +690,414 @@ async fn published_habit_evidence_drives_audited_cas_delta_pause_and_recompositi
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn http_habit_lifecycle_persists_and_recomposes_against_postgres() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; habit PostgreSQL test skipped");
+        return;
+    };
+    let database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&database.pool, "habit-http-owner").await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(database.pool.clone(), scope)),
+        Arc::new(SystemClock),
+    ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(
+        database.pool.clone(),
+        scope,
+    ));
+    let repository = Arc::new(PostgresHabitRepository::new(database.pool.clone(), scope));
+    let (app, access_token) = postgres_habit_http_app(
+        &database.pool,
+        scope,
+        items.clone(),
+        repository,
+        schedules.clone(),
+    )
+    .await;
+    let habit_id = Uuid::new_v4();
+    let created = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/items",
+            Some(serde_json::to_value(habit(habit_id)).expect("serialize HTTP lifecycle habit")),
+            Some("habit-http-create-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP habit creation");
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let request = compose_request();
+    let preview_response = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(serde_json::to_value(&request).expect("serialize schedule preview")),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP schedule preview");
+    assert_eq!(preview_response.status(), StatusCode::OK);
+    let preview = habit_http_body_json(preview_response).await;
+    let planner_occurrence_id = Uuid::parse_str(
+        preview["plan"]["occurrences"][0]["id"]
+            .as_str()
+            .expect("planned habit occurrence id"),
+    )
+    .expect("planner occurrence UUID");
+    let publish_body = habit_http_publish_body(&request, &preview);
+    let published = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/publish",
+            Some(publish_body),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP schedule publication");
+    assert_eq!(published.status(), StatusCode::OK);
+    let published = habit_http_body_json(published).await;
+    let published_revision_id = Uuid::parse_str(
+        published["revision"]["id"]
+            .as_str()
+            .expect("published schedule revision id"),
+    )
+    .expect("published schedule revision UUID");
+
+    let list = app
+        .clone()
+        .oneshot(habit_http_request(
+            "GET",
+            &format!(
+                "/v1/habits/{habit_id}/occurrences?start_date=2025-10-26&end_date=2025-10-26&limit=100"
+            ),
+            None,
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP occurrence list");
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(list.headers()[header::CACHE_CONTROL], "no-store, max-age=0");
+    let list = habit_http_body_json(list).await;
+    assert_eq!(list["occurrences"].as_array().map(Vec::len), Some(1));
+    let occurrence: HabitOccurrence = serde_json::from_value(list["occurrences"][0].clone())
+        .expect("native-compatible occurrence wire shape");
+    occurrence
+        .evidence
+        .validate()
+        .expect("strict published occurrence evidence");
+    assert_eq!(occurrence.evidence.habit_id, habit_id);
+    assert_eq!(
+        occurrence.evidence.planner_occurrence_id,
+        planner_occurrence_id
+    );
+    assert_eq!(
+        occurrence.evidence.source_schedule_revision_id,
+        published_revision_id
+    );
+    let evidence_id = occurrence.evidence.id;
+
+    let baseline_delta = app
+        .clone()
+        .oneshot(habit_http_request(
+            "GET",
+            "/v1/habits/occurrences/delta?limit=200",
+            None,
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP baseline delta");
+    assert_eq!(baseline_delta.status(), StatusCode::OK);
+    let baseline_delta = habit_http_body_json(baseline_delta).await;
+    let baseline_cursor = baseline_delta["next_cursor"]
+        .as_str()
+        .expect("opaque baseline cursor")
+        .to_owned();
+    // Evidence admission advances the habit ledger head, so this post-publication preview is the
+    // exact baseline that the outcome mutation below must invalidate.
+    let stale_preview_response = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(serde_json::to_value(&request).expect("serialize stale-fence preview")),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP stale-fence baseline preview");
+    assert_eq!(stale_preview_response.status(), StatusCode::OK);
+    let stale_preview = habit_http_body_json(stale_preview_response).await;
+    let stale_publish_body = habit_http_publish_body(&request, &stale_preview);
+
+    let partial_operation_id = Uuid::new_v4();
+    let partial_body = serde_json::to_value(partial_command(partial_operation_id, 0, PRIVATE_NOTE))
+        .expect("serialize partial outcome");
+    let partial = app
+        .clone()
+        .oneshot(habit_http_request(
+            "PUT",
+            &format!("/v1/habits/{habit_id}/occurrences/{evidence_id}"),
+            Some(partial_body.clone()),
+            Some("habit-http-partial-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP partial outcome");
+    assert_eq!(partial.status(), StatusCode::OK);
+    assert_eq!(partial.headers()["idempotency-replayed"], "false");
+    assert_eq!(
+        partial.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let partial = habit_http_body_json(partial).await;
+    assert_eq!(partial["occurrence"]["outcome"]["revision"], 1);
+    assert_eq!(
+        partial["occurrence"]["outcome"]["progress_basis_points"],
+        5_000
+    );
+
+    let replay = app
+        .clone()
+        .oneshot(habit_http_request(
+            "PUT",
+            &format!("/v1/habits/{habit_id}/occurrences/{evidence_id}"),
+            Some(partial_body),
+            Some("habit-http-partial-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP partial replay");
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(habit_http_body_json(replay).await["replayed"], true);
+
+    let stale_publication = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/publish",
+            Some(stale_publish_body),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP stale publication response");
+    assert_eq!(stale_publication.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        habit_http_body_json(stale_publication).await["error"]["code"],
+        "schedule_publication_stale"
+    );
+
+    let partial_preview_response = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(serde_json::to_value(&request).expect("serialize partial preview")),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP partial recomposition");
+    assert_eq!(partial_preview_response.status(), StatusCode::OK);
+    let partial_preview = habit_http_body_json(partial_preview_response).await;
+    assert_eq!(
+        habit_http_scheduled_minutes(&partial_preview, planner_occurrence_id),
+        15
+    );
+
+    let completed = app
+        .clone()
+        .oneshot(habit_http_request(
+            "PUT",
+            &format!("/v1/habits/{habit_id}/occurrences/{evidence_id}"),
+            Some(
+                serde_json::to_value(terminal_command(
+                    Uuid::new_v4(),
+                    1,
+                    HabitOutcomeStatus::Completed,
+                    10_000,
+                ))
+                .expect("serialize completed outcome"),
+            ),
+            Some("habit-http-completed-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP completed correction");
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(
+        habit_http_body_json(completed).await["occurrence"]["outcome"]["revision"],
+        2
+    );
+
+    let recomposed = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(serde_json::to_value(&request).expect("serialize terminal preview")),
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP terminal recomposition");
+    assert_eq!(recomposed.status(), StatusCode::OK);
+    let recomposed = habit_http_body_json(recomposed).await;
+    assert!(
+        recomposed["plan"]["blocks"]
+            .as_array()
+            .expect("terminal schedule blocks")
+            .iter()
+            .all(|block| block["occurrence_id"] != planner_occurrence_id.to_string()),
+        "HTTP-completed authoritative occurrence must not be scheduled again"
+    );
+
+    let analytics = app
+        .clone()
+        .oneshot(habit_http_request(
+            "GET",
+            &format!(
+                "/v1/habits/{habit_id}/analytics?start_date=2025-10-26&end_date=2025-10-26&bucket=day"
+            ),
+            None,
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP habit analytics");
+    assert_eq!(analytics.status(), StatusCode::OK);
+    assert_eq!(
+        analytics.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    assert_eq!(analytics.headers()[header::PRAGMA], "no-cache");
+    let analytics = habit_http_body_json(analytics).await;
+    assert_eq!(analytics["analytics"]["expected"], 1);
+    assert_eq!(analytics["analytics"]["completed"], 1);
+    assert_eq!(analytics["analytics"]["adherence_basis_points"], 10_000);
+    assert!(!analytics.to_string().contains(PRIVATE_NOTE));
+
+    let pause_id = Uuid::new_v4();
+    let started_at = postgres_now() - Duration::minutes(5);
+    let started = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            &format!("/v1/habits/{habit_id}/pauses"),
+            Some(
+                serde_json::to_value(HabitPauseStartCommand {
+                    operation_id: Uuid::new_v4(),
+                    pause_id,
+                    expected_revision: 0,
+                    started_at,
+                })
+                .expect("serialize pause start"),
+            ),
+            Some("habit-http-pause-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP habit pause");
+    assert_eq!(started.status(), StatusCode::OK);
+    let started = habit_http_body_json(started).await;
+    assert_eq!(started["pause"]["revision"], 1);
+    assert_eq!(started["pause"]["preserves_streak"], true);
+
+    let resumed = app
+        .clone()
+        .oneshot(habit_http_request(
+            "POST",
+            &format!("/v1/habits/{habit_id}/pauses/{pause_id}/resume"),
+            Some(
+                serde_json::to_value(HabitPauseResumeCommand {
+                    operation_id: Uuid::new_v4(),
+                    expected_revision: 1,
+                    ended_at: postgres_now(),
+                })
+                .expect("serialize pause resume"),
+            ),
+            Some("habit-http-pause-resume-001"),
+            &access_token,
+        ))
+        .await
+        .expect("HTTP habit resume");
+    assert_eq!(resumed.status(), StatusCode::OK);
+    assert_eq!(habit_http_body_json(resumed).await["pause"]["revision"], 2);
+
+    let delta = app
+        .clone()
+        .oneshot(habit_http_request(
+            "GET",
+            &format!("/v1/habits/occurrences/delta?cursor={baseline_cursor}&limit=200"),
+            None,
+            None,
+            &access_token,
+        ))
+        .await
+        .expect("HTTP lifecycle delta");
+    assert_eq!(delta.status(), StatusCode::OK);
+    assert_eq!(
+        delta.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let delta = habit_http_body_json(delta).await;
+    let changes: Vec<HabitDeltaChange> =
+        serde_json::from_value(delta["changes"].clone()).expect("strict habit delta changes");
+    assert_eq!(changes.len(), 4);
+    let [
+        HabitDeltaChange::OccurrenceUpsert {
+            occurrence: partial,
+        },
+        HabitDeltaChange::OccurrenceUpsert {
+            occurrence: completed,
+        },
+        HabitDeltaChange::PauseUpsert { pause: started },
+        HabitDeltaChange::PauseUpsert { pause: resumed },
+    ] = changes.as_slice()
+    else {
+        panic!("habit lifecycle delta must preserve mutation order: {changes:?}");
+    };
+    assert_eq!(partial.evidence.id, evidence_id);
+    assert_eq!(
+        partial.outcome.as_ref().expect("partial outcome").revision,
+        1
+    );
+    assert_eq!(completed.evidence.id, evidence_id);
+    assert_eq!(
+        completed
+            .outcome
+            .as_ref()
+            .expect("completed outcome")
+            .revision,
+        2
+    );
+    assert_eq!(started.id, pause_id);
+    assert_eq!(started.revision, 1);
+    assert_eq!(resumed.id, pause_id);
+    assert_eq!(resumed.revision, 2);
+    assert_eq!(delta["has_more"], false);
+
+    drop(app);
+    drop(schedules);
+    drop(items);
+    database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn matching_republication_rejects_malformed_existing_evidence() {
     let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
         eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; habit PostgreSQL test skipped");
@@ -771,6 +1199,143 @@ async fn matching_republication_rejects_malformed_existing_evidence() {
     );
 
     database.destroy().await;
+}
+
+async fn postgres_habit_http_app(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    items: Arc<ItemService>,
+    habits: Arc<PostgresHabitRepository>,
+    schedules: Arc<PostgresSchedulingRepository>,
+) -> (Router, String) {
+    let repository = Arc::new(PostgresCredentialRepository::new(pool.clone(), scope));
+    let now = postgres_now();
+    let enrollment = GeneratedCredential::generate(CredentialKind::Enrollment)
+        .expect("generate habit HTTP enrollment credential");
+    repository
+        .create_device_enrollment(
+            DeviceEnrollmentSpec {
+                id: Uuid::new_v4(),
+                client_instance_id: Uuid::new_v4(),
+                client_kind: DeviceClientKind::Macos,
+                device_label: "Habit HTTP PostgreSQL integration".to_owned(),
+                scopes: vec![
+                    Scope::ItemsRead,
+                    Scope::ItemsWrite,
+                    Scope::ScheduleRead,
+                    Scope::ScheduleSimulate,
+                    Scope::SchedulePublish,
+                ],
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+                client_version: "habit-http-postgres-integration-1".to_owned(),
+                client_capabilities: vec!["schedule-publication-journal-v1".to_owned()],
+                created_at: now,
+            },
+            &enrollment.parsed().expect("parse enrollment credential"),
+        )
+        .await
+        .expect("create habit HTTP device enrollment");
+    let access = GeneratedCredential::generate(CredentialKind::DeviceAccess)
+        .expect("generate habit HTTP access credential");
+    let refresh = GeneratedCredential::generate(CredentialKind::DeviceRefresh)
+        .expect("generate habit HTTP refresh credential");
+    repository
+        .consume_device_enrollment(
+            &enrollment.parsed().expect("parse enrollment credential"),
+            Uuid::new_v4(),
+            &access.parsed().expect("parse access credential"),
+            &refresh.parsed().expect("parse refresh credential"),
+            now,
+        )
+        .await
+        .expect("consume habit HTTP device enrollment");
+    let access_token = access.expose().to_owned();
+    let credential_repository: Arc<dyn CredentialRepository> = repository;
+    let clock = Arc::new(SystemClock);
+    let authenticator: Arc<dyn Authenticator> = Arc::new(RuntimeAuthenticator::new(
+        None,
+        credential_repository.clone(),
+        clock.clone(),
+    ));
+    let proposals: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposals,
+        clock,
+        StdDuration::from_hours(24),
+    ));
+    let readiness = Readiness::default();
+    readiness.set_ready(true);
+    let app = router(
+        AppState::new(proposals, authenticator.clone(), readiness)
+            .with_items(items)
+            .with_habit_repository(habits)
+            .with_postgres_scheduling(schedules, Arc::new(Vec::new()))
+            .with_credential_auth(
+                credential_repository,
+                authenticator,
+                AuthMode::CredentialOnly,
+            ),
+    );
+    (app, access_token)
+}
+
+fn habit_http_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    idempotency_key: Option<&str>,
+    access_token: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"));
+    if let Some(idempotency_key) = idempotency_key {
+        builder = builder.header("idempotency-key", idempotency_key);
+    }
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .expect("valid habit HTTP request")
+}
+
+async fn habit_http_body_json(response: Response<Body>) -> Value {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("habit HTTP response body")
+        .to_bytes();
+    serde_json::from_slice(&bytes).expect("habit HTTP JSON response")
+}
+
+fn habit_http_publish_body(request: &ComposeScheduleRequest, preview: &Value) -> Value {
+    json!({
+        "idempotency_key": Uuid::new_v4(),
+        "expected_input_digest": preview["input_digest"],
+        "schedule": request,
+    })
+}
+
+fn habit_http_scheduled_minutes(preview: &Value, occurrence_id: Uuid) -> i64 {
+    preview["plan"]["blocks"]
+        .as_array()
+        .expect("schedule preview blocks")
+        .iter()
+        .filter(|block| block["occurrence_id"] == occurrence_id.to_string())
+        .map(|block| {
+            let start = DateTime::parse_from_rfc3339(
+                block["start"].as_str().expect("schedule block start"),
+            )
+            .expect("RFC 3339 schedule block start");
+            let end =
+                DateTime::parse_from_rfc3339(block["end"].as_str().expect("schedule block end"))
+                    .expect("RFC 3339 schedule block end");
+            (end - start).num_minutes()
+        })
+        .sum()
 }
 
 fn habit(id: Uuid) -> NewItem {

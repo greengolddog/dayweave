@@ -60,11 +60,16 @@ is complete.
 
 The current milestone is cross-platform habit end-to-end closure. The shared
 core, authoritative backend, macOS client, and Android client slices are
-implemented and covered; these remaining checks keep the broader habit path in
-progress:
+implemented and covered; a scoped device now exercises item creation, schedule
+publication, the PostgreSQL habit ledger, corrections, stale fencing,
+recomposition, analytics, pause/resume, and delta catch-up through the real HTTP
+router. These remaining items keep the broader habit path in progress:
 
-- run integrated Rust/backend/macOS/Android contract and protocol gates against
-  one controlled service deployment;
+- preserve exact/ranged/unknown duration shape and provenance through both
+  native editors, expose general habit minimum spacing, and complete the
+  skip/carry/reduce/ask missed-occurrence workflow;
+- run the macOS and Android transports against one controlled service and keep
+  the shared Rust/macOS/Android contract gates green;
 - exercise the complete occurrence, correction, pause, analytics, invalidation,
   offline replay, conflict, and recomposition path on both native clients;
 - verify the local macOS build and signed APK on the owner's Mac and Pixel 11;
@@ -92,7 +97,7 @@ percentage.
 | Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
 | Scheduling restrictions and profiles (`CON`) | **In progress** | **60%** | Close every per-item hard/soft restriction, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence case. |
 | Scheduler intelligence (`SCH`) | **In progress** | **55%** | Complete configurable objective ordering, movement-cost tuning, alternatives/what-if, overload resolution, fragile-deadline warnings, “Why here?”, learned preference controls, and 90-day performance proof. |
-| Habits (`HAB`) | **In progress** | **90%** | Run controlled cross-platform service/client E2E, local macOS and Pixel 11 verification, and the seven-day acceptance trial for all nine habit requirements. |
+| Habits (`HAB`) | **In progress** | **80%** | Preserve rich duration shape/provenance during native edits, expose general minimum spacing, complete the missed-occurrence policy workflow, run native-client/service E2E, verify macOS and Pixel 11 builds, and finish the seven-day trial. |
 | Active execution (`EXE`) | **In progress** | **65%** | Add Focus/DND mappings, inactivity correction, duration-learning controls, Pomodoro/mandatory-break settings, and full cross-device/UI coverage. |
 | Google Calendar (`GCAL`) | **In progress** | **45%** | Complete full bidirectional parity for series scopes, attendees/RSVP, conferencing, attachments, flexible-event moves, birthdays/observances, OOO/free/tentative policy, conflicts, travel, density, and notification ownership. |
 | Google Tasks (`GTASK`) | **In progress** | **45%** | Finish bidirectional field/list parity, external completion/deletion/due-date reactions, shared conflict/undo behavior, and controlled real-account tests. |
