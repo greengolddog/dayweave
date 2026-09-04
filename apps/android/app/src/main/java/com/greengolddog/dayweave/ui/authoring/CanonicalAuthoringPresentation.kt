@@ -5,6 +5,9 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalConstraintLevel
+import com.greengolddog.dayweave.model.CanonicalDependencyDraft
+import com.greengolddog.dayweave.model.CanonicalDependencyRelation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
@@ -14,6 +17,7 @@ import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
+import com.greengolddog.dayweave.model.decodeCanonicalFlexibleConstraints
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import java.time.Instant
@@ -33,6 +37,24 @@ internal enum class CanonicalAuthoringSyncState {
     QUEUED,
     SUBMITTED,
     CONFLICTED,
+}
+
+internal data class CanonicalDependencyPresentation(
+    val itemId: String,
+    /** Already redacted when the predecessor is effectively sensitive or unavailable. */
+    val displayTitle: String,
+    val status: String?,
+    val relation: CanonicalDependencyRelation?,
+    val minimumLagMinutes: Long,
+    val level: CanonicalConstraintLevel,
+    val softWeight: Long?,
+    val isSensitive: Boolean,
+    val isAvailable: Boolean,
+    val isReportedBlocker: Boolean = false,
+) {
+    val isSatisfied: Boolean get() = status == "completed"
+    val isBlocking: Boolean get() = isReportedBlocker ||
+        level == CanonicalConstraintLevel.HARD && !isSatisfied
 }
 
 internal data class CanonicalAuthoringRow(
@@ -67,6 +89,9 @@ internal data class CanonicalAuthoringRow(
     val isReadOnly: Boolean,
     val hasMissingParent: Boolean,
     val hasHierarchyCycle: Boolean,
+    val dependencies: List<CanonicalDependencyPresentation> = emptyList(),
+    val blockingDependencies: List<CanonicalDependencyPresentation> = emptyList(),
+    val hasOpaqueDependencies: Boolean = false,
 ) {
     /** Opaque metadata blocks replacement, but a stable unfenced canonical row remains trashable. */
     val canTrash: Boolean
@@ -84,6 +109,9 @@ internal data class CanonicalAuthoringPresentation(
     val itemCount: Int get() = (inbox + planned + blocked + recentlyDeleted)
         .distinctBy(CanonicalAuthoringRow::itemId)
         .size
+
+    val activeRowsByItemId: Map<String, CanonicalAuthoringRow>
+        get() = (inbox + planned + blocked).associateBy(CanonicalAuthoringRow::itemId)
 
     companion object {
         fun build(state: DayWeaveUiState): CanonicalAuthoringPresentation {
@@ -121,6 +149,7 @@ internal data class CanonicalAuthoringPresentation(
             }
 
             val hierarchy = AuthoringHierarchy(nodes)
+            val dependencyResolver = DependencyPresentationResolver(state)
             val inbox = mutableListOf<CanonicalAuthoringRow>()
             val planned = mutableListOf<CanonicalAuthoringRow>()
             val blocked = mutableListOf<CanonicalAuthoringRow>()
@@ -142,6 +171,7 @@ internal data class CanonicalAuthoringPresentation(
                     }.getOrDefault(true),
                     hasMissingParent = itemId in hierarchy.missingParentIds,
                     hasHierarchyCycle = itemId in hierarchy.cyclicIds,
+                    dependencyResolver = dependencyResolver,
                 )
                 when (row.status) {
                     CanonicalDraftPlacement.INBOX.wireValue -> inbox += row
@@ -198,6 +228,9 @@ internal data class CanonicalAuthoringPresentation(
                         isReadOnly = true,
                         hasMissingParent = false,
                         hasHierarchyCycle = false,
+                        hasOpaqueDependencies = item?.let {
+                            runCatching(it::decodeCanonicalFlexibleConstraints).isFailure
+                        } ?: false,
                     )
                     deleted += row
                     if (row.syncState == CanonicalAuthoringSyncState.CONFLICTED) conflicts += row
@@ -262,6 +295,9 @@ internal data class CanonicalAuthoringPresentation(
                         isReadOnly = true,
                         hasMissingParent = false,
                         hasHierarchyCycle = false,
+                        hasOpaqueDependencies = item?.let {
+                            runCatching(it::decodeCanonicalFlexibleConstraints).isFailure
+                        } ?: false,
                     )
                     deleted += row
                     if (row.syncState == CanonicalAuthoringSyncState.CONFLICTED) conflicts += row
@@ -309,6 +345,8 @@ private data class AuthoringNode(
     val blockedReasonKind: CanonicalBlockedReasonKind?,
     val blockedByItemId: String?,
     val blockedReason: String?,
+    val dependencies: List<CanonicalDependencyDraft>,
+    val hasOpaqueDependencies: Boolean,
     val mutation: PendingCanonicalAuthoringMutation?,
     val draft: CanonicalItemDraft?,
     val revision: Long?,
@@ -321,6 +359,7 @@ private data class AuthoringNode(
         isSensitive: Boolean,
         hasMissingParent: Boolean,
         hasHierarchyCycle: Boolean,
+        dependencyResolver: DependencyPresentationResolver,
     ): CanonicalAuthoringRow {
         val source = when (mutation?.operation) {
             CanonicalAuthoringOperation.CREATE -> CanonicalAuthoringRowSource.LOCAL_CREATE
@@ -329,6 +368,21 @@ private data class AuthoringNode(
             CanonicalAuthoringOperation.TRASH -> error("Trash nodes are not active rows")
             null -> CanonicalAuthoringRowSource.CANONICAL
         }
+        val reportedBlockerId = blockedByItemId
+            ?.takeIf { blockedReasonKind == CanonicalBlockedReasonKind.DEPENDENCY }
+        val dependencyPresentation = dependencies.map { dependency ->
+            dependencyResolver.resolve(dependency).let { presented ->
+                if (presented.itemId == reportedBlockerId) {
+                    presented.copy(isReportedBlocker = true)
+                } else {
+                    presented
+                }
+            }
+        }
+        val compatibilityBlocker = reportedBlockerId
+            ?.takeIf { blockedId -> dependencyPresentation.none { it.itemId == blockedId } }
+            ?.let(dependencyResolver::resolveCompatibilityBlocker)
+        val allDependencies = dependencyPresentation + listOfNotNull(compatibilityBlocker)
         return CanonicalAuthoringRow(
             itemId = itemId,
             title = title,
@@ -364,6 +418,9 @@ private data class AuthoringNode(
                 hasMissingParent || hasHierarchyCycle,
             hasMissingParent = hasMissingParent,
             hasHierarchyCycle = hasHierarchyCycle,
+            dependencies = allDependencies,
+            blockingDependencies = allDependencies.filter(CanonicalDependencyPresentation::isBlocking),
+            hasOpaqueDependencies = hasOpaqueDependencies,
         )
     }
 
@@ -382,6 +439,14 @@ private data class AuthoringNode(
                 Result.success(pendingDraft)
             }
             val decoded = decodedAttempt.getOrNull()
+            val dependencyDecode = if (decoded == null) {
+                runCatching(item::decodeCanonicalFlexibleConstraints)
+            } else {
+                null
+            }
+            val dependencies = decoded?.constraints?.scheduling?.dependencies
+                ?: dependencyDecode?.getOrNull()?.scheduling?.dependencies
+                ?: emptyList()
             val usesPendingDraft = pendingDraft != null
             val presentedDuration = decoded?.durationSeconds ?: item.durationSeconds
             val presentedDeadline = decoded?.deadlineAt ?: item.deadlineAt
@@ -435,6 +500,8 @@ private data class AuthoringNode(
                 blockedReasonKind = if (usesPendingDraft) null else item.blockedReasonKind,
                 blockedByItemId = if (usesPendingDraft) null else item.blockedByItemId,
                 blockedReason = if (usesPendingDraft) null else item.blockedReason,
+                dependencies = dependencies,
+                hasOpaqueDependencies = dependencyDecode?.isFailure == true,
                 mutation = mutation,
                 draft = decoded,
                 revision = item.revision,
@@ -479,12 +546,109 @@ private data class AuthoringNode(
             blockedReasonKind = null,
             blockedByItemId = null,
             blockedReason = null,
+            dependencies = draft.constraints.scheduling?.dependencies.orEmpty(),
+            hasOpaqueDependencies = false,
             mutation = mutation,
             draft = draft,
             revision = null,
             unsupported = false,
             unsupportedDiagnostic = null,
         )
+    }
+}
+
+private class DependencyPresentationResolver(state: DayWeaveUiState) {
+    private data class Target(
+        val id: String,
+        val title: String,
+        val status: String,
+        val isSensitive: Boolean,
+    )
+
+    private val targets: Map<String, Target>
+
+    init {
+        data class MutableTarget(
+            val id: String,
+            val title: String,
+            val status: String,
+        )
+
+        val projected = state.canonicalItems
+            .filter { it.deletedAt == null }
+            .associate { item ->
+                item.id to MutableTarget(item.id, item.title, item.status)
+            }
+            .toMutableMap()
+        state.pendingCanonicalAuthoringMutations.forEach { mutation ->
+            when (mutation.operation) {
+                CanonicalAuthoringOperation.TRASH -> projected.remove(mutation.itemId)
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                -> mutation.draft?.let { draft ->
+                    projected[mutation.itemId] = MutableTarget(
+                        id = mutation.itemId,
+                        title = draft.title,
+                        status = draft.placement.wireValue,
+                    )
+                }
+                CanonicalAuthoringOperation.RESTORE -> Unit
+            }
+        }
+        targets = projected.mapValues { (itemId, target) ->
+            val isSensitive = runCatching {
+                effectiveCanonicalSensitivity(
+                    items = state.canonicalItems,
+                    itemId = itemId,
+                    pendingMutation = state.pendingCanonicalMutation,
+                    pendingAuthoringMutations = state.pendingCanonicalAuthoringMutations,
+                )
+            }.getOrDefault(true)
+            Target(
+                id = target.id,
+                title = target.title,
+                status = target.status,
+                isSensitive = isSensitive,
+            )
+        }
+    }
+
+    fun resolve(dependency: CanonicalDependencyDraft): CanonicalDependencyPresentation {
+        val target = targets[dependency.itemId]
+        return CanonicalDependencyPresentation(
+            itemId = dependency.itemId,
+            displayTitle = target?.safeDisplayTitle()
+                ?: "Unavailable item · ${dependency.itemId.take(8)}",
+            status = target?.status,
+            relation = dependency.relation,
+            minimumLagMinutes = dependency.minimumLagMinutes,
+            level = dependency.strength.level,
+            softWeight = dependency.strength.weight,
+            isSensitive = target?.isSensitive ?: true,
+            isAvailable = target != null,
+        )
+    }
+
+    fun resolveCompatibilityBlocker(itemId: String): CanonicalDependencyPresentation {
+        val target = targets[itemId]
+        return CanonicalDependencyPresentation(
+            itemId = itemId,
+            displayTitle = target?.safeDisplayTitle() ?: "Unavailable item · ${itemId.take(8)}",
+            status = target?.status,
+            relation = null,
+            minimumLagMinutes = 0,
+            level = CanonicalConstraintLevel.HARD,
+            softWeight = null,
+            isSensitive = target?.isSensitive ?: true,
+            isAvailable = target != null,
+            isReportedBlocker = true,
+        )
+    }
+
+    private fun Target.safeDisplayTitle(): String = if (isSensitive) {
+        "Sensitive item · ${id.take(8)}"
+    } else {
+        title.trim().ifEmpty { "Untitled item" }
     }
 }
 

@@ -102,6 +102,7 @@ enum class RemoteProposalItemField {
     @SerialName("earliest_start_at") EARLIEST_START_AT,
     @SerialName("recurrence") RECURRENCE,
     @SerialName("flexible_constraints") FLEXIBLE_CONSTRAINTS,
+    @SerialName("dependencies") DEPENDENCIES,
     @SerialName("split_policy") SPLIT_POLICY,
     @SerialName("importance") IMPORTANCE,
     @SerialName("urgency") URGENCY,
@@ -223,6 +224,7 @@ enum class RemoteProposalRiskCode {
     @SerialName("changes_deadline") CHANGES_DEADLINE,
     @SerialName("relaxes_deadline") RELAXES_DEADLINE,
     @SerialName("changes_hierarchy") CHANGES_HIERARCHY,
+    @SerialName("changes_dependencies") CHANGES_DEPENDENCIES,
     @SerialName("changes_sensitivity") CHANGES_SENSITIVITY,
     @SerialName("changes_recurrence") CHANGES_RECURRENCE,
     @SerialName("changes_execution_state") CHANGES_EXECUTION_STATE,
@@ -250,6 +252,8 @@ enum class RemoteProposalConflictCode {
     @SerialName("item_revision_mismatch") ITEM_REVISION_MISMATCH,
     @SerialName("parent_not_found") PARENT_NOT_FOUND,
     @SerialName("hierarchy_cycle") HIERARCHY_CYCLE,
+    @SerialName("dependency_not_found") DEPENDENCY_NOT_FOUND,
+    @SerialName("dependency_cycle") DEPENDENCY_CYCLE,
     @SerialName("invalid_parent_state") INVALID_PARENT_STATE,
     @SerialName("non_leaf_executable") NON_LEAF_EXECUTABLE,
     @SerialName("has_children") HAS_CHILDREN,
@@ -1118,8 +1122,13 @@ private fun materialChangedFields(
         changed(RemoteProposalItemField.RECURRENCE, before.recurrence, after.recurrence)
         changed(
             RemoteProposalItemField.FLEXIBLE_CONSTRAINTS,
-            before.flexibleConstraints,
-            after.flexibleConstraints,
+            before.flexibleConstraints.withoutDependencies(),
+            after.flexibleConstraints.withoutDependencies(),
+        )
+        changed(
+            RemoteProposalItemField.DEPENDENCIES,
+            before.flexibleConstraints.dependencies(),
+            after.flexibleConstraints.dependencies(),
         )
         changed(RemoteProposalItemField.HAS_OWN_EFFORT, before.hasOwnEffort, after.hasOwnEffort)
         changed(RemoteProposalItemField.SPLIT_POLICY, before.splitPolicy, after.splitPolicy)
@@ -1142,6 +1151,20 @@ private fun materialChangedFields(
         changed(RemoteProposalItemField.REVISION, before.revision, after.revision)
         changed(RemoteProposalItemField.COMPLETED_AT, before.completedAt, after.completedAt)
         changed(RemoteProposalItemField.DELETED_AT, before.deletedAt, after.deletedAt)
+    }
+}
+
+private fun JsonObject.dependencies(): JsonArray =
+    (get("constraints") as? JsonObject)?.get("dependencies") as? JsonArray ?: JsonArray(emptyList())
+
+private fun JsonObject.withoutDependencies(): JsonObject {
+    val constraints = get("constraints") as? JsonObject ?: return this
+    if ("dependencies" !in constraints) return this
+    val remainingConstraints = JsonObject(constraints - "dependencies")
+    return if (remainingConstraints.isEmpty()) {
+        JsonObject(this - "constraints")
+    } else {
+        JsonObject(this + ("constraints" to remainingConstraints))
     }
 }
 
@@ -1392,6 +1415,7 @@ private val MATERIAL_PROPOSAL_ITEM_FIELDS = listOf(
     RemoteProposalItemField.EARLIEST_START_AT,
     RemoteProposalItemField.RECURRENCE,
     RemoteProposalItemField.FLEXIBLE_CONSTRAINTS,
+    RemoteProposalItemField.DEPENDENCIES,
     RemoteProposalItemField.HAS_OWN_EFFORT,
     RemoteProposalItemField.SPLIT_POLICY,
     RemoteProposalItemField.IMPORTANCE,
@@ -1420,6 +1444,7 @@ private val LEGACY_MATERIAL_PROPOSAL_ITEM_FIELDS = MATERIAL_PROPOSAL_ITEM_FIELDS
         RemoteProposalItemField.BLOCKED_REASON_KIND,
         RemoteProposalItemField.BLOCKED_BY_ITEM_ID,
         RemoteProposalItemField.BLOCKED_REASON,
+        RemoteProposalItemField.DEPENDENCIES,
     )
 }
 private val REVIEW_HASH = Regex("^sha256:[0-9a-fA-F]{64}$")

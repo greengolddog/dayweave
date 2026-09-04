@@ -2749,7 +2749,8 @@ class CanonicalSyncManager(
             if (!seenCursors.add(cursor)) throw RemotePlannerMappingException()
             val page = transport.itemDelta(configuration, cursor)
             if (
-                page.changes.size > MAX_DELTA_PAGE_SIZE || !validCursor(page.nextCursor) ||
+                page.changes.size > maximumItemDeltaResponseChanges(MAX_DELTA_PAGE_SIZE) ||
+                    !validCursor(page.nextCursor) ||
                 (page.hasMore && page.nextCursor in seenCursors)
             ) {
                 throw RemotePlannerMappingException()

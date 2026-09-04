@@ -221,7 +221,7 @@ class CanonicalAuthoringModelsTest {
         assertEquals("calendar", recurrence.getValue("semantics").jsonPrimitive.content)
         assertTrue(metadata.getValue("constraints").jsonObject.containsKey("buffers"))
         assertEquals(JsonNull, metadata.getValue("constraints").jsonObject["occurrence_window"])
-        assertEquals(draft, canonicalItem(draft).toCanonicalDraft())
+        assertEquals(draft.normalized(), canonicalItem(draft).toCanonicalDraft())
 
         val custom = draft.copy(
             recurrence = CanonicalRecurrenceDraft(
@@ -629,6 +629,84 @@ class CanonicalAuthoringModelsTest {
             CanonicalFlexibleConstraintsDraft(
                 minimumGapMinutes = MAX_SCHEDULING_OFFSET_MINUTES + 1,
             ).requireValid()
+        }
+    }
+
+    @Test
+    fun itemDependenciesAreTypedAuthorableWhileSelfAndDuplicateEdgesFailClosed() {
+        val predecessors = CanonicalDependencyRelation.entries.mapIndexed { index, relation ->
+            CanonicalDependencyDraft(
+                itemId = stableUuid("predecessor-$index"),
+                relation = relation,
+                minimumLagMinutes = index.toLong() * 15,
+                strength = if (index % 2 == 0) {
+                    CanonicalConstraintStrengthDraft.hard()
+                } else {
+                    CanonicalConstraintStrengthDraft.soft(25L + index)
+                },
+            )
+        }
+        val draft = taskDraft().copy(
+            constraints = CanonicalFlexibleConstraintsDraft(
+                scheduling = CanonicalSchedulingConstraintsDraft(dependencies = predecessors),
+            ),
+        )
+
+        draft.requireValid(ITEM_ID)
+        val normalized = draft.normalized()
+        assertEquals(
+            normalized.constraints.scheduling?.dependencies?.map { it.itemId }?.sorted(),
+            normalized.constraints.scheduling?.dependencies?.map { it.itemId },
+        )
+        assertEquals(normalized, canonicalItem(draft).toCanonicalDraft())
+
+        assertThrows(IllegalArgumentException::class.java) {
+            draft.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(
+                    scheduling = CanonicalSchedulingConstraintsDraft(
+                        dependencies = listOf(predecessors.first().copy(itemId = ITEM_ID)),
+                    ),
+                ),
+            ).requireValid(ITEM_ID)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            draft.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(
+                    scheduling = CanonicalSchedulingConstraintsDraft(
+                        dependencies = listOf(
+                            predecessors.first().copy(
+                                itemId = "00000000-0000-0000-0000-000000000000",
+                            ),
+                        ),
+                    ),
+                ),
+            ).requireValid(ITEM_ID)
+        }
+        val alphabeticItemId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        assertThrows(IllegalArgumentException::class.java) {
+            draft.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(
+                    scheduling = CanonicalSchedulingConstraintsDraft(
+                        dependencies = listOf(
+                            predecessors.first().copy(itemId = alphabeticItemId.uppercase()),
+                        ),
+                    ),
+                ),
+            ).requireValid(alphabeticItemId)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            draft.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(
+                    scheduling = CanonicalSchedulingConstraintsDraft(
+                        dependencies = listOf(predecessors.first(), predecessors.first()),
+                    ),
+                ),
+            ).requireValid(ITEM_ID)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            draft.copy(
+                constraints = draft.constraints.copy(goalIds = listOf(predecessors.first().itemId)),
+            ).requireValid(ITEM_ID)
         }
     }
 

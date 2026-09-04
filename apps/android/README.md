@@ -226,6 +226,13 @@ durable local persistence. Habits and events continue into the detailed editor s
 exact timing are never guessed. The editor covers task, habit, routine, goal, event, and break
 items; recurrence, fixed event timing, split policy, priority, energy and spacing constraints,
 privacy, and unbounded parent/child hierarchy are validated before an intent can enter the journal.
+Dependencies use the same full-item journal: the searchable predecessor picker supports multiple
+finish/start relationships, non-negative lag, and hard or weighted-soft strength. It rejects nil,
+self, and duplicate edges locally, warns and disables choices that would close a cycle (including
+ordered-routine edges), and leaves the server to revalidate the authoritative graph at sync time.
+Item cards derive every currently unmet hard predecessor, show a readable cause for each, and can
+open an editable predecessor directly. Effectively sensitive predecessor titles are replaced with
+an opaque local label so a private item cannot leak into a non-sensitive dependent card or search.
 
 Inbox separates canonical Inbox, Planned, conflicts, and Recently Deleted while retaining older
 local review drafts. Accepted assistant/proposal drafts and older captures have a **Review as

@@ -76,6 +76,8 @@ import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1249,7 +1251,11 @@ internal fun proposalReviewFieldValue(
             item.deadlineSoftWeight?.toString() ?: "null"
         RemoteProposalItemField.EARLIEST_START_AT -> quotedOrNull(item.earliestStartAt)
         RemoteProposalItemField.RECURRENCE -> item.recurrence?.toString() ?: "null"
-        RemoteProposalItemField.FLEXIBLE_CONSTRAINTS -> item.flexibleConstraints.toString()
+        RemoteProposalItemField.FLEXIBLE_CONSTRAINTS ->
+            item.flexibleConstraints.withoutProposalDependencies().toString()
+        RemoteProposalItemField.DEPENDENCIES ->
+            ((item.flexibleConstraints["constraints"] as? JsonObject)
+                ?.get("dependencies") as? JsonArray ?: JsonArray(emptyList())).toString()
         RemoteProposalItemField.SPLIT_POLICY -> item.splitPolicy.toString()
         RemoteProposalItemField.IMPORTANCE -> item.importance.toString()
         RemoteProposalItemField.URGENCY -> item.urgency.toString()
@@ -1264,6 +1270,17 @@ internal fun proposalReviewFieldValue(
         RemoteProposalItemField.REVISION -> item.revision.toString()
         RemoteProposalItemField.COMPLETED_AT -> quotedOrNull(item.completedAt)
         RemoteProposalItemField.DELETED_AT -> quotedOrNull(item.deletedAt)
+    }
+}
+
+private fun JsonObject.withoutProposalDependencies(): JsonObject {
+    val constraints = get("constraints") as? JsonObject ?: return this
+    if ("dependencies" !in constraints) return this
+    val remainingConstraints = JsonObject(constraints - "dependencies")
+    return if (remainingConstraints.isEmpty()) {
+        JsonObject(this - "constraints")
+    } else {
+        JsonObject(this + ("constraints" to remainingConstraints))
     }
 }
 

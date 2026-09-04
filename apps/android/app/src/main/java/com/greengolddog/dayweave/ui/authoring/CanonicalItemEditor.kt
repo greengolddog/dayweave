@@ -47,9 +47,12 @@ import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalAbsoluteWindowDraft
 import com.greengolddog.dayweave.model.CanonicalBreakCategory
 import com.greengolddog.dayweave.model.CanonicalBufferPolicyDraft
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalConstraintLevel
 import com.greengolddog.dayweave.model.CanonicalConstraintStrengthDraft
 import com.greengolddog.dayweave.model.CanonicalDailyWindowDraft
+import com.greengolddog.dayweave.model.CanonicalDependencyDraft
+import com.greengolddog.dayweave.model.CanonicalDependencyRelation
 import com.greengolddog.dayweave.model.CanonicalEventTimingDraft
 import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalGoalMeasureDraft
@@ -72,6 +75,8 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.decodeCanonicalFlexibleConstraints
+import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.requireCanonicalInstant
 import com.greengolddog.dayweave.state.canonicalDeviceTimezoneName
 import java.time.Duration
@@ -126,6 +131,304 @@ internal data class CanonicalParentOption(
     val title: String,
 )
 
+internal data class CanonicalDependencyOption(
+    val id: String,
+    /** Already redacted when the referenced item is effectively sensitive. */
+    val displayTitle: String,
+    val status: String,
+    val isSensitive: Boolean,
+    val hasOpaqueDependencies: Boolean,
+)
+
+internal data class CanonicalDependencyGraphNode(
+    val id: String,
+    val title: String,
+    val status: String,
+    val kind: ItemKind,
+    val hasRecurrence: Boolean,
+    val parentId: String?,
+    val siblingOrder: Long,
+    val constraints: CanonicalFlexibleConstraintsDraft?,
+    val isDeleted: Boolean,
+    val hasOpaqueDependencies: Boolean,
+)
+
+internal data class CanonicalDependencyEditorContext(
+    val editedItemId: String,
+    val options: List<CanonicalDependencyOption>,
+    private val baseNodes: Map<String, CanonicalDependencyGraphNode>,
+) {
+    val selectableOptions: List<CanonicalDependencyOption>
+        get() = options.filterNot(CanonicalDependencyOption::hasOpaqueDependencies)
+
+    private enum class GraphSafety {
+        SAFE,
+        CYCLE,
+        CYCLE_UNPROVEN,
+        RECURRING_BOUNDARY,
+        RECURRING_BOUNDARY_UNPROVEN,
+    }
+
+    private enum class DependencyPath {
+        ABSENT,
+        PRESENT,
+        UNKNOWN,
+    }
+
+    private data class DependencyGraphProjection(
+        val explicitDependenciesByItem: Map<String, Set<String>>,
+        val knownDependenciesByItem: Map<String, Set<String>>,
+        val opaqueItemIds: Set<String>,
+        val recurringOwnersByItem: Map<String, RecurringOwner>,
+    )
+
+    private sealed interface RecurringOwner {
+        data object None : RecurringOwner
+        data object Unknown : RecurringOwner
+        data class Known(val itemId: String) : RecurringOwner
+    }
+
+    private enum class RecurringBoundarySafety {
+        SAFE,
+        CROSS_BOUNDARY,
+        UNPROVEN,
+    }
+
+    fun option(itemId: String): CanonicalDependencyOption? =
+        options.firstOrNull { it.id == itemId }
+
+    fun cycleWarning(draft: CanonicalItemDraft): String? = when (graphSafety(draft)) {
+        GraphSafety.SAFE -> null
+        GraphSafety.CYCLE ->
+            "These dependencies would create a cycle. Change or remove a predecessor before saving."
+        GraphSafety.CYCLE_UNPROVEN ->
+            "Dependency safety cannot be verified because a related item uses newer metadata."
+        GraphSafety.RECURRING_BOUNDARY ->
+            "A recurring predecessor can only be linked from within the same recurring subtree."
+        GraphSafety.RECURRING_BOUNDARY_UNPROVEN ->
+            "Dependency recurrence safety cannot be verified because related hierarchy metadata is unavailable."
+    }
+
+    fun candidateIssue(draft: CanonicalItemDraft, candidateItemId: String): String? =
+        when (graphSafety(draft.withAdditionalDependency(candidateItemId))) {
+            GraphSafety.SAFE -> null
+            GraphSafety.CYCLE -> "Would create a cycle"
+            GraphSafety.CYCLE_UNPROVEN -> "Cannot verify cycle safety"
+            GraphSafety.RECURRING_BOUNDARY -> "Different recurring subtree"
+            GraphSafety.RECURRING_BOUNDARY_UNPROVEN ->
+                "Cannot verify recurring-subtree ownership"
+        }
+
+    fun wouldCreateCycle(
+        draft: CanonicalItemDraft,
+        candidateItemId: String,
+    ): Boolean = candidateIssue(draft, candidateItemId) != null
+
+    private fun CanonicalItemDraft.withAdditionalDependency(
+        candidateItemId: String,
+    ): CanonicalItemDraft {
+        val scheduling = constraints.scheduling ?: CanonicalSchedulingConstraintsDraft()
+        return copy(
+            constraints = constraints.copy(
+                scheduling = scheduling.copy(
+                    dependencies = scheduling.dependencies + CanonicalDependencyDraft(
+                        itemId = candidateItemId,
+                        relation = CanonicalDependencyRelation.FINISH_TO_START,
+                        strength = CanonicalConstraintStrengthDraft.hard(),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    private fun graphSafety(draft: CanonicalItemDraft): GraphSafety {
+        val before = projectGraph(baseNodes)
+        val after = graphWith(draft)
+        when (after.recurringBoundarySafety()) {
+            RecurringBoundarySafety.CROSS_BOUNDARY ->
+                return GraphSafety.RECURRING_BOUNDARY
+            RecurringBoundarySafety.UNPROVEN ->
+                return GraphSafety.RECURRING_BOUNDARY_UNPROVEN
+            RecurringBoundarySafety.SAFE -> Unit
+        }
+        if (after.knownDependenciesByItem.hasCycle()) return GraphSafety.CYCLE
+        val cannotProveAcyclic = after.addedEdgesComparedTo(before).any { (successor, predecessor) ->
+            after.dependencyPath(start = predecessor, target = successor) == DependencyPath.UNKNOWN
+        }
+        return if (cannotProveAcyclic) GraphSafety.CYCLE_UNPROVEN else GraphSafety.SAFE
+    }
+
+    private fun graphWith(draft: CanonicalItemDraft): DependencyGraphProjection {
+        val nodes = baseNodes.toMutableMap().also { projected ->
+            projected[editedItemId] = CanonicalDependencyGraphNode(
+                id = editedItemId,
+                title = draft.title,
+                status = draft.placement.wireValue,
+                kind = draft.kind,
+                hasRecurrence = draft.recurrence != null,
+                parentId = draft.parentId,
+                siblingOrder = draft.siblingOrder,
+                constraints = draft.constraints,
+                isDeleted = false,
+                hasOpaqueDependencies = false,
+            )
+        }
+        return projectGraph(nodes)
+    }
+
+    private fun projectGraph(
+        nodes: Map<String, CanonicalDependencyGraphNode>,
+    ): DependencyGraphProjection {
+        val explicitGraph: Map<String, Set<String>> = nodes.values.associate { node ->
+            node.id to node.constraints?.scheduling?.dependencies.orEmpty()
+                .mapTo(linkedSetOf(), CanonicalDependencyDraft::itemId)
+        }
+        val graph = explicitGraph.toMutableMap()
+        nodes.values
+            .filter { node ->
+                !node.isDeleted && node.kind == ItemKind.ROUTINE &&
+                    node.constraints?.routineOrdered == true
+            }
+            .forEach { routine ->
+                val children = nodes.values
+                    .filter { !it.isDeleted && it.parentId == routine.id }
+                    .sortedWith(
+                        compareBy(
+                            CanonicalDependencyGraphNode::siblingOrder,
+                            CanonicalDependencyGraphNode::id,
+                        ),
+                    )
+                children.zipWithNext { predecessor, successor ->
+                    graph[successor.id] = graph.getValue(successor.id) + predecessor.id
+                }
+            }
+        return DependencyGraphProjection(
+            explicitDependenciesByItem = explicitGraph,
+            knownDependenciesByItem = graph,
+            opaqueItemIds = nodes.values.asSequence()
+                .filter(CanonicalDependencyGraphNode::hasOpaqueDependencies)
+                .map(CanonicalDependencyGraphNode::id)
+                .toSet(),
+            recurringOwnersByItem = recurringOwners(nodes),
+        )
+    }
+
+    private fun recurringOwners(
+        nodes: Map<String, CanonicalDependencyGraphNode>,
+    ): Map<String, RecurringOwner> {
+        val resolved = mutableMapOf<String, RecurringOwner>()
+        nodes.keys.forEach { start ->
+            if (start in resolved) return@forEach
+            val path = mutableListOf<String>()
+            val visiting = hashSetOf<String>()
+            var current: String? = start
+            var owner: RecurringOwner? = null
+            while (owner == null) {
+                val itemId = current
+                if (itemId == null) {
+                    owner = RecurringOwner.None
+                    break
+                }
+                val cachedOwner = resolved[itemId]
+                if (cachedOwner != null) {
+                    owner = cachedOwner
+                    break
+                }
+                if (!visiting.add(itemId)) {
+                    owner = RecurringOwner.Unknown
+                    break
+                }
+                val item = nodes[itemId]
+                if (item == null) {
+                    owner = RecurringOwner.Unknown
+                    break
+                }
+                path += itemId
+                current = item.parentId
+            }
+            var inheritedOwner = requireNotNull(owner)
+            path.asReversed().forEach { itemId ->
+                if (inheritedOwner == RecurringOwner.None && nodes.getValue(itemId).hasRecurrence) {
+                    inheritedOwner = RecurringOwner.Known(itemId)
+                }
+                resolved[itemId] = inheritedOwner
+            }
+        }
+        return resolved
+    }
+
+    private fun DependencyGraphProjection.recurringBoundarySafety(): RecurringBoundarySafety {
+        var unproven = false
+        explicitDependenciesByItem.forEach { (successorId, predecessorIds) ->
+            predecessorIds.forEach { predecessorId ->
+                when (val predecessorOwner = recurringOwnersByItem[predecessorId]
+                    ?: RecurringOwner.Unknown) {
+                    RecurringOwner.None -> Unit
+                    RecurringOwner.Unknown -> unproven = true
+                    is RecurringOwner.Known -> when (
+                        val successorOwner = recurringOwnersByItem[successorId]
+                            ?: RecurringOwner.Unknown
+                    ) {
+                        RecurringOwner.Unknown -> unproven = true
+                        RecurringOwner.None -> return RecurringBoundarySafety.CROSS_BOUNDARY
+                        is RecurringOwner.Known -> if (
+                            successorOwner.itemId != predecessorOwner.itemId
+                        ) {
+                            return RecurringBoundarySafety.CROSS_BOUNDARY
+                        }
+                    }
+                }
+            }
+        }
+        return if (unproven) {
+            RecurringBoundarySafety.UNPROVEN
+        } else {
+            RecurringBoundarySafety.SAFE
+        }
+    }
+
+    private fun DependencyGraphProjection.addedEdgesComparedTo(
+        previous: DependencyGraphProjection,
+    ): Sequence<Pair<String, String>> = knownDependenciesByItem.asSequence().flatMap {
+        (successor, predecessors) ->
+        val previousPredecessors = previous.knownDependenciesByItem[successor].orEmpty()
+        predecessors.asSequence()
+            .filter { it !in previousPredecessors }
+            .map { predecessor -> successor to predecessor }
+    }
+
+    private fun DependencyGraphProjection.dependencyPath(
+        start: String,
+        target: String,
+    ): DependencyPath {
+        val pending = ArrayDeque<String>().also { it.add(start) }
+        val visited = hashSetOf<String>()
+        var reachedOpaqueItem = false
+        while (pending.isNotEmpty()) {
+            val itemId = pending.removeLast()
+            if (itemId == target) return DependencyPath.PRESENT
+            if (!visited.add(itemId)) continue
+            if (itemId in opaqueItemIds) reachedOpaqueItem = true
+            knownDependenciesByItem[itemId].orEmpty().forEach(pending::add)
+        }
+        return if (reachedOpaqueItem) DependencyPath.UNKNOWN else DependencyPath.ABSENT
+    }
+
+    private fun Map<String, Set<String>>.hasCycle(): Boolean {
+        val visiting = hashSetOf<String>()
+        val visited = hashSetOf<String>()
+        fun visit(itemId: String): Boolean {
+            if (itemId in visiting) return true
+            if (!visited.add(itemId)) return false
+            visiting += itemId
+            if (get(itemId).orEmpty().any(::visit)) return true
+            visiting -= itemId
+            return false
+        }
+        return keys.any(::visit)
+    }
+}
+
 internal data class CanonicalStrengthForm(
     val level: CanonicalConstraintLevel = CanonicalConstraintLevel.SOFT,
     val weight: String = "100",
@@ -144,6 +447,31 @@ internal data class CanonicalStrengthForm(
         fun from(value: CanonicalConstraintStrengthDraft) = CanonicalStrengthForm(
             level = value.level,
             weight = (value.weight ?: 100).toString(),
+        )
+    }
+}
+
+internal data class CanonicalDependencyForm(
+    val itemId: String,
+    val relation: CanonicalDependencyRelation = CanonicalDependencyRelation.FINISH_TO_START,
+    val minimumLagMinutes: String = "0",
+    val strength: CanonicalStrengthForm = CanonicalStrengthForm(
+        CanonicalConstraintLevel.HARD,
+    ),
+) {
+    fun draft() = CanonicalDependencyDraft(
+        itemId = itemId,
+        relation = relation,
+        minimumLagMinutes = minimumLagMinutes.requiredLong("Dependency minimum lag"),
+        strength = strength.draft("Dependency"),
+    ).also(CanonicalDependencyDraft::requireValid)
+
+    companion object {
+        fun from(value: CanonicalDependencyDraft) = CanonicalDependencyForm(
+            itemId = value.itemId,
+            relation = value.relation,
+            minimumLagMinutes = value.minimumLagMinutes.toString(),
+            strength = CanonicalStrengthForm.from(value.strength),
         )
     }
 }
@@ -306,6 +634,7 @@ internal data class CanonicalItemEditorForm(
     val forbiddenWindows: List<CanonicalAbsoluteWindowForm>,
     val requiredContexts: List<CanonicalStringConstraintForm>,
     val requiredLocation: CanonicalStringConstraintForm?,
+    val dependencies: List<CanonicalDependencyForm>,
     val maximumDailyWork: CanonicalMinutesConstraintForm?,
     val maximumWeeklyWork: CanonicalMinutesConstraintForm?,
     val bufferBeforeMinutes: String,
@@ -379,6 +708,7 @@ internal data class CanonicalItemEditorForm(
         forbiddenWindows = emptyList(),
         requiredContexts = emptyList(),
         requiredLocation = null,
+        dependencies = emptyList(),
         maximumDailyWork = null,
         maximumWeeklyWork = null,
         bufferBeforeMinutes = "0",
@@ -511,7 +841,7 @@ internal data class CanonicalItemEditorForm(
             forbiddenWindows = forbiddenWindows.map { it.draft("Forbidden window") },
             requiredContexts = requiredContexts.map { it.draft("Required context") },
             requiredLocation = requiredLocation?.draft("Required location"),
-            dependencies = source.constraints.scheduling?.dependencies.orEmpty(),
+            dependencies = dependencies.map(CanonicalDependencyForm::draft),
             maximumDailyWork = maximumDailyWork?.draft("Maximum daily work"),
             maximumWeeklyWork = maximumWeeklyWork?.draft("Maximum weekly work"),
             buffers = if (bufferSpecified) {
@@ -696,6 +1026,9 @@ internal data class CanonicalItemEditorForm(
                 requiredLocation = draft.constraints.scheduling?.requiredLocation?.let(
                     CanonicalStringConstraintForm::from,
                 ),
+                dependencies = draft.constraints.scheduling?.dependencies.orEmpty().map(
+                    CanonicalDependencyForm::from,
+                ),
                 maximumDailyWork = draft.constraints.scheduling?.maximumDailyWork?.let(
                     CanonicalMinutesConstraintForm::from,
                 ),
@@ -760,6 +1093,7 @@ internal data class CanonicalItemEditorForm(
 internal fun CanonicalItemEditorSheet(
     route: CanonicalItemEditorRoute,
     parentOptions: List<CanonicalParentOption>,
+    dependencyContext: CanonicalDependencyEditorContext,
     onDismiss: () -> Unit,
     onSave: suspend (CanonicalItemDraft) -> Boolean,
 ) {
@@ -769,7 +1103,10 @@ internal fun CanonicalItemEditorSheet(
     var saveError by remember(route.routeId) { mutableStateOf<String?>(null) }
     var isSaving by remember(route.routeId) { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
-    val issue = form.validationIssue(route.itemId)
+    val currentDraft = form.draft(route.itemId)
+    val issue = currentDraft.exceptionOrNull()?.let {
+        it.message?.takeIf(String::isNotBlank) ?: "Review the highlighted item details."
+    } ?: currentDraft.getOrNull()?.let(dependencyContext::cycleWarning)
     val hasRetainedCustomRecurrence =
         form.source.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM
 
@@ -1513,6 +1850,14 @@ internal fun CanonicalItemEditorSheet(
                             form = form.copy(requiredLocation = it, schedulingSpecified = true)
                         },
                     )
+                    DependencyListEditor(
+                        values = form.dependencies,
+                        context = dependencyContext,
+                        ownerDraft = currentDraft.getOrNull(),
+                        onValuesChange = {
+                            form = form.copy(dependencies = it, schedulingSpecified = true)
+                        },
+                    )
                     OptionalMinutesConstraintEditor(
                         title = "Maximum daily work",
                         value = form.maximumDailyWork,
@@ -1809,6 +2154,149 @@ private fun OptionalStringConstraintEditor(
 }
 
 @Composable
+private fun DependencyListEditor(
+    values: List<CanonicalDependencyForm>,
+    context: CanonicalDependencyEditorContext,
+    ownerDraft: CanonicalItemDraft?,
+    onValuesChange: (List<CanonicalDependencyForm>) -> Unit,
+) {
+    var isAdding by remember { mutableStateOf(false) }
+    var search by remember { mutableStateOf("") }
+    Text("Dependencies", style = MaterialTheme.typography.labelLarge)
+    Text(
+        "Choose everything that must start or finish first. Hard links block scheduling; " +
+            "soft links influence the plan by their weight.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    values.forEachIndexed { index, dependency ->
+        val option = context.option(dependency.itemId)
+        WindowCardLabel("Predecessor ${index + 1}") {
+            onValuesChange(values.removing(index))
+        }
+        Text(
+            option?.displayTitle ?: "Unavailable item · ${dependency.itemId.take(8)}",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.testTag("canonical_editor_dependency_title_$index"),
+        )
+        Text(
+            option?.takeIf(CanonicalDependencyOption::hasOpaqueDependencies)?.let {
+                "Dependency details require a newer DayWeave version; keep or remove this link."
+            } ?: option?.let { "${canonicalStatusLabel(it.status)} predecessor" }
+                ?: "This saved predecessor is unavailable locally; remove it to unlink it.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text("Relationship", style = MaterialTheme.typography.labelLarge)
+        ChoiceRow {
+            CanonicalDependencyRelation.entries.forEach { relation ->
+                FilterChip(
+                    selected = dependency.relation == relation,
+                    onClick = {
+                        onValuesChange(
+                            values.replacing(index, dependency.copy(relation = relation)),
+                        )
+                    },
+                    label = { Text(relation.editorLabel()) },
+                    modifier = Modifier.testTag(
+                        "canonical_editor_dependency_${index}_${relation.wireValue}",
+                    ),
+                )
+            }
+        }
+        NumberField(
+            value = dependency.minimumLagMinutes,
+            onValueChange = {
+                onValuesChange(
+                    values.replacing(index, dependency.copy(minimumLagMinutes = it)),
+                )
+            },
+            label = "Minimum lag (minutes, max 527,040)",
+            testTag = "canonical_editor_dependency_lag_$index",
+        )
+        ConstraintStrengthEditor(dependency.strength) {
+            onValuesChange(values.replacing(index, dependency.copy(strength = it)))
+        }
+        HorizontalDivider(modifier = Modifier.padding(vertical = 3.dp))
+    }
+
+    if (isAdding) {
+        OutlinedTextField(
+            value = search,
+            onValueChange = { search = it },
+            label = { Text("Search predecessors") },
+            placeholder = { Text("Title, status, or item ID") },
+            modifier = Modifier.fillMaxWidth().testTag("canonical_editor_dependency_search"),
+            singleLine = true,
+        )
+        val selectedIds = values.mapTo(hashSetOf(), CanonicalDependencyForm::itemId)
+        val normalizedSearch = search.trim().lowercase()
+        val matches = context.selectableOptions.asSequence()
+            .filter { it.id !in selectedIds }
+            .filter { option ->
+                normalizedSearch.isEmpty() ||
+                    normalizedSearch in option.displayTitle.lowercase() ||
+                    normalizedSearch in option.status.lowercase() ||
+                    normalizedSearch in option.id.lowercase()
+            }
+            .take(MAX_DEPENDENCY_SEARCH_RESULTS)
+            .toList()
+        if (matches.isEmpty()) {
+            Text(
+                if (context.selectableOptions.all { it.id in selectedIds }) {
+                    "Every available predecessor is already linked."
+                } else {
+                    "No predecessor matches this search."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        matches.forEach { option ->
+            val candidateIssue = if (ownerDraft == null) {
+                "Finish correcting the draft first"
+            } else {
+                context.candidateIssue(ownerDraft, option.id)
+            }
+            OutlinedButton(
+                onClick = {
+                    onValuesChange(values + CanonicalDependencyForm(itemId = option.id))
+                    search = ""
+                    isAdding = false
+                },
+                enabled = candidateIssue == null,
+                modifier = Modifier.fillMaxWidth().testTag(
+                    "canonical_editor_dependency_option_${option.id}",
+                ),
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(option.displayTitle)
+                    Text(
+                        candidateIssue ?: canonicalStatusLabel(option.status),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
+        OutlinedButton(onClick = { isAdding = false }) { Text("Close search") }
+    } else {
+        OutlinedButton(
+            onClick = { isAdding = true },
+            modifier = Modifier.testTag("canonical_editor_add_dependency"),
+        ) { Text("Add predecessor") }
+    }
+
+    ownerDraft?.let(context::cycleWarning)?.let { warning ->
+        Text(
+            warning,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.testTag("canonical_editor_dependency_cycle"),
+        )
+    }
+}
+
+@Composable
 private fun AbsoluteWindowListEditor(
     title: String,
     values: List<CanonicalAbsoluteWindowForm>,
@@ -2014,6 +2502,130 @@ internal fun canonicalParentOptions(
         .map { CanonicalParentOption(it.id, it.title) }
 }
 
+internal fun canonicalDependencyEditorContext(
+    state: DayWeaveUiState,
+    editedItemId: String,
+): CanonicalDependencyEditorContext {
+    val nodes = state.canonicalItems
+        .associate { item ->
+            val decodedConstraints = runCatching(item::decodeCanonicalFlexibleConstraints)
+            item.id to CanonicalDependencyGraphNode(
+                id = item.id,
+                title = item.title,
+                status = item.status,
+                kind = ItemKind.entries.firstOrNull {
+                    it.name.equals(item.kind, ignoreCase = true)
+                } ?: ItemKind.TASK,
+                hasRecurrence = item.recurrenceJson != null,
+                parentId = item.parentId,
+                siblingOrder = item.siblingOrder,
+                constraints = decodedConstraints.getOrNull(),
+                isDeleted = item.deletedAt != null,
+                hasOpaqueDependencies = decodedConstraints.isFailure,
+            )
+        }
+        .toMutableMap()
+    state.canonicalRecentlyDeleted.forEach { record ->
+        val item = record.lastKnownItem ?: return@forEach
+        if (item.id !in nodes) {
+            val decodedConstraints = runCatching(item::decodeCanonicalFlexibleConstraints)
+            nodes[item.id] = CanonicalDependencyGraphNode(
+                id = item.id,
+                title = item.title,
+                status = item.status,
+                kind = ItemKind.entries.firstOrNull {
+                    it.name.equals(item.kind, ignoreCase = true)
+                } ?: ItemKind.TASK,
+                hasRecurrence = item.recurrenceJson != null,
+                parentId = item.parentId,
+                siblingOrder = item.siblingOrder,
+                constraints = decodedConstraints.getOrNull(),
+                isDeleted = true,
+                hasOpaqueDependencies = decodedConstraints.isFailure,
+            )
+        }
+    }
+    state.pendingCanonicalAuthoringMutations.forEach { mutation ->
+        when (mutation.operation) {
+            CanonicalAuthoringOperation.TRASH -> nodes[mutation.itemId]?.let { existing ->
+                nodes[mutation.itemId] = existing.copy(isDeleted = true)
+            }
+            CanonicalAuthoringOperation.CREATE,
+            CanonicalAuthoringOperation.REPLACE,
+            -> mutation.draft?.let { draft ->
+                nodes[mutation.itemId] = CanonicalDependencyGraphNode(
+                    id = mutation.itemId,
+                    title = draft.title,
+                    status = draft.placement.wireValue,
+                    kind = draft.kind,
+                    hasRecurrence = draft.recurrence != null,
+                    parentId = draft.parentId,
+                    siblingOrder = draft.siblingOrder,
+                    constraints = draft.constraints,
+                    isDeleted = false,
+                    hasOpaqueDependencies = false,
+                )
+            }
+            CanonicalAuthoringOperation.RESTORE -> {
+                val existing = nodes[mutation.itemId]
+                    ?: mutation.baseItem?.let { item ->
+                        val decodedConstraints = runCatching(
+                            item::decodeCanonicalFlexibleConstraints,
+                        )
+                        CanonicalDependencyGraphNode(
+                            id = item.id,
+                            title = item.title,
+                            status = item.status,
+                            kind = ItemKind.entries.firstOrNull {
+                                it.name.equals(item.kind, ignoreCase = true)
+                            } ?: ItemKind.TASK,
+                            hasRecurrence = item.recurrenceJson != null,
+                            parentId = item.parentId,
+                            siblingOrder = item.siblingOrder,
+                            constraints = decodedConstraints.getOrNull(),
+                            isDeleted = true,
+                            hasOpaqueDependencies = decodedConstraints.isFailure,
+                        )
+                    }
+                if (existing != null) {
+                    nodes[mutation.itemId] = existing.copy(isDeleted = false)
+                }
+            }
+        }
+    }
+
+    val options = nodes.values.asSequence()
+        .filter { !it.isDeleted && it.id != editedItemId }
+        .map { node ->
+            val isSensitive = runCatching {
+                effectiveCanonicalSensitivity(
+                    items = state.canonicalItems,
+                    itemId = node.id,
+                    pendingMutation = state.pendingCanonicalMutation,
+                    pendingAuthoringMutations = state.pendingCanonicalAuthoringMutations,
+                )
+            }.getOrDefault(true)
+            CanonicalDependencyOption(
+                id = node.id,
+                displayTitle = if (isSensitive) {
+                    "Sensitive item · ${node.id.take(8)}"
+                } else {
+                    node.title.trim().ifEmpty { "Untitled item" }
+                },
+                status = node.status,
+                isSensitive = isSensitive,
+                hasOpaqueDependencies = node.hasOpaqueDependencies,
+            )
+        }
+        .sortedWith(compareBy({ it.displayTitle.lowercase() }, CanonicalDependencyOption::id))
+        .toList()
+    return CanonicalDependencyEditorContext(
+        editedItemId = editedItemId,
+        options = options,
+        baseNodes = nodes,
+    )
+}
+
 private fun String.required(label: String): String = trim().takeIf(String::isNotEmpty)
     ?: throw IllegalArgumentException("$label is required")
 
@@ -2054,6 +2666,15 @@ private fun CanonicalConstraintLevel.editorLabel(): String = when (this) {
     CanonicalConstraintLevel.HARD -> "Hard"
     CanonicalConstraintLevel.SOFT -> "Soft"
 }
+
+private fun CanonicalDependencyRelation.editorLabel(): String = when (this) {
+    CanonicalDependencyRelation.FINISH_TO_START -> "FS · Finish → start"
+    CanonicalDependencyRelation.START_TO_START -> "SS · Start → start"
+    CanonicalDependencyRelation.FINISH_TO_FINISH -> "FF · Finish → finish"
+    CanonicalDependencyRelation.START_TO_FINISH -> "SF · Start → finish"
+}
+
+private const val MAX_DEPENDENCY_SEARCH_RESULTS = 24
 
 private fun CanonicalRecurrenceKind.editorLabel(): String = when (this) {
     CanonicalRecurrenceKind.DAILY -> "Daily"

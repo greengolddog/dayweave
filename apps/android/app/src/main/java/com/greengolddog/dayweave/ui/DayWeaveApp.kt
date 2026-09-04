@@ -102,6 +102,7 @@ import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorSheet
 import com.greengolddog.dayweave.ui.authoring.GoogleCalendarOutboundReviewSheet
 import com.greengolddog.dayweave.ui.authoring.GoogleSchedulePublicationReviewSheet
+import com.greengolddog.dayweave.ui.authoring.canonicalDependencyEditorContext
 import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
@@ -1211,6 +1212,7 @@ private fun DayWeaveRoot(
         CanonicalItemEditorSheet(
             route = route,
             parentOptions = canonicalParentOptions(state, route.itemId),
+            dependencyContext = canonicalDependencyEditorContext(state, route.itemId),
             onDismiss = { canonicalEditorRoute = null },
             onSave = { draft ->
                 val saved = when (route.mode) {

@@ -336,7 +336,8 @@ internal class ForegroundCanonicalItemInvalidationManager(
     }
 
     private fun RemoteItemDeltaPage.isValidProbePage(): Boolean =
-        changes.size <= FOREGROUND_DELTA_PROBE_PAGE_SIZE && isCanonicalItemCursor(nextCursor)
+        changes.size <= maximumItemDeltaResponseChanges(FOREGROUND_DELTA_PROBE_PAGE_SIZE) &&
+            isCanonicalItemCursor(nextCursor)
 
     private data class ProbeHint(val cursor: String?)
     private data class ActivationBinding(val baseUrl: String, val configurationId: String)

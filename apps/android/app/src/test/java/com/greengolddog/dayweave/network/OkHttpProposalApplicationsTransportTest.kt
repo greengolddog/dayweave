@@ -135,6 +135,52 @@ class OkHttpProposalApplicationsTransportTest {
     }
 
     @Test
+    fun previewDecodesAndRecomputesDependencyChangesAndRisk() {
+        val dependencyConstraints = """
+            {"constraints":{"dependencies":[{
+              "item_id":"$IMPLICIT_ITEM_ID",
+              "relation":"finish_to_start",
+              "minimum_lag":15,
+              "strength":{"level":"hard"}
+            }]}}
+        """.trimIndent().replace("\n", "")
+        val response = replacePreviewJson(
+            changedFields = "[\"title\",\"dependencies\",\"revision\"]",
+            afterFlexibleConstraints = dependencyConstraints,
+        )
+            .replace("\"maximum_risk\":\"low\"", "\"maximum_risk\":\"high\"")
+            .replace(
+                "\"requires_explicit_approval\":false",
+                "\"requires_explicit_approval\":true",
+            )
+            .replace(
+                "\"risks\":[]",
+                """"risks":[{
+                  "code":"changes_dependencies",
+                  "level":"high",
+                  "command_id":"$COMMAND_ID",
+                  "item_id":"$ITEM_ID",
+                  "requires_explicit_approval":true,
+                  "summary":"Changes which items constrain this item's schedule."
+                }]""".trimIndent().replace("\n", ""),
+            )
+        server.enqueue(jsonResponse(response, status = 201))
+
+        val preview = runBlocking { preview() }
+
+        assertEquals(
+            listOf(
+                RemoteProposalItemField.TITLE,
+                RemoteProposalItemField.DEPENDENCIES,
+                RemoteProposalItemField.REVISION,
+            ),
+            preview.diffs.single().changedFields,
+        )
+        assertEquals(RemoteProposalRiskCode.CHANGES_DEPENDENCIES, preview.risks.single().code)
+        assertEquals(RemoteProposalRiskLevel.HIGH, preview.maximumRisk)
+    }
+
+    @Test
     fun applyBuilderBindsExactUrlBodyDigestAndSecurityHeaders() {
         val request = prepareProposalApplyHttpRequest(
             configuration(),
@@ -356,6 +402,25 @@ class OkHttpProposalApplicationsTransportTest {
         }
         assertEquals(RemoteProposalConflictCode.PREVIEW_EXPIRED, conflict.conflictCode)
 
+        listOf(
+            "dependency_not_found" to RemoteProposalConflictCode.DEPENDENCY_NOT_FOUND,
+            "dependency_cycle" to RemoteProposalConflictCode.DEPENDENCY_CYCLE,
+        ).forEach { (wireCode, expected) ->
+            server.enqueue(
+                errorResponse(
+                    status = 409,
+                    code = "conflict",
+                    details = """{"conflict_code":"$wireCode"}""",
+                ),
+            )
+            val dependencyConflict = assertThrows(
+                ProposalApplicationApiException.Conflict::class.java,
+            ) {
+                runBlocking { transport.getById(configuration(), APPLICATION_ID) }
+            }
+            assertEquals(expected, dependencyConflict.conflictCode)
+        }
+
         server.enqueue(errorResponse(status = 422, code = "validation_failed"))
         val validation = assertThrows(ProposalApplicationApiException.Validation::class.java) {
             runBlocking { transport.getById(configuration(), APPLICATION_ID) }
@@ -477,7 +542,10 @@ class OkHttpProposalApplicationsTransportTest {
         }
     """.trimIndent()
 
-    private fun replacePreviewJson(changedFields: String): String {
+    private fun replacePreviewJson(
+        changedFields: String,
+        afterFlexibleConstraints: String? = null,
+    ): String {
         val before = itemJson().replace(
             "\"title\":\"Review the proposal\"",
             "\"title\":\"Original title\"",
@@ -489,6 +557,11 @@ class OkHttpProposalApplicationsTransportTest {
                 "\"updated_at\":\"2026-09-01T10:00:00Z\"",
                 "\"updated_at\":\"2026-09-01T10:05:00Z\"",
             )
+            .let { value ->
+                afterFlexibleConstraints?.let { constraints ->
+                    value.replace("\"flexible_constraints\":{}", "\"flexible_constraints\":$constraints")
+                } ?: value
+            }
         return """
             {
               "preview_id":"$PREVIEW_ID",

@@ -433,6 +433,8 @@ data class CanonicalDependencyDraft(
     val minimumLagMinutes: Long = 0,
     val strength: CanonicalConstraintStrengthDraft,
 ) {
+    fun normalized() = copy(itemId = UUID.fromString(itemId).toString())
+
     fun requireValid() {
         requireNonNilUuid(itemId, "dependency")
         require(minimumLagMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES) {
@@ -443,12 +445,12 @@ data class CanonicalDependencyDraft(
     }
 
     fun toCanonicalJson(): JsonObject {
-        requireValid()
+        val value = normalized().also(CanonicalDependencyDraft::requireValid)
         return buildJsonObject {
-            put("item_id", itemId)
-            put("relation", relation.wireValue)
-            put("minimum_lag", minimumLagMinutes)
-            put("strength", strength.toCanonicalJson())
+            put("item_id", value.itemId)
+            put("relation", value.relation.wireValue)
+            put("minimum_lag", value.minimumLagMinutes)
+            put("strength", value.strength.toCanonicalJson())
         }
     }
 }
@@ -506,6 +508,8 @@ data class CanonicalSchedulingConstraintsDraft(
         preferredDailyWindows = preferredDailyWindows.map(CanonicalDailyWindowDraft::normalized),
         requiredContexts = requiredContexts.map(CanonicalQualifiedStringDraft::normalized),
         requiredLocation = requiredLocation?.normalized(),
+        dependencies = dependencies.map(CanonicalDependencyDraft::normalized)
+            .sortedBy(CanonicalDependencyDraft::itemId),
     )
 
     fun requireValid() {
@@ -583,7 +587,14 @@ data class CanonicalSchedulingConstraintsDraft(
                 put("required_location", it.toCanonicalJson("required location"))
             }
             if (dependencies.isNotEmpty()) {
-                put("dependencies", JsonArray(dependencies.map { it.toCanonicalJson() }))
+                put(
+                    "dependencies",
+                    JsonArray(
+                        dependencies.map(CanonicalDependencyDraft::normalized)
+                            .sortedBy(CanonicalDependencyDraft::itemId)
+                            .map(CanonicalDependencyDraft::toCanonicalJson),
+                    ),
+                )
             }
             maximumDailyWork?.let {
                 put("maximum_daily_work", it.toCanonicalJson("maximum daily work"))
@@ -702,7 +713,9 @@ data class CanonicalFlexibleConstraintsDraft(
 ) {
     fun normalized(): CanonicalFlexibleConstraintsDraft = copy(
         tags = tags.sorted(),
-        scheduling = scheduling?.normalized(),
+        scheduling = scheduling?.normalized()?.takeUnless {
+            it == CanonicalSchedulingConstraintsDraft()
+        },
         goalIds = goalIds.sorted(),
         habitTarget = habitTarget?.normalized(),
         goalMeasures = goalMeasures?.map(CanonicalGoalMeasureDraft::normalized),
@@ -901,11 +914,16 @@ data class CanonicalItemDraft(
         require(earliest == null || deadline == null || earliest < deadline)
         value.recurrence?.requireValid()
         value.constraints.requireValid(value.durationSeconds, value.eventTiming)
+        require(value.constraints.goalIds.isEmpty()) {
+            "Goal links are read-only until safe graph editing is available"
+        }
+        val parsedItemId = UUID.fromString(itemId)
         require(
-            value.constraints.goalIds.isEmpty() &&
-                value.constraints.scheduling?.dependencies.orEmpty().isEmpty(),
+            value.constraints.scheduling?.dependencies.orEmpty().none {
+                UUID.fromString(it.itemId) == parsedItemId
+            },
         ) {
-            "Goal links and dependencies are read-only until safe graph editing is available"
+            "An item cannot depend on itself"
         }
         value.split.requireValid(value.durationSeconds)
         require(value.split.kind == CanonicalSplitKind.SPLITTABLE ||
@@ -1299,6 +1317,26 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
             "Canonical item contains unsupported authoring fields"
         }
     }
+}
+
+/**
+ * Decodes only the typed flexible-constraint payload for graph presentation and validation.
+ *
+ * Unlike [toCanonicalDraft], this remains usable for completed, blocked, and structurally rich
+ * items that cannot safely be replaced by this client. Callers must continue to fail closed when
+ * decoding returns an error; this helper grants no mutation authority.
+ */
+internal fun CanonicalItemSnapshot.decodeCanonicalFlexibleConstraints():
+    CanonicalFlexibleConstraintsDraft {
+    requireCanonicalAuthoringShape()
+    val kindValue = ItemKind.entries.firstOrNull { it.name.equals(kind, ignoreCase = true) }
+        ?: throw IllegalArgumentException("Unsupported canonical item kind")
+    return decodeCanonicalConstraints(
+        flexibleConstraintsJson,
+        kindValue,
+        timezoneName,
+        durationSeconds,
+    ).first
 }
 
 /**

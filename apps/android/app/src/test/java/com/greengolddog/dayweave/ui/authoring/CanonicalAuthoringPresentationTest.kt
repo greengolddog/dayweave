@@ -3,13 +3,18 @@ package com.greengolddog.dayweave.ui.authoring
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalConstraintStrengthDraft
 import com.greengolddog.dayweave.model.CanonicalDeadlineKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDependencyDraft
+import com.greengolddog.dayweave.model.CanonicalDependencyRelation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
+import com.greengolddog.dayweave.model.CanonicalSchedulingConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
@@ -156,9 +161,10 @@ class CanonicalAuthoringPresentationTest {
         )
         assertEquals("Due 2026-09-30 · Soft · weight 42", canonicalTimingLabel(row))
         assertEquals(
-            "Blocked · waiting for item ${PARENT_ID.take(8)} · Vendor approval",
+            "Blocked · waiting for External prerequisite · Vendor approval",
             canonicalBlockedReasonLabel(row),
         )
+        assertEquals(listOf(PARENT_ID), row.blockingDependencies.map { it.itemId })
 
         val event = item(CONFLICT_ITEM_ID, "Calendar interval", "planned").copy(
             kind = "event",
@@ -172,6 +178,97 @@ class CanonicalAuthoringPresentationTest {
         ).planned.single()
         assertTrue(canonicalTimingLabel(eventRow).orEmpty().startsWith("Ends "))
         assertFalse(canonicalTimingLabel(eventRow).orEmpty().startsWith("Due "))
+    }
+
+    @Test
+    fun derivesEveryUnmetHardBlockerAndRedactsSensitiveCrossItemContent() {
+        val ordinary = item(PARENT_ID, "Publish draft", "planned")
+        val sensitive = item(SENSITIVE_ID, "Private medical approval", "planned").copy(
+            isSensitive = true,
+        )
+        val completed = item(COMPLETED_ID, "Finished prerequisite", "completed")
+        val soft = item(SOFT_ID, "Preferred warm-up", "planned")
+        val dependencies = listOf(
+            CanonicalDependencyDraft(
+                itemId = ordinary.id,
+                relation = CanonicalDependencyRelation.FINISH_TO_START,
+                strength = CanonicalConstraintStrengthDraft.hard(),
+            ),
+            CanonicalDependencyDraft(
+                itemId = sensitive.id,
+                relation = CanonicalDependencyRelation.START_TO_START,
+                minimumLagMinutes = 15,
+                strength = CanonicalConstraintStrengthDraft.hard(),
+            ),
+            CanonicalDependencyDraft(
+                itemId = completed.id,
+                relation = CanonicalDependencyRelation.FINISH_TO_FINISH,
+                strength = CanonicalConstraintStrengthDraft.hard(),
+            ),
+            CanonicalDependencyDraft(
+                itemId = soft.id,
+                relation = CanonicalDependencyRelation.START_TO_FINISH,
+                strength = CanonicalConstraintStrengthDraft.soft(80),
+            ),
+        )
+        val blocked = item(CHILD_ID, "Waiting action", "blocked").copy(
+            flexibleConstraintsJson = CanonicalFlexibleConstraintsDraft(
+                scheduling = CanonicalSchedulingConstraintsDraft(dependencies = dependencies),
+            ).toCanonicalJson(null).toString(),
+            blockedReasonKind = CanonicalBlockedReasonKind.DEPENDENCY,
+            blockedByItemId = sensitive.id,
+            blockedReason = "Private medical approval is outstanding",
+            hasExplicitStructuralMetadata = true,
+        )
+
+        val row = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(
+                canonicalItems = listOf(ordinary, sensitive, completed, soft, blocked),
+            ),
+        ).blocked.single()
+
+        assertEquals(4, row.dependencies.size)
+        assertEquals(
+            listOf(PARENT_ID, SENSITIVE_ID),
+            row.blockingDependencies.map(CanonicalDependencyPresentation::itemId),
+        )
+        val sensitiveCause = row.blockingDependencies.single { it.itemId == SENSITIVE_ID }
+        assertTrue(sensitiveCause.isSensitive)
+        assertFalse(sensitiveCause.displayTitle.contains("medical", ignoreCase = true))
+        assertTrue(sensitiveCause.displayTitle.startsWith("Sensitive item"))
+        assertEquals(
+            "Start → start · lag 15m · Hard · Planned",
+            canonicalDependencyDetail(sensitiveCause),
+        )
+        val summary = requireNotNull(canonicalBlockedReasonLabel(row))
+        assertEquals("Blocked · waiting for 2 predecessors", summary)
+        assertFalse(summary.contains("medical", ignoreCase = true))
+    }
+
+    @Test
+    fun opaqueDependencyMetadataRemainsVisibleAndCompatibilityBlockerStaysRedacted() {
+        val sensitive = item(SENSITIVE_ID, "Private medical approval", "planned").copy(
+            isSensitive = true,
+        )
+        val blocked = item(CHILD_ID, "Waiting action", "blocked").copy(
+            flexibleConstraintsJson =
+                """{"constraints":{"dependencies":{"schema_version":2}}}""",
+            blockedReasonKind = CanonicalBlockedReasonKind.DEPENDENCY,
+            blockedByItemId = sensitive.id,
+            blockedReason = "Private medical approval is outstanding",
+            hasExplicitStructuralMetadata = true,
+        )
+
+        val row = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(sensitive, blocked)),
+        ).blocked.single()
+
+        assertTrue(row.hasOpaqueDependencies)
+        val compatibilityBlocker = row.blockingDependencies.single()
+        assertTrue(compatibilityBlocker.isSensitive)
+        assertFalse(compatibilityBlocker.displayTitle.contains("medical", ignoreCase = true))
+        val summary = requireNotNull(canonicalBlockedReasonLabel(row))
+        assertFalse(summary.contains("medical", ignoreCase = true))
     }
 
     @Test
@@ -264,6 +361,9 @@ class CanonicalAuthoringPresentationTest {
         const val DELETED_ID = "44444444-4444-4444-8444-444444444444"
         const val CONFLICT_MUTATION_ID = "55555555-5555-4555-8555-555555555555"
         const val REPLACE_MUTATION_ID = "66666666-6666-4666-8666-666666666666"
+        const val SENSITIVE_ID = "77777777-7777-4777-8777-777777777777"
+        const val COMPLETED_ID = "88888888-8888-4888-8888-888888888888"
+        const val SOFT_ID = "99999999-9999-4999-8999-999999999999"
         const val NOW = "2026-08-30T10:00:00Z"
     }
 }

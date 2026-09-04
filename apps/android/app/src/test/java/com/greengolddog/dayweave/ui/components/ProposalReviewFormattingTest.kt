@@ -8,7 +8,9 @@ import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
 import com.greengolddog.dayweave.network.RemoteProposalItemField
 import com.greengolddog.dayweave.network.RemoteProposalItemKind
 import com.greengolddog.dayweave.network.RemoteProposalItemStatus
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -37,6 +39,10 @@ class ProposalReviewFormattingTest {
             RemoteProposalItemField.EARLIEST_START_AT to "\"2026-09-01T08:00:00Z\"",
             RemoteProposalItemField.RECURRENCE to "{\"frequency\":\"weekly\"}",
             RemoteProposalItemField.FLEXIBLE_CONSTRAINTS to "{\"window\":\"morning\"}",
+            RemoteProposalItemField.DEPENDENCIES to
+                "[{\"item_id\":\"33333333-3333-4333-8333-333333333333\"," +
+                "\"relation\":\"finish_to_start\",\"minimum_lag\":30," +
+                "\"strength\":{\"level\":\"hard\"}}]",
             RemoteProposalItemField.SPLIT_POLICY to "{\"type\":\"indivisible\"}",
             RemoteProposalItemField.IMPORTANCE to "73",
             RemoteProposalItemField.URGENCY to "61",
@@ -113,7 +119,27 @@ class ProposalReviewFormattingTest {
         deadlineStrength = CanonicalDeadlineStrength.HARD,
         earliestStartAt = "2026-09-01T08:00:00Z",
         recurrence = buildJsonObject { put("frequency", "weekly") },
-        flexibleConstraints = buildJsonObject { put("window", "morning") },
+        flexibleConstraints = buildJsonObject {
+            put("window", "morning")
+            put(
+                "constraints",
+                buildJsonObject {
+                    put(
+                        "dependencies",
+                        buildJsonArray {
+                            add(
+                                buildJsonObject {
+                                    put("item_id", "33333333-3333-4333-8333-333333333333")
+                                    put("relation", "finish_to_start")
+                                    put("minimum_lag", 30)
+                                    put("strength", buildJsonObject { put("level", "hard") })
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
         splitPolicy = buildJsonObject { put("type", "indivisible") },
         importance = 73,
         urgency = 61,

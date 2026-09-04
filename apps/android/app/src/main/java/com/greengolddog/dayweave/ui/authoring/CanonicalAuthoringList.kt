@@ -48,6 +48,8 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalConstraintLevel
+import com.greengolddog.dayweave.model.CanonicalDependencyRelation
 import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundCandidate
@@ -89,6 +91,7 @@ internal fun CanonicalAuthoringList(
         state.canonicalRecentlyDeleted,
         state.pendingCanonicalMutation,
     ) { CanonicalAuthoringPresentation.build(state) }
+    val activeRowsByItemId = presentation.activeRowsByItemId
     var trashCandidate by remember { mutableStateOf<CanonicalAuthoringRow?>(null) }
     var diagnostic by remember { mutableStateOf<String?>(null) }
     var actionInFlight by remember { mutableStateOf(false) }
@@ -179,6 +182,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Inbox",
             rows = presentation.inbox,
+            activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is waiting for triage.",
             actionsEnabled = effectiveActionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -206,6 +210,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Planned",
             rows = presentation.planned,
+            activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Move an item to Planned when it is ready for composition.",
             actionsEnabled = effectiveActionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -231,6 +236,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Blocked",
             rows = presentation.blocked,
+            activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is currently waiting on a blocker.",
             actionsEnabled = effectiveActionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -260,6 +266,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Conflicts",
             rows = presentation.conflicts,
+            activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "No authoring conflicts need review.",
             actionsEnabled = effectiveActionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -285,6 +292,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Recently Deleted",
             rows = presentation.recentlyDeleted,
+            activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Deleted items available for restore appear here.",
             actionsEnabled = effectiveActionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -362,6 +370,7 @@ internal fun CanonicalAuthoringList(
 private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     title: String,
     rows: List<CanonicalAuthoringRow>,
+    activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     emptyMessage: String,
     actionsEnabled: Boolean,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
@@ -397,6 +406,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     items(rows, key = { "$title:${it.itemId}" }) { row ->
         CanonicalAuthoringCard(
             row = row,
+            activeRowsByItemId = activeRowsByItemId,
             actionsEnabled = actionsEnabled,
             onOpenEditor = onOpenEditor,
             onTrash = { onTrash(row) },
@@ -414,6 +424,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
 @Composable
 private fun CanonicalAuthoringCard(
     row: CanonicalAuthoringRow,
+    activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     actionsEnabled: Boolean,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
     onTrash: () -> Unit,
@@ -517,6 +528,60 @@ private fun CanonicalAuthoringCard(
                         modifier = Modifier.testTag("canonical_blocked_reason_${row.itemId}"),
                     )
                 }
+                if (row.status == "blocked" && row.blockingDependencies.isNotEmpty()) {
+                    Text(
+                        if (row.blockingDependencies.size == 1) {
+                            "Waiting on 1 predecessor"
+                        } else {
+                            "Waiting on ${row.blockingDependencies.size} predecessors"
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    row.blockingDependencies.forEachIndexed { index, dependency ->
+                        val targetRoute = activeRowsByItemId[dependency.itemId]?.editorRoute()
+                        Row(
+                            modifier = Modifier.fillMaxWidth().testTag(
+                                "canonical_dependency_blocker_${row.itemId}_$index",
+                            ),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    dependency.displayTitle,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    canonicalDependencyDetail(dependency),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (targetRoute != null) {
+                                TextButton(
+                                    onClick = { onOpenEditor(targetRoute) },
+                                    enabled = actionsEnabled,
+                                    modifier = Modifier.testTag(
+                                        "canonical_open_dependency_${dependency.itemId}",
+                                    ),
+                                ) { Text("Open") }
+                            }
+                        }
+                    }
+                }
+                if (row.hasOpaqueDependencies) {
+                    Text(
+                        "Dependency details require a newer DayWeave version and remain read-only.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag(
+                            "canonical_dependency_opaque_${row.itemId}",
+                        ),
+                    )
+                }
                 if (row.hasMissingParent || row.hasHierarchyCycle) {
                     Text(
                         if (row.hasHierarchyCycle) "Hierarchy cycle" else "Parent unavailable",
@@ -528,33 +593,10 @@ private fun CanonicalAuthoringCard(
                     Text(it, style = MaterialTheme.typography.bodySmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val editable = row.draft != null && !row.isReadOnly &&
-                        row.source in setOf(
-                            CanonicalAuthoringRowSource.CANONICAL,
-                            CanonicalAuthoringRowSource.LOCAL_CREATE,
-                            CanonicalAuthoringRowSource.PENDING_REPLACE,
-                        )
-                    if (editable) {
+                    val editorRoute = row.editorRoute()
+                    if (editorRoute != null) {
                         OutlinedButton(
-                            onClick = {
-                                val draft = requireNotNull(row.draft)
-                                onOpenEditor(
-                                    if (row.mutationId == null) {
-                                        CanonicalItemEditorRoute(
-                                            itemId = row.itemId,
-                                            initialDraft = draft,
-                                            mode = CanonicalItemEditorMode.REPLACE,
-                                        )
-                                    } else {
-                                        CanonicalItemEditorRoute(
-                                            itemId = row.itemId,
-                                            initialDraft = draft,
-                                            mode = CanonicalItemEditorMode.UPDATE_PENDING,
-                                            mutationId = row.mutationId,
-                                        )
-                                    },
-                                )
-                            },
+                            onClick = { onOpenEditor(editorRoute) },
                             enabled = actionsEnabled,
                         ) {
                             Icon(Icons.Outlined.Edit, contentDescription = null)
@@ -809,9 +851,18 @@ internal fun canonicalBlockedReasonLabel(row: CanonicalAuthoringRow): String? {
     if (row.status != "blocked") return null
     return when (row.blockedReasonKind) {
         CanonicalBlockedReasonKind.DEPENDENCY -> {
-            val dependency = row.blockedByItemId?.take(8)?.let { "waiting for item $it" }
-                ?: "waiting for a dependency"
-            row.blockedReason?.let { "Blocked · $dependency · $it" } ?: "Blocked · $dependency"
+            val dependency = when (row.blockingDependencies.size) {
+                0 -> "waiting for a dependency"
+                1 -> "waiting for ${row.blockingDependencies.single().displayTitle}"
+                else -> "waiting for ${row.blockingDependencies.size} predecessors"
+            }
+            val primary = row.blockedByItemId?.let { blockerId ->
+                row.blockingDependencies.firstOrNull { it.itemId == blockerId }
+            }
+            val safeReason = row.blockedReason?.takeIf {
+                primary != null && row.blockingDependencies.none { it.isSensitive }
+            }
+            safeReason?.let { "Blocked · $dependency · $it" } ?: "Blocked · $dependency"
         }
         CanonicalBlockedReasonKind.MANUAL -> row.blockedReason?.let {
             "Manually blocked · $it"
@@ -821,6 +872,54 @@ internal fun canonicalBlockedReasonLabel(row: CanonicalAuthoringRow): String? {
         } ?: "External blocker"
         null -> "Blocked reason unavailable"
         else -> "Blocked for a reason that requires a newer DayWeave version"
+    }
+}
+
+internal fun canonicalDependencyDetail(
+    dependency: CanonicalDependencyPresentation,
+): String = buildList {
+    add(
+        when (dependency.relation) {
+            CanonicalDependencyRelation.FINISH_TO_START -> "Finish → start"
+            CanonicalDependencyRelation.START_TO_START -> "Start → start"
+            CanonicalDependencyRelation.FINISH_TO_FINISH -> "Finish → finish"
+            CanonicalDependencyRelation.START_TO_FINISH -> "Start → finish"
+            null -> "Dependency"
+        },
+    )
+    if (dependency.minimumLagMinutes > 0) add("lag ${dependency.minimumLagMinutes}m")
+    add(
+        when (dependency.level) {
+            CanonicalConstraintLevel.HARD -> "Hard"
+            CanonicalConstraintLevel.SOFT -> dependency.softWeight?.let { "Soft · weight $it" }
+                ?: "Soft"
+        },
+    )
+    add(dependency.status?.let(::canonicalStatusLabel) ?: "Unavailable")
+}.joinToString(" · ")
+
+private fun CanonicalAuthoringRow.editorRoute(): CanonicalItemEditorRoute? {
+    val value = draft ?: return null
+    if (
+        isReadOnly || source !in setOf(
+            CanonicalAuthoringRowSource.CANONICAL,
+            CanonicalAuthoringRowSource.LOCAL_CREATE,
+            CanonicalAuthoringRowSource.PENDING_REPLACE,
+        )
+    ) return null
+    return if (mutationId == null) {
+        CanonicalItemEditorRoute(
+            itemId = itemId,
+            initialDraft = value,
+            mode = CanonicalItemEditorMode.REPLACE,
+        )
+    } else {
+        CanonicalItemEditorRoute(
+            itemId = itemId,
+            initialDraft = value,
+            mode = CanonicalItemEditorMode.UPDATE_PENDING,
+            mutationId = mutationId,
+        )
     }
 }
 
