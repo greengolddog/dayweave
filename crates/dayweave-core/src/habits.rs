@@ -7,79 +7,140 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 use time::{Date, Duration, OffsetDateTime};
 
-use crate::{DayOfWeek, ItemId, OccurrenceId};
+use crate::{
+    DayOfWeek, HabitMissedPolicy, HabitSpec, ItemId, Occurrence, OccurrenceId, OccurrenceState,
+    RecurrenceException, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    RecurrenceMoveSource,
+};
 
 /// One hundred percent expressed in basis points.
 pub const HABIT_BASIS_POINTS_SCALE: u16 = 10_000;
 
-/// Maximum UTF-8 size of an occurrence note accepted by the pure domain.
-pub const MAX_HABIT_OCCURRENCE_NOTE_BYTES: usize = 16 * 1024;
+/// Maximum number of Unicode scalar values in an occurrence note.
+pub const MAX_HABIT_OCCURRENCE_NOTE_CHARS: usize = 10_000;
 
-/// Maximum UTF-8 size of a quantitative unit label.
+/// Legacy byte-oriented note bound retained for source compatibility.
+pub const MAX_HABIT_OCCURRENCE_NOTE_BYTES: usize = 16 * 1_024;
+
+/// Maximum number of Unicode scalar values in a quantitative unit label.
+pub const MAX_HABIT_QUANTITY_UNIT_CHARS: usize = 200;
+
+/// Legacy byte-oriented unit bound retained for source compatibility.
 pub const MAX_HABIT_QUANTITY_UNIT_BYTES: usize = 128;
+
+/// Largest absolute quantitative value accepted as occurrence evidence.
+pub const MAX_HABIT_QUANTITY: i64 = 1_000_000_000_000;
+
+/// Largest actual elapsed time accepted for one occurrence (366 days).
+pub const MAX_HABIT_ACTUAL_SECONDS: u64 = 366 * 24 * 60 * 60;
 
 /// Largest history accepted by one analytics projection.
 pub const MAX_HABIT_ANALYTICS_OCCURRENCES: usize = 1_000_000;
 
+/// Largest pause history accepted by one analytics projection.
+pub const MAX_HABIT_ANALYTICS_PAUSES: usize = 100_000;
+
 /// Largest inclusive local-date range accepted by one analytics projection.
 pub const MAX_HABIT_ANALYTICS_RANGE_DAYS: i64 = 36_600;
 
-/// Quantitative progress for one habit occurrence.
+/// Optional named quantitative evidence for one habit occurrence.
 ///
-/// `completed_units` is cumulative, not a delta. The target and unit are a
-/// snapshot so later edits to a habit do not reinterpret historical progress.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// This measurement is intentionally independent from normalized percentage
+/// progress. Its unit is stored with the value so analytics never mix unlike
+/// quantities. The expected target/unit belong to the immutable generated
+/// occurrence evidence, not to this mutable outcome projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HabitQuantityProgress {
-    pub completed_units: u64,
-    pub target_units: u64,
+    pub amount: i64,
     pub unit: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HabitQuantityWire {
+    Current(CurrentHabitQuantityWire),
+    Legacy(LegacyHabitQuantityWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentHabitQuantityWire {
+    amount: i64,
+    unit: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyHabitQuantityWire {
+    completed_units: u64,
+    target_units: u64,
+    unit: String,
+}
+
+struct DecodedHabitQuantity {
+    value: HabitQuantityProgress,
+    legacy_target_units: Option<u64>,
+}
+
+impl HabitQuantityWire {
+    fn decode(self) -> Result<DecodedHabitQuantity, &'static str> {
+        match self {
+            Self::Current(value) => Ok(DecodedHabitQuantity {
+                value: HabitQuantityProgress {
+                    amount: value.amount,
+                    unit: value.unit,
+                },
+                legacy_target_units: None,
+            }),
+            Self::Legacy(value) => {
+                if value.completed_units == 0
+                    || value.target_units == 0
+                    || value.target_units > i64::MAX as u64
+                {
+                    return Err(
+                        "legacy habit quantity requires positive completed and target units",
+                    );
+                }
+                let amount = i64::try_from(value.completed_units)
+                    .map_err(|_| "legacy habit quantity exceeds the signed range")?;
+                Ok(DecodedHabitQuantity {
+                    value: HabitQuantityProgress {
+                        amount,
+                        unit: value.unit,
+                    },
+                    legacy_target_units: Some(value.target_units),
+                })
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HabitQuantityProgress {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HabitQuantityWire::deserialize(deserializer)?
+            .decode()
+            .map(|decoded| decoded.value)
+            .map_err(D::Error::custom)
+    }
+}
+
 impl HabitQuantityProgress {
-    fn validate_common(&self) -> Result<(), HabitOccurrenceError> {
-        if self.completed_units == 0 || self.target_units == 0 {
+    fn validate(&self) -> Result<(), HabitOccurrenceError> {
+        if self.amount.unsigned_abs() > MAX_HABIT_QUANTITY as u64 {
             return Err(HabitOccurrenceError::InvalidQuantity);
         }
-        if self.completed_units > i64::MAX as u64 || self.target_units > i64::MAX as u64 {
-            return Err(HabitOccurrenceError::InvalidQuantity);
-        }
-        if self.unit.is_empty()
-            || self.unit.trim() != self.unit
-            || self.unit.len() > MAX_HABIT_QUANTITY_UNIT_BYTES
-            || self.unit.chars().any(char::is_control)
-        {
+        if !valid_text(&self.unit, MAX_HABIT_QUANTITY_UNIT_CHARS, true) {
             return Err(HabitOccurrenceError::InvalidQuantityUnit);
         }
         Ok(())
-    }
-
-    fn validate_partial(&self) -> Result<(), HabitOccurrenceError> {
-        self.validate_common()?;
-        if self.completed_units >= self.target_units {
-            return Err(HabitOccurrenceError::InvalidPartialQuantity);
-        }
-        Ok(())
-    }
-
-    fn validate_completed(&self) -> Result<(), HabitOccurrenceError> {
-        self.validate_common()?;
-        if self.completed_units < self.target_units {
-            return Err(HabitOccurrenceError::IncompleteCompletedQuantity);
-        }
-        Ok(())
-    }
-
-    fn basis_points(&self) -> u16 {
-        let scaled = u128::from(self.completed_units)
-            .saturating_mul(u128::from(HABIT_BASIS_POINTS_SCALE))
-            / u128::from(self.target_units);
-        u16::try_from(scaled.min(u128::from(HABIT_BASIS_POINTS_SCALE)))
-            .expect("a value capped to the basis-point scale fits in u16")
     }
 }
 
@@ -92,71 +153,196 @@ pub enum HabitSkipReason {
 }
 
 /// Current outcome projection for one generated occurrence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HabitOccurrenceOutcome {
     Pending,
+    Partial,
+    Completed,
+    Skipped { reason: HabitSkipReason },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum HabitOutcomeWire {
+    Pending,
     Partial {
-        quantity: HabitQuantityProgress,
+        #[serde(default)]
+        quantity: Option<HabitQuantityWire>,
     },
     Completed {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        quantity: Option<HabitQuantityProgress>,
+        #[serde(default)]
+        quantity: Option<HabitQuantityWire>,
     },
     Skipped {
         reason: HabitSkipReason,
     },
 }
 
-impl HabitOccurrenceOutcome {
-    /// Validates quantitative invariants without consulting mutable habit data.
-    ///
-    /// # Errors
-    ///
-    /// Returns a quantity error when partial progress reaches the target, a
-    /// completed quantitative result is below its target, or a unit is unsafe.
-    pub fn validate(&self) -> Result<(), HabitOccurrenceError> {
+impl HabitOutcomeWire {
+    fn decode(
+        self,
+    ) -> Result<
+        (
+            HabitOccurrenceOutcome,
+            Option<DecodedHabitQuantity>,
+            Option<u16>,
+        ),
+        &'static str,
+    > {
         match self {
-            Self::Partial { quantity } => quantity.validate_partial(),
-            Self::Completed {
-                quantity: Some(quantity),
-            } => quantity.validate_completed(),
-            Self::Pending | Self::Completed { quantity: None } | Self::Skipped { .. } => Ok(()),
-        }
-    }
-
-    fn is_recorded(&self) -> bool {
-        !matches!(self, Self::Pending)
-    }
-
-    fn adherence_basis_points(&self) -> u16 {
-        match self {
-            Self::Completed { .. } => HABIT_BASIS_POINTS_SCALE,
-            Self::Partial { quantity } => quantity.basis_points(),
-            Self::Pending | Self::Skipped { .. } => 0,
+            Self::Pending => Ok((HabitOccurrenceOutcome::Pending, None, Some(0))),
+            Self::Partial { quantity } => {
+                let quantity = quantity.map(HabitQuantityWire::decode).transpose()?;
+                let inferred = quantity
+                    .as_ref()
+                    .and_then(|quantity| quantity.legacy_target_units)
+                    .map(|target| {
+                        let completed = u64::try_from(
+                            quantity
+                                .as_ref()
+                                .expect("legacy target came from this quantity")
+                                .value
+                                .amount,
+                        )
+                        .map_err(|_| "legacy partial quantity must be positive")?;
+                        if completed >= target {
+                            return Err("legacy partial quantity must remain below its target");
+                        }
+                        let scaled =
+                            completed.saturating_mul(u64::from(HABIT_BASIS_POINTS_SCALE)) / target;
+                        Ok(
+                            u16::try_from(scaled.clamp(1, u64::from(HABIT_BASIS_POINTS_SCALE - 1)))
+                                .expect("clamped basis points fit u16"),
+                        )
+                    })
+                    .transpose()?;
+                Ok((HabitOccurrenceOutcome::Partial, quantity, inferred))
+            }
+            Self::Completed { quantity } => {
+                let quantity = quantity.map(HabitQuantityWire::decode).transpose()?;
+                if let Some((completed, target)) = quantity.as_ref().and_then(|quantity| {
+                    quantity
+                        .legacy_target_units
+                        .map(|target| (quantity.value.amount, target))
+                }) {
+                    let completed = u64::try_from(completed)
+                        .map_err(|_| "legacy completed quantity must be positive")?;
+                    if completed < target {
+                        return Err("legacy completed quantity must reach its target");
+                    }
+                }
+                Ok((
+                    HabitOccurrenceOutcome::Completed,
+                    quantity,
+                    Some(HABIT_BASIS_POINTS_SCALE),
+                ))
+            }
+            Self::Skipped { reason } => {
+                Ok((HabitOccurrenceOutcome::Skipped { reason }, None, Some(0)))
+            }
         }
     }
 }
 
+impl<'de> Deserialize<'de> for HabitOccurrenceOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        HabitOutcomeWire::deserialize(deserializer)?
+            .decode()
+            .map(|(outcome, _, _)| outcome)
+            .map_err(D::Error::custom)
+    }
+}
+
+impl HabitOccurrenceOutcome {
+    fn is_recorded(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
 /// User-visible value of an occurrence at one revision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HabitOccurrenceValue {
     pub outcome: HabitOccurrenceOutcome,
+    /// Normalized completion percentage. Percentage, quantity, and elapsed
+    /// time are orthogonal evidence and may be recorded independently.
+    pub progress_basis_points: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<HabitQuantityProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// When the outcome actually occurred. A later correction keeps this
+    /// When the outcome actually occurred. A later correction can keep this
     /// distinct from the command's recording time.
     #[serde(default, with = "time::serde::rfc3339::option")]
-    pub effective_at: Option<OffsetDateTime>,
+    pub occurred_at: Option<OffsetDateTime>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HabitOccurrenceValueWire {
+    outcome: HabitOutcomeWire,
+    #[serde(default)]
+    progress_basis_points: Option<u16>,
+    #[serde(default)]
+    quantity: Option<HabitQuantityWire>,
+    #[serde(default)]
+    actual_seconds: Option<u64>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default, alias = "effective_at", with = "time::serde::rfc3339::option")]
+    occurred_at: Option<OffsetDateTime>,
+}
+
+impl<'de> Deserialize<'de> for HabitOccurrenceValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HabitOccurrenceValueWire::deserialize(deserializer)?;
+        let (outcome, embedded_quantity, inferred_progress) =
+            wire.outcome.decode().map_err(D::Error::custom)?;
+        if embedded_quantity.is_some() && wire.quantity.is_some() {
+            return Err(D::Error::custom(
+                "habit quantity cannot be present in both outcome and value",
+            ));
+        }
+        let quantity = wire
+            .quantity
+            .map(HabitQuantityWire::decode)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .or(embedded_quantity)
+            .map(|decoded| decoded.value);
+        let progress_basis_points = wire
+            .progress_basis_points
+            .or(inferred_progress)
+            .ok_or_else(|| D::Error::custom("partial habit value requires explicit progress"))?;
+        Ok(Self {
+            outcome,
+            progress_basis_points,
+            quantity,
+            actual_seconds: wire.actual_seconds,
+            note: wire.note,
+            occurred_at: wire.occurred_at,
+        })
+    }
 }
 
 impl Default for HabitOccurrenceValue {
     fn default() -> Self {
         Self {
             outcome: HabitOccurrenceOutcome::Pending,
+            progress_basis_points: 0,
+            quantity: None,
+            actual_seconds: None,
             note: None,
-            effective_at: None,
+            occurred_at: None,
         }
     }
 }
@@ -168,17 +354,22 @@ impl HabitOccurrenceValue {
         Self::default()
     }
 
-    /// Constructs a cumulative partial-quantity value.
+    /// Constructs a partial value from independent normalized and raw evidence.
     #[must_use]
     pub fn partial(
-        quantity: HabitQuantityProgress,
+        progress_basis_points: u16,
+        quantity: Option<HabitQuantityProgress>,
+        actual_seconds: Option<u64>,
         note: Option<String>,
-        effective_at: OffsetDateTime,
+        occurred_at: OffsetDateTime,
     ) -> Self {
         Self {
-            outcome: HabitOccurrenceOutcome::Partial { quantity },
+            outcome: HabitOccurrenceOutcome::Partial,
+            progress_basis_points,
+            quantity,
+            actual_seconds,
             note,
-            effective_at: Some(effective_at),
+            occurred_at: Some(occurred_at),
         }
     }
 
@@ -186,13 +377,17 @@ impl HabitOccurrenceValue {
     #[must_use]
     pub fn completed(
         quantity: Option<HabitQuantityProgress>,
+        actual_seconds: Option<u64>,
         note: Option<String>,
-        effective_at: OffsetDateTime,
+        occurred_at: OffsetDateTime,
     ) -> Self {
         Self {
-            outcome: HabitOccurrenceOutcome::Completed { quantity },
+            outcome: HabitOccurrenceOutcome::Completed,
+            progress_basis_points: HABIT_BASIS_POINTS_SCALE,
+            quantity,
+            actual_seconds,
             note,
-            effective_at: Some(effective_at),
+            occurred_at: Some(occurred_at),
         }
     }
 
@@ -200,27 +395,73 @@ impl HabitOccurrenceValue {
     #[must_use]
     pub fn skipped(
         reason: HabitSkipReason,
+        progress_basis_points: u16,
+        quantity: Option<HabitQuantityProgress>,
+        actual_seconds: Option<u64>,
         note: Option<String>,
-        effective_at: OffsetDateTime,
+        occurred_at: OffsetDateTime,
     ) -> Self {
         Self {
             outcome: HabitOccurrenceOutcome::Skipped { reason },
+            progress_basis_points,
+            quantity,
+            actual_seconds,
             note,
-            effective_at: Some(effective_at),
+            occurred_at: Some(occurred_at),
         }
     }
 
-    fn validate(&self, recorded_at: OffsetDateTime) -> Result<(), HabitOccurrenceError> {
-        self.outcome.validate()?;
+    /// Validates all status/evidence invariants against an explicit recording time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a shape, evidence, or timestamp error when the projection cannot
+    /// be stored as one internally consistent occurrence revision.
+    pub fn validate(&self, recorded_at: OffsetDateTime) -> Result<(), HabitOccurrenceError> {
+        if let Some(quantity) = &self.quantity {
+            quantity.validate()?;
+        }
+        if self
+            .actual_seconds
+            .is_some_and(|seconds| seconds > MAX_HABIT_ACTUAL_SECONDS)
+        {
+            return Err(HabitOccurrenceError::InvalidActualSeconds);
+        }
         validate_note(self.note.as_deref())?;
-        match (&self.outcome, self.effective_at) {
+        match self.outcome {
+            HabitOccurrenceOutcome::Pending
+                if self.progress_basis_points != 0
+                    || self.quantity.is_some()
+                    || self.actual_seconds.is_some()
+                    || self.note.is_some() =>
+            {
+                return Err(HabitOccurrenceError::PendingHasEvidence);
+            }
+            HabitOccurrenceOutcome::Partial
+                if !(1..HABIT_BASIS_POINTS_SCALE).contains(&self.progress_basis_points) =>
+            {
+                return Err(HabitOccurrenceError::InvalidPartialProgress);
+            }
+            HabitOccurrenceOutcome::Completed
+                if self.progress_basis_points != HABIT_BASIS_POINTS_SCALE =>
+            {
+                return Err(HabitOccurrenceError::InvalidCompletedProgress);
+            }
+            HabitOccurrenceOutcome::Skipped { .. }
+                if self.progress_basis_points >= HABIT_BASIS_POINTS_SCALE =>
+            {
+                return Err(HabitOccurrenceError::InvalidSkippedProgress);
+            }
+            _ => {}
+        }
+        match (&self.outcome, self.occurred_at) {
             (HabitOccurrenceOutcome::Pending, None) => Ok(()),
             (HabitOccurrenceOutcome::Pending, Some(_)) => {
-                Err(HabitOccurrenceError::PendingHasEffectiveTime)
+                Err(HabitOccurrenceError::PendingHasOccurredTime)
             }
-            (_, Some(effective_at)) if effective_at <= recorded_at => Ok(()),
-            (_, Some(_)) => Err(HabitOccurrenceError::EffectiveTimeInFuture),
-            (_, None) => Err(HabitOccurrenceError::RecordedOutcomeMissingEffectiveTime),
+            (_, Some(occurred_at)) if occurred_at <= recorded_at => Ok(()),
+            (_, Some(_)) => Err(HabitOccurrenceError::OccurredTimeInFuture),
+            (_, None) => Err(HabitOccurrenceError::RecordedOutcomeMissingOccurredTime),
         }
     }
 }
@@ -332,9 +573,10 @@ pub struct HabitOccurrenceTransition {
 /// Applies one occurrence mutation without I/O or an implicit clock.
 ///
 /// Ordinary recording is monotonic: pending occurrences can be recorded, and
-/// cumulative partial progress can advance or complete. Reopening, decreasing
-/// quantity, changing a target/unit, or changing a terminal result requires an
-/// explicit correction. The returned preimage is suitable for audit and undo.
+/// normalized partial progress can advance, complete, or become skipped while
+/// retaining its evidence. Reopening, decreasing normalized progress, removing
+/// evidence, or changing a terminal result requires an explicit correction.
+/// The returned preimage is suitable for audit and undo.
 ///
 /// # Errors
 ///
@@ -358,7 +600,7 @@ pub fn apply_habit_occurrence_command(
     let (next_value, transition_kind) = match command.kind {
         HabitOccurrenceCommandKind::Record { value } => {
             value.validate(command.recorded_at)?;
-            validate_forward_record(&current.value.outcome, &value.outcome)?;
+            validate_forward_record(&current.value, &value)?;
             let kind = if matches!(current.value.outcome, HabitOccurrenceOutcome::Pending) {
                 HabitOccurrenceTransitionKind::Recorded
             } else {
@@ -398,46 +640,78 @@ pub fn apply_habit_occurrence_command(
 }
 
 fn validate_forward_record(
-    current: &HabitOccurrenceOutcome,
-    next: &HabitOccurrenceOutcome,
+    current: &HabitOccurrenceValue,
+    next: &HabitOccurrenceValue,
 ) -> Result<(), HabitOccurrenceError> {
-    match (current, next) {
-        (HabitOccurrenceOutcome::Pending, next) if next.is_recorded() => Ok(()),
-        (
-            HabitOccurrenceOutcome::Partial { quantity: previous },
-            HabitOccurrenceOutcome::Partial { quantity: next }
-            | HabitOccurrenceOutcome::Completed {
-                quantity: Some(next),
-            },
-        ) => {
-            if previous.unit != next.unit {
-                return Err(HabitOccurrenceError::QuantityUnitChanged);
+    match (current.outcome, next.outcome) {
+        (HabitOccurrenceOutcome::Pending, outcome) if outcome.is_recorded() => Ok(()),
+        (HabitOccurrenceOutcome::Partial, HabitOccurrenceOutcome::Partial) => {
+            if next.progress_basis_points <= current.progress_basis_points {
+                return Err(HabitOccurrenceError::ProgressDidNotAdvance);
             }
-            if previous.target_units != next.target_units {
-                return Err(HabitOccurrenceError::QuantityTargetChanged);
-            }
-            if next.completed_units <= previous.completed_units {
-                return Err(HabitOccurrenceError::QuantityDidNotAdvance);
-            }
-            Ok(())
+            validate_evidence_preserved(current, next)
         }
-        (
-            HabitOccurrenceOutcome::Partial { .. },
-            HabitOccurrenceOutcome::Completed { quantity: None },
-        ) => Err(HabitOccurrenceError::QuantityEvidenceRemoved),
+        (HabitOccurrenceOutcome::Partial, HabitOccurrenceOutcome::Completed) => {
+            validate_evidence_preserved(current, next)
+        }
+        (HabitOccurrenceOutcome::Partial, HabitOccurrenceOutcome::Skipped { .. }) => {
+            if next.progress_basis_points < current.progress_basis_points {
+                return Err(HabitOccurrenceError::ProgressRegressed);
+            }
+            validate_evidence_preserved(current, next)
+        }
         _ => Err(HabitOccurrenceError::InvalidForwardTransition),
     }
 }
 
+fn validate_evidence_preserved(
+    current: &HabitOccurrenceValue,
+    next: &HabitOccurrenceValue,
+) -> Result<(), HabitOccurrenceError> {
+    if let Some(previous) = &current.quantity {
+        let Some(next) = &next.quantity else {
+            return Err(HabitOccurrenceError::QuantityEvidenceRemoved);
+        };
+        if previous.unit != next.unit {
+            return Err(HabitOccurrenceError::QuantityUnitChanged);
+        }
+        if previous.amount != next.amount {
+            return Err(HabitOccurrenceError::QuantityEvidenceChanged);
+        }
+    }
+    if let Some(previous) = current.actual_seconds {
+        let Some(next) = next.actual_seconds else {
+            return Err(HabitOccurrenceError::ActualSecondsEvidenceRemoved);
+        };
+        if next < previous {
+            return Err(HabitOccurrenceError::ActualSecondsRegressed);
+        }
+    }
+    if let Some(previous) = &current.note {
+        let Some(next) = &next.note else {
+            return Err(HabitOccurrenceError::NoteEvidenceRemoved);
+        };
+        if previous != next {
+            return Err(HabitOccurrenceError::NoteEvidenceChanged);
+        }
+    }
+    Ok(())
+}
+
 fn validate_note(note: Option<&str>) -> Result<(), HabitOccurrenceError> {
     if let Some(note) = note
-        && (note.trim().is_empty()
-            || note.len() > MAX_HABIT_OCCURRENCE_NOTE_BYTES
-            || note.contains('\0'))
+        && !valid_text(note, MAX_HABIT_OCCURRENCE_NOTE_CHARS, false)
     {
         return Err(HabitOccurrenceError::InvalidNote);
     }
     Ok(())
+}
+
+fn valid_text(value: &str, max_chars: usize, require_trimmed: bool) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= max_chars
+        && (!require_trimmed || value.trim() == value)
+        && !value.chars().any(char::is_control)
 }
 
 /// Errors returned by occurrence lifecycle commands and value validation.
@@ -455,32 +729,48 @@ pub enum HabitOccurrenceError {
     RevisionOverflow,
     #[error("recording time cannot move backwards")]
     TimestampRegression,
-    #[error("quantity and target must be positive signed-64-bit values")]
+    #[error("quantity is outside the supported signed integer range")]
     InvalidQuantity,
-    #[error("quantity unit must be trimmed, printable, non-empty, and bounded")]
+    #[error("quantity unit must be printable, non-empty, and bounded")]
     InvalidQuantityUnit,
-    #[error("partial quantity must remain below its target")]
-    InvalidPartialQuantity,
-    #[error("completed quantitative progress must reach its target")]
-    IncompleteCompletedQuantity,
-    #[error("occurrence note must be non-empty, NUL-free, and bounded")]
+    #[error("actual elapsed seconds exceed the supported bound")]
+    InvalidActualSeconds,
+    #[error("occurrence note must be non-empty, safe, and bounded")]
     InvalidNote,
-    #[error("a pending outcome cannot have an effective time")]
-    PendingHasEffectiveTime,
-    #[error("a recorded outcome requires an effective time")]
-    RecordedOutcomeMissingEffectiveTime,
-    #[error("effective time cannot be later than recording time")]
-    EffectiveTimeInFuture,
+    #[error("a pending outcome cannot retain progress or user evidence")]
+    PendingHasEvidence,
+    #[error("partial progress must be between 1 and 9,999 basis points")]
+    InvalidPartialProgress,
+    #[error("completed progress must be exactly 10,000 basis points")]
+    InvalidCompletedProgress,
+    #[error("skipped progress must remain below 10,000 basis points")]
+    InvalidSkippedProgress,
+    #[error("a pending outcome cannot have an occurrence time")]
+    PendingHasOccurredTime,
+    #[error("a recorded outcome requires an occurrence time")]
+    RecordedOutcomeMissingOccurredTime,
+    #[error("occurrence time cannot be later than recording time")]
+    OccurredTimeInFuture,
     #[error("ordinary recording does not permit that transition")]
     InvalidForwardTransition,
+    #[error("ordinary partial progress must increase")]
+    ProgressDidNotAdvance,
+    #[error("ordinary recording cannot decrease normalized progress")]
+    ProgressRegressed,
     #[error("ordinary progress cannot change its quantity unit")]
     QuantityUnitChanged,
-    #[error("ordinary progress cannot change its quantity target")]
-    QuantityTargetChanged,
-    #[error("ordinary cumulative quantity must increase")]
-    QuantityDidNotAdvance,
-    #[error("ordinary completion cannot discard partial quantity evidence")]
+    #[error("ordinary progress cannot rewrite a recorded quantity")]
+    QuantityEvidenceChanged,
+    #[error("ordinary recording cannot discard quantity evidence")]
     QuantityEvidenceRemoved,
+    #[error("ordinary recording cannot discard elapsed-time evidence")]
+    ActualSecondsEvidenceRemoved,
+    #[error("ordinary elapsed time cannot decrease")]
+    ActualSecondsRegressed,
+    #[error("ordinary recording cannot discard note evidence")]
+    NoteEvidenceRemoved,
+    #[error("ordinary recording cannot rewrite a recorded note")]
+    NoteEvidenceChanged,
     #[error("a correction requires an already-recorded outcome")]
     CorrectionRequiresRecordedOutcome,
     #[error("command does not change the occurrence")]
@@ -543,16 +833,6 @@ pub fn habit_occurrence_eligibility(
     })
 }
 
-/// Configured action for an unmet occurrence after its window closes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HabitMissedPolicy {
-    Skip,
-    Carry,
-    ReduceFrequency,
-    Ask,
-}
-
 /// Reason that a missed-policy evaluation intentionally changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -564,13 +844,28 @@ pub enum HabitMissedNoActionReason {
 }
 
 /// Pure decision emitted for an overdue unmet occurrence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HabitMissedDecision {
-    NoAction { reason: HabitMissedNoActionReason },
-    MarkSkipped,
-    CarryForward,
-    ReduceFrequency,
+    NoAction {
+        reason: HabitMissedNoActionReason,
+    },
+    /// Complete replacement projection ready for an optimistic record command.
+    MarkSkipped {
+        value: HabitOccurrenceValue,
+    },
+    /// Concrete replacement window for moving the same stable occurrence.
+    CarryForward {
+        #[serde(with = "time::serde::rfc3339")]
+        window_start: OffsetDateTime,
+        #[serde(with = "time::serde::rfc3339")]
+        window_end: OffsetDateTime,
+    },
+    /// Concrete deterministic reduction: suppress exactly this many upcoming
+    /// generated occurrences through ordinary skip exceptions.
+    ReduceFrequency {
+        skip_next_occurrences: u16,
+    },
     RequestDecision,
 }
 
@@ -578,28 +873,29 @@ pub enum HabitMissedDecision {
 ///
 /// A pause suppresses missed handling regardless of its analytics policy.
 /// Partial progress is still unmet and therefore follows the configured policy
-/// after the window closes; its quantity remains available to a carry command.
+/// after the window closes. A skip decision retains its normalized, quantity,
+/// elapsed-time, and note evidence verbatim and only changes status/reason/time.
 ///
 /// # Errors
 ///
-/// Returns an error for an invalid outcome, occurrence window, or pause.
+/// Returns an error for an invalid value, occurrence window, or pause.
 pub fn decide_habit_missed_behavior(
     policy: HabitMissedPolicy,
     as_of: OffsetDateTime,
     window_start: OffsetDateTime,
     window_end: OffsetDateTime,
-    outcome: &HabitOccurrenceOutcome,
+    value: &HabitOccurrenceValue,
     pauses: &[HabitPauseInterval],
 ) -> Result<HabitMissedDecision, HabitPolicyError> {
     validate_window(window_start, window_end)?;
-    outcome
-        .validate()
+    value
+        .validate(as_of)
         .map_err(HabitPolicyError::InvalidOutcome)?;
     for pause in pauses {
         pause.validate()?;
     }
-    match outcome {
-        HabitOccurrenceOutcome::Completed { .. } => {
+    match value.outcome {
+        HabitOccurrenceOutcome::Completed => {
             return Ok(HabitMissedDecision::NoAction {
                 reason: HabitMissedNoActionReason::AlreadyCompleted,
             });
@@ -609,7 +905,7 @@ pub fn decide_habit_missed_behavior(
                 reason: HabitMissedNoActionReason::AlreadySkipped,
             });
         }
-        HabitOccurrenceOutcome::Pending | HabitOccurrenceOutcome::Partial { .. } => {}
+        HabitOccurrenceOutcome::Pending | HabitOccurrenceOutcome::Partial => {}
     }
     if pauses
         .iter()
@@ -625,11 +921,161 @@ pub fn decide_habit_missed_behavior(
         });
     }
     Ok(match policy {
-        HabitMissedPolicy::Skip => HabitMissedDecision::MarkSkipped,
-        HabitMissedPolicy::Carry => HabitMissedDecision::CarryForward,
-        HabitMissedPolicy::ReduceFrequency => HabitMissedDecision::ReduceFrequency,
+        HabitMissedPolicy::Skip => HabitMissedDecision::MarkSkipped {
+            value: HabitOccurrenceValue::skipped(
+                HabitSkipReason::MissedPolicy,
+                value.progress_basis_points,
+                value.quantity.clone(),
+                value.actual_seconds,
+                value.note.clone(),
+                as_of,
+            ),
+        },
+        HabitMissedPolicy::Carry => {
+            let duration = window_end - window_start;
+            let carried_end = as_of
+                .checked_add(duration)
+                .ok_or(HabitPolicyError::TimestampOverflow)?;
+            HabitMissedDecision::CarryForward {
+                window_start: as_of,
+                window_end: carried_end,
+            }
+        }
+        HabitMissedPolicy::ReduceFrequency => HabitMissedDecision::ReduceFrequency {
+            skip_next_occurrences: 1,
+        },
         HabitMissedPolicy::Ask => HabitMissedDecision::RequestDecision,
     })
+}
+
+/// Evaluates missed handling using the policy persisted on the habit.
+///
+/// # Errors
+///
+/// Returns the same bounded validation errors as
+/// [`decide_habit_missed_behavior`].
+pub fn decide_configured_habit_missed_behavior(
+    habit: &HabitSpec,
+    as_of: OffsetDateTime,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+    value: &HabitOccurrenceValue,
+    pauses: &[HabitPauseInterval],
+) -> Result<HabitMissedDecision, HabitPolicyError> {
+    decide_habit_missed_behavior(
+        habit.missed_policy,
+        as_of,
+        window_start,
+        window_end,
+        value,
+        pauses,
+    )
+}
+
+/// Converts a missed-policy decision into exact recurrence exceptions.
+///
+/// Carry moves the same stable occurrence identity to the decision's concrete
+/// replacement window. Reduce-frequency skips the requested number of next
+/// generated occurrences in nominal order. Mark-skipped suppresses the missed
+/// occurrence itself; ask/no-action decisions make no scheduling change.
+/// Every returned move includes the immutable source proof that recurrence
+/// expansion independently rederives before accepting it.
+///
+/// # Errors
+///
+/// Returns an error for invalid source evidence, an invalid carry window, a
+/// zero reduction, or too few materialized future occurrences.
+pub fn materialize_habit_missed_scheduling_decision(
+    item_revision: u64,
+    missed: &Occurrence,
+    decision: &HabitMissedDecision,
+    occurrences: &[Occurrence],
+) -> Result<Vec<RecurrenceException>, HabitPolicyError> {
+    match decision {
+        HabitMissedDecision::NoAction { .. } | HabitMissedDecision::RequestDecision => {
+            Ok(Vec::new())
+        }
+        HabitMissedDecision::MarkSkipped { .. } => {
+            validate_missed_occurrence_source(item_revision, missed)?;
+            Ok(vec![skip_exception(missed.series_item_id, missed.id)])
+        }
+        HabitMissedDecision::CarryForward {
+            window_start,
+            window_end,
+        } => {
+            validate_missed_occurrence_source(item_revision, missed)?;
+            validate_window(*window_start, *window_end)?;
+            Ok(vec![RecurrenceException {
+                item_id: missed.series_item_id,
+                selector: RecurrenceExceptionSelector::Occurrence { id: missed.id },
+                action: RecurrenceExceptionAction::Move {
+                    start: *window_start,
+                    end: *window_end,
+                    source: RecurrenceMoveSource {
+                        item_revision,
+                        identity: missed.identity,
+                        nominal_start: missed.nominal_start,
+                        nominal_end: missed.nominal_end,
+                        local_date: missed.local_date,
+                        ordinal: missed.ordinal,
+                    },
+                },
+            }])
+        }
+        HabitMissedDecision::ReduceFrequency {
+            skip_next_occurrences,
+        } => {
+            validate_missed_occurrence_source(item_revision, missed)?;
+            if *skip_next_occurrences == 0 {
+                return Err(HabitPolicyError::InvalidFrequencyReduction);
+            }
+            let mut upcoming = occurrences
+                .iter()
+                .filter(|occurrence| {
+                    occurrence.series_item_id == missed.series_item_id
+                        && occurrence.id != missed.id
+                        && (occurrence.nominal_start, occurrence.ordinal, occurrence.id)
+                            > (missed.nominal_start, missed.ordinal, missed.id)
+                        && occurrence.state == OccurrenceState::Generated
+                })
+                .collect::<Vec<_>>();
+            upcoming.sort_by_key(|occurrence| {
+                (occurrence.nominal_start, occurrence.ordinal, occurrence.id)
+            });
+            let count = usize::from(*skip_next_occurrences);
+            if upcoming.len() < count {
+                return Err(HabitPolicyError::InsufficientUpcomingOccurrences);
+            }
+            Ok(upcoming
+                .into_iter()
+                .take(count)
+                .map(|occurrence| skip_exception(missed.series_item_id, occurrence.id))
+                .collect())
+        }
+    }
+}
+
+fn validate_missed_occurrence_source(
+    item_revision: u64,
+    occurrence: &Occurrence,
+) -> Result<(), HabitPolicyError> {
+    if item_revision == 0
+        || occurrence.series_item_id.0.is_nil()
+        || occurrence.id.0.is_nil()
+        || occurrence.nominal_start >= occurrence.nominal_end
+        || occurrence.state != OccurrenceState::Generated
+    {
+        return Err(HabitPolicyError::InvalidOccurrenceEvidence);
+    }
+    Ok(())
+}
+
+const fn skip_exception(item_id: ItemId, occurrence_id: OccurrenceId) -> RecurrenceException {
+    RecurrenceException {
+        item_id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: occurrence_id },
+        action: RecurrenceExceptionAction::Skip,
+    }
 }
 
 fn validate_window(
@@ -652,6 +1098,14 @@ pub enum HabitPolicyError {
     InvalidPauseInterval,
     #[error("invalid occurrence outcome: {0}")]
     InvalidOutcome(HabitOccurrenceError),
+    #[error("missed-policy scheduling window exceeds the supported timestamp range")]
+    TimestampOverflow,
+    #[error("missed-policy scheduling requires a valid generated occurrence preimage")]
+    InvalidOccurrenceEvidence,
+    #[error("missed-policy frequency reduction must skip at least one occurrence")]
+    InvalidFrequencyReduction,
+    #[error("missed-policy frequency reduction lacks enough upcoming occurrences")]
+    InsufficientUpcomingOccurrences,
 }
 
 /// One expected occurrence supplied to the analytics projector.
@@ -659,7 +1113,7 @@ pub enum HabitPolicyError {
 /// The caller resolves `local_date` using the habit's IANA timezone and supplies
 /// its exact window separately. This avoids treating a 23- or 25-hour DST day as
 /// a fixed UTC day.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HabitAnalyticsOccurrence {
     pub occurrence_id: OccurrenceId,
@@ -669,7 +1123,68 @@ pub struct HabitAnalyticsOccurrence {
     pub window_start: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: OffsetDateTime,
-    pub outcome: HabitOccurrenceOutcome,
+    /// Current validated lifecycle projection for this occurrence.
+    pub value: HabitOccurrenceValue,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HabitAnalyticsOccurrenceWire {
+    occurrence_id: OccurrenceId,
+    #[serde(with = "date_serde")]
+    local_date: Date,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: OffsetDateTime,
+    #[serde(default)]
+    value: Option<HabitOccurrenceValue>,
+    #[serde(default)]
+    outcome: Option<HabitOutcomeWire>,
+}
+
+impl<'de> Deserialize<'de> for HabitAnalyticsOccurrence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HabitAnalyticsOccurrenceWire::deserialize(deserializer)?;
+        let value = match (wire.value, wire.outcome) {
+            (Some(value), None) => value,
+            (None, Some(outcome)) => {
+                let (outcome, quantity, progress_basis_points) =
+                    outcome.decode().map_err(D::Error::custom)?;
+                HabitOccurrenceValue {
+                    outcome,
+                    progress_basis_points: progress_basis_points.ok_or_else(|| {
+                        D::Error::custom("legacy partial analytics outcome requires quantity")
+                    })?,
+                    quantity: quantity.map(|decoded| decoded.value),
+                    actual_seconds: None,
+                    note: None,
+                    occurred_at: (!matches!(outcome, HabitOccurrenceOutcome::Pending))
+                        .then_some(wire.window_end),
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "analytics occurrence cannot contain both value and legacy outcome",
+                ));
+            }
+            (None, None) => {
+                return Err(D::Error::custom(
+                    "analytics occurrence requires value or legacy outcome",
+                ));
+            }
+        };
+        Ok(Self {
+            occurrence_id: wire.occurrence_id,
+            local_date: wire.local_date,
+            window_start: wire.window_start,
+            window_end: wire.window_end,
+            value,
+        })
+    }
 }
 
 /// Calendar unit used for deterministic trend buckets.
@@ -732,6 +1247,21 @@ pub struct HabitTrendBucket {
     pub counts: HabitAnalyticsCounts,
     /// `None` means the bucket has no eligible due occurrence.
     pub adherence_basis_points: Option<u16>,
+    /// Actual elapsed time recorded for all due occurrences in this bucket,
+    /// including evidence on protected paused occurrences.
+    #[serde(default)]
+    pub actual_seconds_total: u64,
+    /// Quantitative evidence grouped deterministically by exact unit label.
+    #[serde(default)]
+    pub quantity_totals: Vec<HabitQuantityTotal>,
+}
+
+/// Sum of occurrence quantity evidence for one exact unit label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HabitQuantityTotal {
+    pub unit: String,
+    pub amount: i64,
 }
 
 /// Stable facts that clients can render with supportive localized copy.
@@ -761,10 +1291,18 @@ pub struct HabitSupportiveFact {
 #[serde(deny_unknown_fields)]
 pub struct HabitAnalytics {
     pub counts: HabitAnalyticsCounts,
-    /// Equal-weight occurrence adherence. Completed occurrences contribute
-    /// 10,000; partial occurrences contribute their quantity fraction; pending
-    /// and skipped occurrences contribute zero. Division rounds down.
+    /// Equal-weight occurrence adherence. Every eligible occurrence contributes
+    /// its explicit normalized progress, including retained partial progress on
+    /// a skipped result. Division rounds to nearest (half upward) without
+    /// floating-point arithmetic.
     pub adherence_basis_points: Option<u16>,
+    /// Actual elapsed time recorded across all due occurrences, including
+    /// protected paused occurrences.
+    #[serde(default)]
+    pub actual_seconds_total: u64,
+    /// Quantitative evidence grouped deterministically by exact unit label.
+    #[serde(default)]
+    pub quantity_totals: Vec<HabitQuantityTotal>,
     /// Consecutive successful eligible habit dates at the end of the range.
     pub current_streak: u32,
     /// Longest run of successful eligible habit dates in the range.
@@ -802,6 +1340,7 @@ pub fn calculate_habit_analytics(
     };
     let mut total = MutableTally::default();
     let mut streak_dates = BTreeMap::<Date, bool>::new();
+    let eligibilities = analytics_eligibilities(input, effective_end);
 
     for occurrence in &input.occurrences {
         if occurrence.local_date < input.range_start
@@ -810,14 +1349,11 @@ pub fn calculate_habit_analytics(
         {
             continue;
         }
-        let eligibility = habit_occurrence_eligibility(
-            occurrence.window_start,
-            occurrence.window_end,
-            &input.pauses,
-            input.preserves_statistics_when_paused,
-        )
-        .map_err(HabitAnalyticsError::Policy)?;
-        total.observe(&occurrence.outcome, eligibility)?;
+        let eligibility = eligibilities
+            .get(&occurrence.occurrence_id)
+            .copied()
+            .ok_or(HabitAnalyticsError::CalendarOverflow)?;
+        total.observe(&occurrence.value, eligibility)?;
         let bucket_start = calendar_bucket_start(
             occurrence.local_date,
             input.trend_granularity,
@@ -826,9 +1362,9 @@ pub fn calculate_habit_analytics(
         trend
             .get_mut(&bucket_start)
             .ok_or(HabitAnalyticsError::CalendarOverflow)?
-            .observe(&occurrence.outcome, eligibility)?;
+            .observe(&occurrence.value, eligibility)?;
         if eligibility != HabitOccurrenceEligibility::PausedProtected {
-            let successful = matches!(occurrence.outcome, HabitOccurrenceOutcome::Completed { .. });
+            let successful = matches!(occurrence.value.outcome, HabitOccurrenceOutcome::Completed);
             streak_dates
                 .entry(occurrence.local_date)
                 .and_modify(|all_successful| *all_successful &= successful)
@@ -839,6 +1375,9 @@ pub fn calculate_habit_analytics(
     let (current_streak, longest_streak) = streaks(&streak_dates)?;
     let adherence_basis_points = total.adherence_basis_points()?;
     let counts = total.counts;
+    let actual_seconds_total = total.actual_seconds_total;
+    let quantity_totals = total.quantity_totals();
+    let partial_progress_count = total.partial_progress_count;
     let trend_buckets = trend
         .into_iter()
         .map(|(start_date, tally)| {
@@ -846,6 +1385,8 @@ pub fn calculate_habit_analytics(
                 start_date,
                 counts: tally.counts,
                 adherence_basis_points: tally.adherence_basis_points()?,
+                actual_seconds_total: tally.actual_seconds_total,
+                quantity_totals: tally.quantity_totals(),
             })
         })
         .collect::<Result<Vec<_>, HabitAnalyticsError>>()?;
@@ -853,12 +1394,14 @@ pub fn calculate_habit_analytics(
         counts,
         adherence_basis_points,
         current_streak,
-        longest_streak,
+        partial_progress_count,
         &trend_buckets,
     );
     Ok(HabitAnalytics {
         counts,
         adherence_basis_points,
+        actual_seconds_total,
+        quantity_totals,
         current_streak,
         longest_streak,
         trend_buckets,
@@ -879,6 +1422,9 @@ fn validate_analytics_input(input: &HabitAnalyticsInput) -> Result<(), HabitAnal
     if input.occurrences.len() > MAX_HABIT_ANALYTICS_OCCURRENCES {
         return Err(HabitAnalyticsError::TooManyOccurrences);
     }
+    if input.pauses.len() > MAX_HABIT_ANALYTICS_PAUSES {
+        return Err(HabitAnalyticsError::TooManyPauses);
+    }
     for pause in &input.pauses {
         pause.validate().map_err(HabitAnalyticsError::Policy)?;
     }
@@ -895,26 +1441,108 @@ fn validate_analytics_input(input: &HabitAnalyticsInput) -> Result<(), HabitAnal
         validate_window(occurrence.window_start, occurrence.window_end)
             .map_err(HabitAnalyticsError::Policy)?;
         occurrence
-            .outcome
-            .validate()
+            .value
+            .validate(input.as_of)
             .map_err(HabitAnalyticsError::InvalidOutcome)?;
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+fn analytics_eligibilities(
+    input: &HabitAnalyticsInput,
+    effective_end: Date,
+) -> BTreeMap<OccurrenceId, HabitOccurrenceEligibility> {
+    let pauses = merged_pauses(&input.pauses);
+    let mut occurrences = input
+        .occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence.local_date >= input.range_start
+                && occurrence.local_date <= effective_end
+                && occurrence.window_end <= input.as_of
+        })
+        .collect::<Vec<_>>();
+    occurrences.sort_by_key(|occurrence| {
+        (
+            occurrence.window_start,
+            occurrence.window_end,
+            occurrence.occurrence_id,
+        )
+    });
+    let mut pause_index = 0_usize;
+    let mut result = BTreeMap::new();
+    for occurrence in occurrences {
+        while pauses
+            .get(pause_index)
+            .is_some_and(|pause| pause.end.is_some_and(|end| end <= occurrence.window_start))
+        {
+            pause_index += 1;
+        }
+        let overlaps = pauses.get(pause_index).is_some_and(|pause| {
+            pause.start < occurrence.window_end
+                && pause.end.is_none_or(|end| end > occurrence.window_start)
+        });
+        let eligibility = match (overlaps, input.preserves_statistics_when_paused) {
+            (false, _) => HabitOccurrenceEligibility::Eligible,
+            (true, true) => HabitOccurrenceEligibility::PausedProtected,
+            (true, false) => HabitOccurrenceEligibility::PausedUnprotected,
+        };
+        result.insert(occurrence.occurrence_id, eligibility);
+    }
+    result
+}
+
+fn merged_pauses(pauses: &[HabitPauseInterval]) -> Vec<HabitPauseInterval> {
+    let mut sorted = pauses.to_vec();
+    sorted.sort_by_key(|pause| (pause.start, pause.end));
+    let mut merged: Vec<HabitPauseInterval> = Vec::new();
+    for pause in sorted {
+        let Some(last) = merged.last_mut() else {
+            merged.push(pause);
+            continue;
+        };
+        let touches = last.end.is_none_or(|end| pause.start <= end);
+        if touches {
+            last.end = match (last.end, pause.end) {
+                (None, _) | (_, None) => None,
+                (Some(left), Some(right)) => Some(left.max(right)),
+            };
+        } else {
+            merged.push(pause);
+        }
+    }
+    merged
+}
+
+#[derive(Debug, Clone, Default)]
 struct MutableTally {
     counts: HabitAnalyticsCounts,
     adherence_sum: u64,
+    actual_seconds_total: u64,
+    quantity_totals: BTreeMap<String, i64>,
+    partial_progress_count: u32,
 }
 
 impl MutableTally {
     fn observe(
         &mut self,
-        outcome: &HabitOccurrenceOutcome,
+        value: &HabitOccurrenceValue,
         eligibility: HabitOccurrenceEligibility,
     ) -> Result<(), HabitAnalyticsError> {
         increment(&mut self.counts.due)?;
+        self.actual_seconds_total = self
+            .actual_seconds_total
+            .checked_add(value.actual_seconds.unwrap_or(0))
+            .ok_or(HabitAnalyticsError::ArithmeticOverflow)?;
+        if let Some(quantity) = &value.quantity {
+            let total = self
+                .quantity_totals
+                .entry(quantity.unit.clone())
+                .or_default();
+            *total = total
+                .checked_add(quantity.amount)
+                .ok_or(HabitAnalyticsError::ArithmeticOverflow)?;
+        }
         if eligibility != HabitOccurrenceEligibility::Eligible {
             increment(&mut self.counts.paused)?;
         }
@@ -923,32 +1551,50 @@ impl MutableTally {
             return Ok(());
         }
         increment(&mut self.counts.eligible)?;
-        match outcome {
+        match value.outcome {
             HabitOccurrenceOutcome::Pending => increment(&mut self.counts.pending)?,
-            HabitOccurrenceOutcome::Partial { .. } => increment(&mut self.counts.partial)?,
-            HabitOccurrenceOutcome::Completed { .. } => increment(&mut self.counts.completed)?,
+            HabitOccurrenceOutcome::Partial => increment(&mut self.counts.partial)?,
+            HabitOccurrenceOutcome::Completed => increment(&mut self.counts.completed)?,
             HabitOccurrenceOutcome::Skipped { reason } => {
                 increment(&mut self.counts.skipped)?;
-                if *reason == HabitSkipReason::MissedPolicy {
+                if reason == HabitSkipReason::MissedPolicy {
                     increment(&mut self.counts.missed_policy_skips)?;
                 }
             }
         }
+        if (1..HABIT_BASIS_POINTS_SCALE).contains(&value.progress_basis_points) {
+            increment(&mut self.partial_progress_count)?;
+        }
         self.adherence_sum = self
             .adherence_sum
-            .checked_add(u64::from(outcome.adherence_basis_points()))
+            .checked_add(u64::from(value.progress_basis_points))
             .ok_or(HabitAnalyticsError::ArithmeticOverflow)?;
         Ok(())
     }
 
-    fn adherence_basis_points(self) -> Result<Option<u16>, HabitAnalyticsError> {
+    fn adherence_basis_points(&self) -> Result<Option<u16>, HabitAnalyticsError> {
         if self.counts.eligible == 0 {
             return Ok(None);
         }
-        let value = self.adherence_sum / u64::from(self.counts.eligible);
+        let denominator = u64::from(self.counts.eligible);
+        let value = self
+            .adherence_sum
+            .checked_add(denominator / 2)
+            .ok_or(HabitAnalyticsError::ArithmeticOverflow)?
+            / denominator;
         u16::try_from(value)
             .map(Some)
             .map_err(|_| HabitAnalyticsError::ArithmeticOverflow)
+    }
+
+    fn quantity_totals(&self) -> Vec<HabitQuantityTotal> {
+        self.quantity_totals
+            .iter()
+            .map(|(unit, amount)| HabitQuantityTotal {
+                unit: unit.clone(),
+                amount: *amount,
+            })
+            .collect()
     }
 }
 
@@ -979,11 +1625,11 @@ fn supportive_facts(
     counts: HabitAnalyticsCounts,
     adherence_basis_points: Option<u16>,
     current_streak: u32,
-    longest_streak: u32,
+    partial_progress_count: u32,
     trend: &[HabitTrendBucket],
 ) -> Vec<HabitSupportiveFact> {
     let mut facts = Vec::new();
-    if counts.eligible == 0 {
+    if counts.due == 0 {
         facts.push(HabitSupportiveFact {
             code: HabitSupportiveFactCode::NoDueOccurrences,
             value: None,
@@ -995,10 +1641,10 @@ fn supportive_facts(
             value: Some(counts.protected_paused),
         });
     }
-    if counts.partial > 0 {
+    if partial_progress_count > 0 {
         facts.push(HabitSupportiveFact {
             code: HabitSupportiveFactCode::PartialProgressRecorded,
-            value: Some(counts.partial),
+            value: Some(partial_progress_count),
         });
     }
     if adherence_basis_points == Some(HABIT_BASIS_POINTS_SCALE) {
@@ -1013,21 +1659,11 @@ fn supportive_facts(
             value: Some(current_streak),
         });
     }
-    if longest_streak > current_streak && longest_streak > 0 {
-        facts.push(HabitSupportiveFact {
-            code: HabitSupportiveFactCode::PersonalBest,
-            value: Some(longest_streak),
-        });
-    }
-    let mut nonempty = trend
-        .iter()
-        .filter_map(|bucket| bucket.adherence_basis_points);
-    let mut previous = nonempty.next();
-    let mut latest_pair = None;
-    for value in nonempty {
-        latest_pair = previous.map(|prior| (prior, value));
-        previous = Some(value);
-    }
+    let latest_pair = trend.len().checked_sub(2).and_then(|index| {
+        trend[index]
+            .adherence_basis_points
+            .zip(trend[index + 1].adherence_basis_points)
+    });
     if latest_pair.is_some_and(|(prior, latest)| latest > prior) {
         facts.push(HabitSupportiveFact {
             code: HabitSupportiveFactCode::ImprovingTrend,
@@ -1146,6 +1782,8 @@ pub enum HabitAnalyticsError {
     RangeTooLarge,
     #[error("analytics occurrence count exceeds {MAX_HABIT_ANALYTICS_OCCURRENCES}")]
     TooManyOccurrences,
+    #[error("analytics pause count exceeds {MAX_HABIT_ANALYTICS_PAUSES}")]
+    TooManyPauses,
     #[error("analytics occurrence identifier cannot be nil")]
     InvalidOccurrenceId,
     #[error("duplicate analytics occurrence {0}")]
@@ -1194,10 +1832,9 @@ mod tests {
     const HABIT_ID: ItemId = ItemId(Uuid::from_u128(1));
     const OCCURRENCE_ID: OccurrenceId = OccurrenceId(Uuid::from_u128(2));
 
-    fn quantity(completed_units: u64, target_units: u64) -> HabitQuantityProgress {
+    fn quantity(amount: i64) -> HabitQuantityProgress {
         HabitQuantityProgress {
-            completed_units,
-            target_units,
+            amount,
             unit: "glasses".to_owned(),
         }
     }
@@ -1230,7 +1867,34 @@ mod tests {
             local_date,
             window_start,
             window_end,
-            outcome,
+            value: match outcome {
+                HabitOccurrenceOutcome::Pending => HabitOccurrenceValue::pending(),
+                HabitOccurrenceOutcome::Partial => {
+                    HabitOccurrenceValue::partial(5_000, None, None, None, window_end)
+                }
+                HabitOccurrenceOutcome::Completed => {
+                    HabitOccurrenceValue::completed(None, None, None, window_end)
+                }
+                HabitOccurrenceOutcome::Skipped { reason } => {
+                    HabitOccurrenceValue::skipped(reason, 0, None, None, None, window_end)
+                }
+            },
+        }
+    }
+
+    fn analytics_occurrence_with_value(
+        id: u128,
+        local_date: Date,
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+        value: HabitOccurrenceValue,
+    ) -> HabitAnalyticsOccurrence {
+        HabitAnalyticsOccurrence {
+            occurrence_id: OccurrenceId(Uuid::from_u128(id)),
+            local_date,
+            window_start,
+            window_end,
+            value,
         }
     }
 
@@ -1244,7 +1908,9 @@ mod tests {
                 datetime!(2026-03-01 9:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::partial(
-                        quantity(2, 8),
+                        2_500,
+                        Some(quantity(2)),
+                        Some(600),
                         Some("Morning".to_owned()),
                         datetime!(2026-03-01 8:55 UTC),
                     ),
@@ -1263,8 +1929,10 @@ mod tests {
                 datetime!(2026-03-01 12:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::partial(
-                        quantity(5, 8),
-                        Some("Lunch".to_owned()),
+                        6_250,
+                        Some(quantity(2)),
+                        Some(1_200),
+                        Some("Morning".to_owned()),
                         datetime!(2026-03-01 11:55 UTC),
                     ),
                 },
@@ -1280,8 +1948,9 @@ mod tests {
                 datetime!(2026-03-01 20:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::completed(
-                        Some(quantity(8, 8)),
-                        None,
+                        Some(quantity(2)),
+                        Some(1_800),
+                        Some("Morning".to_owned()),
                         datetime!(2026-03-01 19:58 UTC),
                     ),
                 },
@@ -1291,7 +1960,7 @@ mod tests {
         assert_eq!(completed.kind, HabitOccurrenceTransitionKind::Progressed);
         assert!(matches!(
             completed.current.value.outcome,
-            HabitOccurrenceOutcome::Completed { .. }
+            HabitOccurrenceOutcome::Completed
         ));
     }
 
@@ -1302,7 +1971,12 @@ mod tests {
             expected_revision: 9,
             recorded_at: datetime!(2026-03-01 9:00 UTC),
             kind: HabitOccurrenceCommandKind::Record {
-                value: HabitOccurrenceValue::completed(None, None, datetime!(2026-03-01 9:00 UTC)),
+                value: HabitOccurrenceValue::completed(
+                    None,
+                    None,
+                    None,
+                    datetime!(2026-03-01 9:00 UTC),
+                ),
             },
         };
         assert_eq!(
@@ -1320,7 +1994,9 @@ mod tests {
                 datetime!(2026-03-01 9:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::partial(
-                        quantity(2, 8),
+                        2_500,
+                        Some(quantity(2)),
+                        None,
                         None,
                         datetime!(2026-03-01 9:00 UTC),
                     ),
@@ -1336,37 +2012,167 @@ mod tests {
                 datetime!(2026-03-01 10:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::partial(
-                        quantity(2, 8),
+                        2_500,
+                        Some(quantity(3)),
+                        Some(60),
                         None,
                         datetime!(2026-03-01 10:00 UTC),
                     ),
                 },
             ),
         );
-        assert_eq!(result, Err(HabitOccurrenceError::QuantityDidNotAdvance));
+        assert_eq!(result, Err(HabitOccurrenceError::ProgressDidNotAdvance));
     }
 
     #[test]
-    fn partial_and_completed_quantity_invariants_are_strict() {
+    fn status_and_evidence_shape_invariants_are_strict() {
         assert_eq!(
-            HabitOccurrenceOutcome::Partial {
-                quantity: quantity(8, 8)
-            }
-            .validate(),
-            Err(HabitOccurrenceError::InvalidPartialQuantity)
+            HabitOccurrenceValue::partial(
+                0,
+                Some(quantity(8)),
+                None,
+                None,
+                datetime!(2026-03-01 9:00 UTC),
+            )
+            .validate(datetime!(2026-03-01 9:00 UTC)),
+            Err(HabitOccurrenceError::InvalidPartialProgress)
         );
         assert_eq!(
-            HabitOccurrenceOutcome::Completed {
-                quantity: Some(quantity(7, 8))
+            HabitOccurrenceValue {
+                outcome: HabitOccurrenceOutcome::Completed,
+                progress_basis_points: 9_999,
+                quantity: None,
+                actual_seconds: None,
+                note: None,
+                occurred_at: Some(datetime!(2026-03-01 9:00 UTC)),
             }
-            .validate(),
-            Err(HabitOccurrenceError::IncompleteCompletedQuantity)
+            .validate(datetime!(2026-03-01 9:00 UTC)),
+            Err(HabitOccurrenceError::InvalidCompletedProgress)
         );
         assert_eq!(
-            HabitOccurrenceOutcome::Partial {
-                quantity: quantity(0, 8)
+            HabitOccurrenceValue {
+                outcome: HabitOccurrenceOutcome::Pending,
+                progress_basis_points: 1,
+                quantity: None,
+                actual_seconds: None,
+                note: None,
+                occurred_at: None,
             }
-            .validate(),
+            .validate(datetime!(2026-03-01 9:00 UTC)),
+            Err(HabitOccurrenceError::PendingHasEvidence)
+        );
+        assert_eq!(
+            HabitOccurrenceValue::partial(
+                1,
+                None,
+                Some(MAX_HABIT_ACTUAL_SECONDS + 1),
+                None,
+                datetime!(2026-03-01 9:00 UTC),
+            )
+            .validate(datetime!(2026-03-01 9:00 UTC)),
+            Err(HabitOccurrenceError::InvalidActualSeconds)
+        );
+        for note in ["line\nfeed", "tab\tvalue", "escape\u{1b}", "delete\u{7f}"] {
+            assert_eq!(
+                HabitOccurrenceValue::partial(
+                    1,
+                    None,
+                    None,
+                    Some(note.to_owned()),
+                    datetime!(2026-03-01 9:00 UTC),
+                )
+                .validate(datetime!(2026-03-01 9:00 UTC)),
+                Err(HabitOccurrenceError::InvalidNote),
+            );
+        }
+        for unit in [
+            " unit",
+            "unit ",
+            "line\nfeed",
+            "escape\u{1b}",
+            "delete\u{7f}",
+        ] {
+            assert_eq!(
+                HabitOccurrenceValue::partial(
+                    1,
+                    Some(HabitQuantityProgress {
+                        amount: 1,
+                        unit: unit.to_owned(),
+                    }),
+                    None,
+                    None,
+                    datetime!(2026-03-01 9:00 UTC),
+                )
+                .validate(datetime!(2026-03-01 9:00 UTC)),
+                Err(HabitOccurrenceError::InvalidQuantityUnit),
+            );
+        }
+    }
+
+    #[test]
+    fn percentage_quantity_and_elapsed_time_are_independent_evidence() {
+        let at = datetime!(2026-03-01 9:00 UTC);
+        assert_eq!(
+            HabitOccurrenceValue::partial(3_333, None, None, None, at).validate(at),
+            Ok(())
+        );
+        assert_eq!(
+            HabitOccurrenceValue::partial(5_000, None, Some(900), None, at).validate(at),
+            Ok(())
+        );
+        assert_eq!(
+            HabitOccurrenceValue::partial(1, Some(quantity(0)), None, None, at).validate(at),
+            Ok(())
+        );
+        assert_eq!(
+            HabitOccurrenceValue::completed(
+                Some(HabitQuantityProgress {
+                    amount: -25,
+                    unit: "net minutes".to_owned(),
+                }),
+                None,
+                None,
+                at,
+            )
+            .validate(at),
+            Ok(())
+        );
+        assert_eq!(
+            HabitOccurrenceValue::skipped(
+                HabitSkipReason::User,
+                9_999,
+                None,
+                Some(10),
+                Some("Partial work still counts".to_owned()),
+                at,
+            )
+            .validate(at),
+            Ok(())
+        );
+        assert_eq!(
+            HabitOccurrenceValue::skipped(
+                HabitSkipReason::User,
+                HABIT_BASIS_POINTS_SCALE,
+                None,
+                None,
+                None,
+                at,
+            )
+            .validate(at),
+            Err(HabitOccurrenceError::InvalidSkippedProgress)
+        );
+        assert_eq!(
+            HabitOccurrenceValue::partial(
+                1,
+                Some(HabitQuantityProgress {
+                    amount: i64::MIN,
+                    unit: "units".to_owned(),
+                }),
+                None,
+                None,
+                at,
+            )
+            .validate(at),
             Err(HabitOccurrenceError::InvalidQuantity)
         );
     }
@@ -1382,6 +2188,7 @@ mod tests {
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::completed(
                         None,
+                        Some(900),
                         Some("Initially done".to_owned()),
                         datetime!(2026-03-01 8:50 UTC),
                     ),
@@ -1398,6 +2205,9 @@ mod tests {
                 HabitOccurrenceCommandKind::Correct {
                     value: HabitOccurrenceValue::skipped(
                         HabitSkipReason::User,
+                        0,
+                        None,
+                        None,
                         Some("Corrected the wrong day".to_owned()),
                         datetime!(2026-03-01 8:50 UTC),
                     ),
@@ -1433,8 +2243,10 @@ mod tests {
                 datetime!(2026-03-01 9:00 UTC),
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::partial(
-                        quantity(2, 8),
-                        None,
+                        2_500,
+                        Some(quantity(2)),
+                        Some(300),
+                        Some("original".to_owned()),
                         datetime!(2026-03-01 9:00 UTC),
                     ),
                 },
@@ -1451,6 +2263,7 @@ mod tests {
                     value: HabitOccurrenceValue::completed(
                         None,
                         None,
+                        None,
                         datetime!(2026-03-01 10:00 UTC),
                     ),
                 },
@@ -1460,6 +2273,131 @@ mod tests {
             removes_quantity,
             Err(HabitOccurrenceError::QuantityEvidenceRemoved)
         );
+
+        let rewrites_quantity = apply_habit_occurrence_command(
+            &partial,
+            command(
+                &partial,
+                datetime!(2026-03-01 10:00 UTC),
+                HabitOccurrenceCommandKind::Record {
+                    value: HabitOccurrenceValue::partial(
+                        5_000,
+                        Some(quantity(3)),
+                        Some(300),
+                        None,
+                        datetime!(2026-03-01 10:00 UTC),
+                    ),
+                },
+            ),
+        );
+        assert_eq!(
+            rewrites_quantity,
+            Err(HabitOccurrenceError::QuantityEvidenceChanged)
+        );
+
+        let mut rewrites_note = partial.value.clone();
+        rewrites_note.progress_basis_points = 5_000;
+        rewrites_note.note = Some("replacement".to_owned());
+        assert_eq!(
+            apply_habit_occurrence_command(
+                &partial,
+                command(
+                    &partial,
+                    datetime!(2026-03-01 10:00 UTC),
+                    HabitOccurrenceCommandKind::Record {
+                        value: rewrites_note,
+                    },
+                ),
+            ),
+            Err(HabitOccurrenceError::NoteEvidenceChanged),
+        );
+    }
+
+    #[test]
+    fn ordinary_partial_skip_preserves_evidence_but_correction_may_remove_it() {
+        let pending = record();
+        let partial = apply_habit_occurrence_command(
+            &pending,
+            command(
+                &pending,
+                datetime!(2026-03-01 9:00 UTC),
+                HabitOccurrenceCommandKind::Record {
+                    value: HabitOccurrenceValue::partial(
+                        4_000,
+                        Some(quantity(3)),
+                        Some(720),
+                        Some("Three rounds".to_owned()),
+                        datetime!(2026-03-01 8:55 UTC),
+                    ),
+                },
+            ),
+        )
+        .unwrap()
+        .current;
+
+        let dropping_elapsed = apply_habit_occurrence_command(
+            &partial,
+            command(
+                &partial,
+                datetime!(2026-03-01 10:00 UTC),
+                HabitOccurrenceCommandKind::Record {
+                    value: HabitOccurrenceValue::skipped(
+                        HabitSkipReason::User,
+                        4_000,
+                        Some(quantity(3)),
+                        None,
+                        Some("Three rounds".to_owned()),
+                        datetime!(2026-03-01 10:00 UTC),
+                    ),
+                },
+            ),
+        );
+        assert_eq!(
+            dropping_elapsed,
+            Err(HabitOccurrenceError::ActualSecondsEvidenceRemoved)
+        );
+
+        let skipped = apply_habit_occurrence_command(
+            &partial,
+            command(
+                &partial,
+                datetime!(2026-03-01 10:00 UTC),
+                HabitOccurrenceCommandKind::Record {
+                    value: HabitOccurrenceValue::skipped(
+                        HabitSkipReason::User,
+                        4_000,
+                        Some(quantity(3)),
+                        Some(720),
+                        Some("Three rounds".to_owned()),
+                        datetime!(2026-03-01 10:00 UTC),
+                    ),
+                },
+            ),
+        )
+        .unwrap()
+        .current;
+        let corrected = apply_habit_occurrence_command(
+            &skipped,
+            command(
+                &skipped,
+                datetime!(2026-03-01 11:00 UTC),
+                HabitOccurrenceCommandKind::Correct {
+                    value: HabitOccurrenceValue::skipped(
+                        HabitSkipReason::User,
+                        0,
+                        None,
+                        None,
+                        None,
+                        datetime!(2026-03-01 10:00 UTC),
+                    ),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(corrected.kind, HabitOccurrenceTransitionKind::Corrected);
+        assert_eq!(corrected.current.value.progress_basis_points, 0);
+        assert_eq!(corrected.current.value.quantity, None);
+        assert_eq!(corrected.current.value.actual_seconds, None);
     }
 
     #[test]
@@ -1502,13 +2440,33 @@ mod tests {
         let start = datetime!(2026-03-01 8:00 UTC);
         let end = datetime!(2026-03-01 9:00 UTC);
         let as_of = datetime!(2026-03-01 10:00 UTC);
-        let pending = HabitOccurrenceOutcome::Pending;
+        let pending = HabitOccurrenceValue::pending();
         let cases = [
-            (HabitMissedPolicy::Skip, HabitMissedDecision::MarkSkipped),
-            (HabitMissedPolicy::Carry, HabitMissedDecision::CarryForward),
+            (
+                HabitMissedPolicy::Skip,
+                HabitMissedDecision::MarkSkipped {
+                    value: HabitOccurrenceValue::skipped(
+                        HabitSkipReason::MissedPolicy,
+                        0,
+                        None,
+                        None,
+                        None,
+                        as_of,
+                    ),
+                },
+            ),
+            (
+                HabitMissedPolicy::Carry,
+                HabitMissedDecision::CarryForward {
+                    window_start: as_of,
+                    window_end: datetime!(2026-03-01 11:00 UTC),
+                },
+            ),
             (
                 HabitMissedPolicy::ReduceFrequency,
-                HabitMissedDecision::ReduceFrequency,
+                HabitMissedDecision::ReduceFrequency {
+                    skip_next_occurrences: 1,
+                },
             ),
             (HabitMissedPolicy::Ask, HabitMissedDecision::RequestDecision),
         ];
@@ -1518,6 +2476,21 @@ mod tests {
                 Ok(expected)
             );
         }
+
+        let configured = HabitSpec {
+            recurrence: crate::Recurrence::Daily { times_per_day: 1 },
+            target: None,
+            preserves_streak_when_paused: true,
+            missed_policy: HabitMissedPolicy::Carry,
+            minimum_spacing: crate::Minutes(90),
+        };
+        assert_eq!(
+            decide_configured_habit_missed_behavior(&configured, as_of, start, end, &pending, &[],),
+            Ok(HabitMissedDecision::CarryForward {
+                window_start: as_of,
+                window_end: datetime!(2026-03-01 11:00 UTC),
+            }),
+        );
 
         let paused = [HabitPauseInterval {
             start,
@@ -1552,6 +2525,41 @@ mod tests {
     }
 
     #[test]
+    fn missed_partial_skip_preserves_every_piece_of_progress_evidence() {
+        let start = datetime!(2026-03-01 8:00 UTC);
+        let end = datetime!(2026-03-01 9:00 UTC);
+        let as_of = datetime!(2026-03-01 10:00 UTC);
+        let partial = HabitOccurrenceValue::partial(
+            4_250,
+            Some(HabitQuantityProgress {
+                amount: -3,
+                unit: "minutes under target".to_owned(),
+            }),
+            Some(1_530),
+            Some("Kept the effort".to_owned()),
+            datetime!(2026-03-01 8:45 UTC),
+        );
+
+        let decision =
+            decide_habit_missed_behavior(HabitMissedPolicy::Skip, as_of, start, end, &partial, &[])
+                .unwrap();
+        let HabitMissedDecision::MarkSkipped { value } = decision else {
+            panic!("skip policy must produce a skipped projection");
+        };
+        assert_eq!(
+            value.outcome,
+            HabitOccurrenceOutcome::Skipped {
+                reason: HabitSkipReason::MissedPolicy,
+            }
+        );
+        assert_eq!(value.progress_basis_points, 4_250);
+        assert_eq!(value.quantity, partial.quantity);
+        assert_eq!(value.actual_seconds, partial.actual_seconds);
+        assert_eq!(value.note, partial.note);
+        assert_eq!(value.occurred_at, Some(as_of));
+    }
+
+    #[test]
     fn integer_adherence_counts_partial_quantity_without_floats() {
         let input = HabitAnalyticsInput {
             range_start: date!(2026 - 03 - 01),
@@ -1568,23 +2576,21 @@ mod tests {
                     date!(2026 - 03 - 01),
                     datetime!(2026-03-01 8:00 UTC),
                     datetime!(2026-03-01 9:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
                 analytics_occurrence(
                     11,
                     date!(2026 - 03 - 02),
                     datetime!(2026-03-02 8:00 UTC),
                     datetime!(2026-03-02 9:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
                 analytics_occurrence(
                     12,
                     date!(2026 - 03 - 03),
                     datetime!(2026-03-03 8:00 UTC),
                     datetime!(2026-03-03 9:00 UTC),
-                    HabitOccurrenceOutcome::Partial {
-                        quantity: quantity(1, 2),
-                    },
+                    HabitOccurrenceOutcome::Partial,
                 ),
                 analytics_occurrence(
                     13,
@@ -1618,6 +2624,108 @@ mod tests {
     }
 
     #[test]
+    fn analytics_sums_time_and_signed_quantities_and_credits_skipped_progress() {
+        let pauses = vec![HabitPauseInterval {
+            start: datetime!(2026-03-04 0:00 UTC),
+            end: Some(datetime!(2026-03-05 0:00 UTC)),
+        }];
+        let occurrences = vec![
+            analytics_occurrence_with_value(
+                60,
+                date!(2026 - 03 - 01),
+                datetime!(2026-03-01 8:00 UTC),
+                datetime!(2026-03-01 9:00 UTC),
+                HabitOccurrenceValue::completed(
+                    Some(quantity(2)),
+                    Some(600),
+                    None,
+                    datetime!(2026-03-01 9:00 UTC),
+                ),
+            ),
+            analytics_occurrence_with_value(
+                61,
+                date!(2026 - 03 - 02),
+                datetime!(2026-03-02 8:00 UTC),
+                datetime!(2026-03-02 9:00 UTC),
+                HabitOccurrenceValue::partial(
+                    2_500,
+                    Some(quantity(3)),
+                    Some(300),
+                    None,
+                    datetime!(2026-03-02 9:00 UTC),
+                ),
+            ),
+            analytics_occurrence_with_value(
+                62,
+                date!(2026 - 03 - 03),
+                datetime!(2026-03-03 8:00 UTC),
+                datetime!(2026-03-03 9:00 UTC),
+                HabitOccurrenceValue::skipped(
+                    HabitSkipReason::MissedPolicy,
+                    5_000,
+                    Some(quantity(-1)),
+                    Some(120),
+                    Some("Retained partial".to_owned()),
+                    datetime!(2026-03-03 9:00 UTC),
+                ),
+            ),
+            analytics_occurrence_with_value(
+                63,
+                date!(2026 - 03 - 04),
+                datetime!(2026-03-04 8:00 UTC),
+                datetime!(2026-03-04 9:00 UTC),
+                HabitOccurrenceValue::completed(
+                    Some(HabitQuantityProgress {
+                        amount: 5,
+                        unit: "minutes".to_owned(),
+                    }),
+                    Some(60),
+                    None,
+                    datetime!(2026-03-04 9:00 UTC),
+                ),
+            ),
+        ];
+        let analytics = calculate_habit_analytics(&HabitAnalyticsInput {
+            range_start: date!(2026 - 03 - 01),
+            range_end: date!(2026 - 03 - 04),
+            as_of: datetime!(2026-03-05 0:00 UTC),
+            as_of_local_date: date!(2026 - 03 - 05),
+            trend_granularity: HabitTrendGranularity::Week,
+            week_starts_on: DayOfWeek::Monday,
+            preserves_statistics_when_paused: true,
+            pauses,
+            occurrences,
+        })
+        .unwrap();
+
+        assert_eq!(analytics.counts.due, 4);
+        assert_eq!(analytics.counts.eligible, 3);
+        assert_eq!(analytics.counts.protected_paused, 1);
+        assert_eq!(analytics.adherence_basis_points, Some(5_833));
+        assert_eq!(analytics.actual_seconds_total, 1_080);
+        assert_eq!(
+            analytics.quantity_totals,
+            vec![
+                HabitQuantityTotal {
+                    unit: "glasses".to_owned(),
+                    amount: 4,
+                },
+                HabitQuantityTotal {
+                    unit: "minutes".to_owned(),
+                    amount: 5,
+                },
+            ]
+        );
+        assert_eq!(analytics.trend_buckets.len(), 2);
+        assert_eq!(analytics.trend_buckets[0].actual_seconds_total, 600);
+        assert_eq!(analytics.trend_buckets[1].actual_seconds_total, 480);
+        assert!(analytics.supportive_facts.contains(&HabitSupportiveFact {
+            code: HabitSupportiveFactCode::PartialProgressRecorded,
+            value: Some(2),
+        }));
+    }
+
+    #[test]
     fn protected_pauses_do_not_break_streak_or_reduce_adherence() {
         let pauses = vec![HabitPauseInterval {
             start: datetime!(2026-03-02 0:00 UTC),
@@ -1638,7 +2746,7 @@ mod tests {
                     date!(2026 - 03 - 01),
                     datetime!(2026-03-01 8:00 UTC),
                     datetime!(2026-03-01 9:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
                 analytics_occurrence(
                     21,
@@ -1652,7 +2760,7 @@ mod tests {
                     date!(2026 - 03 - 03),
                     datetime!(2026-03-03 8:00 UTC),
                     datetime!(2026-03-03 9:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
             ],
         };
@@ -1671,7 +2779,7 @@ mod tests {
         .unwrap();
         assert_eq!(unprotected.counts.eligible, 3);
         assert_eq!(unprotected.counts.protected_paused, 0);
-        assert_eq!(unprotected.adherence_basis_points, Some(6_666));
+        assert_eq!(unprotected.adherence_basis_points, Some(6_667));
         assert_eq!(unprotected.current_streak, 1);
         assert_eq!(unprotected.longest_streak, 1);
     }
@@ -1695,14 +2803,14 @@ mod tests {
                     date!(2026 - 03 - 29),
                     datetime!(2026-03-28 23:00 UTC),
                     datetime!(2026-03-29 22:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
                 analytics_occurrence(
                     31,
                     date!(2026 - 03 - 30),
                     datetime!(2026-03-29 22:00 UTC),
                     datetime!(2026-03-30 22:00 UTC),
-                    HabitOccurrenceOutcome::Completed { quantity: None },
+                    HabitOccurrenceOutcome::Completed,
                 ),
             ],
         };
@@ -1724,6 +2832,9 @@ mod tests {
                 HabitOccurrenceCommandKind::Record {
                     value: HabitOccurrenceValue::skipped(
                         HabitSkipReason::User,
+                        0,
+                        None,
+                        None,
                         None,
                         datetime!(2026-03-01 9:00 UTC),
                     ),
@@ -1740,6 +2851,7 @@ mod tests {
                 HabitOccurrenceCommandKind::Correct {
                     value: HabitOccurrenceValue::completed(
                         None,
+                        Some(600),
                         Some("Found the correct log".to_owned()),
                         datetime!(2026-03-01 9:00 UTC),
                     ),
@@ -1757,12 +2869,12 @@ mod tests {
             week_starts_on: DayOfWeek::Monday,
             preserves_statistics_when_paused: true,
             pauses: Vec::new(),
-            occurrences: vec![analytics_occurrence(
+            occurrences: vec![analytics_occurrence_with_value(
                 40,
                 corrected.local_date,
                 datetime!(2026-03-01 8:00 UTC),
                 datetime!(2026-03-01 9:00 UTC),
-                corrected.value.outcome,
+                corrected.value,
             )],
         };
         let analytics = calculate_habit_analytics(&input).unwrap();
@@ -1843,5 +2955,188 @@ mod tests {
             ),
             Err(HabitPolicyError::InvalidPauseInterval)
         );
+    }
+
+    #[test]
+    fn legacy_occurrence_and_analytics_json_remain_readable_but_strict() {
+        let legacy = serde_json::json!({
+            "outcome": {
+                "type": "partial",
+                "quantity": {
+                    "completed_units": 1,
+                    "target_units": 20_000,
+                    "unit": "pages"
+                }
+            },
+            "note": "kept",
+            "effective_at": "2026-03-01T08:55:00Z"
+        });
+        let decoded: HabitOccurrenceValue = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.outcome, HabitOccurrenceOutcome::Partial);
+        assert_eq!(decoded.progress_basis_points, 1);
+        assert_eq!(
+            decoded.quantity,
+            Some(HabitQuantityProgress {
+                amount: 1,
+                unit: "pages".to_owned(),
+            })
+        );
+        assert_eq!(decoded.note.as_deref(), Some("kept"));
+        assert_eq!(decoded.occurred_at, Some(datetime!(2026-03-01 8:55 UTC)));
+        decoded.validate(datetime!(2026-03-01 9:00 UTC)).unwrap();
+
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded["outcome"], serde_json::json!({"type": "partial"}));
+        assert_eq!(encoded["progress_basis_points"], 1);
+        assert_eq!(encoded["quantity"]["amount"], 1);
+        assert!(encoded.get("effective_at").is_none());
+
+        let legacy_analytics: HabitAnalyticsOccurrence =
+            serde_json::from_value(serde_json::json!({
+                "occurrence_id": OCCURRENCE_ID,
+                "local_date": "2026-03-01",
+                "window_start": "2026-03-01T08:00:00Z",
+                "window_end": "2026-03-01T09:00:00Z",
+                "outcome": {"type": "completed"}
+            }))
+            .unwrap();
+        assert_eq!(
+            legacy_analytics.value,
+            HabitOccurrenceValue::completed(None, None, None, datetime!(2026-03-01 9:00 UTC),)
+        );
+
+        for invalid in [
+            serde_json::json!({
+                "outcome": {
+                    "type": "partial",
+                    "quantity": {
+                        "completed_units": 2,
+                        "target_units": 2,
+                        "unit": "pages"
+                    }
+                },
+                "effective_at": "2026-03-01T09:00:00Z"
+            }),
+            serde_json::json!({
+                "outcome": {
+                    "type": "completed",
+                    "quantity": {
+                        "completed_units": 1,
+                        "target_units": 2,
+                        "unit": "pages"
+                    }
+                },
+                "effective_at": "2026-03-01T09:00:00Z"
+            }),
+            serde_json::json!({
+                "outcome": {"type": "partial"},
+                "effective_at": "2026-03-01T09:00:00Z"
+            }),
+        ] {
+            assert!(serde_json::from_value::<HabitOccurrenceValue>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn pause_projection_is_bounded_and_matches_half_open_union_semantics() {
+        let pauses = vec![
+            HabitPauseInterval {
+                start: datetime!(2026-03-02 8:30 UTC),
+                end: Some(datetime!(2026-03-02 10:00 UTC)),
+            },
+            HabitPauseInterval {
+                start: datetime!(2026-03-01 8:00 UTC),
+                end: Some(datetime!(2026-03-01 9:00 UTC)),
+            },
+            HabitPauseInterval {
+                start: datetime!(2026-03-02 8:00 UTC),
+                end: Some(datetime!(2026-03-02 9:00 UTC)),
+            },
+        ];
+        let occurrences = vec![
+            analytics_occurrence(
+                70,
+                date!(2026 - 03 - 01),
+                datetime!(2026-03-01 9:00 UTC),
+                datetime!(2026-03-01 10:00 UTC),
+                HabitOccurrenceOutcome::Pending,
+            ),
+            analytics_occurrence(
+                71,
+                date!(2026 - 03 - 02),
+                datetime!(2026-03-02 9:30 UTC),
+                datetime!(2026-03-02 10:30 UTC),
+                HabitOccurrenceOutcome::Pending,
+            ),
+        ];
+        let input = HabitAnalyticsInput {
+            range_start: date!(2026 - 03 - 01),
+            range_end: date!(2026 - 03 - 02),
+            as_of: datetime!(2026-03-03 0:00 UTC),
+            as_of_local_date: date!(2026 - 03 - 03),
+            trend_granularity: HabitTrendGranularity::Day,
+            week_starts_on: DayOfWeek::Monday,
+            preserves_statistics_when_paused: true,
+            pauses,
+            occurrences,
+        };
+        let analytics = calculate_habit_analytics(&input).unwrap();
+        assert_eq!(analytics.counts.due, 2);
+        assert_eq!(analytics.counts.protected_paused, 1);
+        assert_eq!(analytics.counts.eligible, 1);
+
+        let too_many = HabitAnalyticsInput {
+            pauses: vec![
+                HabitPauseInterval {
+                    start: datetime!(2026-03-01 8:00 UTC),
+                    end: Some(datetime!(2026-03-01 9:00 UTC)),
+                };
+                MAX_HABIT_ANALYTICS_PAUSES + 1
+            ],
+            occurrences: Vec::new(),
+            ..input
+        };
+        assert_eq!(
+            calculate_habit_analytics(&too_many),
+            Err(HabitAnalyticsError::TooManyPauses),
+        );
+    }
+
+    #[test]
+    fn supportive_facts_do_not_invent_no_due_personal_best_or_gapped_trends() {
+        let protected = analytics_occurrence(
+            80,
+            date!(2026 - 03 - 01),
+            datetime!(2026-03-01 8:00 UTC),
+            datetime!(2026-03-01 9:00 UTC),
+            HabitOccurrenceOutcome::Pending,
+        );
+        let analytics = calculate_habit_analytics(&HabitAnalyticsInput {
+            range_start: date!(2026 - 03 - 01),
+            range_end: date!(2026 - 03 - 03),
+            as_of: datetime!(2026-03-04 0:00 UTC),
+            as_of_local_date: date!(2026 - 03 - 04),
+            trend_granularity: HabitTrendGranularity::Day,
+            week_starts_on: DayOfWeek::Monday,
+            preserves_statistics_when_paused: true,
+            pauses: vec![HabitPauseInterval {
+                start: datetime!(2026-03-01 8:00 UTC),
+                end: Some(datetime!(2026-03-01 9:00 UTC)),
+            }],
+            occurrences: vec![protected],
+        })
+        .unwrap();
+        assert_eq!(analytics.counts.due, 1);
+        assert_eq!(analytics.counts.eligible, 0);
+        assert!(!analytics.supportive_facts.iter().any(|fact| matches!(
+            fact.code,
+            HabitSupportiveFactCode::NoDueOccurrences
+                | HabitSupportiveFactCode::PersonalBest
+                | HabitSupportiveFactCode::ImprovingTrend
+        )));
+        assert!(analytics.supportive_facts.contains(&HabitSupportiveFact {
+            code: HabitSupportiveFactCode::PausedOccurrencesProtected,
+            value: Some(1),
+        }));
     }
 }

@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbounded_minute_offsets_and_custom_rrules_before_scheduling() {
+    fn rejects_unbounded_minute_offsets_before_scheduling() {
         let cases = [
             (
                 "/request/items/0/constraints/minimum_notice/value",
@@ -1093,6 +1093,18 @@ mod tests {
                 "resource_limit_exceeded",
             ),
             (
+                "/request/items/0/kind",
+                serde_json::json!({
+                    "type": "habit",
+                    "recurrence": {"type": "daily", "times_per_day": 1},
+                    "target": null,
+                    "preserves_streak_when_paused": true,
+                    "missed_policy": "ask",
+                    "minimum_spacing": 4_294_967_295_u32
+                }),
+                "resource_limit_exceeded",
+            ),
+            (
                 "/request/recurrence_context",
                 serde_json::json!({
                     "minimum_spacing": {
@@ -1100,17 +1112,6 @@ mod tests {
                     }
                 }),
                 "resource_limit_exceeded",
-            ),
-            (
-                "/request/items/0/kind",
-                serde_json::json!({
-                    "type": "recurring_task",
-                    "recurrence": {
-                        "type": "custom",
-                        "rrule": "FREQ=YEARLY;BYMONTH=9"
-                    }
-                }),
-                "invalid_recurrence",
             ),
         ];
         for (pointer, replacement, expected) in cases {
@@ -1128,6 +1129,34 @@ mod tests {
             });
             assert!(outcome.is_ok(), "{pointer} must not unwind");
             assert_eq!(error_code(&outcome.expect("catch result")), expected);
+        }
+    }
+
+    #[test]
+    fn accepts_finite_custom_rrules_and_rejects_unsupported_or_unbounded_ones() {
+        let mut bounded: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+        bounded["request"]["items"][0]["kind"] = serde_json::json!({
+            "type": "recurring_task",
+            "recurrence": {
+                "type": "custom",
+                "rrule": "FREQ=DAILY;COUNT=2"
+            }
+        });
+        assert_eq!(
+            process_bytes(&serde_json::to_vec(&bounded).unwrap()).exit_code,
+            SUCCESS_EXIT_CODE
+        );
+
+        for rrule in ["FREQ=YEARLY;COUNT=2", "FREQ=DAILY"] {
+            let mut invalid: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+            invalid["request"]["items"][0]["kind"] = serde_json::json!({
+                "type": "recurring_task",
+                "recurrence": {"type": "custom", "rrule": rrule}
+            });
+            assert_eq!(
+                error_code(&process_bytes(&serde_json::to_vec(&invalid).unwrap())),
+                "invalid_recurrence"
+            );
         }
     }
 

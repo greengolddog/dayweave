@@ -4,8 +4,8 @@ use chrono::{DateTime, Timelike as _, Utc};
 use chrono_tz::Tz;
 use dayweave_core::{
     AllocationRange, BreakCategory, CalendarEventSpec, ConstraintStrength, EnergyLevel,
-    GoalMeasure, Minutes, Qualified, QuantityTarget, Recurrence, RecurrencePeriod,
-    RecurrenceSemantics, SchedulingConstraints,
+    GoalMeasure, HabitMissedPolicy, Minutes, Qualified, QuantityTarget, Recurrence,
+    RecurrencePeriod, RecurrenceSemantics, SchedulingConstraints, canonicalize_custom_rrule,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +54,10 @@ pub struct SchedulingMetadata {
     pub habit_target: Option<QuantityTarget>,
     #[serde(skip_serializing_if = "is_true")]
     pub preserves_streak_when_paused: bool,
+    #[serde(skip_serializing_if = "is_default")]
+    pub habit_missed_policy: HabitMissedPolicy,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub habit_minimum_spacing_minutes: u32,
     #[serde(skip_serializing_if = "is_false")]
     pub routine_ordered: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -89,6 +93,8 @@ impl Default for SchedulingMetadata {
             dayweave_firm_block: None,
             habit_target: None,
             preserves_streak_when_paused: true,
+            habit_missed_policy: HabitMissedPolicy::Ask,
+            habit_minimum_spacing_minutes: 0,
             routine_ordered: false,
             goal_measures: Vec::new(),
             goal_weekly_allocation: None,
@@ -235,7 +241,11 @@ pub fn validate_scheduling_metadata(
     let metadata: SchedulingMetadata =
         serde_json::from_value(input.flexible_constraints.clone())
             .map_err(|error| flexible(format!("unsupported shape: {error}")))?;
-    let recurrence = parse_recurrence(input.recurrence)?;
+    let mut recurrence = parse_recurrence(input.recurrence)?;
+    if let Some(Recurrence::Custom { rrule }) = &mut recurrence {
+        *rrule = canonicalize_custom_rrule(rrule)
+            .map_err(|error| SchedulingMetadataError::Recurrence(error.to_string()))?;
+    }
     validate_recurrence_rule(recurrence.as_ref())?;
     validate_constraints(&metadata.constraints)?;
     validate_metadata_values(&metadata)?;
@@ -589,9 +599,6 @@ fn validate_recurrence_rule(value: Option<&Recurrence>) -> Result<(), Scheduling
         }) => Err(recurrence(
             "calendar frequency cannot define a rolling anchor",
         )),
-        Some(Recurrence::Custom { .. }) => Err(recurrence(
-            "custom RRULE recurrence is retained for read compatibility but is not authorable or schedulable until bounded RFC 5545 expansion is available",
-        )),
         Some(Recurrence::Frequency {
             anchor: Some(anchor),
             ..
@@ -777,6 +784,10 @@ fn validate_metadata_values(value: &SchedulingMetadata) -> Result<(), Scheduling
             "habit_target requires a positive amount and non-empty unit",
         ));
     }
+    validate_policy_minutes(
+        Minutes(value.habit_minimum_spacing_minutes),
+        "habit_minimum_spacing_minutes",
+    )?;
     for measure in &value.goal_measures {
         if measure.name.trim().is_empty() || measure.unit.trim().is_empty() {
             return Err(flexible("goal_measures require non-empty names and units"));
@@ -823,7 +834,12 @@ fn validate_kind_keys(
         return Err(flexible("calendar metadata is only valid for event items"));
     }
     if input.kind != CanonicalItemKind::Habit
-        && has_any(&["habit_target", "preserves_streak_when_paused"])
+        && has_any(&[
+            "habit_target",
+            "preserves_streak_when_paused",
+            "habit_missed_policy",
+            "habit_minimum_spacing_minutes",
+        ])
     {
         return Err(flexible("habit metadata is only valid for habit items"));
     }

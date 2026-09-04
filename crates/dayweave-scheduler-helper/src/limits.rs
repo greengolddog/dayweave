@@ -5,7 +5,7 @@ use dayweave_compose::MAX_SCHEDULING_OFFSET_MINUTES;
 use dayweave_core::{
     ConstraintStrength, ItemId, ItemKind, PlanRequest, Recurrence, RecurrenceExceptionAction,
     RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity, RecurrencePeriod,
-    RecurrenceSemantics, ScheduleError, SplitPolicy, WorkItem,
+    RecurrenceSemantics, ScheduleError, SplitPolicy, WorkItem, custom_rrule_search_day_bound,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -28,6 +28,7 @@ const MAX_IMMUTABLE_OVERLAP_VIOLATIONS: usize = 10_000;
 const MAX_MATERIALIZED_COLLECTION_ENTRIES: usize = 100_000;
 const MAX_MATERIALIZED_STRING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CANDIDATE_STRING_WORK_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CUSTOM_DATE_EVALUATIONS: usize = 10_000_000;
 const GENERATED_DEPENDENCY_ALLOWANCE: usize = 2;
 
 const CONTEXT_UNAVAILABLE_OVERHEAD: usize = "Required context '' is unavailable.".len();
@@ -90,6 +91,7 @@ fn validate_shape(request: &PlanRequest) -> Result<(), PreflightError> {
         .saturating_add(context.rolling_anchors.len())
         .saturating_add(context.minimum_spacing.len())
         .saturating_add(context.completed_occurrence_ids.len())
+        .saturating_add(context.partial_progress.len())
         .saturating_add(context.pauses.len())
         .saturating_add(context.exceptions.len());
     if context_entries > MAX_RECURRENCE_CONTEXT_ENTRIES {
@@ -99,6 +101,25 @@ fn validate_shape(request: &PlanRequest) -> Result<(), PreflightError> {
         .minimum_spacing
         .values()
         .any(|spacing| spacing.get() > MAX_SCHEDULING_OFFSET_MINUTES)
+    {
+        return Err(PreflightError::ResourceLimit);
+    }
+    if context
+        .partial_progress
+        .iter()
+        .any(|(occurrence_id, progress)| {
+            occurrence_id.0.is_nil()
+                || !(1..10_000).contains(&progress.progress_basis_points)
+                || progress.expected_duration_minutes.is_zero()
+                || progress.expected_duration_minutes.get() > MAX_SCHEDULING_OFFSET_MINUTES
+                || progress
+                    .remaining_duration_minutes
+                    .is_some_and(|remaining| {
+                        remaining.is_zero()
+                            || remaining > progress.expected_duration_minutes
+                            || remaining.get() > MAX_SCHEDULING_OFFSET_MINUTES
+                    })
+        })
     {
         return Err(PreflightError::ResourceLimit);
     }
@@ -129,11 +150,6 @@ fn validate_items(request: &PlanRequest) -> Result<(), PreflightError> {
         }
         if !item_temporal_offsets_are_bounded(item) {
             return Err(PreflightError::ResourceLimit);
-        }
-        if matches!(recurrence_of(item), Some(Recurrence::Custom { .. })) {
-            return Err(PreflightError::Schedule(ScheduleError::InvalidRecurrence(
-                "custom RRULE recurrence has no bounded scheduler expansion".to_owned(),
-            )));
         }
         constraint_entries = constraint_entries
             .checked_add(constraint_entry_count(item)?)
@@ -361,7 +377,7 @@ fn validate_rolling_anchor_bounds(request: &PlanRequest) -> Result<(), Preflight
                                 .copied()
                         })
                         .unwrap_or(item.created_at),
-                    period_minutes / u32::from(*target),
+                    period_minutes,
                 )
             }
             Recurrence::Daily { .. }
@@ -374,10 +390,19 @@ fn validate_rolling_anchor_bounds(request: &PlanRequest) -> Result<(), Preflight
         if interval_minutes == 0 {
             continue;
         }
-        let elapsed_minutes = (request.horizon_start - anchor).whole_minutes();
-        if elapsed_minutes > 0
-            && elapsed_minutes.div_euclid(i64::from(interval_minutes)) > i64::from(i32::MAX) - 2
-        {
+        let elapsed_minutes = (request.horizon_start - anchor).whole_minutes().max(0);
+        let maximum_index = match recurrence {
+            Recurrence::Frequency {
+                target,
+                period: RecurrencePeriod::Day | RecurrencePeriod::Week,
+                semantics: RecurrenceSemantics::Rolling,
+                ..
+            } => i128::from(elapsed_minutes)
+                .checked_mul(i128::from(*target))
+                .and_then(|value| value.checked_div(i128::from(interval_minutes))),
+            _ => Some(i128::from(elapsed_minutes).div_euclid(i128::from(interval_minutes))),
+        };
+        if maximum_index.is_none_or(|index| index > i128::from(u32::MAX - 2)) {
             return Err(PreflightError::ResourceLimit);
         }
     }
@@ -482,11 +507,40 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
     let mut cloned_attempts = 0_usize;
     let mut root_occurrences = BTreeMap::new();
     let moved_occurrence_bounds = moved_occurrence_bounds(request);
+    let mut custom_date_evaluations = 0_usize;
     for root in recurrence_roots {
         let subtree_size = subtree_sizes[&root];
         let subtree_session_count = subtree_sessions[&root];
         let subtree_attempt_count = subtree_attempts[&root];
         let recurrence = recurrence_of(by_id[&root]).ok_or(PreflightError::InvalidRequest)?;
+        if let Recurrence::Custom { rrule } = recurrence {
+            let scans = 2_usize
+                + usize::from(
+                    request
+                        .recurrence_context
+                        .exceptions
+                        .iter()
+                        .any(|exception| {
+                            exception.item_id == root
+                                && matches!(
+                                    exception.action,
+                                    RecurrenceExceptionAction::Move { .. }
+                                )
+                        }),
+                );
+            let evaluations = custom_rrule_search_day_bound(rrule, by_id[&root].created_at.date())
+                .map_err(|error| {
+                    PreflightError::Schedule(ScheduleError::InvalidRecurrence(error.to_string()))
+                })?
+                .checked_mul(scans)
+                .ok_or(PreflightError::ResourceLimit)?;
+            custom_date_evaluations = custom_date_evaluations
+                .checked_add(evaluations)
+                .ok_or(PreflightError::ResourceLimit)?;
+            if custom_date_evaluations > MAX_CUSTOM_DATE_EVALUATIONS {
+                return Err(PreflightError::ResourceLimit);
+            }
+        }
         // Core can restore an occurrence-ID move after its nominal bucket has rolled out of the
         // horizon. Count every distinct in-horizon destination conservatively; a selector that
         // also matches a native occurrence may overestimate by one, but may never bypass the
@@ -1086,7 +1140,11 @@ fn recurrence_bound(
         Recurrence::Weekly { times_per_week, .. } => calendar_bound(*times_per_week, week_count),
         Recurrence::Monthly { times_per_month } => calendar_bound(*times_per_month, month_count),
         Recurrence::EveryInterval { interval } => rolling_bound(interval.get()),
-        Recurrence::AfterCompletion { .. } | Recurrence::Custom { .. } => Ok(1),
+        Recurrence::AfterCompletion { .. } => Ok(1),
+        // The supported finite RRULE subset can emit at most one occurrence for each resolved
+        // local calendar date. This conservative bound keeps custom recurrence materialization
+        // under the same occurrence, clone, and candidate-work ceilings as built-in rules.
+        Recurrence::Custom { .. } => Ok(day_count),
         Recurrence::Frequency {
             target,
             period,
@@ -1141,9 +1199,10 @@ fn rolling_frequency_bound(
             String::new(),
         )));
     }
-    let interval = period_minutes / u32::from(target);
     horizon_minutes
-        .checked_div(interval as usize)
+        .checked_mul(usize::from(target))
+        .and_then(|value| value.checked_add(period_minutes as usize - 1))
+        .and_then(|value| value.checked_div(period_minutes as usize))
         .and_then(|value| value.checked_add(2))
         .ok_or(PreflightError::ResourceLimit)
 }
@@ -1380,7 +1439,14 @@ fn item_temporal_offsets_are_bounded(item: &WorkItem) -> bool {
             | Recurrence::Monthly { .. }
             | Recurrence::Custom { .. } => true,
         });
-    scalar_offsets_are_bounded && split_offset_is_bounded && recurrence_offsets_are_bounded
+    let habit_spacing_is_bounded = match &item.kind {
+        ItemKind::Habit(spec) => spec.minimum_spacing.get() <= MAX_SCHEDULING_OFFSET_MINUTES,
+        _ => true,
+    };
+    scalar_offsets_are_bounded
+        && split_offset_is_bounded
+        && recurrence_offsets_are_bounded
+        && habit_spacing_is_bounded
 }
 
 const fn strength_is_bounded(strength: ConstraintStrength) -> bool {
@@ -1410,16 +1476,133 @@ fn invalid_item(item_id: ItemId) -> PreflightError {
 #[cfg(test)]
 mod tests {
     use dayweave_core::{
-        ItemId, OccurrenceId, PlanRequest, RecurrenceContext, RecurrenceException,
-        RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceMoveSource,
-        RecurrenceOccurrenceIdentity, SchedulerConfig,
+        HabitMissedPolicy, HabitSpec, ItemId, ItemKind, Minutes, OccurrenceId, PlanRequest,
+        Recurrence, RecurrenceContext, RecurrenceException, RecurrenceExceptionAction,
+        RecurrenceExceptionSelector, RecurrenceMoveSource, RecurrenceOccurrenceIdentity,
+        RecurrencePartialProgress, SchedulerConfig,
     };
     use time::{Duration, macros::datetime};
     use uuid::Uuid;
 
     use super::{
-        moved_occurrence_bounds, recurrence_context_has_imprecise_instant, shrink_attempt_bound,
+        MAX_CUSTOM_DATE_EVALUATIONS, PreflightError, moved_occurrence_bounds, recurrence_bound,
+        recurrence_context_has_imprecise_instant, rolling_frequency_bound, shrink_attempt_bound,
+        validate,
     };
+
+    fn fixture_request() -> PlanRequest {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/plan-request-v1.json"))
+                .unwrap();
+        serde_json::from_value(envelope["request"].clone()).unwrap()
+    }
+
+    fn make_habit(item: &mut dayweave_core::WorkItem, recurrence: Recurrence) {
+        item.kind = ItemKind::Habit(HabitSpec {
+            recurrence,
+            target: None,
+            preserves_streak_when_paused: true,
+            missed_policy: HabitMissedPolicy::Ask,
+            minimum_spacing: Minutes::ZERO,
+        });
+    }
+
+    #[test]
+    fn custom_recurrence_budget_allows_at_most_one_occurrence_per_local_day() {
+        let recurrence = dayweave_core::Recurrence::Custom {
+            rrule: "FREQ=DAILY;COUNT=10000".to_owned(),
+        };
+        assert_eq!(recurrence_bound(&recurrence, 92, 132_481).unwrap(), 92);
+    }
+
+    #[test]
+    fn rolling_frequency_bound_accounts_for_remainder_slots() {
+        assert_eq!(rolling_frequency_bound(7, 1_440, 1_440).unwrap(), 9);
+        assert_eq!(
+            rolling_frequency_bound(1_000, 10_080, 10_080).unwrap(),
+            1_002
+        );
+        assert!(matches!(
+            rolling_frequency_bound(1_441, 1_440, 1_440),
+            Err(PreflightError::Schedule(_))
+        ));
+    }
+
+    #[test]
+    fn custom_recurrence_scans_are_globally_budgeted_before_materialization() {
+        let mut request = fixture_request();
+        let template = request.items[0].clone();
+        let per_root = 36_600_usize * 2;
+        let accepted_roots = MAX_CUSTOM_DATE_EVALUATIONS / per_root;
+        request.items = (0..accepted_roots)
+            .map(|index| {
+                let mut item = template.clone();
+                item.id =
+                    ItemId::from_uuid(Uuid::from_u128(u128::try_from(index).unwrap() + 10_000));
+                item.title = format!("Sparse custom habit {index}");
+                make_habit(
+                    &mut item,
+                    Recurrence::Custom {
+                        rrule: "FREQ=DAILY;INTERVAL=7;BYDAY=TU;COUNT=1000".to_owned(),
+                    },
+                );
+                item
+            })
+            .collect();
+        assert!(validate(&request).is_ok());
+
+        let mut overflow = template;
+        overflow.id = ItemId::from_uuid(Uuid::from_u128(99_999));
+        overflow.title = "One custom scan too many".to_owned();
+        make_habit(
+            &mut overflow,
+            Recurrence::Custom {
+                rrule: "FREQ=DAILY;INTERVAL=7;BYDAY=TU;COUNT=1000".to_owned(),
+            },
+        );
+        request.items.push(overflow);
+        assert!(matches!(
+            validate(&request),
+            Err(PreflightError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn partial_progress_is_shape_checked_and_shares_the_context_entry_budget() {
+        let mut request = fixture_request();
+        make_habit(
+            &mut request.items[0],
+            Recurrence::Daily { times_per_day: 1 },
+        );
+        request.recurrence_context.partial_progress.insert(
+            OccurrenceId(Uuid::from_u128(2)),
+            RecurrencePartialProgress {
+                progress_basis_points: 0,
+                expected_duration_minutes: Minutes(30),
+                remaining_duration_minutes: None,
+            },
+        );
+        assert!(matches!(
+            validate(&request),
+            Err(PreflightError::ResourceLimit)
+        ));
+
+        request.recurrence_context.partial_progress.clear();
+        for index in 0..=10_000_u128 {
+            request.recurrence_context.partial_progress.insert(
+                OccurrenceId(Uuid::from_u128(index + 100)),
+                RecurrencePartialProgress {
+                    progress_basis_points: 5_000,
+                    expected_duration_minutes: Minutes(30),
+                    remaining_duration_minutes: Some(Minutes(15)),
+                },
+            );
+        }
+        assert!(matches!(
+            validate(&request),
+            Err(PreflightError::ResourceLimit)
+        ));
+    }
 
     #[test]
     fn shrink_attempt_bound_includes_the_clamped_minimum_attempt() {

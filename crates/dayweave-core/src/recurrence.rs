@@ -10,6 +10,7 @@ use crate::{
     Recurrence, RecurrenceExceptionAction, RecurrenceExceptionSelector,
     RecurrenceOccurrenceIdentity, RecurrencePeriod, RecurrenceSemantics, WorkItem,
     ZonedDayBoundary,
+    custom_recurrence::{CustomRecurrenceRuleError, parse_custom_rrule},
 };
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub enum RecurrenceError {
     DuplicateOccurrence(OccurrenceId),
     #[error("manual placement {0} does not bind to an exact materialized occurrence")]
     InvalidManualPlacement(Uuid),
+    #[error("partial progress for occurrence {0} is invalid or does not bind to schedulable work")]
+    InvalidPartialProgress(OccurrenceId),
     #[error(
         "dependency from item {successor_id} to item {predecessor_id} crosses a materialized recurring subtree boundary"
     )]
@@ -93,12 +96,37 @@ pub fn expand_occurrences(request: &PlanRequest) -> Result<Vec<Occurrence>, Recu
         result.extend(occurrences);
     }
     let mut occurrence_owners = BTreeMap::new();
+    let mut occurrence_states = BTreeMap::new();
     for occurrence in &result {
         if occurrence_owners
             .insert(occurrence.id, occurrence.series_item_id)
             .is_some()
         {
             return Err(RecurrenceError::DuplicateOccurrence(occurrence.id));
+        }
+        occurrence_states.insert(occurrence.id, occurrence.state);
+    }
+    for (occurrence_id, progress) in &request.recurrence_context.partial_progress {
+        let valid_shape = (1..crate::HABIT_BASIS_POINTS_SCALE)
+            .contains(&progress.progress_basis_points)
+            && !progress.expected_duration_minutes.is_zero()
+            && progress.expected_duration_minutes.get() <= crate::MAX_DEPENDENCY_LAG_MINUTES
+            && progress.remaining_duration_minutes.is_none_or(|remaining| {
+                !remaining.is_zero()
+                    && remaining <= progress.expected_duration_minutes
+                    && remaining.get() <= crate::MAX_DEPENDENCY_LAG_MINUTES
+            });
+        let valid_occurrence = occurrence_states
+            .get(occurrence_id)
+            .zip(occurrence_owners.get(occurrence_id))
+            .is_some_and(|(state, owner)| {
+                matches!(state, OccurrenceState::Generated | OccurrenceState::Paused)
+                    && by_id
+                        .get(owner)
+                        .is_some_and(|item| matches!(item.kind, ItemKind::Habit(_)))
+            });
+        if !valid_shape || !valid_occurrence {
+            return Err(RecurrenceError::InvalidPartialProgress(*occurrence_id));
         }
     }
     result.sort_by_key(|occurrence| {
@@ -204,7 +232,24 @@ pub(crate) fn materialize_recurrences(
                     start: occurrence.window_start,
                     end: occurrence.window_end,
                 });
-                if let Some(duration) = &mut clone.duration {
+                if let Some(progress) = request
+                    .recurrence_context
+                    .partial_progress
+                    .get(&occurrence.id)
+                    .filter(|_| *original_id == root)
+                {
+                    let remaining = partial_remaining_minutes(occurrence.id, *progress)?;
+                    let source = clone
+                        .duration
+                        .map_or(crate::EstimateSource::User, |duration| duration.source);
+                    clone.duration = Some(crate::DurationEstimate {
+                        minimum: progress.expected_duration_minutes,
+                        expected: progress.expected_duration_minutes,
+                        maximum: progress.expected_duration_minutes,
+                        remaining: Some(remaining),
+                        source,
+                    });
+                } else if let Some(duration) = &mut clone.duration {
                     duration.remaining = None;
                 }
                 if !spacing.is_zero()
@@ -254,6 +299,29 @@ pub(crate) fn materialize_recurrences(
         occurrences,
         identities,
     })
+}
+
+fn partial_remaining_minutes(
+    occurrence_id: OccurrenceId,
+    progress: crate::RecurrencePartialProgress,
+) -> Result<Minutes, RecurrenceError> {
+    if let Some(remaining) = progress.remaining_duration_minutes {
+        return (!remaining.is_zero() && remaining <= progress.expected_duration_minutes)
+            .then_some(remaining)
+            .ok_or(RecurrenceError::InvalidPartialProgress(occurrence_id));
+    }
+    let incomplete = u64::from(crate::HABIT_BASIS_POINTS_SCALE - progress.progress_basis_points);
+    let numerator = u64::from(progress.expected_duration_minutes.get())
+        .checked_mul(incomplete)
+        .and_then(|value| value.checked_add(u64::from(crate::HABIT_BASIS_POINTS_SCALE - 1)))
+        .ok_or(RecurrenceError::InvalidPartialProgress(occurrence_id))?;
+    let remaining = numerator / u64::from(crate::HABIT_BASIS_POINTS_SCALE);
+    let remaining = u32::try_from(remaining)
+        .ok()
+        .filter(|value| *value > 0 && *value <= progress.expected_duration_minutes.get())
+        .map(Minutes)
+        .ok_or(RecurrenceError::InvalidPartialProgress(occurrence_id))?;
+    Ok(remaining)
 }
 
 fn validate_recurring_subtree_dependencies(
@@ -323,6 +391,54 @@ fn has_recurring_ancestor(
 }
 
 fn validate_recurrence_context(request: &PlanRequest) -> Result<(), RecurrenceError> {
+    validate_zoned_calendar(request)?;
+    for pause in &request.recurrence_context.pauses {
+        if pause.start >= pause.end {
+            return Err(RecurrenceError::InvalidPause(pause.item_id));
+        }
+    }
+    if let Some(item_id) =
+        request
+            .recurrence_context
+            .minimum_spacing
+            .iter()
+            .find_map(|(item_id, spacing)| {
+                (spacing.get() > crate::MAX_DEPENDENCY_LAG_MINUTES).then_some(*item_id)
+            })
+    {
+        return Err(RecurrenceError::InvalidRule {
+            item_id,
+            message: format!(
+                "minimum spacing must be at most {} minutes",
+                crate::MAX_DEPENDENCY_LAG_MINUTES
+            ),
+        });
+    }
+    for exception in &request.recurrence_context.exceptions {
+        if let RecurrenceExceptionAction::Move { start, end, source } = exception.action {
+            if start >= end {
+                return Err(RecurrenceError::InvalidException(exception.item_id));
+            }
+            if !matches!(
+                exception.selector,
+                RecurrenceExceptionSelector::Occurrence { .. }
+            ) {
+                return Err(RecurrenceError::InvalidMoveSource(exception.item_id));
+            }
+            if source.item_revision == 0
+                || source.nominal_start >= source.nominal_end
+                || source
+                    .local_date
+                    .is_some_and(|date| date != source.nominal_start.date())
+            {
+                return Err(RecurrenceError::InvalidMoveSource(exception.item_id));
+            }
+        }
+    }
+    validate_item_recurrences(request)
+}
+
+fn validate_zoned_calendar(request: &PlanRequest) -> Result<(), RecurrenceError> {
     let mut dates = BTreeSet::new();
     for day in &request.recurrence_context.calendar.days {
         let Some(last_instant) = day.end.checked_sub(Duration::nanoseconds(1)) else {
@@ -357,35 +473,35 @@ fn validate_recurrence_context(request: &PlanRequest) -> Result<(), RecurrenceEr
             return Err(RecurrenceError::IncompleteZonedCalendar);
         }
     }
-    for pause in &request.recurrence_context.pauses {
-        if pause.start >= pause.end {
-            return Err(RecurrenceError::InvalidPause(pause.item_id));
-        }
-    }
-    for exception in &request.recurrence_context.exceptions {
-        if let RecurrenceExceptionAction::Move { start, end, source } = exception.action {
-            if start >= end {
-                return Err(RecurrenceError::InvalidException(exception.item_id));
-            }
-            if !matches!(
-                exception.selector,
-                RecurrenceExceptionSelector::Occurrence { .. }
-            ) {
-                return Err(RecurrenceError::InvalidMoveSource(exception.item_id));
-            }
-            if source.item_revision == 0
-                || source.nominal_start >= source.nominal_end
-                || source
-                    .local_date
-                    .is_some_and(|date| date != source.nominal_start.date())
-            {
-                return Err(RecurrenceError::InvalidMoveSource(exception.item_id));
-            }
-        }
-    }
+    Ok(())
+}
+
+fn validate_item_recurrences(request: &PlanRequest) -> Result<(), RecurrenceError> {
     for item in &request.items {
+        if let ItemKind::Habit(spec) = &item.kind
+            && spec.minimum_spacing.get() > crate::MAX_DEPENDENCY_LAG_MINUTES
+        {
+            return Err(RecurrenceError::InvalidRule {
+                item_id: item.id,
+                message: format!(
+                    "habit minimum spacing must be at most {} minutes",
+                    crate::MAX_DEPENDENCY_LAG_MINUTES
+                ),
+            });
+        }
         if let Some(recurrence) = recurrence_of(item) {
             validate_rule(item.id, recurrence)?;
+            if let Recurrence::Custom { rrule } = recurrence {
+                parse_custom_rrule(rrule)
+                    .and_then(|rule| {
+                        rule.all_occurrence_dates(
+                            item.created_at.date(),
+                            request.recurrence_context.calendar.week_starts_on,
+                        )
+                    })
+                    .map(|_| ())
+                    .map_err(|error| custom_rule_error(item.id, &error))?;
+            }
         }
     }
     Ok(())
@@ -430,9 +546,9 @@ fn validate_rule(item_id: ItemId, recurrence: &Recurrence) -> Result<(), Recurre
         } if u32::from(*target) > 7 * 24 * 60 => {
             Err(invalid("rolling weekly target exceeds minute precision"))
         }
-        Recurrence::Custom { .. } => Err(invalid(
-            "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available",
-        )),
+        Recurrence::Custom { rrule } => parse_custom_rrule(rrule)
+            .map(|_| ())
+            .map_err(|error| custom_rule_error(item_id, &error)),
         _ => Ok(()),
     }
 }
@@ -536,7 +652,7 @@ fn expand_series(
             period,
             semantics,
             weekdays,
-            minimum_spacing,
+            minimum_spacing: _,
             anchor,
         } => match semantics {
             RecurrenceSemantics::Calendar => match period {
@@ -550,7 +666,7 @@ fn expand_series(
                         })
                         .map(|day| (day.local_date.to_string(), vec![*day])),
                     *target,
-                    *minimum_spacing,
+                    spacing,
                     request,
                     "frequency-calendar-day",
                 )),
@@ -562,7 +678,7 @@ fn expand_series(
                             .into_iter()
                             .map(|(key, value)| (key.to_string(), value)),
                         *target,
-                        *minimum_spacing,
+                        spacing,
                         request,
                         "frequency-calendar-week",
                     ))
@@ -573,7 +689,7 @@ fn expand_series(
                     days,
                     *target,
                     weekdays,
-                    *minimum_spacing,
+                    spacing,
                     "frequency-calendar-month",
                 ),
             },
@@ -588,18 +704,20 @@ fn expand_series(
                     })
                     .unwrap_or(item.created_at);
                 match period {
-                    RecurrencePeriod::Day => expand_rolling_minutes(
+                    RecurrencePeriod::Day => expand_rolling_frequency(
                         request,
                         item,
                         anchor,
-                        (24 * 60) / u32::from(*target),
+                        *target,
+                        24 * 60,
                         "frequency-rolling-day",
                     ),
-                    RecurrencePeriod::Week => expand_rolling_minutes(
+                    RecurrencePeriod::Week => expand_rolling_frequency(
                         request,
                         item,
                         anchor,
-                        (7 * 24 * 60) / u32::from(*target),
+                        *target,
+                        7 * 24 * 60,
                         "frequency-rolling-week",
                     ),
                     RecurrencePeriod::Month => {
@@ -608,13 +726,76 @@ fn expand_series(
                 }
             }
         },
-        // `validate_rule` rejects this before dispatch. Keep the arm fail-closed so a future
-        // internal caller cannot accidentally restore the former horizon-wide placeholder.
-        Recurrence::Custom { .. } => Err(RecurrenceError::InvalidRule {
-            item_id: item.id,
-            message: "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available".to_owned(),
-        }),
+        Recurrence::Custom { rrule } => expand_custom(request, item, rrule, days),
     }
+}
+
+fn custom_rule_error(item_id: ItemId, error: &CustomRecurrenceRuleError) -> RecurrenceError {
+    RecurrenceError::InvalidRule {
+        item_id,
+        message: error.to_string(),
+    }
+}
+
+fn expand_custom(
+    request: &PlanRequest,
+    item: &WorkItem,
+    rrule: &str,
+    days: &[ZonedDayBoundary],
+) -> Result<Vec<Occurrence>, RecurrenceError> {
+    let parsed_rule =
+        parse_custom_rrule(rrule).map_err(|error| custom_rule_error(item.id, &error))?;
+    let Some(through) = days.last().map(|day| day.local_date) else {
+        return Ok(Vec::new());
+    };
+    let anchor = item.created_at.date();
+    let dates = parsed_rule
+        .occurrence_dates_through(
+            anchor,
+            through,
+            request.recurrence_context.calendar.week_starts_on,
+        )
+        .map_err(|error| custom_rule_error(item.id, &error))?;
+    let rule_id = parsed_rule.rule_id();
+    let mut result = Vec::new();
+    for (sequence, date) in dates {
+        let Some(day) = days.iter().find(|day| day.local_date == date) else {
+            continue;
+        };
+        let nominal_start = if date == anchor {
+            day.start.max(item.created_at)
+        } else {
+            day.start
+        };
+        if nominal_start >= day.end {
+            continue;
+        }
+        let identity = RecurrenceOccurrenceIdentity::CustomRule {
+            rule_id,
+            sequence,
+            date,
+        };
+        let key = custom_identity_key(rule_id, sequence, date);
+        let occurrence = make_occurrence(
+            item.id,
+            key.as_bytes(),
+            identity,
+            (nominal_start, day.end),
+            (
+                nominal_start.max(request.horizon_start),
+                day.end.min(request.horizon_end),
+            ),
+            Some(date),
+        );
+        if occurrence.window_start < occurrence.window_end {
+            result.push(occurrence);
+        }
+    }
+    Ok(result)
+}
+
+fn custom_identity_key(rule_id: Uuid, sequence: u32, date: Date) -> String {
+    format!("custom:{rule_id}:{sequence}:{date}")
 }
 
 fn expand_monthly(
@@ -830,11 +1011,17 @@ fn expand_rolling_minutes(
         if start >= request.horizon_end {
             break;
         }
+        if u32::try_from(index).is_err() {
+            return Err(RecurrenceError::DateOutOfRange);
+        }
         let nominal_end = start
             .checked_add(interval)
             .ok_or(RecurrenceError::DateOutOfRange)?;
         let end = nominal_end.min(request.horizon_end);
-        let key = format!("{label}:{index}");
+        let key = format!(
+            "{label}:{}:{interval_minutes}:{index}",
+            anchor.unix_timestamp_nanos()
+        );
         result.push(make_occurrence(
             item.id,
             key.as_bytes(),
@@ -864,6 +1051,99 @@ fn rolling_instant(
         .ok_or(RecurrenceError::DateOutOfRange)
 }
 
+fn expand_rolling_frequency(
+    request: &PlanRequest,
+    item: &WorkItem,
+    anchor: OffsetDateTime,
+    target: u16,
+    period_minutes: u32,
+    label: &str,
+) -> Result<Vec<Occurrence>, RecurrenceError> {
+    if target == 0 || u32::from(target) > period_minutes {
+        return Ok(Vec::new());
+    }
+    let elapsed_minutes = (request.horizon_start - anchor).whole_minutes().max(0);
+    let estimated_index = i128::from(elapsed_minutes)
+        .checked_mul(i128::from(target))
+        .and_then(|value| value.checked_div(i128::from(period_minutes)))
+        .ok_or(RecurrenceError::DateOutOfRange)?;
+    let mut index = i64::try_from(estimated_index).map_err(|_| RecurrenceError::DateOutOfRange)?;
+    while index > 0
+        && rolling_frequency_instant(anchor, target, period_minutes, index)? > request.horizon_start
+    {
+        index -= 1;
+    }
+    loop {
+        let next = index
+            .checked_add(1)
+            .ok_or(RecurrenceError::DateOutOfRange)?;
+        if rolling_frequency_instant(anchor, target, period_minutes, next)? > request.horizon_start
+        {
+            break;
+        }
+        index = next;
+    }
+
+    let mut result = Vec::new();
+    loop {
+        let start = rolling_frequency_instant(anchor, target, period_minutes, index)?;
+        if start >= request.horizon_end {
+            break;
+        }
+        if u32::try_from(index).is_err() {
+            return Err(RecurrenceError::DateOutOfRange);
+        }
+        let next = index
+            .checked_add(1)
+            .ok_or(RecurrenceError::DateOutOfRange)?;
+        let nominal_end = rolling_frequency_instant(anchor, target, period_minutes, next)?;
+        let key = format!(
+            "{label}:{}:{target}:{period_minutes}:{index}",
+            anchor.unix_timestamp_nanos()
+        );
+        result.push(make_occurrence(
+            item.id,
+            key.as_bytes(),
+            RecurrenceOccurrenceIdentity::RollingMinutes { index, anchor },
+            (start, nominal_end),
+            (
+                start.max(request.horizon_start),
+                nominal_end.min(request.horizon_end),
+            ),
+            None,
+        ));
+        index = next;
+    }
+    Ok(result)
+}
+
+fn rolling_frequency_instant(
+    anchor: OffsetDateTime,
+    target: u16,
+    period_minutes: u32,
+    index: i64,
+) -> Result<OffsetDateTime, RecurrenceError> {
+    if index < 0 || target == 0 {
+        return Err(RecurrenceError::DateOutOfRange);
+    }
+    let target = i128::from(target);
+    let index = i128::from(index);
+    let cycle = index / target;
+    let slot = index % target;
+    let offset = cycle
+        .checked_mul(i128::from(period_minutes))
+        .and_then(|value| {
+            slot.checked_mul(i128::from(period_minutes))
+                .and_then(|slot_value| slot_value.checked_div(target))
+                .and_then(|slot_value| value.checked_add(slot_value))
+        })
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RecurrenceError::DateOutOfRange)?;
+    anchor
+        .checked_add(Duration::minutes(offset))
+        .ok_or(RecurrenceError::DateOutOfRange)
+}
+
 fn expand_after_completion(
     request: &PlanRequest,
     item: &WorkItem,
@@ -878,17 +1158,24 @@ fn expand_after_completion(
     let due = anchor
         .checked_add(Duration::minutes(i64::from(interval.get())))
         .ok_or(RecurrenceError::DateOutOfRange)?;
-    if due >= request.horizon_end {
+    let nominal_end = due
+        .checked_add(Duration::minutes(i64::from(interval.get())))
+        .ok_or(RecurrenceError::DateOutOfRange)?;
+    if due >= request.horizon_end || nominal_end <= request.horizon_start {
         return Ok(Vec::new());
     }
     let start = due.max(request.horizon_start);
-    let key = format!("after-completion:{}", anchor.unix_timestamp_nanos());
+    let key = format!(
+        "after-completion:{}:{}",
+        anchor.unix_timestamp_nanos(),
+        interval.get()
+    );
     Ok(vec![make_occurrence(
         item.id,
         key.as_bytes(),
         RecurrenceOccurrenceIdentity::AfterCompletion { anchor },
-        (due, request.horizon_end),
-        (start, request.horizon_end),
+        (due, nominal_end),
+        (start, nominal_end.min(request.horizon_end)),
         None,
     )])
 }
@@ -943,7 +1230,10 @@ fn expand_rolling_months(
                         .ok_or(RecurrenceError::DateOutOfRange)?
                 };
                 if start < request.horizon_end && request.horizon_start < end {
-                    let key = format!("frequency-rolling-month:{cycle}:{index}");
+                    let key = format!(
+                        "frequency-rolling-month:{}:{target}:{cycle}:{index}",
+                        anchor.unix_timestamp_nanos()
+                    );
                     result.push(make_occurrence(
                         item.id,
                         key.as_bytes(),
@@ -1002,6 +1292,7 @@ fn stable_ordinal(identity: RecurrenceOccurrenceIdentity) -> Option<u32> {
         RecurrenceOccurrenceIdentity::AfterCompletion { .. }
         | RecurrenceOccurrenceIdentity::Custom => Some(0),
         RecurrenceOccurrenceIdentity::RollingMonth { index, .. } => Some(u32::from(index)),
+        RecurrenceOccurrenceIdentity::CustomRule { sequence, .. } => Some(sequence),
     }
 }
 
@@ -1017,16 +1308,6 @@ fn apply_pauses_and_exceptions(
             .contains(&occurrence.id)
         {
             occurrence.state = OccurrenceState::Completed;
-        }
-        if request.recurrence_context.pauses.iter().any(|pause| {
-            pause.item_id == item_id
-                && pause.start < occurrence.window_end
-                && occurrence.window_start < pause.end
-        }) && occurrence.state != OccurrenceState::Completed
-        {
-            occurrence.state = OccurrenceState::Paused;
-        }
-        if occurrence.state == OccurrenceState::Completed {
             continue;
         }
         for exception in request
@@ -1065,6 +1346,17 @@ fn apply_pauses_and_exceptions(
                 }
             }
         }
+        // Pause eligibility is evaluated against the final moved window. A move
+        // must never make habit work bypass an authoritative pause interval.
+        if occurrence.state == OccurrenceState::Generated
+            && request.recurrence_context.pauses.iter().any(|pause| {
+                pause.item_id == item_id
+                    && pause.start < occurrence.window_end
+                    && occurrence.window_start < pause.end
+            })
+        {
+            occurrence.state = OccurrenceState::Paused;
+        }
     }
 }
 
@@ -1075,6 +1367,7 @@ fn apply_pauses_and_exceptions(
 /// request can safely materialize the moved work without regenerating the old nominal bucket.
 /// The synthetic nominal fields are presentation metadata only; materialization and subsequent
 /// reconciliation continue to use the original occurrence ID.
+#[allow(clippy::too_many_lines)]
 fn append_moved_occurrences_for_horizon(
     request: &PlanRequest,
     item: &WorkItem,
@@ -1082,6 +1375,31 @@ fn append_moved_occurrences_for_horizon(
     occurrences: &mut Vec<Occurrence>,
 ) -> Result<(), RecurrenceError> {
     let item_id = item.id;
+    let has_custom_move = request
+        .recurrence_context
+        .exceptions
+        .iter()
+        .any(|exception| {
+            exception.item_id == item_id
+                && matches!(exception.action, RecurrenceExceptionAction::Move { .. })
+        });
+    let custom_proof = match recurrence {
+        Recurrence::Custom { rrule } if has_custom_move => {
+            let rule =
+                parse_custom_rrule(rrule).map_err(|error| custom_rule_error(item.id, &error))?;
+            let dates = rule
+                .all_occurrence_dates(
+                    item.created_at.date(),
+                    request.recurrence_context.calendar.week_starts_on,
+                )
+                .map_err(|error| custom_rule_error(item.id, &error))?;
+            Some(CustomMoveProof {
+                rule_id: rule.rule_id(),
+                dates,
+            })
+        }
+        _ => None,
+    };
     let mut moved_ids = BTreeSet::new();
     let mut occurrence_indices = BTreeMap::new();
     for (index, occurrence) in occurrences.iter().enumerate() {
@@ -1102,22 +1420,20 @@ fn append_moved_occurrences_for_horizon(
         else {
             continue;
         };
-        if !moved_ids.insert(id) || !move_source_is_valid(request, item, recurrence, id, source) {
+        if !moved_ids.insert(id)
+            || !move_source_is_valid(request, item, recurrence, id, source, custom_proof.as_ref())
+        {
             return Err(RecurrenceError::InvalidMoveSource(item_id));
         }
         let existing_index = occurrence_indices.get(&id).copied();
         if let Some(index) = existing_index {
             let occurrence = &mut occurrences[index];
             let native_metadata_matches = match recurrence {
-                Recurrence::Custom { .. }
-                | Recurrence::Frequency {
+                Recurrence::Frequency {
                     period: RecurrencePeriod::Month,
                     semantics: RecurrenceSemantics::Rolling,
                     ..
                 } => true,
-                Recurrence::AfterCompletion { .. } => {
-                    occurrence.nominal_start == source.nominal_start
-                }
                 _ => {
                     occurrence.nominal_start == source.nominal_start
                         && occurrence.nominal_end == source.nominal_end
@@ -1158,12 +1474,18 @@ fn append_moved_occurrences_for_horizon(
     Ok(())
 }
 
+struct CustomMoveProof {
+    rule_id: Uuid,
+    dates: Vec<Date>,
+}
+
 fn move_source_is_valid(
     request: &PlanRequest,
     item: &WorkItem,
     recurrence: &Recurrence,
     id: OccurrenceId,
     source: crate::RecurrenceMoveSource,
+    custom_proof: Option<&CustomMoveProof>,
 ) -> bool {
     if id.0.get_version_num() != 5
         || source.item_revision != item.revision
@@ -1172,7 +1494,7 @@ fn move_source_is_valid(
         return false;
     }
     let Some((key, expected_local_date)) =
-        validated_identity_name(request, item, recurrence, source)
+        validated_identity_name(request, item, recurrence, source, custom_proof)
     else {
         return false;
     };
@@ -1186,6 +1508,7 @@ fn validated_identity_name(
     item: &WorkItem,
     recurrence: &Recurrence,
     source: crate::RecurrenceMoveSource,
+    custom_proof: Option<&CustomMoveProof>,
 ) -> Option<(String, Option<Date>)> {
     let calendar = &request.recurrence_context.calendar;
     let local_day_is_plausible = |date: Date| {
@@ -1203,7 +1526,18 @@ fn validated_identity_name(
                 date,
                 bucket_ordinal,
             },
-        ) if bucket_ordinal < *times_per_day && local_day_is_plausible(date) => {
+        ) if bucket_ordinal < *times_per_day
+            && local_day_is_plausible(date)
+            && calendar_source_matches(
+                request,
+                item.id,
+                source,
+                date,
+                *times_per_day,
+                1,
+                bucket_ordinal,
+            ) =>
+        {
             Some((format!("daily:{date}:{bucket_ordinal}"), Some(date)))
         }
         (
@@ -1223,7 +1557,21 @@ fn validated_identity_name(
                 *times_per_week,
                 bucket_ordinal,
             )?;
-            local_day_is_plausible(date).then(|| {
+            (local_day_is_plausible(date)
+                && calendar_source_matches(
+                    request,
+                    item.id,
+                    source,
+                    date,
+                    *times_per_week,
+                    if weekdays.is_empty() {
+                        7
+                    } else {
+                        weekdays.len()
+                    },
+                    bucket_ordinal,
+                ))
+            .then(|| {
                 (
                     format!("weekly:{identity_week_key}:{bucket_ordinal}"),
                     Some(date),
@@ -1245,7 +1593,18 @@ fn validated_identity_name(
                 *times_per_month,
                 bucket_ordinal,
             )?;
-            local_day_is_plausible(date).then(|| {
+            let eligible_day_count = usize::from(Month::try_from(month).ok()?.length(year));
+            (local_day_is_plausible(date)
+                && calendar_source_matches(
+                    request,
+                    item.id,
+                    source,
+                    date,
+                    *times_per_month,
+                    eligible_day_count,
+                    bucket_ordinal,
+                ))
+            .then(|| {
                 (
                     format!("monthly:{year:04}-{month:02}:{bucket_ordinal}"),
                     Some(date),
@@ -1274,12 +1633,21 @@ fn validated_identity_name(
                 .copied()
                 .unwrap_or(item.created_at);
             let due = effective_anchor.checked_add(Duration::minutes(i64::from(interval.get())))?;
+            let expected_end = due.checked_add(Duration::minutes(i64::from(interval.get())))?;
             (anchor == effective_anchor
+                && anchor.offset() == effective_anchor.offset()
                 && source.nominal_start == due
+                && source.nominal_start.offset() == due.offset()
+                && source.nominal_end == expected_end
+                && source.nominal_end.offset() == expected_end.offset()
                 && source.local_date.is_none())
             .then(|| {
                 (
-                    format!("after-completion:{}", anchor.unix_timestamp_nanos()),
+                    format!(
+                        "after-completion:{}:{}",
+                        anchor.unix_timestamp_nanos(),
+                        interval.get()
+                    ),
                     None,
                 )
             })
@@ -1299,7 +1667,16 @@ fn validated_identity_name(
         ) if bucket_ordinal < *target
             && (weekdays.is_empty()
                 || weekdays.contains(&DayOfWeek::from_time(date.weekday())))
-            && local_day_is_plausible(date) =>
+            && local_day_is_plausible(date)
+            && calendar_source_matches(
+                request,
+                item.id,
+                source,
+                date,
+                *target,
+                1,
+                bucket_ordinal,
+            ) =>
         {
             Some((
                 format!("frequency-calendar-day:{date}:{bucket_ordinal}"),
@@ -1326,7 +1703,21 @@ fn validated_identity_name(
                 *target,
                 bucket_ordinal,
             )?;
-            local_day_is_plausible(date).then(|| {
+            (local_day_is_plausible(date)
+                && calendar_source_matches(
+                    request,
+                    item.id,
+                    source,
+                    date,
+                    *target,
+                    if weekdays.is_empty() {
+                        7
+                    } else {
+                        weekdays.len()
+                    },
+                    bucket_ordinal,
+                ))
+            .then(|| {
                 (
                     format!("frequency-calendar-week:{identity_week_key}:{bucket_ordinal}"),
                     Some(date),
@@ -1348,7 +1739,24 @@ fn validated_identity_name(
             },
         ) => {
             let date = allocated_month_date(year, month, weekdays, *target, bucket_ordinal)?;
-            local_day_is_plausible(date).then(|| {
+            let month_value = Month::try_from(month).ok()?;
+            let eligible_day_count = (1..=month_value.length(year))
+                .filter_map(|day| Date::from_calendar_date(year, month_value, day).ok())
+                .filter(|date| {
+                    weekdays.is_empty() || weekdays.contains(&DayOfWeek::from_time(date.weekday()))
+                })
+                .count();
+            (local_day_is_plausible(date)
+                && calendar_source_matches(
+                    request,
+                    item.id,
+                    source,
+                    date,
+                    *target,
+                    eligible_day_count,
+                    bucket_ordinal,
+                ))
+            .then(|| {
                 (
                     format!("frequency-calendar-month:{year:04}-{month:02}:{bucket_ordinal}"),
                     Some(date),
@@ -1373,11 +1781,12 @@ fn validated_identity_name(
                 RecurrencePeriod::Week => (7 * 24 * 60, "frequency-rolling-week"),
                 RecurrencePeriod::Month => unreachable!(),
             };
-            validated_rolling_minute_name(
+            validated_rolling_frequency_name(
                 source,
                 effective_rolling_anchor(request, item, *anchor),
                 identity_anchor,
-                period_minutes / u32::from(*target),
+                *target,
+                period_minutes,
                 index,
                 label,
             )
@@ -1397,19 +1806,62 @@ fn validated_identity_name(
             },
         ) if cycle >= 0 && cycle <= i64::from(i32::MAX) && index < *target => {
             let effective_anchor = effective_rolling_anchor(request, item, *anchor);
-            let start_date = add_months(effective_anchor.date(), cycle).ok()?;
-            let end_date = add_months(effective_anchor.date(), cycle.checked_add(1)?).ok()?;
             let nominal_dates_match = identity_anchor == effective_anchor
-                && source.nominal_start.date() >= start_date
-                && source.nominal_start.date() < end_date
-                && source
-                    .nominal_end
-                    .checked_sub(Duration::nanoseconds(1))
-                    .is_some_and(|value| value.date() < end_date)
+                && identity_anchor.offset() == effective_anchor.offset()
+                && rolling_month_source_matches(
+                    request,
+                    source,
+                    effective_anchor,
+                    cycle,
+                    index,
+                    *target,
+                )
                 && source.local_date.is_none();
-            nominal_dates_match.then(|| (format!("frequency-rolling-month:{cycle}:{index}"), None))
+            nominal_dates_match.then(|| {
+                (
+                    format!(
+                        "frequency-rolling-month:{}:{target}:{cycle}:{index}",
+                        effective_anchor.unix_timestamp_nanos()
+                    ),
+                    None,
+                )
+            })
         }
-        // Custom rules are rejected before expansion and have no supported movable identity.
+        (
+            Recurrence::Custom { rrule: _ },
+            RecurrenceOccurrenceIdentity::CustomRule {
+                rule_id,
+                sequence,
+                date,
+            },
+        ) => {
+            let proof = custom_proof?;
+            if proof.rule_id != rule_id
+                || usize::try_from(sequence)
+                    .ok()
+                    .and_then(|index| proof.dates.get(index).copied())
+                    != Some(date)
+                || !local_day_is_plausible(date)
+            {
+                return None;
+            }
+            let day = calendar
+                .days
+                .iter()
+                .find(|boundary| boundary.local_date == date)
+                .filter(|_| calendar.time_zone_id.is_some())?;
+            let expected_start = if date == item.created_at.date() {
+                day.start.max(item.created_at)
+            } else {
+                day.start
+            };
+            let nominal_matches = source.nominal_start == expected_start
+                && source.nominal_start.offset() == expected_start.offset()
+                && source.nominal_end == day.end
+                && source.nominal_end.offset() == day.end.offset();
+            nominal_matches.then(|| (custom_identity_key(rule_id, sequence, date), Some(date)))
+        }
+        // The legacy placeholder is never valid proof for a generated custom occurrence.
         _ => None,
     }
 }
@@ -1428,10 +1880,51 @@ fn validated_rolling_minute_name(
     let expected_start = anchor.checked_add(elapsed)?;
     let expected_end = expected_start.checked_add(interval)?;
     (identity_anchor == anchor
+        && identity_anchor.offset() == anchor.offset()
         && source.nominal_start == expected_start
+        && source.nominal_start.offset() == expected_start.offset()
         && source.nominal_end == expected_end
+        && source.nominal_end.offset() == expected_end.offset()
         && source.local_date.is_none())
-    .then(|| (format!("{label}:{index}"), None))
+    .then(|| {
+        (
+            format!(
+                "{label}:{}:{interval_minutes}:{index}",
+                anchor.unix_timestamp_nanos()
+            ),
+            None,
+        )
+    })
+}
+
+fn validated_rolling_frequency_name(
+    source: crate::RecurrenceMoveSource,
+    anchor: OffsetDateTime,
+    identity_anchor: OffsetDateTime,
+    target: u16,
+    period_minutes: u32,
+    index: i64,
+    label: &str,
+) -> Option<(String, Option<Date>)> {
+    let expected_start = rolling_frequency_instant(anchor, target, period_minutes, index).ok()?;
+    let expected_end =
+        rolling_frequency_instant(anchor, target, period_minutes, index.checked_add(1)?).ok()?;
+    (identity_anchor == anchor
+        && identity_anchor.offset() == anchor.offset()
+        && source.nominal_start == expected_start
+        && source.nominal_start.offset() == expected_start.offset()
+        && source.nominal_end == expected_end
+        && source.nominal_end.offset() == expected_end.offset()
+        && source.local_date.is_none())
+    .then(|| {
+        (
+            format!(
+                "{label}:{}:{target}:{period_minutes}:{index}",
+                anchor.unix_timestamp_nanos()
+            ),
+            None,
+        )
+    })
 }
 
 fn effective_rolling_anchor(
@@ -1497,6 +1990,168 @@ fn allocated_date(dates: &[Date], target: u16, bucket_ordinal: u16) -> Option<Da
     dates.get(index).copied()
 }
 
+fn calendar_source_matches(
+    request: &PlanRequest,
+    item_id: ItemId,
+    source: crate::RecurrenceMoveSource,
+    date: Date,
+    target: u16,
+    eligible_day_count: usize,
+    bucket_ordinal: u16,
+) -> bool {
+    let Some(day) = authoritative_day_boundary(request, date) else {
+        return false;
+    };
+    let Some((expected_start, expected_end)) = calendar_occurrence_bounds(
+        day,
+        target,
+        eligible_day_count,
+        bucket_ordinal,
+        minimum_spacing(request, item_id),
+    ) else {
+        return false;
+    };
+    source.nominal_start == expected_start
+        && source.nominal_start.offset() == expected_start.offset()
+        && source.nominal_end == expected_end
+        && source.nominal_end.offset() == expected_end.offset()
+}
+
+fn authoritative_day_boundary(request: &PlanRequest, date: Date) -> Option<ZonedDayBoundary> {
+    let calendar = &request.recurrence_context.calendar;
+    if !calendar.days.is_empty() {
+        calendar.time_zone_id.as_ref()?;
+        return calendar
+            .days
+            .iter()
+            .find(|day| day.local_date == date)
+            .copied();
+    }
+    let offset = request.horizon_start.offset();
+    let start = midnight(date, offset).ok()?;
+    let end = midnight(date.next_day()?, offset).ok()?;
+    Some(ZonedDayBoundary {
+        local_date: date,
+        start,
+        end,
+    })
+}
+
+fn authoritative_boundary_instant(request: &PlanRequest, date: Date) -> Option<OffsetDateTime> {
+    let calendar = &request.recurrence_context.calendar;
+    if !calendar.days.is_empty() {
+        calendar.time_zone_id.as_ref()?;
+        return calendar.days.iter().find_map(|day| {
+            if day.local_date == date {
+                Some(day.start)
+            } else if day.local_date.next_day() == Some(date) {
+                Some(day.end)
+            } else {
+                None
+            }
+        });
+    }
+    midnight(date, request.horizon_start.offset()).ok()
+}
+
+fn rolling_month_source_matches(
+    request: &PlanRequest,
+    source: crate::RecurrenceMoveSource,
+    anchor: OffsetDateTime,
+    cycle: i64,
+    index: u16,
+    target: u16,
+) -> bool {
+    let Some(next_cycle) = cycle.checked_add(1) else {
+        return false;
+    };
+    let Some(start_date) = add_months(anchor.date(), cycle).ok() else {
+        return false;
+    };
+    let Some(end_date) = add_months(anchor.date(), next_cycle).ok() else {
+        return false;
+    };
+    let Some(cycle_start) = authoritative_boundary_instant(request, start_date) else {
+        return false;
+    };
+    let Some(cycle_end) = authoritative_boundary_instant(request, end_date) else {
+        return false;
+    };
+    let duration = cycle_end - cycle_start;
+    let Some(start_offset) = duration
+        .checked_mul(i32::from(index))
+        .and_then(|value| value.checked_div(i32::from(target)))
+    else {
+        return false;
+    };
+    let Some(expected_start) = cycle_start.checked_add(start_offset) else {
+        return false;
+    };
+    let expected_end = if index + 1 == target {
+        cycle_end
+    } else {
+        let Some(end_offset) = duration
+            .checked_mul(i32::from(index + 1))
+            .and_then(|value| value.checked_div(i32::from(target)))
+        else {
+            return false;
+        };
+        let Some(end) = cycle_start.checked_add(end_offset) else {
+            return false;
+        };
+        end
+    };
+    source.nominal_start == expected_start
+        && source.nominal_start.offset() == expected_start.offset()
+        && source.nominal_end == expected_end
+        && source.nominal_end.offset() == expected_end.offset()
+}
+
+fn calendar_occurrence_bounds(
+    day: ZonedDayBoundary,
+    target: u16,
+    eligible_day_count: usize,
+    bucket_ordinal: u16,
+    minimum_spacing: Minutes,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    if target == 0 || bucket_ordinal >= target || eligible_day_count == 0 {
+        return None;
+    }
+    let target = usize::from(target);
+    let ordinal = usize::from(bucket_ordinal);
+    let day_index = ordinal
+        .checked_mul(eligible_day_count)?
+        .checked_div(target)?;
+    let first = day_index
+        .checked_mul(target)?
+        .checked_add(eligible_day_count - 1)?
+        .checked_div(eligible_day_count)?;
+    let after_last = day_index
+        .checked_add(1)?
+        .checked_mul(target)?
+        .checked_add(eligible_day_count - 1)?
+        .checked_div(eligible_day_count)?;
+    let position = ordinal.checked_sub(first)?;
+    let count = after_last.checked_sub(first)?;
+    let position = i32::try_from(position).ok()?;
+    let count = i32::try_from(count).ok()?;
+    let day_duration = day.end - day.start;
+    let start_offset = day_duration.checked_mul(position)?.checked_div(count)?;
+    let start = day.start.checked_add(start_offset)?;
+    let end = if position.checked_add(1)? == count {
+        day.end
+    } else {
+        let end_offset = day_duration
+            .checked_mul(position.checked_add(1)?)?
+            .checked_div(count)?;
+        day.start.checked_add(end_offset)?
+    };
+    let spacing_end = start
+        .checked_add(Duration::minutes(i64::from(minimum_spacing.get())))
+        .map_or(day.end, |value| value.min(day.end));
+    Some((start, end.max(spacing_end)))
+}
+
 fn minimum_spacing(request: &PlanRequest, item_id: ItemId) -> Minutes {
     request
         .recurrence_context
@@ -1507,12 +2162,17 @@ fn minimum_spacing(request: &PlanRequest, item_id: ItemId) -> Minutes {
             request
                 .items
                 .iter()
-                .find_map(|item| (item.id == item_id).then(|| recurrence_of(item)).flatten())
-                .and_then(|recurrence| match recurrence {
-                    Recurrence::Frequency {
-                        minimum_spacing, ..
-                    } => Some(*minimum_spacing),
-                    _ => None,
+                .find(|item| item.id == item_id)
+                .and_then(|item| match &item.kind {
+                    ItemKind::Habit(spec) if !spec.minimum_spacing.is_zero() => {
+                        Some(spec.minimum_spacing)
+                    }
+                    _ => recurrence_of(item).and_then(|recurrence| match recurrence {
+                        Recurrence::Frequency {
+                            minimum_spacing, ..
+                        } => Some(*minimum_spacing),
+                        _ => None,
+                    }),
                 })
         })
         .unwrap_or(Minutes::ZERO)
@@ -1665,4 +2325,36 @@ fn boundary_instant(
         return Ok(previous.end);
     }
     midnight(date, fallback_offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::partial_remaining_minutes;
+    use crate::{HABIT_BASIS_POINTS_SCALE, Minutes, OccurrenceId, RecurrencePartialProgress};
+
+    #[test]
+    fn every_nonterminal_basis_point_derives_a_positive_ceiling_bounded_remainder() {
+        let occurrence_id = OccurrenceId(Uuid::from_u128(1));
+        let expected = Minutes(527_040);
+        for progress_basis_points in 1..HABIT_BASIS_POINTS_SCALE {
+            let remaining = partial_remaining_minutes(
+                occurrence_id,
+                RecurrencePartialProgress {
+                    progress_basis_points,
+                    expected_duration_minutes: expected,
+                    remaining_duration_minutes: None,
+                },
+            )
+            .unwrap();
+            let incomplete = u64::from(HABIT_BASIS_POINTS_SCALE - progress_basis_points);
+            let derived = (u64::from(expected.get()) * incomplete
+                + u64::from(HABIT_BASIS_POINTS_SCALE - 1))
+                / u64::from(HABIT_BASIS_POINTS_SCALE);
+            assert_eq!(u64::from(remaining.get()), derived);
+            assert!(!remaining.is_zero());
+            assert!(remaining <= expected);
+        }
+    }
 }

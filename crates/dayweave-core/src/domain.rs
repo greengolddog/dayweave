@@ -401,11 +401,30 @@ pub struct RecurringTaskSpec {
     pub recurrence: Recurrence,
 }
 
+/// Configured action for an unmet habit occurrence after its window closes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HabitMissedPolicy {
+    Skip,
+    Carry,
+    ReduceFrequency,
+    #[default]
+    Ask,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HabitSpec {
     pub recurrence: Recurrence,
     pub target: Option<QuantityTarget>,
     pub preserves_streak_when_paused: bool,
+    /// Missed handling is persisted with the habit instead of being supplied
+    /// as an unauthenticated per-command choice.
+    #[serde(default)]
+    pub missed_policy: HabitMissedPolicy,
+    /// General occurrence spacing, including recurrence forms that do not
+    /// carry an inline frequency spacing field.
+    #[serde(default)]
+    pub minimum_spacing: Minutes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,7 +526,8 @@ pub enum Recurrence {
         anchor: Option<OffsetDateTime>,
     },
     Custom {
-        /// RFC 5545 recurrence rule, retained losslessly for calendar parity.
+        /// Strict bounded RFC 5545 subset. Validation and expansion accept
+        /// daily, weekly, and monthly calendar rules only.
         rrule: String,
     },
 }
@@ -1117,10 +1137,30 @@ pub struct RecurrenceContext {
     /// visible in expansion output but do not create schedule demand.
     #[serde(default)]
     pub completed_occurrence_ids: BTreeSet<OccurrenceId>,
+    /// Authoritative remaining-work evidence for partially completed generated
+    /// occurrences. Keys are stable planner occurrence IDs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub partial_progress: BTreeMap<OccurrenceId, RecurrencePartialProgress>,
     #[serde(default)]
     pub pauses: Vec<RecurrencePause>,
     #[serde(default)]
     pub exceptions: Vec<RecurrenceException>,
+}
+
+/// Bounded per-occurrence partial progress admitted from immutable ledger
+/// evidence before recurrence materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecurrencePartialProgress {
+    /// Normalized partial progress. Values outside 1..=9,999 are terminal or
+    /// pending states and are not valid partial scheduling evidence.
+    pub progress_basis_points: u16,
+    /// Immutable expected duration captured when the occurrence was admitted.
+    pub expected_duration_minutes: Minutes,
+    /// Exact authoritative remainder when available. When absent, core derives
+    /// a ceiling-rounded remainder from expected duration and basis points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_duration_minutes: Option<Minutes>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1256,7 +1296,17 @@ pub enum RecurrenceOccurrenceIdentity {
         #[serde(with = "time::serde::rfc3339")]
         anchor: OffsetDateTime,
     },
+    /// Legacy placeholder retained for decoding pre-expansion move envelopes.
+    /// Newly generated custom occurrences always use `CustomRule`.
     Custom,
+    CustomRule {
+        /// UUID-v5 of the canonical parsed RRULE semantics.
+        rule_id: Uuid,
+        /// Zero-based sequence in the finite rule, independent of horizon.
+        sequence: u32,
+        #[serde(with = "iso_date")]
+        date: time::Date,
+    },
 }
 
 mod iso_date {

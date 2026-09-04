@@ -37,6 +37,18 @@ fn recurring_item(value: u128, recurrence: Recurrence) -> WorkItem {
     }
 }
 
+fn habit_item(value: u128, recurrence: Recurrence) -> WorkItem {
+    let mut item = recurring_item(value, recurrence.clone());
+    item.kind = ItemKind::Habit(HabitSpec {
+        recurrence,
+        target: None,
+        preserves_streak_when_paused: true,
+        missed_policy: HabitMissedPolicy::Ask,
+        minimum_spacing: Minutes::ZERO,
+    });
+    item
+}
+
 fn request(item: WorkItem, start: OffsetDateTime, end: OffsetDateTime) -> PlanRequest {
     PlanRequest {
         as_of: start,
@@ -194,6 +206,18 @@ fn after_completion_generates_only_the_next_due_occurrence() {
     let values = expand_occurrences(&input).unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(values[0].window_start, START + Duration::hours(12));
+    assert_eq!(values[0].nominal_start, START + Duration::hours(12));
+    assert_eq!(values[0].nominal_end, START + Duration::hours(15));
+
+    let mut clipped = input.clone();
+    clipped.horizon_start = START + Duration::hours(13);
+    clipped.horizon_end = START + Duration::hours(16);
+    let clipped_value = expand_occurrences(&clipped).unwrap()[0];
+    assert_eq!(clipped_value.id, values[0].id);
+    assert_eq!(clipped_value.nominal_start, values[0].nominal_start);
+    assert_eq!(clipped_value.nominal_end, values[0].nominal_end);
+    assert_eq!(clipped_value.window_start, clipped.horizon_start);
+    assert_eq!(clipped_value.window_end, values[0].nominal_end);
 
     input.horizon_end = START + Duration::hours(11);
     assert!(expand_occurrences(&input).unwrap().is_empty());
@@ -237,6 +261,420 @@ fn calendar_and_rolling_frequency_have_distinct_anchor_semantics() {
     assert_eq!(calendar[1].window_start, START + Duration::hours(12));
     assert_eq!(rolling[0].window_start, START + Duration::hours(6));
     assert_eq!(rolling[1].window_start, START + Duration::hours(18));
+}
+
+#[test]
+fn rolling_frequency_distributes_remainders_without_overproducing() {
+    let item = recurring_item(
+        700,
+        Recurrence::Frequency {
+            target: 7,
+            period: RecurrencePeriod::Day,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes::ZERO,
+            anchor: Some(START),
+        },
+    );
+    let broad =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(2))).unwrap();
+    assert_eq!(broad.len(), 14);
+    assert_eq!(
+        broad[..7]
+            .iter()
+            .map(|occurrence| (occurrence.nominal_start - START).whole_minutes())
+            .collect::<Vec<_>>(),
+        vec![0, 205, 411, 617, 822, 1_028, 1_234]
+    );
+    assert_eq!(broad[7].nominal_start, START + Duration::minutes(1_440));
+    assert!(broad.windows(2).all(|pair| matches!(
+        (pair[1].nominal_start - pair[0].nominal_start).whole_minutes(),
+        205 | 206
+    )));
+
+    for shifted_start in [1, 206, 700] {
+        let start = START + Duration::minutes(shifted_start);
+        let end = start + Duration::days(1);
+        let shifted = expand_occurrences(&request(item.clone(), start, end)).unwrap();
+        assert_eq!(
+            shifted
+                .iter()
+                .filter(|occurrence| {
+                    occurrence.nominal_start >= start && occurrence.nominal_start < end
+                })
+                .count(),
+            7
+        );
+        for occurrence in &shifted {
+            let matching = broad
+                .iter()
+                .find(|candidate| candidate.id == occurrence.id)
+                .expect("two-day expansion covers each shifted occurrence");
+            assert_eq!(matching.nominal_start, occurrence.nominal_start);
+            assert_eq!(matching.nominal_end, occurrence.nominal_end);
+        }
+    }
+}
+
+#[test]
+fn rolling_identity_binds_its_anchor_and_window_frequency() {
+    let occurrence = |target, anchor| {
+        let item = recurring_item(
+            704,
+            Recurrence::Frequency {
+                target,
+                period: RecurrencePeriod::Day,
+                semantics: RecurrenceSemantics::Rolling,
+                weekdays: BTreeSet::new(),
+                minimum_spacing: Minutes::ZERO,
+                anchor: Some(anchor),
+            },
+        );
+        expand_occurrences(&request(item, START, START + Duration::days(1))).unwrap()[0]
+    };
+    let baseline = occurrence(7, START);
+    assert_ne!(baseline.id, occurrence(8, START).id);
+    assert_ne!(baseline.id, occurrence(7, START + Duration::minutes(1)).id);
+}
+
+#[test]
+fn rolling_frequency_supports_one_per_minute_and_rederives_move_gaps() {
+    let item = recurring_item(
+        701,
+        Recurrence::Frequency {
+            target: 1_440,
+            period: RecurrencePeriod::Day,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes::ZERO,
+            anchor: Some(START + Duration::hours(3)),
+        },
+    );
+    let minute_values = expand_occurrences(&request(
+        item,
+        START + Duration::hours(3),
+        START + Duration::hours(4),
+    ))
+    .unwrap();
+    assert_eq!(minute_values.len(), 60);
+    assert!(
+        minute_values
+            .iter()
+            .all(|value| value.nominal_end - value.nominal_start == Duration::minutes(1))
+    );
+
+    let item = recurring_item(
+        702,
+        Recurrence::Frequency {
+            target: 7,
+            period: RecurrencePeriod::Day,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes::ZERO,
+            anchor: Some(START),
+        },
+    );
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    let baseline = expand_occurrences(&input).unwrap();
+    let source = baseline[1];
+    let moved_start = START + Duration::hours(20);
+    input
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::minutes(30),
+                source: move_source(&item, &source),
+            },
+        });
+    assert!(expand_occurrences(&input).is_ok());
+    let RecurrenceExceptionAction::Move { source, .. } =
+        &mut input.recurrence_context.exceptions[0].action
+    else {
+        unreachable!();
+    };
+    source.nominal_end += Duration::minutes(1);
+    assert_eq!(
+        expand_occurrences(&input),
+        Err(RecurrenceError::InvalidMoveSource(item.id))
+    );
+}
+
+#[test]
+fn rolling_week_frequency_preserves_remainders_and_arbitrary_window_counts() {
+    let anchor = START + Duration::minutes(37);
+    let item = recurring_item(
+        703,
+        Recurrence::Frequency {
+            target: 1_000,
+            period: RecurrencePeriod::Week,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes::ZERO,
+            anchor: Some(anchor),
+        },
+    );
+    let broad =
+        expand_occurrences(&request(item.clone(), anchor, anchor + Duration::weeks(2))).unwrap();
+    assert_eq!(broad.len(), 2_000);
+    assert!(broad.windows(2).all(|pair| matches!(
+        (pair[1].nominal_start - pair[0].nominal_start).whole_minutes(),
+        10 | 11
+    )));
+
+    for shift in [1, 11, 5_039] {
+        let start = anchor + Duration::minutes(shift);
+        let end = start + Duration::weeks(1);
+        let shifted = expand_occurrences(&request(item.clone(), start, end)).unwrap();
+        assert_eq!(
+            shifted
+                .iter()
+                .filter(|occurrence| {
+                    occurrence.nominal_start >= start && occurrence.nominal_start < end
+                })
+                .count(),
+            1_000,
+        );
+        for occurrence in shifted {
+            let same = broad
+                .iter()
+                .find(|candidate| candidate.id == occurrence.id)
+                .expect("the broad horizon covers every shifted occurrence");
+            assert_eq!(same.nominal_start, occurrence.nominal_start);
+            assert_eq!(same.nominal_end, occurrence.nominal_end);
+        }
+    }
+}
+
+#[test]
+fn partial_progress_materializes_only_bounded_remaining_work() {
+    for (case, basis_points, expected_remaining) in
+        [(0_u128, 1_u16, 30_u32), (1, 5_000, 15), (2, 9_999, 1)]
+    {
+        let item = habit_item(720 + case, Recurrence::Daily { times_per_day: 1 });
+        let mut input = request(item.clone(), START, START + Duration::days(1));
+        input.availability = all_day_availability(START, 1);
+        let occurrence = expand_occurrences(&input).unwrap()[0];
+        input.recurrence_context.partial_progress.insert(
+            occurrence.id,
+            RecurrencePartialProgress {
+                progress_basis_points: basis_points,
+                expected_duration_minutes: Minutes(30),
+                remaining_duration_minutes: None,
+            },
+        );
+        let plan = Scheduler.plan(&input).unwrap();
+        let scheduled = plan
+            .blocks_for(item.id)
+            .map(|block| u32::try_from((block.end - block.start).whole_minutes()).unwrap())
+            .sum::<u32>();
+        assert_eq!(scheduled, expected_remaining, "{basis_points} bp");
+    }
+
+    let item = habit_item(730, Recurrence::Daily { times_per_day: 1 });
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.availability = all_day_availability(START, 1);
+    let occurrence = expand_occurrences(&input).unwrap()[0];
+    input.recurrence_context.partial_progress.insert(
+        occurrence.id,
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: Some(Minutes(7)),
+        },
+    );
+    let plan = Scheduler.plan(&input).unwrap();
+    assert_eq!(
+        plan.blocks_for(item.id)
+            .map(|block| (block.end - block.start).whole_minutes())
+            .sum::<i64>(),
+        7
+    );
+}
+
+#[test]
+fn partial_progress_rejects_terminal_unknown_and_invalid_evidence() {
+    let item = habit_item(731, Recurrence::Daily { times_per_day: 1 });
+    let base = request(item.clone(), START, START + Duration::days(1));
+    let occurrence = expand_occurrences(&base).unwrap()[0];
+    for progress in [
+        RecurrencePartialProgress {
+            progress_basis_points: 0,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+        RecurrencePartialProgress {
+            progress_basis_points: 10_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: Some(Minutes::ZERO),
+        },
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: Some(Minutes(31)),
+        },
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(MAX_DEPENDENCY_LAG_MINUTES + 1),
+            remaining_duration_minutes: None,
+        },
+    ] {
+        let mut invalid = base.clone();
+        invalid
+            .recurrence_context
+            .partial_progress
+            .insert(occurrence.id, progress);
+        assert_eq!(
+            expand_occurrences(&invalid),
+            Err(RecurrenceError::InvalidPartialProgress(occurrence.id))
+        );
+    }
+
+    let unknown = OccurrenceId(Uuid::from_u128(999_999));
+    let mut invalid = base.clone();
+    invalid.recurrence_context.partial_progress.insert(
+        unknown,
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+    );
+    assert_eq!(
+        expand_occurrences(&invalid),
+        Err(RecurrenceError::InvalidPartialProgress(unknown))
+    );
+
+    let mut terminal = base;
+    terminal
+        .recurrence_context
+        .completed_occurrence_ids
+        .insert(occurrence.id);
+    terminal.recurrence_context.partial_progress.insert(
+        occurrence.id,
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+    );
+    assert_eq!(
+        expand_occurrences(&terminal),
+        Err(RecurrenceError::InvalidPartialProgress(occurrence.id))
+    );
+
+    let non_habit = recurring_item(733, Recurrence::Daily { times_per_day: 1 });
+    let mut invalid_owner = request(non_habit, START, START + Duration::days(1));
+    let non_habit_occurrence = expand_occurrences(&invalid_owner).unwrap()[0];
+    invalid_owner.recurrence_context.partial_progress.insert(
+        non_habit_occurrence.id,
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+    );
+    assert_eq!(
+        expand_occurrences(&invalid_owner),
+        Err(RecurrenceError::InvalidPartialProgress(
+            non_habit_occurrence.id
+        )),
+    );
+}
+
+#[test]
+fn partial_progress_binds_to_a_restored_move_before_final_state_validation() {
+    let item = habit_item(735, Recurrence::Daily { times_per_day: 1 });
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let horizon_start = START + Duration::days(1);
+    let moved_start = horizon_start + Duration::hours(9);
+    let mut destination = request(
+        item.clone(),
+        horizon_start,
+        horizon_start + Duration::days(1),
+    );
+    destination.availability = all_day_availability(horizon_start, 1);
+    destination
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::hours(1),
+                source: move_source(&item, &source),
+            },
+        });
+    destination.recurrence_context.partial_progress.insert(
+        source.id,
+        RecurrencePartialProgress {
+            progress_basis_points: 5_000,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        },
+    );
+    let plan = Scheduler.plan(&destination).unwrap();
+    assert_eq!(
+        plan.blocks
+            .iter()
+            .filter(|block| block.occurrence_id == Some(source.id))
+            .map(|block| (block.end - block.start).whole_minutes())
+            .sum::<i64>(),
+        15,
+    );
+
+    destination.recurrence_context.pauses.push(RecurrencePause {
+        item_id: item.id,
+        start: moved_start,
+        end: moved_start + Duration::hours(1),
+    });
+    let occurrences = expand_occurrences(&destination).unwrap();
+    assert_eq!(
+        occurrences
+            .iter()
+            .find(|occurrence| occurrence.id == source.id)
+            .unwrap()
+            .state,
+        OccurrenceState::Paused,
+    );
+    assert!(
+        Scheduler
+            .plan(&destination)
+            .unwrap()
+            .blocks
+            .iter()
+            .all(|block| block.occurrence_id != Some(source.id))
+    );
+}
+
+#[test]
+fn habit_quantity_target_never_falls_back_to_a_duration() {
+    let mut item = habit_item(732, Recurrence::Daily { times_per_day: 1 });
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.target = Some(QuantityTarget {
+        amount: 10_000,
+        unit: "steps".to_owned(),
+    });
+    item.duration = None;
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.availability = all_day_availability(START, 1);
+    let plan = Scheduler.plan(&input).unwrap();
+    assert!(plan.blocks_for(item.id).next().is_none());
+    assert!(plan.unscheduled.iter().any(|work| {
+        work.item_id == item.id && work.reason == UnscheduledReason::MissingDuration
+    }));
 }
 
 #[test]
@@ -295,6 +733,55 @@ fn completed_paused_skipped_and_moved_occurrences_integrate_with_planning() {
     assert_eq!(blocks[0].start, moved_start);
     assert_eq!(blocks[0].occurrence_id, Some(baseline[3].id));
     assert_eq!(plan.occurrences, expanded);
+}
+
+#[test]
+fn carry_and_reduce_missed_decisions_materialize_as_exact_scheduler_actions() {
+    let item = habit_item(734, Recurrence::Daily { times_per_day: 1 });
+    let mut input = request(item.clone(), START, START + Duration::days(3));
+    let baseline = expand_occurrences(&input).unwrap();
+    let missed = baseline[0];
+    let as_of = missed.window_end;
+    let ItemKind::Habit(mut carry_spec) = item.kind.clone() else {
+        unreachable!();
+    };
+    carry_spec.missed_policy = HabitMissedPolicy::Carry;
+
+    let carry = decide_configured_habit_missed_behavior(
+        &carry_spec,
+        as_of,
+        missed.window_start,
+        missed.window_end,
+        &HabitOccurrenceValue::pending(),
+        &[],
+    )
+    .unwrap();
+    input.recurrence_context.exceptions =
+        materialize_habit_missed_scheduling_decision(item.revision, &missed, &carry, &baseline)
+            .unwrap();
+    let carried = expand_occurrences(&input)
+        .unwrap()
+        .into_iter()
+        .find(|occurrence| occurrence.id == missed.id)
+        .unwrap();
+    assert_eq!(carried.window_start, as_of);
+    assert_eq!(carried.window_end, as_of + Duration::days(1));
+
+    let reduce = HabitMissedDecision::ReduceFrequency {
+        skip_next_occurrences: 1,
+    };
+    input.recurrence_context.exceptions =
+        materialize_habit_missed_scheduling_decision(item.revision, &missed, &reduce, &baseline)
+            .unwrap();
+    let reduced = expand_occurrences(&input).unwrap();
+    assert_eq!(
+        reduced
+            .iter()
+            .find(|occurrence| occurrence.id == baseline[1].id)
+            .unwrap()
+            .state,
+        OccurrenceState::Skipped,
+    );
 }
 
 #[test]
@@ -397,6 +884,49 @@ fn occurrence_id_move_survives_from_its_nominal_day_to_its_destination_day() {
             restored.window_start,
             restored.window_end,
         ),
+    );
+}
+
+#[test]
+fn a_move_cannot_bypass_a_pause_covering_its_destination() {
+    let item = habit_item(801, Recurrence::Daily { times_per_day: 1 });
+    let source_request = request(item.clone(), START, START + Duration::days(1));
+    let source = expand_occurrences(&source_request).unwrap()[0];
+    let moved_start = START + Duration::days(1) + Duration::hours(9);
+    let mut destination = request(
+        item.clone(),
+        START + Duration::days(1),
+        START + Duration::days(2),
+    );
+    destination
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::hours(1),
+                source: move_source(&item, &source),
+            },
+        });
+    destination.recurrence_context.pauses.push(RecurrencePause {
+        item_id: item.id,
+        start: moved_start,
+        end: moved_start + Duration::hours(1),
+    });
+    let moved = expand_occurrences(&destination)
+        .unwrap()
+        .into_iter()
+        .find(|occurrence| occurrence.id == source.id)
+        .unwrap();
+    assert_eq!(moved.state, OccurrenceState::Paused);
+    assert!(
+        Scheduler
+            .plan(&destination)
+            .unwrap()
+            .blocks_for(item.id)
+            .all(|block| block.occurrence_id != Some(source.id))
     );
 }
 
@@ -647,20 +1177,234 @@ fn after_completion_move_accepts_a_new_horizon_end() {
 }
 
 #[test]
-fn custom_rrule_is_retained_but_not_schedulable() {
+fn custom_rrule_ids_are_stable_across_horizons_and_equivalent_parsing() {
+    let rule = "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12";
     let item = recurring_item(
         813,
         Recurrence::Custom {
-            rrule: "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=1".to_owned(),
+            rrule: rule.to_owned(),
         },
     );
+    let broad =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(15))).unwrap();
+    let narrow_start = START + Duration::days(6);
+    let narrow = expand_occurrences(&request(
+        item.clone(),
+        narrow_start,
+        START + Duration::days(15),
+    ))
+    .unwrap();
     assert_eq!(
-        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap_err(),
-        RecurrenceError::InvalidRule {
-            item_id: item.id,
-            message: "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available".to_owned(),
-        }
+        broad
+            .iter()
+            .filter(|occurrence| occurrence.nominal_start >= narrow_start)
+            .map(|occurrence| occurrence.id)
+            .collect::<Vec<_>>(),
+        narrow
+            .iter()
+            .map(|occurrence| occurrence.id)
+            .collect::<Vec<_>>()
     );
+    assert!(broad.iter().enumerate().all(|(expected, occurrence)| {
+        matches!(
+            occurrence.identity,
+            RecurrenceOccurrenceIdentity::CustomRule { sequence, .. }
+                if usize::try_from(sequence) == Ok(expected)
+        )
+    }));
+
+    let equivalent = recurring_item(
+        813,
+        Recurrence::Custom {
+            rrule: "rrule:count=12;byday=fr,we,mo;interval=1;freq=weekly".to_owned(),
+        },
+    );
+    let reparsed =
+        expand_occurrences(&request(equivalent, START, START + Duration::days(15))).unwrap();
+    assert_eq!(
+        broad.iter().map(|value| value.id).collect::<Vec<_>>(),
+        reparsed.iter().map(|value| value.id).collect::<Vec<_>>()
+    );
+
+    let semantically_different = recurring_item(
+        813,
+        Recurrence::Custom {
+            rrule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE,FR;COUNT=12".to_owned(),
+        },
+    );
+    let different = expand_occurrences(&request(
+        semantically_different,
+        START,
+        START + Duration::days(15),
+    ))
+    .unwrap();
+    assert_ne!(broad[0].id, different[0].id);
+}
+
+#[test]
+fn custom_rrule_uses_resolved_dst_boundaries() {
+    let mut item = recurring_item(
+        814,
+        Recurrence::Custom {
+            rrule: "FREQ=DAILY;COUNT=4".to_owned(),
+        },
+    );
+    item.created_at = datetime!(2026-10-24 0:00 +02:00);
+    item.updated_at = item.created_at;
+    let days = vec![
+        ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 10 - 24),
+            start: datetime!(2026-10-24 0:00 +02:00),
+            end: datetime!(2026-10-25 0:00 +02:00),
+        },
+        ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 10 - 25),
+            start: datetime!(2026-10-25 0:00 +02:00),
+            end: datetime!(2026-10-26 0:00 +01:00),
+        },
+        ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 10 - 26),
+            start: datetime!(2026-10-26 0:00 +01:00),
+            end: datetime!(2026-10-27 0:00 +01:00),
+        },
+    ];
+    let mut broad_request = request(
+        item.clone(),
+        datetime!(2026-10-24 0:00 +02:00),
+        datetime!(2026-10-27 0:00 +01:00),
+    );
+    broad_request.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Paris".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: days.clone(),
+    };
+    let broad = expand_occurrences(&broad_request).unwrap();
+    assert_eq!(broad.len(), 3);
+    let fall_back = broad
+        .iter()
+        .find(|occurrence| occurrence.local_date == Some(time::macros::date!(2026 - 10 - 25)))
+        .unwrap();
+    assert_eq!(
+        fall_back.nominal_end - fall_back.nominal_start,
+        Duration::hours(25)
+    );
+
+    let mut narrow_request = request(
+        item,
+        datetime!(2026-10-25 0:00 +02:00),
+        datetime!(2026-10-27 0:00 +01:00),
+    );
+    narrow_request.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Paris".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: days.into_iter().skip(1).collect(),
+    };
+    let narrow = expand_occurrences(&narrow_request).unwrap();
+    assert_eq!(narrow[0].id, fall_back.id);
+    assert_eq!(narrow[0].nominal_start, fall_back.nominal_start);
+    assert_eq!(narrow[0].nominal_end, fall_back.nominal_end);
+}
+
+#[test]
+fn custom_rrule_move_source_is_rederived_and_tampering_is_rejected() {
+    let item = recurring_item(
+        815,
+        Recurrence::Custom {
+            rrule: "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=30".to_owned(),
+        },
+    );
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(7))).unwrap()[0];
+    let move_start = START + Duration::days(19) + Duration::hours(9);
+    let mut destination = request(
+        item.clone(),
+        START + Duration::days(19),
+        START + Duration::days(20),
+    );
+    destination.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("UTC".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: (0..20)
+            .map(|offset| ZonedDayBoundary {
+                local_date: (START + Duration::days(offset)).date(),
+                start: START + Duration::days(offset),
+                end: START + Duration::days(offset + 1),
+            })
+            .collect(),
+    };
+    destination.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: move_start,
+            end: move_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    }];
+    let moved = expand_occurrences(&destination).unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].id, source.id);
+    assert_eq!(moved[0].window_start, move_start);
+
+    let mut tampered_source = move_source(&item, &source);
+    if let RecurrenceOccurrenceIdentity::CustomRule {
+        rule_id,
+        sequence,
+        date,
+    } = tampered_source.identity
+    {
+        tampered_source.identity = RecurrenceOccurrenceIdentity::CustomRule {
+            rule_id,
+            sequence: sequence + 1,
+            date,
+        };
+        tampered_source.ordinal += 1;
+    } else {
+        panic!("custom expansion must use a verifiable identity");
+    }
+    let RecurrenceExceptionAction::Move { source, .. } =
+        &mut destination.recurrence_context.exceptions[0].action
+    else {
+        unreachable!();
+    };
+    *source = tampered_source;
+    assert_eq!(
+        expand_occurrences(&destination),
+        Err(RecurrenceError::InvalidMoveSource(item.id))
+    );
+}
+
+#[test]
+fn unsupported_or_unbounded_custom_rrules_fail_closed() {
+    let cases = [
+        (
+            "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=1;COUNT=2",
+            "custom RRULE frequency YEARLY is unsupported",
+        ),
+        (
+            "FREQ=DAILY;INTERVAL=2",
+            "custom RRULE must define exactly one finite COUNT or UNTIL",
+        ),
+        (
+            "FREQ=MONTHLY;BYDAY=1MO;COUNT=2",
+            "custom RRULE does not support ordinal BYDAY entries",
+        ),
+    ];
+    for (rrule, message) in cases {
+        let item = recurring_item(
+            816,
+            Recurrence::Custom {
+                rrule: rrule.to_owned(),
+            },
+        );
+        assert_eq!(
+            expand_occurrences(&request(item.clone(), START, START + Duration::days(1))),
+            Err(RecurrenceError::InvalidRule {
+                item_id: item.id,
+                message: message.to_owned(),
+            })
+        );
+    }
 }
 
 #[test]
@@ -692,6 +1436,43 @@ fn move_source_preserves_non_utc_rfc3339_offsets() {
     assert_eq!(
         encoded["source"]["nominal_end"],
         json!("2026-09-02T00:00:00+02:00")
+    );
+}
+
+#[test]
+fn off_horizon_calendar_move_rejects_unproved_cross_dst_source_offsets() {
+    let item = recurring_item(819, Recurrence::Daily { times_per_day: 1 });
+    let source_start = datetime!(2026-09-01 0:00 +02:00);
+    let source_end = datetime!(2026-09-02 0:00 +02:00);
+    let mut source_request = request(item.clone(), source_start, source_end);
+    source_request.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: vec![ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 09 - 01),
+            start: source_start,
+            end: source_end,
+        }],
+    };
+    let source = expand_occurrences(&source_request).unwrap()[0];
+    let destination_start = datetime!(2026-10-30 0:00 +01:00);
+    let mut destination = request(
+        item.clone(),
+        destination_start,
+        destination_start + Duration::days(1),
+    );
+    destination.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: destination_start + Duration::hours(9),
+            end: destination_start + Duration::hours(10),
+            source: move_source(&item, &source),
+        },
+    }];
+    assert_eq!(
+        expand_occurrences(&destination),
+        Err(RecurrenceError::InvalidMoveSource(item.id)),
     );
 }
 
@@ -786,7 +1567,7 @@ fn rolling_month_move_keeps_source_metadata_when_horizon_offset_changes() {
     let mut source_request = request(item.clone(), source_horizon_start, source_horizon_end);
     let summer = UtcOffset::from_hms(2, 0, 0).unwrap();
     let winter = UtcOffset::from_hms(1, 0, 0).unwrap();
-    let days = (1..=31)
+    let days: Vec<_> = (1..=31)
         .map(|day| {
             let date = time::Date::from_calendar_date(2026, time::Month::October, day).unwrap();
             let next = date.next_day().unwrap();
@@ -802,7 +1583,7 @@ fn rolling_month_move_keeps_source_metadata_when_horizon_offset_changes() {
     source_request.recurrence_context.calendar = RecurrenceCalendar {
         time_zone_id: Some("Europe/Madrid".to_owned()),
         week_starts_on: DayOfWeek::Monday,
-        days,
+        days: days.clone(),
     };
     let source = expand_occurrences(&source_request)
         .unwrap()
@@ -822,6 +1603,11 @@ fn rolling_month_move_keeps_source_metadata_when_horizon_offset_changes() {
         datetime!(2026-10-30 0:00 +01:00),
         datetime!(2026-10-31 0:00 +01:00),
     );
+    destination.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days,
+    };
     destination.recurrence_context.exceptions = vec![RecurrenceException {
         item_id: item.id,
         selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
@@ -1281,23 +2067,38 @@ fn dependencies_inside_a_recurring_subtree_are_rewritten_per_occurrence() {
 
 #[test]
 fn minimum_spacing_is_enforced_between_occurrence_starts() {
-    let item = recurring_item(13, Recurrence::Daily { times_per_day: 3 });
-    let mut input = request(item.clone(), START, START + Duration::days(1));
-    input.availability = all_day_availability(START, 1);
-    input
-        .recurrence_context
-        .minimum_spacing
-        .insert(item.id, Minutes(600));
-    let plan = Scheduler.plan(&input).unwrap();
-    let blocks: Vec<_> = plan.blocks_for(item.id).collect();
-    assert_eq!(blocks.len(), 3);
-    assert!((blocks[1].start - blocks[0].start) >= Duration::hours(10));
-    assert!((blocks[2].start - blocks[1].start) >= Duration::hours(10));
+    for (id, recurrence) in [
+        (13, Recurrence::Daily { times_per_day: 3 }),
+        (
+            14,
+            Recurrence::Frequency {
+                target: 3,
+                period: RecurrencePeriod::Day,
+                semantics: RecurrenceSemantics::Calendar,
+                weekdays: BTreeSet::new(),
+                minimum_spacing: Minutes::ZERO,
+                anchor: None,
+            },
+        ),
+    ] {
+        let mut item = habit_item(id, recurrence);
+        let ItemKind::Habit(spec) = &mut item.kind else {
+            unreachable!();
+        };
+        spec.minimum_spacing = Minutes(600);
+        let mut input = request(item.clone(), START, START + Duration::days(1));
+        input.availability = all_day_availability(START, 1);
+        let plan = Scheduler.plan(&input).unwrap();
+        let blocks: Vec<_> = plan.blocks_for(item.id).collect();
+        assert_eq!(blocks.len(), 3);
+        assert!((blocks[1].start - blocks[0].start) >= Duration::hours(10));
+        assert!((blocks[2].start - blocks[1].start) >= Duration::hours(10));
+    }
 }
 
 #[test]
 fn old_json_without_recurrence_fields_remains_readable() {
-    let item = recurring_item(14, Recurrence::Daily { times_per_day: 1 });
+    let item = recurring_item(15, Recurrence::Daily { times_per_day: 1 });
     let input = request(item, START, START + Duration::days(1));
     let mut value = serde_json::to_value(&input).unwrap();
     value.as_object_mut().unwrap().remove("recurrence_context");
@@ -1308,12 +2109,26 @@ fn old_json_without_recurrence_fields_remains_readable() {
     let decoded: PlanRequest = serde_json::from_value(value).unwrap();
     assert_eq!(decoded.recurrence_context, RecurrenceContext::default());
     assert_eq!(decoded.items[0].constraints.occurrence_window, None);
+    assert!(
+        serde_json::to_value(RecurrenceContext::default())
+            .unwrap()
+            .get("partial_progress")
+            .is_none()
+    );
 
     let old_rule = r#"{"type":"daily","times_per_day":2}"#;
     assert_eq!(
         serde_json::from_str::<Recurrence>(old_rule).unwrap(),
         Recurrence::Daily { times_per_day: 2 }
     );
+    let old_habit = r#"{
+        "recurrence":{"type":"daily","times_per_day":1},
+        "target":null,
+        "preserves_streak_when_paused":true
+    }"#;
+    let decoded: HabitSpec = serde_json::from_str(old_habit).unwrap();
+    assert_eq!(decoded.missed_policy, HabitMissedPolicy::Ask);
+    assert_eq!(decoded.minimum_spacing, Minutes::ZERO);
 }
 
 #[test]

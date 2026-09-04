@@ -3,20 +3,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, Offset as _, TimeZone as _, Utc};
 use chrono_tz::Tz;
 use dayweave_core::{
-    AvailabilityWindow, BreakCategory, BreakSpec, ConstraintStrength, DailyTimeWindow,
+    AvailabilityWindow, BreakCategory, BreakSpec, ConstraintStrength, DailyTimeWindow, DayOfWeek,
     DurationEstimate, EnergyLevel, EstimateSource, FixedBlock, FixedBlockSource, GoalSpec,
     HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
     PreviousAssignment, PreviousBlock, Priority, Qualified, Recurrence, RecurrenceContext,
     RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity,
     RecurringTaskSpec, RoutineSpec, SchedulerConfig, SchedulingConstraints,
     SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus, ZonedDayBoundary,
+    validate_custom_rrule_for_anchor,
 };
-use time::{OffsetDateTime, UtcOffset};
+use time::{Duration as TimeDuration, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::metadata::{
-    EnergyMetadata, MAX_RECURRENCE_BYTES, MAX_SCHEDULING_METADATA_BYTES, SchedulingMetadata,
-    SchedulingMetadataInput, validate_scheduling_metadata,
+    EnergyMetadata, MAX_RECURRENCE_BYTES, MAX_SCHEDULING_METADATA_BYTES,
+    MAX_SCHEDULING_OFFSET_MINUTES, SchedulingMetadata, SchedulingMetadataInput,
+    validate_scheduling_metadata,
 };
 use crate::model::{
     AvailabilityInput, CanonicalBlockedReasonKind, CanonicalDeadlineKind,
@@ -227,6 +229,7 @@ pub fn validate_schedule_request(
         .saturating_add(request.recurrence_context.rolling_anchors.len())
         .saturating_add(request.recurrence_context.minimum_spacing.len())
         .saturating_add(request.recurrence_context.completed_occurrence_ids.len())
+        .saturating_add(request.recurrence_context.partial_progress.len())
         .saturating_add(request.recurrence_context.pauses.len())
         .saturating_add(request.recurrence_context.exceptions.len());
     if context_entries > MAX_RECURRENCE_CONTEXT_ENTRIES {
@@ -236,6 +239,26 @@ pub fn validate_schedule_request(
     }
     if request.recurrence_context.calendar.days.len() > MAX_CALENDAR_DAYS {
         return invalid("recurrence calendar contains more days than the maximum horizon");
+    }
+    if request
+        .recurrence_context
+        .partial_progress
+        .iter()
+        .any(|(occurrence_id, progress)| {
+            occurrence_id.0.is_nil()
+                || !(1..10_000).contains(&progress.progress_basis_points)
+                || progress.expected_duration_minutes.is_zero()
+                || progress.expected_duration_minutes.get() > MAX_SCHEDULING_OFFSET_MINUTES
+                || progress
+                    .remaining_duration_minutes
+                    .is_some_and(|remaining| {
+                        remaining.is_zero()
+                            || remaining > progress.expected_duration_minutes
+                            || remaining.get() > MAX_SCHEDULING_OFFSET_MINUTES
+                    })
+        })
+    {
+        return invalid("recurrence partial progress is outside supported bounds");
     }
     Ok(())
 }
@@ -434,7 +457,12 @@ pub fn prepare_canonical_schedule(
             continue;
         }
         let is_sensitive = effective_sensitivity.get(&item.id).copied().unwrap_or(true);
-        match classify_item(item, is_sensitive) {
+        match classify_item(
+            item,
+            is_sensitive,
+            &request.timezone_name,
+            request.recurrence_context.calendar.week_starts_on,
+        ) {
             Ok(MappedScheduleItem::Plannable(mapped)) => accepted.push(*mapped),
             Ok(MappedScheduleItem::ContextOnly) => {
                 accepted_without_work_count = accepted_without_work_count
@@ -853,7 +881,12 @@ enum MappedScheduleItem {
     ContextOnly,
 }
 
-fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedScheduleItem, String> {
+fn classify_item(
+    item: &CanonicalItem,
+    is_sensitive: bool,
+    planning_timezone_name: &str,
+    week_starts_on: DayOfWeek,
+) -> Result<MappedScheduleItem, String> {
     let item_timezone: Tz = item
         .timezone_name
         .parse()
@@ -874,6 +907,15 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
     .map_err(|error| error.to_string())?;
     let metadata = validated.metadata;
     let recurrence = validated.recurrence;
+    if recurrence.is_some() && item.timezone_name != planning_timezone_name {
+        return Err("recurring item timezone must match the planning timezone".to_owned());
+    }
+    let created_at =
+        to_time_in_timezone(item.created_at, item_timezone).map_err(|error| error.to_string())?;
+    if let Some(Recurrence::Custom { rrule }) = &recurrence {
+        validate_custom_rrule_for_anchor(rrule, created_at.date(), week_starts_on)
+            .map_err(|error| format!("invalid recurrence: {error}"))?;
+    }
     if metadata.calendar_context.is_some() {
         return Ok(MappedScheduleItem::ContextOnly);
     }
@@ -938,8 +980,7 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
         split_policy,
         energy: metadata.energy.map(EnergyMetadata::into_qualified),
         tags: metadata.tags,
-        created_at: to_time_in_timezone(item.created_at, item_timezone)
-            .map_err(|error| error.to_string())?,
+        created_at,
         updated_at: to_time_in_timezone(item.updated_at, item_timezone)
             .map_err(|error| error.to_string())?,
     })))
@@ -988,6 +1029,8 @@ fn map_kind(
                     recurrence,
                     target: metadata.habit_target.clone(),
                     preserves_streak_when_paused: metadata.preserves_streak_when_paused,
+                    missed_policy: metadata.habit_missed_policy,
+                    minimum_spacing: Minutes(metadata.habit_minimum_spacing_minutes),
                 })
             })
             .ok_or_else(|| "habit requires recurrence".into()),
@@ -1386,6 +1429,11 @@ fn populate_recurrence_calendar(
     horizon_start: DateTime<Utc>,
     horizon_end: DateTime<Utc>,
 ) -> Result<(), PrepareScheduleError> {
+    let timezone: Tz = timezone_name
+        .parse()
+        .map_err(|_| PrepareScheduleError::InvalidRequest("invalid timezone_name".into()))?;
+    let (required_first_date, required_last_date) =
+        recurrence_calendar_date_bounds(context, timezone, horizon_start, horizon_end)?;
     if !context.calendar.days.is_empty() {
         if context
             .calendar
@@ -1395,13 +1443,48 @@ fn populate_recurrence_calendar(
         {
             return invalid("recurrence calendar timezone does not match timezone_name");
         }
+        for day in &context.calendar.days {
+            let local_date = NaiveDate::from_ymd_opt(
+                day.local_date.year(),
+                u32::from(u8::from(day.local_date.month())),
+                u32::from(day.local_date.day()),
+            )
+            .ok_or_else(|| PrepareScheduleError::InvalidRequest("invalid local date".into()))?;
+            let next_date = local_date.succ_opt().ok_or_else(|| {
+                PrepareScheduleError::InvalidRequest("horizon date overflow".into())
+            })?;
+            let expected_start = zoned_midnight(timezone, local_date)?;
+            let expected_end = zoned_midnight(timezone, next_date)?;
+            if day.start != expected_start
+                || day.start.offset() != expected_start.offset()
+                || day.end != expected_end
+                || day.end.offset() != expected_end.offset()
+            {
+                return invalid(format!(
+                    "recurrence calendar boundary for {} does not match timezone {timezone_name}",
+                    day.local_date
+                ));
+            }
+        }
+        let required_first_time = time_date(required_first_date)?;
+        let required_last_time = time_date(required_last_date)?;
+        if context
+            .calendar
+            .days
+            .iter()
+            .all(|day| day.local_date != required_first_time)
+            || context
+                .calendar
+                .days
+                .iter()
+                .all(|day| day.local_date != required_last_time)
+        {
+            return invalid("recurrence calendar does not cover moved-source proof dates");
+        }
         context.calendar.time_zone_id = Some(timezone_name.to_owned());
         return Ok(());
     }
-    let timezone: Tz = timezone_name
-        .parse()
-        .map_err(|_| PrepareScheduleError::InvalidRequest("invalid timezone_name".into()))?;
-    let mut date = horizon_start.with_timezone(&timezone).date_naive();
+    let mut date = required_first_date;
     let mut days = Vec::new();
     loop {
         let next = date
@@ -1409,36 +1492,95 @@ fn populate_recurrence_calendar(
             .ok_or_else(|| PrepareScheduleError::InvalidRequest("horizon date overflow".into()))?;
         let start = zoned_midnight(timezone, date)?;
         let end = zoned_midnight(timezone, next)?;
-        if start < to_time(horizon_end)? && end > to_time(horizon_start)? {
-            days.push(ZonedDayBoundary {
-                local_date: time::Date::from_calendar_date(
-                    date.year(),
-                    time::Month::try_from(u8::try_from(date.month()).map_err(|_| {
-                        PrepareScheduleError::InvalidRequest("invalid local month".into())
-                    })?)
-                    .map_err(|_| {
-                        PrepareScheduleError::InvalidRequest("invalid local month".into())
-                    })?,
-                    u8::try_from(date.day()).map_err(|_| {
-                        PrepareScheduleError::InvalidRequest("invalid local day".into())
-                    })?,
-                )
-                .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local date".into()))?,
-                start,
-                end,
-            });
+        if days.len() == MAX_CALENDAR_DAYS {
+            return invalid("generated recurrence calendar exceeded horizon bounds");
         }
-        if end >= to_time(horizon_end)? {
+        days.push(ZonedDayBoundary {
+            local_date: time::Date::from_calendar_date(
+                date.year(),
+                time::Month::try_from(u8::try_from(date.month()).map_err(|_| {
+                    PrepareScheduleError::InvalidRequest("invalid local month".into())
+                })?)
+                .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local month".into()))?,
+                u8::try_from(date.day()).map_err(|_| {
+                    PrepareScheduleError::InvalidRequest("invalid local day".into())
+                })?,
+            )
+            .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local date".into()))?,
+            start,
+            end,
+        });
+        if end >= to_time(horizon_end)? && date >= required_last_date {
             break;
         }
         date = next;
-        if days.len() > MAX_CALENDAR_DAYS {
-            return invalid("generated recurrence calendar exceeded horizon bounds");
-        }
     }
     context.calendar.time_zone_id = Some(timezone_name.to_owned());
     context.calendar.days = days;
     Ok(())
+}
+
+fn recurrence_calendar_date_bounds(
+    context: &RecurrenceContext,
+    timezone: Tz,
+    horizon_start: DateTime<Utc>,
+    horizon_end: DateTime<Utc>,
+) -> Result<(NaiveDate, NaiveDate), PrepareScheduleError> {
+    let mut first = horizon_start.with_timezone(&timezone).date_naive();
+    let horizon_last = horizon_end
+        .checked_sub_signed(chrono::Duration::nanoseconds(1))
+        .ok_or_else(|| PrepareScheduleError::InvalidRequest("horizon date overflow".into()))?;
+    let mut last = horizon_last.with_timezone(&timezone).date_naive();
+    for exception in &context.exceptions {
+        let RecurrenceExceptionAction::Move { source, .. } = exception.action else {
+            continue;
+        };
+        if source.nominal_start >= source.nominal_end {
+            return invalid("move source window must have positive duration");
+        }
+        let end_inclusive = source
+            .nominal_end
+            .checked_sub(TimeDuration::nanoseconds(1))
+            .ok_or_else(|| {
+                PrepareScheduleError::InvalidRequest("move source date overflow".into())
+            })?;
+        let source_first = local_date_in_timezone(source.nominal_start, timezone)?;
+        let source_last = local_date_in_timezone(end_inclusive, timezone)?;
+        if source
+            .local_date
+            .is_some_and(|local_date| time_date(source_first).ok() != Some(local_date))
+        {
+            return invalid("move source local date does not match the planning timezone");
+        }
+        first = first.min(source_first);
+        last = last.max(source_last);
+    }
+    Ok((first, last))
+}
+
+fn local_date_in_timezone(
+    value: OffsetDateTime,
+    timezone: Tz,
+) -> Result<NaiveDate, PrepareScheduleError> {
+    let utc = DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())
+        .ok_or_else(|| {
+            PrepareScheduleError::InvalidRequest("timestamp is outside supported range".into())
+        })?;
+    Ok(utc.with_timezone(&timezone).date_naive())
+}
+
+fn time_date(value: NaiveDate) -> Result<time::Date, PrepareScheduleError> {
+    time::Date::from_calendar_date(
+        value.year(),
+        time::Month::try_from(
+            u8::try_from(value.month())
+                .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local month".into()))?,
+        )
+        .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local month".into()))?,
+        u8::try_from(value.day())
+            .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local day".into()))?,
+    )
+    .map_err(|_| PrepareScheduleError::InvalidRequest("invalid local date".into()))
 }
 
 fn zoned_midnight(timezone: Tz, date: NaiveDate) -> Result<OffsetDateTime, PrepareScheduleError> {

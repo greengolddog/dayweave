@@ -431,13 +431,13 @@
       }
     },
     {
-      "name": "custom_rrule_is_retained_but_not_authorable",
-      "expected_error_contains": "custom RRULE recurrence is retained for read compatibility",
+      "name": "custom_rrule_rejects_ordinal_byday",
+      "expected_error_contains": "does not support ordinal BYDAY",
       "fields": {
         "item_id": "00000000-0000-0000-0000-000000000238",
         "kind": "routine", "status": "planned", "timezone_name": "UTC",
         "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
-        "recurrence": { "type": "custom", "rrule": "FREQ=MONTHLY;BYDAY=1MO,-1FR" },
+        "recurrence": { "type": "custom", "rrule": "FREQ=MONTHLY;BYDAY=1MO,-1FR;COUNT=2" },
         "flexible_constraints": { "routine_ordered": true },
         "split_policy": { "type": "indivisible" }, "parent_id": null
       }

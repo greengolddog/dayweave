@@ -147,3 +147,41 @@ fn every_shared_invalid_fixture_fails_for_the_documented_reason() {
         );
     }
 }
+
+#[test]
+fn bounded_custom_rrules_are_authorable_but_unbounded_rules_are_not() {
+    let mut fields = FixtureFields {
+        item_id: Uuid::from_u128(900),
+        kind: CanonicalItemKind::Habit,
+        status: CanonicalItemStatus::Planned,
+        timezone_name: "Europe/Paris".to_owned(),
+        duration_seconds: Some(1_800),
+        deadline_at: None,
+        earliest_start_at: None,
+        recurrence: Some(serde_json::json!({
+            "type": "custom",
+            "rrule": "BYDAY=MO,WE,FR;COUNT=24;FREQ=WEEKLY"
+        })),
+        flexible_constraints: serde_json::json!({}),
+        split_policy: CanonicalSplitPolicy::Indivisible,
+        parent_id: None,
+    };
+    let validated = validate_scheduling_metadata(fields.input()).unwrap();
+    assert_eq!(
+        validated.recurrence,
+        Some(Recurrence::Custom {
+            rrule: "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR;COUNT=24".to_owned(),
+        })
+    );
+
+    fields.recurrence = Some(serde_json::json!({
+        "type": "custom",
+        "rrule": "FREQ=DAILY;INTERVAL=2"
+    }));
+    let error = validate_scheduling_metadata(fields.input()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exactly one finite COUNT or UNTIL")
+    );
+}

@@ -11,9 +11,10 @@ use dayweave_compose::{
     validate_schedule_request,
 };
 use dayweave_core::{
-    ConstraintStrength, EnergyLevel, FixedBlockSource, ItemId, ItemKind, Minutes, Recurrence,
-    RecurrenceException, RecurrenceExceptionAction, RecurrenceExceptionSelector,
-    RecurrenceMoveSource, RecurrenceOccurrenceIdentity, SplitPolicy, WorkStatus,
+    ConstraintStrength, DayOfWeek, EnergyLevel, FixedBlockSource, HabitMissedPolicy, ItemId,
+    ItemKind, Minutes, Recurrence, RecurrenceCalendar, RecurrenceException,
+    RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceMoveSource,
+    RecurrenceOccurrenceIdentity, SplitPolicy, WorkStatus, ZonedDayBoundary, expand_occurrences,
 };
 use serde_json::json;
 use time::{Duration as TimeDuration, macros::datetime};
@@ -471,6 +472,126 @@ fn maps_every_canonical_kind_and_legacy_recurrence_defaults() {
     assert!(matches!(kinds[4], ItemKind::Project));
     assert!(matches!(kinds[5], ItemKind::Break(_)));
     assert!(matches!(kinds[6], ItemKind::CalendarEvent(_)));
+}
+
+#[test]
+fn custom_recurrence_is_canonical_anchor_validated_and_timezone_closed() {
+    let mut valid = canonical_item(550);
+    valid.kind = CanonicalItemKind::Habit;
+    valid.recurrence = Some(json!({
+        "type": "custom",
+        "rrule": "rrule:count=3;byday=fr,mo;freq=weekly"
+    }));
+    valid.flexible_constraints = json!({
+        "habit_missed_policy": "carry",
+        "habit_minimum_spacing_minutes": 90
+    });
+    let prepared = prepare_canonical_schedule(vec![valid], preview_request()).unwrap();
+    let ItemKind::Habit(spec) = &prepared.plan_request.items[0].kind else {
+        panic!("habit must remain a habit");
+    };
+    assert_eq!(
+        spec.recurrence,
+        Recurrence::Custom {
+            rrule: "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=3".to_owned()
+        }
+    );
+    assert_eq!(spec.missed_policy, HabitMissedPolicy::Carry);
+    assert_eq!(spec.minimum_spacing, Minutes(90));
+
+    let mut unreachable = canonical_item(551);
+    unreachable.kind = CanonicalItemKind::Habit;
+    unreachable.recurrence = Some(json!({
+        "type": "custom",
+        "rrule": "FREQ=DAILY;UNTIL=20260828"
+    }));
+    let prepared = prepare_canonical_schedule(vec![unreachable], preview_request()).unwrap();
+    assert_eq!(prepared.rejected_items.len(), 1);
+    assert!(
+        prepared.rejected_items[0]
+            .reason
+            .contains("UNTIL precedes its item creation anchor")
+    );
+
+    let mut cross_timezone = canonical_item(552);
+    cross_timezone.kind = CanonicalItemKind::Habit;
+    cross_timezone.timezone_name = "UTC".to_owned();
+    cross_timezone.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+    let prepared = prepare_canonical_schedule(vec![cross_timezone], preview_request()).unwrap();
+    assert_eq!(prepared.rejected_items.len(), 1);
+    assert!(
+        prepared.rejected_items[0]
+            .reason
+            .contains("recurring item timezone must match the planning timezone")
+    );
+}
+
+#[test]
+fn caller_supplied_recurrence_calendar_must_match_iana_dst_boundaries() {
+    let mut schedule = preview_request();
+    schedule.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: vec![ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 09 - 01),
+            // The local date is correct, but these UTC-midnight boundaries are
+            // not Europe/Madrid midnight and therefore are not source proof.
+            start: datetime!(2026-09-01 0:00 UTC),
+            end: datetime!(2026-09-02 0:00 UTC),
+        }],
+    };
+    assert!(matches!(
+        prepare_canonical_schedule(vec![canonical_item(553)], schedule),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("does not match timezone Europe/Madrid")
+    ));
+}
+
+#[test]
+fn generated_calendar_extends_to_authoritatively_prove_a_bounded_move_source() {
+    let mut item = canonical_item(554);
+    item.kind = CanonicalItemKind::Habit;
+    item.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+    let mut schedule = preview_request();
+    schedule.as_of = Utc.with_ymd_and_hms(2026, 10, 29, 23, 0, 0).unwrap();
+    schedule.horizon_start = schedule.as_of;
+    schedule.horizon_end = Utc.with_ymd_and_hms(2026, 10, 30, 23, 0, 0).unwrap();
+    let source_date = time::macros::date!(2026 - 09 - 01);
+    let occurrence_id = dayweave_core::OccurrenceId(Uuid::new_v5(&item.id, b"daily:2026-09-01:0"));
+    schedule
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: ItemId(item.id),
+            selector: RecurrenceExceptionSelector::Occurrence { id: occurrence_id },
+            action: RecurrenceExceptionAction::Move {
+                start: datetime!(2026-10-30 9:00 +01:00),
+                end: datetime!(2026-10-30 10:00 +01:00),
+                source: RecurrenceMoveSource {
+                    item_revision: item.revision,
+                    identity: RecurrenceOccurrenceIdentity::CalendarDay {
+                        date: source_date,
+                        bucket_ordinal: 0,
+                    },
+                    nominal_start: datetime!(2026-09-01 0:00 +02:00),
+                    nominal_end: datetime!(2026-09-02 0:00 +02:00),
+                    local_date: Some(source_date),
+                    ordinal: 0,
+                },
+            },
+        });
+    let prepared = prepare_canonical_schedule(vec![item], schedule).unwrap();
+    let calendar = &prepared.plan_request.recurrence_context.calendar;
+    assert_eq!(calendar.days.first().unwrap().local_date, source_date);
+    assert_eq!(
+        calendar.days.first().unwrap().start,
+        datetime!(2026-09-01 0:00 +02:00),
+    );
+    let restored = expand_occurrences(&prepared.plan_request).unwrap();
+    assert!(restored.iter().any(|occurrence| {
+        occurrence.id == occurrence_id
+            && occurrence.window_start == datetime!(2026-10-30 9:00 +01:00)
+    }));
 }
 
 #[test]

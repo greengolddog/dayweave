@@ -51,7 +51,7 @@ is complete.
 | Native SwiftUI and Jetpack Compose shells with Today/Calendar/Inbox/Assistant navigation, canonical item editors, planning profiles, privacy-first onboarding, and Google review surfaces | Parts of `UX-001`–`UX-012` | [macOS views](../apps/macos/Sources/DayWeaveMac/Views), [Android UI](../apps/android/app/src/main/java/com/greengolddog/dayweave/ui), and platform test suites |
 | Health Connect energy-signal provider on Android with explicit permissions, private projection, and manual-safe fallback boundaries | `CTX-006`, future boundary for `CTX-008` | [Health Connect integration](../apps/android/app/src/main/java/com/greengolddog/dayweave/health) |
 | Reproducible local macOS and signed-APK build paths, guarded signing boundaries, CI security scans, container builds, encrypted backup scripts, and a cost-guarded Nebius Terraform plan | Parts of `OPS`, `SEC-004`, `SEC-011`, and `DATA-003`–`DATA-006` | [release workflow](../.github/workflows/release.yml), [local build scripts](../scripts), and [deployment assets](../deploy) |
-| Foundational habit occurrence domain and strict Android habit API transport: recurrence identities, lifecycle evidence, pause-aware analytics, bounded wire validation, and correction revisions | Parts of `HAB-001`–`HAB-009` | commit `1f5f722`, commit `dc71285`, and [habit ledger design](habit-occurrence-ledger.md) |
+| Shared habit recurrence and lifecycle core: bounded custom rules, rolling and completion-relative cadence, stable occurrence identity and move proof, missed/spacing policies, corrections, partial-progress demand, pauses, streaks, analytics, and scheduler-helper budgets; plus strict Android habit API transport | Core of `HAB-001`–`HAB-009`, parts of `CON` and `SCH` | [habit domain](../crates/dayweave-core/src/habits.rs), [recurrence engine](../crates/dayweave-core/src/recurrence.rs), [custom recurrence](../crates/dayweave-core/src/custom_recurrence.rs), [scheduler tests](../crates/dayweave-core/tests/scheduler.rs), and [habit ledger design](habit-occurrence-ledger.md) |
 | macOS habit occurrence and statistics experience with strict transport, encrypted origin-bound offline persistence, exact replay, conflict review, done/partial/skipped corrections, pause/resume, trends, streaks, quantities, and privacy scrubbing | Client slice of `HAB-006`–`HAB-009`, parts of `SYNC` and `SEC` | [habit models](../apps/macos/Sources/DayWeaveMac/Models/HabitModels.swift), [habit sync store](../apps/macos/Sources/DayWeaveMac/Store/HabitSyncStore.swift), [habit persistence](../apps/macos/Sources/DayWeaveMac/Store/EncryptedHabitPersistence.swift), and their adjacent tests |
 
 ## Active implementation
@@ -61,8 +61,6 @@ authoritative backend, scheduling input, and Android, followed by
 cross-platform end-to-end closure. The macOS client slice is implemented and
 covered; it remains part of the final integrated verification:
 
-- harden every recurrence mode, including rolling frequencies,
-  completion-relative rules, custom rules, spacing, time zones, and DST;
 - persist and synchronize occurrence outcomes, partial progress, corrections,
   missed behavior, and streak-neutral pauses;
 - make habit duration and remaining demand participate in deterministic day

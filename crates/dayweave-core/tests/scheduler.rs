@@ -1434,6 +1434,8 @@ fn habits_and_breaks_are_first_class_schedulable_work() {
             unit: "steps".to_owned(),
         }),
         preserves_streak_when_paused: true,
+        missed_policy: HabitMissedPolicy::Ask,
+        minimum_spacing: Minutes::ZERO,
     });
     let mut rest = item(76, "Lunch break", 30);
     rest.kind = ItemKind::Break(BreakSpec {

@@ -78,6 +78,8 @@ enum ItemKindShape {
         recurrence: IgnoredAny,
         target: Option<IgnoredAny>,
         preserves_streak_when_paused: IgnoredAny,
+        missed_policy: Option<IgnoredAny>,
+        minimum_spacing: Option<IgnoredAny>,
     },
     Routine {
         ordered: IgnoredAny,

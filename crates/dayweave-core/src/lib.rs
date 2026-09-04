@@ -5,11 +5,13 @@
 //! [`SchedulePlan`], which makes offline planning and cross-device conflict
 //! resolution reproducible.
 
+mod custom_recurrence;
 mod domain;
 mod habits;
 mod recurrence;
 mod scheduler;
 
+pub use custom_recurrence::*;
 pub use domain::*;
 pub use habits::*;
 pub use recurrence::*;
