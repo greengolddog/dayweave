@@ -516,19 +516,6 @@ impl Scheduler {
                 });
                 continue;
             }
-            if item.status == crate::WorkStatus::Blocked {
-                state.unscheduled.push(UnscheduledWork {
-                    item_id: item.id,
-                    occurrence_id: None,
-                    remaining: item
-                        .duration
-                        .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes),
-                    reason: UnscheduledReason::Blocked,
-                    message: "Blocked work waits in the plan until its blocker is resolved."
-                        .to_owned(),
-                });
-                continue;
-            }
             let has_children = children
                 .get(&item.id)
                 .is_some_and(|value| !value.is_empty());
@@ -538,6 +525,19 @@ impl Scheduler {
                     occurrence_id: None,
                     kind: DecisionKind::ContainerRolledUp,
                     message: "This parent is represented by its schedulable leaf descendants."
+                        .to_owned(),
+                });
+                continue;
+            }
+            if item.status == crate::WorkStatus::Blocked {
+                state.unscheduled.push(UnscheduledWork {
+                    item_id: item.id,
+                    occurrence_id: None,
+                    remaining: item
+                        .duration
+                        .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes),
+                    reason: UnscheduledReason::Blocked,
+                    message: "Blocked work waits in the plan until its blocker is resolved."
                         .to_owned(),
                 });
                 continue;
@@ -1179,6 +1179,7 @@ fn validate_defer_materialized_target(
         .is_some_and(|children| !children.is_empty());
     if matches!(item.kind, ItemKind::CalendarEvent(_))
         || item.status.is_terminal()
+        || item.status == crate::WorkStatus::Blocked
         || !item.occupies_time(has_children)
     {
         return Err(invalid_defer_candidate(
@@ -1629,7 +1630,7 @@ fn assess_manual_placement_targets(
             {
                 if items
                     .get(&dependency.item_id)
-                    .is_some_and(|predecessor| predecessor.status.is_terminal())
+                    .is_some_and(|predecessor| predecessor.status.satisfies_prerequisite())
                 {
                     continue;
                 }
@@ -1642,19 +1643,16 @@ fn assess_manual_placement_targets(
                     .unscheduled
                     .iter()
                     .any(|work| work.item_id == dependency.item_id && !work.remaining.is_zero());
-                let satisfied = if predecessor_blocks.is_empty() || predecessor_has_remaining_work {
+                let predecessor = items.get(&dependency.item_id).copied();
+                let predecessor_is_unavailable = predecessor.is_some_and(|predecessor| {
+                    predecessor.status.is_terminal()
+                        || predecessor.status == crate::WorkStatus::Blocked
+                });
+                let satisfied = if predecessor_has_remaining_work || predecessor_is_unavailable {
                     false
-                } else {
-                    let predecessor_start = predecessor_blocks
-                        .iter()
-                        .map(|block| block.start)
-                        .min()
-                        .expect("non-empty predecessor blocks");
-                    let predecessor_end = predecessor_blocks
-                        .iter()
-                        .map(|block| block.end)
-                        .max()
-                        .expect("non-empty predecessor blocks");
+                } else if let Some((predecessor_start, predecessor_end)) =
+                    dependency_predecessor_bounds(predecessor, predecessor_blocks.iter().copied())
+                {
                     let Some((observed, required)) = dependency_boundary(
                         dependency,
                         interval,
@@ -1667,6 +1665,8 @@ fn assess_manual_placement_targets(
                         ));
                     };
                     observed >= required
+                } else {
+                    false
                 };
                 if !satisfied {
                     push(
@@ -2049,6 +2049,16 @@ impl PlanningState {
             let ItemKind::CalendarEvent(event) = &item.kind else {
                 continue;
             };
+            if item.status.is_terminal() || item.status == crate::WorkStatus::Blocked {
+                self.decisions.push(PlanDecision {
+                    item_id: item.id,
+                    occurrence_id: None,
+                    kind: DecisionKind::TerminalItemIgnored,
+                    message: "Completed, skipped, canceled, or blocked events do not reserve future time."
+                        .to_owned(),
+                });
+                continue;
+            }
             let interval = Interval {
                 start: event.start,
                 end: event.end,
@@ -2895,15 +2905,15 @@ impl PlanningState {
     ) -> bool {
         for dependency in dependencies {
             let predecessor = all_items.get(&dependency.item_id).copied();
-            if predecessor.is_some_and(|value| value.status.is_terminal()) {
+            if predecessor.is_some_and(|value| value.status.satisfies_prerequisite()) {
                 continue;
             }
-            let mut blocks = self
-                .blocks
-                .iter()
-                .filter(|block| block.item_id == Some(dependency.item_id));
-            let first = blocks.next();
-            let Some(first) = first else {
+            let Some((predecessor_start, predecessor_end)) = dependency_predecessor_bounds(
+                predecessor,
+                self.blocks
+                    .iter()
+                    .filter(|block| block.item_id == Some(dependency.item_id)),
+            ) else {
                 if dependency.strength.is_hard() {
                     return false;
                 }
@@ -2920,12 +2930,6 @@ impl PlanningState {
                 );
                 continue;
             };
-            let mut predecessor_start = first.start;
-            let mut predecessor_end = first.end;
-            for block in blocks {
-                predecessor_start = predecessor_start.min(block.start);
-                predecessor_end = predecessor_end.max(block.end);
-            }
             let boundary =
                 dependency_boundary(dependency, interval, predecessor_start, predecessor_end);
             let satisfied = boundary.is_some_and(|(observed, required)| observed >= required);
@@ -3202,7 +3206,7 @@ fn validate_request(request: &PlanRequest) -> Result<(), ScheduleError> {
         if let Some(duration) = item.duration {
             duration
                 .validate()
-                .map_err(|message| invalid_item(item.id, message))?;
+                .map_err(|error| invalid_item(item.id, error.to_string()))?;
         }
         if item.title.trim().is_empty() {
             return Err(invalid_item(item.id, "title cannot be empty"));
@@ -3255,21 +3259,30 @@ fn validate_previous_assignments(
                 "previous assignment identity is duplicated",
             ));
         }
-        if let Some(placement_id) = assignment.manual_placement_id {
+        if assignment.pinned || assignment.manual_placement_id.is_some() {
             let item = by_id[&assignment.item_id];
             let has_children = children
                 .get(&item.id)
                 .is_some_and(|children| !children.is_empty());
-            if placement_id.is_nil()
-                || !assignment.pinned
-                || assignment.blocks.is_empty()
-                || matches!(item.kind, ItemKind::CalendarEvent(_))
+            let target_is_not_executable = matches!(item.kind, ItemKind::CalendarEvent(_))
                 || item.status.is_terminal()
-                || !item.occupies_time(has_children)
-            {
+                || item.status == crate::WorkStatus::Blocked
+                || !item.occupies_time(has_children);
+            if let Some(placement_id) = assignment.manual_placement_id {
+                if placement_id.is_nil()
+                    || !assignment.pinned
+                    || assignment.blocks.is_empty()
+                    || target_is_not_executable
+                {
+                    return Err(invalid_item(
+                        assignment.item_id,
+                        "manual placement must pin non-empty executable work",
+                    ));
+                }
+            } else if target_is_not_executable {
                 return Err(invalid_item(
                     assignment.item_id,
-                    "manual placement must pin non-empty executable work",
+                    "pinned assignment must identify executable work",
                 ));
             }
         }
@@ -3527,6 +3540,11 @@ fn validate_constraints(item: &WorkItem) -> Result<(), ScheduleError> {
             "buffer strength requires a non-zero before or after buffer",
         ));
     }
+    for dependency in &item.constraints.dependencies {
+        dependency
+            .validate(Some(item.id))
+            .map_err(|error| invalid_item(item.id, error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -3670,7 +3688,7 @@ fn kind_rank(item: &WorkItem) -> u8 {
     match item.kind {
         ItemKind::Habit(_) | ItemKind::Routine(_) | ItemKind::RecurringTask(_) => 1,
         ItemKind::Break(_) => 2,
-        ItemKind::Task | ItemKind::Goal(_) => 3,
+        ItemKind::Task | ItemKind::Project | ItemKind::Goal(_) => 3,
         ItemKind::CalendarEvent(_) => 4,
     }
 }
@@ -3685,10 +3703,16 @@ fn hard_dependency_unavailable(
             return false;
         }
         match items.get(&dependency.item_id) {
-            Some(item) if item.status.is_terminal() => false,
+            Some(item) if item.status.satisfies_prerequisite() => false,
+            Some(item) if item.status.is_terminal() => true,
+            Some(item) if item.status == crate::WorkStatus::Blocked => true,
+            // Calendar events are fixed predecessors rather than planned
+            // outcomes. Their concrete blocks are evaluated by the relation
+            // constraint below, so absence from `outcomes` is intentional.
+            Some(item) if matches!(item.kind, ItemKind::CalendarEvent(_)) => false,
             Some(_) => outcomes
                 .get(&dependency.item_id)
-                .is_some_and(|success| !success),
+                .is_none_or(|success| !success),
             None => true,
         }
     })
@@ -3885,6 +3909,24 @@ fn dependency_boundary(
     predecessor
         .checked_add(Duration::minutes(i64::from(dependency.minimum_lag.get())))
         .map(|required| (observed, required))
+}
+
+fn dependency_predecessor_bounds<'a>(
+    predecessor: Option<&WorkItem>,
+    blocks: impl IntoIterator<Item = &'a ScheduleBlock>,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let mut bounds: Option<(OffsetDateTime, OffsetDateTime)> = None;
+    for block in blocks {
+        bounds = Some(bounds.map_or((block.start, block.end), |(start, end)| {
+            (start.min(block.start), end.max(block.end))
+        }));
+    }
+    bounds.or_else(|| {
+        let ItemKind::CalendarEvent(event) = &predecessor?.kind else {
+            return None;
+        };
+        Some((event.start, event.end))
+    })
 }
 
 fn checked_buffered_interval(

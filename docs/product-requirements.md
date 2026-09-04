@@ -61,7 +61,7 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 ### 4.3 Hierarchy, goals, projects, routines, and dependencies
 
 - **HIE-001** Projects, tasks, and subtasks shall allow unlimited logical nesting with cycle prevention.
-- **HIE-002** Only leaf tasks shall create executable schedule demand. Parent duration and progress shall roll up from descendants.
+- **HIE-002** Only leaf execution components shall create flexible schedule demand. Tasks are executable by default; a leaf project, goal, or routine requires an explicit independent-effort component. Fixed events retain their own interval, and parent duration/progress roll-up shall never duplicate descendant demand.
 - **HIE-003** A parent may carry an explicit independent progress component in addition to child roll-up.
 - **HIE-004** A parent shall auto-complete when all required descendants complete, unless a user-visible manual override is active.
 - **HIE-005** Dependencies shall support finish-to-start at minimum and an extensible typed relation model. Every dependency shall be hard or soft.

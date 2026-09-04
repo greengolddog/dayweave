@@ -68,6 +68,8 @@ pub enum ItemRepositoryError {
     RevisionConflict { expected: u64, actual: u64 },
     #[error("parent item {0} was not found")]
     ParentNotFound(Uuid),
+    #[error("blocking item {0} was not found")]
+    BlockedByItemNotFound(Uuid),
     #[error("item cannot be its own parent")]
     SelfParent,
     #[error("item hierarchy would contain a cycle")]
@@ -220,29 +222,36 @@ impl ItemRepository for InMemoryItemRepository {
         item: Item,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        let mut guard = self.state.lock().await;
-        if let Some(replay) = replay(&mut guard, &idempotency) {
-            return replay;
+        if let Some(parent_id) = item.parent_id
+            && let Some(execution_guard) = &self.execution_guard
+        {
+            let _operation = execution_guard.operation_gate.lock().await;
+            {
+                let mut state = self.state.lock().await;
+                if let Some(replay) = replay(&mut state, &idempotency) {
+                    return replay;
+                }
+            }
+            let snapshot = execution_guard
+                .execution
+                .snapshot()
+                .await
+                .map_err(|_| ItemRepositoryError::Internal)?;
+            if let Some(session) = snapshot
+                .active_session
+                .filter(|session| session.item_id == parent_id)
+            {
+                return Err(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: parent_id,
+                    session_id: session.id,
+                });
+            }
+            let mut state = self.state.lock().await;
+            return create_memory(&mut state, item, idempotency);
         }
-        let mut state = guard.clone();
-        if state.items.contains_key(&item.id) {
-            return Err(ItemRepositoryError::Duplicate(item.id));
-        }
-        validate_parent(&state.items, item.id, item.parent_id)?;
-        state.items.insert(item.id, item.clone());
-        append_change(
-            &mut state,
-            DeltaChange::Upsert {
-                item: Box::new(item.clone()),
-            },
-        )?;
-        refresh_parents(&mut state, [item.parent_id], item.updated_at)?;
-        remember(&mut state, idempotency, item.clone());
-        *guard = state;
-        Ok(ItemMutation {
-            item,
-            replayed: false,
-        })
+
+        let mut state = self.state.lock().await;
+        create_memory(&mut state, item, idempotency)
     }
 
     async fn get(&self, id: Uuid, include_deleted: bool) -> Result<Item, ItemRepositoryError> {
@@ -287,11 +296,13 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        if replacement.status.is_terminal()
+        let may_close_self = replacement.status.prevents_execution()
+            || replacement.may_remove_executable_component();
+        if (may_close_self || replacement.parent_id.is_some())
             && let Some(execution_guard) = &self.execution_guard
         {
             let _operation = execution_guard.operation_gate.lock().await;
-            {
+            let previous_parent_id = {
                 let mut state = self.state.lock().await;
                 if let Some(replay) = replay(&mut state, &idempotency) {
                     return replay;
@@ -302,31 +313,30 @@ impl ItemRepository for InMemoryItemRepository {
                     .filter(|item| item.deleted_at.is_none())
                     .ok_or(ItemRepositoryError::NotFound(id))?;
                 ensure_revision(current, expected_revision)?;
-                if current.status.is_terminal() {
-                    return replace_memory(
-                        &mut state,
-                        id,
-                        expected_revision,
-                        replacement,
-                        now,
-                        idempotency,
-                    );
-                }
-            }
+                current.parent_id
+            };
 
             let snapshot = execution_guard
                 .execution
                 .snapshot()
                 .await
                 .map_err(|_| ItemRepositoryError::Internal)?;
-            if let Some(session) = snapshot
-                .active_session
-                .filter(|session| session.item_id == id)
-            {
-                return Err(ItemRepositoryError::ActiveExecutionConflict {
-                    item_id: id,
-                    session_id: session.id,
-                });
+            if let Some(session) = snapshot.active_session {
+                let conflicted_item = if may_close_self && session.item_id == id {
+                    Some(id)
+                } else if replacement.parent_id != previous_parent_id
+                    && replacement.parent_id == Some(session.item_id)
+                {
+                    Some(session.item_id)
+                } else {
+                    None
+                };
+                if let Some(item_id) = conflicted_item {
+                    return Err(ItemRepositoryError::ActiveExecutionConflict {
+                        item_id,
+                        session_id: session.id,
+                    });
+                }
             }
 
             let mut state = self.state.lock().await;
@@ -403,45 +413,43 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        let mut guard = self.state.lock().await;
-        if let Some(replay) = replay(&mut guard, &idempotency) {
-            return replay;
+        if let Some(execution_guard) = &self.execution_guard {
+            let _operation = execution_guard.operation_gate.lock().await;
+            let parent_id = {
+                let mut state = self.state.lock().await;
+                if let Some(replay) = replay(&mut state, &idempotency) {
+                    return replay;
+                }
+                let current = state
+                    .items
+                    .get(&id)
+                    .filter(|item| item.deleted_at.is_some())
+                    .ok_or(ItemRepositoryError::NotFound(id))?;
+                ensure_revision(current, expected_revision)?;
+                current.parent_id
+            };
+            if let Some(parent_id) = parent_id {
+                let snapshot = execution_guard
+                    .execution
+                    .snapshot()
+                    .await
+                    .map_err(|_| ItemRepositoryError::Internal)?;
+                if let Some(session) = snapshot
+                    .active_session
+                    .filter(|session| session.item_id == parent_id)
+                {
+                    return Err(ItemRepositoryError::ActiveExecutionConflict {
+                        item_id: parent_id,
+                        session_id: session.id,
+                    });
+                }
+            }
+            let mut state = self.state.lock().await;
+            return restore_memory(&mut state, id, expected_revision, now, idempotency);
         }
-        let mut state = guard.clone();
-        let current = state
-            .items
-            .get(&id)
-            .filter(|item| item.deleted_at.is_some())
-            .cloned()
-            .ok_or(ItemRepositoryError::NotFound(id))?;
-        ensure_revision(&current, expected_revision)?;
-        if current.parent_id.is_some_and(|parent_id| {
-            state
-                .items
-                .get(&parent_id)
-                .is_none_or(|parent| parent.deleted_at.is_some())
-        }) {
-            return Err(ItemRepositoryError::DeletedParent);
-        }
-        let mut item = current.restored(now)?;
-        item.is_executable = !has_active_children(id, &state.items);
-        if !item.is_executable && item.status.is_executing_state() {
-            return Err(ItemRepositoryError::NonLeafExecutable);
-        }
-        state.items.insert(id, item.clone());
-        append_change(
-            &mut state,
-            DeltaChange::Upsert {
-                item: Box::new(item.clone()),
-            },
-        )?;
-        refresh_parents(&mut state, [item.parent_id], item.updated_at)?;
-        remember(&mut state, idempotency, item.clone());
-        *guard = state;
-        Ok(ItemMutation {
-            item,
-            replayed: false,
-        })
+
+        let mut state = self.state.lock().await;
+        restore_memory(&mut state, id, expected_revision, now, idempotency)
     }
 
     async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError> {
@@ -480,6 +488,39 @@ impl ItemRepository for InMemoryItemRepository {
     }
 }
 
+fn create_memory(
+    state: &mut MemoryState,
+    mut item: Item,
+    idempotency: IdempotencyContext,
+) -> Result<ItemMutation, ItemRepositoryError> {
+    if let Some(replay) = replay(state, &idempotency) {
+        return replay;
+    }
+    let mut next = state.clone();
+    if next.items.contains_key(&item.id) {
+        return Err(ItemRepositoryError::Duplicate(item.id));
+    }
+    validate_parent(&next.items, item.id, item.parent_id)?;
+    validate_blocked_by(&next.items, item.blocked_by_item_id)?;
+    // The repository owns the topology-aware projection even when an internal
+    // adapter supplies a stale pre-structural value.
+    item.is_executable = item.execution_is_allowed(false);
+    next.items.insert(item.id, item.clone());
+    append_change(
+        &mut next,
+        DeltaChange::Upsert {
+            item: Box::new(item.clone()),
+        },
+    )?;
+    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
+    remember(&mut next, idempotency, item.clone());
+    *state = next;
+    Ok(ItemMutation {
+        item,
+        replayed: false,
+    })
+}
+
 fn replace_memory(
     state: &mut MemoryState,
     id: Uuid,
@@ -503,10 +544,12 @@ fn replace_memory(
     let previous_sibling_order = current.sibling_order;
     let mut item = current.replaced(replacement, now)?;
     validate_parent(&next.items, id, item.parent_id)?;
-    if has_active_children(id, &next.items) && item.status.is_executing_state() {
+    validate_blocked_by(&next.items, item.blocked_by_item_id)?;
+    let has_children = has_active_children(id, &next.items);
+    if has_children && item.status.is_executing_state() {
         return Err(ItemRepositoryError::NonLeafExecutable);
     }
-    item.is_executable = !has_active_children(id, &next.items);
+    item.is_executable = item.execution_is_allowed(has_children);
     next.items.insert(id, item.clone());
     append_change(
         &mut next,
@@ -521,6 +564,53 @@ fn replace_memory(
             item.updated_at,
         )?;
     }
+    remember(&mut next, idempotency, item.clone());
+    *state = next;
+    Ok(ItemMutation {
+        item,
+        replayed: false,
+    })
+}
+
+fn restore_memory(
+    state: &mut MemoryState,
+    id: Uuid,
+    expected_revision: u64,
+    now: DateTime<Utc>,
+    idempotency: IdempotencyContext,
+) -> Result<ItemMutation, ItemRepositoryError> {
+    if let Some(replay) = replay(state, &idempotency) {
+        return replay;
+    }
+    let mut next = state.clone();
+    let current = next
+        .items
+        .get(&id)
+        .filter(|item| item.deleted_at.is_some())
+        .cloned()
+        .ok_or(ItemRepositoryError::NotFound(id))?;
+    ensure_revision(&current, expected_revision)?;
+    if current.parent_id.is_some_and(|parent_id| {
+        next.items
+            .get(&parent_id)
+            .is_none_or(|parent| parent.deleted_at.is_some())
+    }) {
+        return Err(ItemRepositoryError::DeletedParent);
+    }
+    let mut item = current.restored(now)?;
+    let has_children = has_active_children(id, &next.items);
+    item.is_executable = item.execution_is_allowed(has_children);
+    if has_children && item.status.is_executing_state() {
+        return Err(ItemRepositoryError::NonLeafExecutable);
+    }
+    next.items.insert(id, item.clone());
+    append_change(
+        &mut next,
+        DeltaChange::Upsert {
+            item: Box::new(item.clone()),
+        },
+    )?;
+    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
     remember(&mut next, idempotency, item.clone());
     *state = next;
     Ok(ItemMutation {
@@ -605,6 +695,23 @@ fn validate_parent(
     Ok(())
 }
 
+/// A soft-deleted blocker remains a valid historical identity and can still
+/// explain why another item was blocked. Repositories never physically remove
+/// canonical rows, and `PostgreSQL`'s matching foreign key follows this rule.
+fn validate_blocked_by(
+    items: &HashMap<Uuid, Item>,
+    blocked_by_item_id: Option<Uuid>,
+) -> Result<(), ItemRepositoryError> {
+    if let Some(blocked_by_item_id) = blocked_by_item_id
+        && !items.contains_key(&blocked_by_item_id)
+    {
+        return Err(ItemRepositoryError::BlockedByItemNotFound(
+            blocked_by_item_id,
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_revision(item: &Item, expected: u64) -> Result<(), ItemRepositoryError> {
     if item.revision == expected {
         Ok(())
@@ -623,7 +730,7 @@ fn has_active_children(item_id: Uuid, items: &HashMap<Uuid, Item>) -> bool {
 }
 
 fn decorate(mut item: Item, items: &HashMap<Uuid, Item>) -> Item {
-    item.is_executable = item.deleted_at.is_none() && !has_active_children(item.id, items);
+    item.is_executable = item.execution_is_allowed(has_active_children(item.id, items));
     item
 }
 
@@ -643,7 +750,7 @@ fn refresh_parents(
             .cloned()
             .ok_or(ItemRepositoryError::ParentNotFound(parent_id))?;
         let parent =
-            parent.refreshed_execution(!has_active_children(parent_id, &state.items), now)?;
+            parent.refreshed_execution(has_active_children(parent_id, &state.items), now)?;
         state.items.insert(parent_id, parent.clone());
         append_change(
             state,
@@ -709,7 +816,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::items::{ItemKind, ItemStatus, NewItem, SplitPolicy};
+    use crate::items::{BlockedReasonKind, ItemKind, ItemStatus, NewItem, SplitPolicy};
 
     fn new_item(id: Uuid, title: &str, parent_id: Option<Uuid>, order: u32) -> Item {
         Item::new(
@@ -721,16 +828,28 @@ mod tests {
                 title: title.to_owned(),
                 notes: None,
                 timezone_name: "Europe/Madrid".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(1800),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: None,
                 recurrence: None,
                 flexible_constraints: json!({}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 50,
                 urgency: 40,
                 parent_id,
                 sibling_order: order,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             Utc::now(),
         )
@@ -754,16 +873,28 @@ mod tests {
             title: item.title.clone(),
             notes: item.notes.clone(),
             timezone_name: item.timezone_name.clone(),
+            duration_kind: Some(item.duration_kind),
             duration_seconds: item.duration_seconds,
+            duration_min_seconds: item.duration_min_seconds,
+            duration_max_seconds: item.duration_max_seconds,
+            duration_source: item.duration_source,
+            deadline_kind: Some(item.deadline_kind),
+            deadline_date: item.deadline_date,
             deadline_at: item.deadline_at,
+            deadline_strength: item.deadline_strength,
+            deadline_soft_weight: item.deadline_soft_weight,
             earliest_start_at: item.earliest_start_at,
             recurrence: item.recurrence.clone(),
             flexible_constraints: item.flexible_constraints.clone(),
+            has_own_effort: Some(item.has_own_effort),
             split_policy: item.split_policy.clone(),
             importance: item.importance,
             urgency: item.urgency,
             parent_id,
             sibling_order: item.sibling_order,
+            blocked_reason_kind: item.blocked_reason_kind,
+            blocked_by_item_id: item.blocked_by_item_id,
+            blocked_reason: item.blocked_reason.clone(),
         }
     }
 
@@ -828,6 +959,43 @@ mod tests {
                     if item.id == child_id && item.revision == 2 && !item.is_executable
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn semantic_container_projection_requires_explicit_own_effort() {
+        let repository = InMemoryItemRepository::default();
+        for (marker, kind) in [
+            (11, ItemKind::Project),
+            (12, ItemKind::Goal),
+            (13, ItemKind::Routine),
+        ] {
+            // Simulate a direct adapter caller carrying the pre-structural
+            // hierarchy-only projection. The repository remains authoritative.
+            let mut item = new_item(
+                Uuid::from_u128(u128::from(marker)),
+                "Semantic container",
+                None,
+                0,
+            );
+            item.kind = kind;
+            item.has_own_effort = false;
+            item.is_executable = true;
+            let created = repository
+                .create(
+                    item,
+                    idempotency("items.create", &format!("container-{marker}"), marker),
+                )
+                .await
+                .expect("create semantic container");
+            assert!(!created.item.is_executable, "{kind:?} is not executable");
+            assert!(
+                !repository
+                    .get(created.item.id, false)
+                    .await
+                    .expect("read semantic container")
+                    .is_executable
+            );
+        }
     }
 
     #[tokio::test]
@@ -901,5 +1069,89 @@ mod tests {
         let tail = repository.delta(delta.watermark, 10).await.unwrap();
         assert_eq!(tail.changes.len(), 1);
         assert!(matches!(tail.changes[0], DeltaChange::Upsert { .. }));
+    }
+
+    #[tokio::test]
+    async fn dependency_blockers_require_an_existing_identity_and_retain_trashed_history() {
+        let repository = InMemoryItemRepository::default();
+        let missing_id = Uuid::new_v4();
+        let mut missing_blocker = new_item(Uuid::new_v4(), "Blocked", None, 0);
+        missing_blocker.status = ItemStatus::Blocked;
+        missing_blocker.blocked_reason_kind = Some(BlockedReasonKind::Dependency);
+        missing_blocker.blocked_by_item_id = Some(missing_id);
+        let error = repository
+            .create(
+                missing_blocker,
+                idempotency("items.create", "missing-blocker", 1),
+            )
+            .await
+            .expect_err("missing blocker identity must fail");
+        assert_eq!(
+            error,
+            ItemRepositoryError::BlockedByItemNotFound(missing_id)
+        );
+
+        let replace_id = Uuid::new_v4();
+        let replace_current = new_item(replace_id, "Replace target", None, 0);
+        repository
+            .create(
+                replace_current.clone(),
+                idempotency("items.create", "replace-target", 2),
+            )
+            .await
+            .unwrap();
+        let mut replace = replacement(&replace_current, None, ItemStatus::Blocked);
+        replace.blocked_reason_kind = Some(BlockedReasonKind::Dependency);
+        replace.blocked_by_item_id = Some(missing_id);
+        let error = repository
+            .replace(
+                replace_id,
+                1,
+                replace,
+                Utc::now(),
+                idempotency("items.replace", "missing-replacement-blocker", 3),
+            )
+            .await
+            .expect_err("replacement must validate blocker identity");
+        assert_eq!(
+            error,
+            ItemRepositoryError::BlockedByItemNotFound(missing_id)
+        );
+
+        let blocker_id = Uuid::new_v4();
+        let prerequisite = new_item(blocker_id, "Prerequisite", None, 0);
+        repository
+            .create(prerequisite, idempotency("items.create", "blocker-item", 4))
+            .await
+            .unwrap();
+        let mut dependent = new_item(Uuid::new_v4(), "Dependent", None, 0);
+        dependent.status = ItemStatus::Blocked;
+        dependent.blocked_reason_kind = Some(BlockedReasonKind::Dependency);
+        dependent.blocked_by_item_id = Some(blocker_id);
+        repository
+            .create(dependent, idempotency("items.create", "valid-blocker", 5))
+            .await
+            .expect("existing blocker identity");
+        repository
+            .trash(
+                blocker_id,
+                1,
+                Utc::now(),
+                idempotency("items.delete", "trash-blocker", 6),
+            )
+            .await
+            .expect("soft-delete preserves canonical identity");
+
+        let mut historical = new_item(Uuid::new_v4(), "Historical blocker", None, 0);
+        historical.status = ItemStatus::Blocked;
+        historical.blocked_reason_kind = Some(BlockedReasonKind::Dependency);
+        historical.blocked_by_item_id = Some(blocker_id);
+        repository
+            .create(
+                historical,
+                idempotency("items.create", "trashed-blocker", 7),
+            )
+            .await
+            .expect("trashed blocker remains a resolvable historical identity");
     }
 }

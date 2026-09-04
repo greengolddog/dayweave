@@ -1312,7 +1312,9 @@ impl ScheduleQueryPort for PostgresSchedulingRepository {
             let title: String = row.try_get("title").map_err(storage_port)?;
             let status: String = row.try_get("status").map_err(storage_port)?;
             let kind: String = row.try_get("kind").map_err(storage_port)?;
-            let project_id: Option<Uuid> = row.try_get("parent_item_id").map_err(storage_port)?;
+            let project_id: Option<Uuid> = row.try_get("project_id").map_err(storage_port)?;
+            let project_ids: Option<Vec<Uuid>> =
+                row.try_get("project_ids").map_err(storage_port)?;
             let constraints: Value = row
                 .try_get("scheduling_constraints")
                 .map_err(storage_port)?;
@@ -1325,7 +1327,11 @@ impl ScheduleQueryPort for PostgresSchedulingRepository {
                 && query.status.as_ref().is_none_or(|value| value == &status)
                 && query.kind.as_ref().is_none_or(|value| value == &kind)
                 && requested_project_id.as_ref().is_none_or(|value| {
-                    project_id.map(|id| id.to_string()).as_ref() == Some(value)
+                    project_ids
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|id| id.to_string() == *value)
                 })
                 && requested_goal_id
                     .as_ref()
@@ -1349,6 +1355,14 @@ impl ScheduleQueryPort for PostgresSchedulingRepository {
                 .filter(|value| goal_ids.contains(*value))
                 .cloned()
                 .or_else(|| goal_ids.first().cloned());
+            let blocked_by_item_id: Option<Uuid> =
+                row.try_get("blocked_by_item_id").map_err(storage_port)?;
+            let blocked_by_effective_sensitive: bool = row
+                .try_get("blocked_by_effective_sensitive")
+                .map_err(storage_port)?;
+            let visible_blocked_by_item_id = blocked_by_item_id
+                .filter(|_| access.include_sensitive || !blocked_by_effective_sensitive)
+                .map(|id| id.to_string());
             items.push(ItemSummary {
                 id: row
                     .try_get::<Uuid, _>("id")
@@ -1359,6 +1373,20 @@ impl ScheduleQueryPort for PostgresSchedulingRepository {
                 kind,
                 project_id: project_id.map(|id| id.to_string()),
                 goal_id,
+                duration_kind: row.try_get("duration_kind").map_err(storage_port)?,
+                duration_seconds: optional_u32(&row, "duration_seconds")?,
+                duration_min_seconds: optional_u32(&row, "duration_min_seconds")?,
+                duration_max_seconds: optional_u32(&row, "duration_max_seconds")?,
+                duration_source: row.try_get("duration_source").map_err(storage_port)?,
+                deadline_kind: row.try_get("deadline_kind").map_err(storage_port)?,
+                deadline_date: row.try_get("deadline_date").map_err(storage_port)?,
+                deadline_at: row.try_get("deadline_at").map_err(storage_port)?,
+                deadline_strength: row.try_get("deadline_strength").map_err(storage_port)?,
+                deadline_soft_weight: optional_u32(&row, "deadline_soft_weight")?,
+                has_own_effort: row.try_get("has_own_effort").map_err(storage_port)?,
+                blocked_reason_kind: row.try_get("blocked_reason_kind").map_err(storage_port)?,
+                blocked_by_item_id: visible_blocked_by_item_id,
+                blocked_reason: row.try_get("blocked_reason").map_err(storage_port)?,
                 deadline: row.try_get("deadline_at").map_err(storage_port)?,
                 scheduled_start,
             });
@@ -2756,7 +2784,8 @@ pub(crate) async fn authoritative_planning_evidence_tx(
            AND consumption.source_deferred_session_id IS NULL \
            AND item.trashed_at IS NULL \
            AND item.execution_epoch = claim.execution_epoch \
-           AND item.status NOT IN ('completed', 'skipped', 'cancelled') \
+           AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+           AND (item.kind NOT IN ('project', 'goal', 'routine') OR item.has_own_effort) \
            AND NOT EXISTS ( \
                SELECT 1 FROM item_hierarchy AS edge \
                JOIN items AS child ON child.workspace_id = edge.workspace_id \
@@ -3403,7 +3432,8 @@ async fn required_defer_replacement_placements_tx(
            AND consumption.source_deferred_session_id IS NULL \
            AND item.trashed_at IS NULL \
            AND item.execution_epoch = claim.execution_epoch \
-           AND item.status NOT IN ('completed', 'skipped', 'cancelled') \
+           AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+           AND (item.kind NOT IN ('project', 'goal', 'routine') OR item.has_own_effort) \
            AND NOT EXISTS ( \
                SELECT 1 FROM item_hierarchy AS edge \
                JOIN items AS child ON child.workspace_id = edge.workspace_id \
@@ -4378,7 +4408,7 @@ async fn search_item_rows(
         "WITH RECURSIVE sensitivity AS ( \
            SELECT item.id, item.is_sensitive AS effective_sensitive, ARRAY[item.id]::uuid[] AS path \
            FROM items AS item \
-           WHERE item.workspace_id = $1 AND item.trashed_at IS NULL \
+           WHERE item.workspace_id = $1 \
              AND NOT EXISTS (SELECT 1 FROM item_hierarchy AS edge \
                WHERE edge.workspace_id = item.workspace_id AND edge.child_item_id = item.id) \
            UNION ALL \
@@ -4386,20 +4416,52 @@ async fn search_item_rows(
            FROM sensitivity AS parent \
            JOIN item_hierarchy AS edge ON edge.workspace_id = $1 AND edge.parent_item_id = parent.id \
            JOIN items AS child ON child.workspace_id = edge.workspace_id \
-             AND child.id = edge.child_item_id AND child.trashed_at IS NULL \
+             AND child.id = edge.child_item_id \
            WHERE cardinality(parent.path) <= 10000 AND NOT child.id = ANY(parent.path) \
+         ), ancestry AS ( \
+           SELECT edge.child_item_id AS descendant_id, edge.parent_item_id AS ancestor_id, \
+             1 AS depth, ARRAY[edge.child_item_id, edge.parent_item_id]::uuid[] AS path \
+           FROM item_hierarchy AS edge WHERE edge.workspace_id = $1 \
+           UNION ALL \
+           SELECT ancestry.descendant_id, edge.parent_item_id, ancestry.depth + 1, \
+             ancestry.path || edge.parent_item_id \
+           FROM ancestry \
+           JOIN item_hierarchy AS edge ON edge.workspace_id = $1 \
+             AND edge.child_item_id = ancestry.ancestor_id \
+           WHERE cardinality(ancestry.path) <= 10000 \
+             AND NOT edge.parent_item_id = ANY(ancestry.path) \
+         ), project_ancestry AS ( \
+           SELECT ancestry.descendant_id, \
+             (array_agg(ancestry.ancestor_id ORDER BY ancestry.depth) \
+               FILTER (WHERE ancestor.kind = 'project' AND ancestor.trashed_at IS NULL))[1] \
+                 AS project_id, \
+             COALESCE(array_agg(ancestry.ancestor_id ORDER BY ancestry.depth) \
+               FILTER (WHERE ancestor.kind = 'project' AND ancestor.trashed_at IS NULL), \
+               ARRAY[]::uuid[]) AS project_ids \
+           FROM ancestry \
+           JOIN items AS ancestor ON ancestor.workspace_id = $1 \
+             AND ancestor.id = ancestry.ancestor_id \
+           GROUP BY ancestry.descendant_id \
          ), scheduled AS ( \
            SELECT item_id, MIN(starts_at) AS scheduled_start FROM schedule_blocks \
            WHERE workspace_id = $1 AND schedule_revision_id = $2 AND item_id IS NOT NULL \
            GROUP BY item_id \
          ) \
-         SELECT item.id, item.title, item.status, item.kind, item.deadline_at, \
-           item.scheduling_constraints, edge.parent_item_id, scheduled.scheduled_start, \
-           COALESCE(sensitivity.effective_sensitive, true) AS effective_sensitive \
+         SELECT item.id, item.title, item.status, item.kind, item.duration_kind, \
+           item.duration_seconds, item.duration_min_seconds, item.duration_max_seconds, \
+           item.duration_source, item.deadline_kind, item.deadline_date, item.deadline_at, \
+           item.deadline_strength, item.deadline_soft_weight, item.has_own_effort, \
+           item.blocked_reason_kind, item.blocked_by_item_id, item.blocked_reason, \
+           item.scheduling_constraints, project_ancestry.project_id, \
+           project_ancestry.project_ids, scheduled.scheduled_start, \
+           COALESCE(sensitivity.effective_sensitive, true) AS effective_sensitive, \
+           COALESCE(blocker_sensitivity.effective_sensitive, true) \
+             AS blocked_by_effective_sensitive \
          FROM items AS item \
          LEFT JOIN sensitivity ON sensitivity.id = item.id \
-         LEFT JOIN item_hierarchy AS edge ON edge.workspace_id = item.workspace_id \
-           AND edge.child_item_id = item.id \
+         LEFT JOIN sensitivity AS blocker_sensitivity \
+           ON blocker_sensitivity.id = item.blocked_by_item_id \
+         LEFT JOIN project_ancestry ON project_ancestry.descendant_id = item.id \
          LEFT JOIN scheduled ON scheduled.item_id = item.id \
          WHERE item.workspace_id = $1 AND item.trashed_at IS NULL \
          ORDER BY item.title, item.id LIMIT 10001",
@@ -5094,6 +5156,17 @@ fn encode_hex(value: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+fn optional_u32(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<Option<u32>, SchedulingPortError> {
+    row.try_get::<Option<i32>, _>(column)
+        .map_err(storage_port)?
+        .map(u32::try_from)
+        .transpose()
+        .map_err(storage_port)
 }
 
 fn storage_port(_error: impl std::fmt::Debug) -> SchedulingPortError {

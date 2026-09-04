@@ -485,6 +485,10 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
             ApiError::validation("parent item was not found")
                 .with_details(json!({ "parent_id": id }))
         }
+        ItemServiceError::Repository(ItemRepositoryError::BlockedByItemNotFound(id)) => {
+            ApiError::validation("blocking item was not found")
+                .with_details(json!({ "blocked_by_item_id": id }))
+        }
         ItemServiceError::Repository(ItemRepositoryError::RevisionConflict {
             expected,
             actual,
@@ -528,5 +532,57 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
         ItemServiceError::InvalidCursor => ApiError::validation("delta cursor is invalid"),
         ItemServiceError::Repository(ItemRepositoryError::Internal)
         | ItemServiceError::Internal => ApiError::internal(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    const LEGACY_CREATE_JSON: &str = r#"{"id":"00000000-0000-0000-0000-000000000001","is_sensitive":false,"kind":"task","status":"planned","title":"Legacy","notes":null,"timezone_name":"UTC","duration_seconds":3600,"deadline_at":"2026-09-03T12:00:00Z","earliest_start_at":null,"recurrence":null,"flexible_constraints":{},"split_policy":{"type":"indivisible"},"importance":1,"urgency":2,"parent_id":null,"sibling_order":0}"#;
+    const LEGACY_REPLACE_JSON: &str = r#"{"expected_revision":7,"item":{"is_sensitive":false,"kind":"task","status":"planned","title":"Legacy","notes":null,"timezone_name":"UTC","duration_seconds":3600,"deadline_at":"2026-09-03T12:00:00Z","earliest_start_at":null,"recurrence":null,"flexible_constraints":{},"split_policy":{"type":"indivisible"},"importance":1,"urgency":2,"parent_id":null,"sibling_order":0}}"#;
+
+    #[test]
+    fn legacy_item_request_keeps_its_pre_structural_fingerprint() {
+        let request: NewItem =
+            serde_json::from_str(LEGACY_CREATE_JSON).expect("frozen legacy request");
+        let serialized = serde_json::to_vec(&request).expect("serialize request");
+        assert_eq!(serialized, LEGACY_CREATE_JSON.as_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("legacy-create-key"),
+        );
+        let actual = idempotency(&headers, "items.create", None, &request)
+            .expect("legacy idempotency fingerprint");
+        let mut expected = Sha256::new();
+        expected.update(b"items.create");
+        expected.update(LEGACY_CREATE_JSON.as_bytes());
+        assert_eq!(actual.fingerprint, <[u8; 32]>::from(expected.finalize()));
+    }
+
+    #[test]
+    fn legacy_replace_request_keeps_its_pre_structural_fingerprint() {
+        let request: ReplaceItemRequest =
+            serde_json::from_str(LEGACY_REPLACE_JSON).expect("frozen legacy replacement");
+        let serialized = serde_json::to_vec(&request).expect("serialize replacement");
+        assert_eq!(serialized, LEGACY_REPLACE_JSON.as_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("legacy-replace-key"),
+        );
+        let item_id = Uuid::from_u128(1);
+        let actual = idempotency(&headers, "items.replace", Some(item_id), &request)
+            .expect("legacy replacement fingerprint");
+        let mut expected = Sha256::new();
+        expected.update(b"items.replace");
+        expected.update(item_id.as_bytes());
+        expected.update(LEGACY_REPLACE_JSON.as_bytes());
+        assert_eq!(actual.fingerprint, <[u8; 32]>::from(expected.finalize()));
     }
 }

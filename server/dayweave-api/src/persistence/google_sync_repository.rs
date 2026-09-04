@@ -41,7 +41,11 @@ use crate::{
         schedule_publication_desired_set_hash, schedule_publication_intent_hash,
         schedule_publication_preview_hash, schedule_publication_slot_id,
     },
-    items::{Item, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy},
+    items::{
+        BlockedReasonKind, DeadlineKind, DeadlineStrength, DurationKind, DurationSource, Item,
+        ItemKind, ItemRepositoryError, ItemStatus, ItemTombstone, NewItem, ReplaceItem,
+        SplitPolicy,
+    },
     scheduling::{
         assert_current_calendar_projection, assert_current_item_snapshot,
         assert_current_planning_policy_tx, published_planning_policy_tx,
@@ -8000,26 +8004,46 @@ async fn apply_calendar_occurrence_change(
         title: candidate.title,
         notes: candidate.notes,
         timezone_name: candidate.timezone_name,
+        duration_kind: Some(candidate.duration_kind),
         duration_seconds: candidate.duration_seconds,
+        duration_min_seconds: candidate.duration_min_seconds,
+        duration_max_seconds: candidate.duration_max_seconds,
+        duration_source: candidate.duration_source,
+        deadline_kind: Some(candidate.deadline_kind),
+        deadline_date: candidate.deadline_date,
         deadline_at: candidate.deadline_at,
+        deadline_strength: candidate.deadline_strength,
+        deadline_soft_weight: candidate.deadline_soft_weight,
         earliest_start_at: candidate.earliest_start_at,
         recurrence: candidate.recurrence,
         flexible_constraints: candidate.flexible_constraints,
+        has_own_effort: Some(candidate.has_own_effort),
         split_policy: candidate.split_policy,
         importance: candidate.importance,
         urgency: candidate.urgency,
         parent_id: current.parent_id,
         sibling_order: current.sibling_order,
+        blocked_reason_kind: candidate.blocked_reason_kind,
+        blocked_by_item_id: candidate.blocked_by_item_id,
+        blocked_reason: candidate.blocked_reason,
     };
     let mut updated = current
         .replaced(replacement, now)
         .map_err(|_| GoogleSyncRepositoryError::Internal)?;
     if restored {
         updated.deleted_at = None;
+        validate_google_parent_for_restored_child(
+            transaction,
+            scope.workspace_id,
+            updated.id,
+            updated.parent_id,
+        )
+        .await?;
     }
     reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
         .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
+    let updated = fetch_import_item(transaction, scope.workspace_id, updated.id).await?;
     record_import_mutation(
         transaction,
         scope,
@@ -8036,6 +8060,9 @@ async fn apply_calendar_occurrence_change(
         now,
     )
     .await?;
+    if restored {
+        refresh_google_parents(transaction, scope, [updated.parent_id], now).await?;
+    }
     update_calendar_occurrence_mapping(
         transaction,
         mapping_id,
@@ -8445,6 +8472,7 @@ async fn trash_projected_item(
         now,
     )
     .await?;
+    refresh_google_parents(transaction, scope, [deleted.parent_id], now).await?;
     Ok(ImportOutcome::Deleted)
 }
 
@@ -8980,7 +9008,10 @@ async fn apply_remote_delete(
         return Ok(ImportOutcome::Unchanged);
     };
     let row = sqlx::query(
-        "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2 FOR UPDATE",
+        "SELECT item.revision, item.trashed_at, hierarchy.parent_item_id \
+         FROM items AS item LEFT JOIN item_hierarchy AS hierarchy \
+           ON hierarchy.workspace_id = item.workspace_id AND hierarchy.child_item_id = item.id \
+         WHERE item.workspace_id = $1 AND item.id = $2 FOR UPDATE OF item",
     )
     .bind(scope.workspace_id)
     .bind(local_id)
@@ -9015,6 +9046,7 @@ async fn apply_remote_delete(
         return Ok(ImportOutcome::Conflict);
     }
     let already_deleted: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
+    let parent_id: Option<Uuid> = row.try_get("parent_item_id").map_err(internal)?;
     let next_revision = if already_deleted.is_some() {
         actual
     } else {
@@ -9038,7 +9070,7 @@ async fn apply_remote_delete(
             id: local_id,
             revision: i64_to_u64(next)?,
             deleted_at: now,
-            parent_id: None,
+            parent_id,
         };
         record_import_mutation(
             transaction,
@@ -9052,6 +9084,7 @@ async fn apply_remote_delete(
             now,
         )
         .await?;
+        refresh_google_parents(transaction, scope, [parent_id], now).await?;
         next
     };
     update_mapping_remote(
@@ -9339,16 +9372,28 @@ async fn apply_remote_upsert(
         title: candidate.title,
         notes: candidate.notes,
         timezone_name: candidate.timezone_name,
+        duration_kind: Some(candidate.duration_kind),
         duration_seconds: candidate.duration_seconds,
+        duration_min_seconds: candidate.duration_min_seconds,
+        duration_max_seconds: candidate.duration_max_seconds,
+        duration_source: candidate.duration_source,
+        deadline_kind: Some(candidate.deadline_kind),
+        deadline_date: candidate.deadline_date,
         deadline_at: candidate.deadline_at,
+        deadline_strength: candidate.deadline_strength,
+        deadline_soft_weight: candidate.deadline_soft_weight,
         earliest_start_at: candidate.earliest_start_at,
         recurrence: candidate.recurrence,
         flexible_constraints: candidate.flexible_constraints,
+        has_own_effort: Some(candidate.has_own_effort),
         split_policy: candidate.split_policy,
         importance: candidate.importance,
         urgency: candidate.urgency,
         parent_id: current.parent_id,
         sibling_order: current.sibling_order,
+        blocked_reason_kind: candidate.blocked_reason_kind,
+        blocked_by_item_id: candidate.blocked_by_item_id,
+        blocked_reason: candidate.blocked_reason,
     };
     let restored = current.deleted_at.is_some();
     let mut updated = current
@@ -9356,10 +9401,18 @@ async fn apply_remote_upsert(
         .map_err(|_| GoogleSyncRepositoryError::Internal)?;
     if restored {
         updated.deleted_at = None;
+        validate_google_parent_for_restored_child(
+            transaction,
+            scope.workspace_id,
+            updated.id,
+            updated.parent_id,
+        )
+        .await?;
     }
     reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
         .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
+    let updated = fetch_import_item(transaction, scope.workspace_id, updated.id).await?;
     record_import_mutation(
         transaction,
         scope,
@@ -9376,6 +9429,9 @@ async fn apply_remote_upsert(
         now,
     )
     .await?;
+    if restored {
+        refresh_google_parents(transaction, scope, [updated.parent_id], now).await?;
+    }
     update_mapping_remote(
         transaction,
         mapping_id,
@@ -9735,11 +9791,14 @@ async fn insert_imported_item(
     let (split, minimum, maximum) = split_columns(&item.split_policy);
     sqlx::query(
         "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
-         timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, \
-         scheduling_constraints, split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, \
-         importance, urgency, sibling_order, revision, created_at, updated_at, completed_at, trashed_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-         $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
+         timezone_name, duration_kind, duration_seconds, duration_min_seconds, duration_max_seconds, \
+         duration_source, deadline_kind, deadline_date, deadline_at, deadline_strength, \
+         deadline_soft_weight, earliest_start_at, recurrence, scheduling_constraints, has_own_effort, \
+         split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, importance, urgency, sibling_order, \
+         revision, created_at, updated_at, completed_at, trashed_at, blocked_reason_kind, \
+         blocked_by_item_id, blocked_reason) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+         $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
+         $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)",
     )
     .bind(item.id)
     .bind(scope.workspace_id)
@@ -9750,11 +9809,20 @@ async fn insert_imported_item(
     .bind(&item.title)
     .bind(&item.notes)
     .bind(&item.timezone_name)
+    .bind(duration_kind_name(item.duration_kind))
     .bind(item.duration_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_min_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_max_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_source.map(duration_source_name))
+    .bind(deadline_kind_name(item.deadline_kind))
+    .bind(item.deadline_date)
     .bind(item.deadline_at)
+    .bind(item.deadline_strength.map(deadline_strength_name))
+    .bind(item.deadline_soft_weight.map(u32_to_i32).transpose()?)
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
     .bind(&item.flexible_constraints)
+    .bind(item.has_own_effort)
     .bind(split)
     .bind(minimum)
     .bind(maximum)
@@ -9766,6 +9834,9 @@ async fn insert_imported_item(
     .bind(item.updated_at)
     .bind(item.completed_at)
     .bind(item.deleted_at)
+    .bind(item.blocked_reason_kind.map(blocked_reason_kind_name))
+    .bind(item.blocked_by_item_id)
+    .bind(&item.blocked_reason)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -9780,10 +9851,14 @@ async fn update_imported_item(
     let (split, minimum, maximum) = split_columns(&item.split_policy);
     sqlx::query(
         "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
-         duration_seconds = $9, deadline_at = $10, earliest_start_at = $11, recurrence = $12, \
-         scheduling_constraints = $13, split_allowed = $14, minimum_chunk_seconds = $15, \
-         maximum_chunk_seconds = $16, importance = $17, urgency = $18, revision = $19, \
-         updated_at = $20, completed_at = $21, trashed_at = $22 \
+         duration_kind = $9, duration_seconds = $10, duration_min_seconds = $11, \
+         duration_max_seconds = $12, duration_source = $13, deadline_kind = $14, \
+         deadline_date = $15, deadline_at = $16, deadline_strength = $17, \
+         deadline_soft_weight = $18, earliest_start_at = $19, recurrence = $20, \
+         scheduling_constraints = $21, has_own_effort = $22, split_allowed = $23, \
+         minimum_chunk_seconds = $24, maximum_chunk_seconds = $25, importance = $26, \
+         urgency = $27, revision = $28, updated_at = $29, completed_at = $30, trashed_at = $31, \
+         blocked_reason_kind = $32, blocked_by_item_id = $33, blocked_reason = $34 \
          WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
@@ -9794,11 +9869,20 @@ async fn update_imported_item(
     .bind(&item.title)
     .bind(&item.notes)
     .bind(&item.timezone_name)
+    .bind(duration_kind_name(item.duration_kind))
     .bind(item.duration_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_min_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_max_seconds.map(u32_to_i32).transpose()?)
+    .bind(item.duration_source.map(duration_source_name))
+    .bind(deadline_kind_name(item.deadline_kind))
+    .bind(item.deadline_date)
     .bind(item.deadline_at)
+    .bind(item.deadline_strength.map(deadline_strength_name))
+    .bind(item.deadline_soft_weight.map(u32_to_i32).transpose()?)
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
     .bind(&item.flexible_constraints)
+    .bind(item.has_own_effort)
     .bind(split)
     .bind(minimum)
     .bind(maximum)
@@ -9808,6 +9892,9 @@ async fn update_imported_item(
     .bind(item.updated_at)
     .bind(item.completed_at)
     .bind(item.deleted_at)
+    .bind(item.blocked_reason_kind.map(blocked_reason_kind_name))
+    .bind(item.blocked_by_item_id)
+    .bind(&item.blocked_reason)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -9880,12 +9967,42 @@ async fn reject_google_close_for_active_execution(
     current: &Item,
     replacement: &Item,
 ) -> Result<(), GoogleSyncRepositoryError> {
-    let becomes_terminal = !current.status.is_terminal() && replacement.status.is_terminal();
+    let prevents_execution =
+        !current.status.prevents_execution() && replacement.status.prevents_execution();
     let becomes_trashed = current.deleted_at.is_none() && replacement.deleted_at.is_some();
-    if !becomes_terminal && !becomes_trashed {
+    if !prevents_execution && !becomes_trashed {
         return Ok(());
     }
     reject_google_item_for_active_execution(transaction, workspace_id, current.id).await
+}
+
+async fn validate_google_parent_for_restored_child(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    child_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    super::item_repository::validate_parent(transaction, workspace_id, child_id, parent_id)
+        .await
+        .map_err(|error| match error {
+            ItemRepositoryError::Internal => GoogleSyncRepositoryError::Internal,
+            _ => GoogleSyncRepositoryError::CursorConflict,
+        })?;
+    if let Some(parent_id) = parent_id {
+        reject_google_item_for_active_execution(transaction, workspace_id, parent_id).await?;
+    }
+    Ok(())
+}
+
+async fn refresh_google_parents(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    parent_ids: impl IntoIterator<Item = Option<Uuid>>,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    super::item_repository::refresh_parents(transaction, scope, parent_ids, now)
+        .await
+        .map_err(|_| GoogleSyncRepositoryError::Internal)
 }
 
 async fn reject_google_item_for_active_execution(
@@ -9952,11 +10069,20 @@ async fn fetch_import_item_optional(
 ) -> Result<Option<Item>, GoogleSyncRepositoryError> {
     let row = sqlx::query(
         "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
-         item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
-         item.scheduling_constraints, item.split_allowed, item.minimum_chunk_seconds, \
+         item.duration_kind, item.duration_seconds, item.duration_min_seconds, item.duration_max_seconds, \
+         item.duration_source, item.deadline_kind, item.deadline_date, item.deadline_at, \
+         item.deadline_strength, item.deadline_soft_weight, item.earliest_start_at, item.recurrence, \
+         item.scheduling_constraints, item.has_own_effort, item.split_allowed, item.minimum_chunk_seconds, \
          item.maximum_chunk_seconds, item.importance, item.urgency, item.revision, item.created_at, \
-         item.updated_at, item.completed_at, item.trashed_at, hierarchy.parent_item_id, \
-         COALESCE(hierarchy.position, item.sibling_order) AS sibling_order \
+         item.updated_at, item.completed_at, item.trashed_at, item.blocked_reason_kind, \
+         item.blocked_by_item_id, item.blocked_reason, hierarchy.parent_item_id, \
+         COALESCE(hierarchy.position, item.sibling_order) AS sibling_order, \
+         EXISTS (SELECT 1 FROM item_hierarchy AS child_edge \
+             JOIN items AS child ON child.workspace_id = child_edge.workspace_id \
+                 AND child.id = child_edge.child_item_id \
+             WHERE child_edge.workspace_id = item.workspace_id \
+                 AND child_edge.parent_item_id = item.id \
+                 AND child.trashed_at IS NULL) AS has_children \
          FROM items item LEFT JOIN item_hierarchy hierarchy ON hierarchy.workspace_id = item.workspace_id \
            AND hierarchy.child_item_id = item.id \
          WHERE item.workspace_id = $1 AND item.id = $2 FOR UPDATE OF item",
@@ -9984,38 +10110,83 @@ fn item_from_row(row: &PgRow) -> Result<Item, GoogleSyncRepositoryError> {
         SplitPolicy::Indivisible
     };
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
+    let kind = parse_item_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?;
+    let has_own_effort: bool = row.try_get("has_own_effort").map_err(internal)?;
     Ok(Item {
         id: row.try_get("id").map_err(internal)?,
         is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
-        kind: match row.try_get::<String, _>("kind").map_err(internal)?.as_str() {
-            "event" => crate::items::ItemKind::Event,
-            "task" => crate::items::ItemKind::Task,
-            _ => return Err(GoogleSyncRepositoryError::Internal),
-        },
+        kind,
         status: parse_status(&row.try_get::<String, _>("status").map_err(internal)?)?,
         title: row.try_get("title").map_err(internal)?,
         notes: row.try_get("notes").map_err(internal)?,
         timezone_name: row.try_get("timezone_name").map_err(internal)?,
+        duration_kind: parse_duration_kind(
+            &row.try_get::<String, _>("duration_kind")
+                .map_err(internal)?,
+        )?,
         duration_seconds: row
             .try_get::<Option<i32>, _>("duration_seconds")
             .map_err(internal)?
             .map(i32_to_u32)
             .transpose()?,
+        duration_min_seconds: row
+            .try_get::<Option<i32>, _>("duration_min_seconds")
+            .map_err(internal)?
+            .map(i32_to_u32)
+            .transpose()?,
+        duration_max_seconds: row
+            .try_get::<Option<i32>, _>("duration_max_seconds")
+            .map_err(internal)?
+            .map(i32_to_u32)
+            .transpose()?,
+        duration_source: row
+            .try_get::<Option<String>, _>("duration_source")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_duration_source)
+            .transpose()?,
+        deadline_kind: parse_deadline_kind(
+            &row.try_get::<String, _>("deadline_kind")
+                .map_err(internal)?,
+        )?,
+        deadline_date: row.try_get("deadline_date").map_err(internal)?,
         deadline_at: row.try_get("deadline_at").map_err(internal)?,
+        deadline_strength: row
+            .try_get::<Option<String>, _>("deadline_strength")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_deadline_strength)
+            .transpose()?,
+        deadline_soft_weight: row
+            .try_get::<Option<i32>, _>("deadline_soft_weight")
+            .map_err(internal)?
+            .map(i32_to_u32)
+            .transpose()?,
         earliest_start_at: row.try_get("earliest_start_at").map_err(internal)?,
         recurrence: row.try_get("recurrence").map_err(internal)?,
         flexible_constraints: row.try_get("scheduling_constraints").map_err(internal)?,
+        has_own_effort,
         split_policy,
         importance: i16_to_u8(row.try_get("importance").map_err(internal)?)?,
         urgency: i16_to_u8(row.try_get("urgency").map_err(internal)?)?,
         parent_id: row.try_get("parent_item_id").map_err(internal)?,
         sibling_order: i32_to_u32(row.try_get("sibling_order").map_err(internal)?)?,
-        is_executable: deleted_at.is_none(),
+        is_executable: deleted_at.is_none()
+            && !row.try_get::<bool, _>("has_children").map_err(internal)?
+            && kind.has_executable_component(has_own_effort),
         revision: i64_to_u64(row.try_get("revision").map_err(internal)?)?,
         created_at: row.try_get("created_at").map_err(internal)?,
         updated_at: row.try_get("updated_at").map_err(internal)?,
         completed_at: row.try_get("completed_at").map_err(internal)?,
         deleted_at,
+        blocked_reason_kind: row
+            .try_get::<Option<String>, _>("blocked_reason_kind")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_blocked_reason_kind)
+            .transpose()?,
+        blocked_by_item_id: row.try_get("blocked_by_item_id").map_err(internal)?,
+        blocked_reason: row.try_get("blocked_reason").map_err(internal)?,
     })
 }
 
@@ -10265,6 +10436,20 @@ fn parse_status(value: &str) -> Result<ItemStatus, GoogleSyncRepositoryError> {
         "completed" => Ok(ItemStatus::Completed),
         "skipped" => Ok(ItemStatus::Skipped),
         "cancelled" => Ok(ItemStatus::Cancelled),
+        "blocked" => Ok(ItemStatus::Blocked),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+fn parse_item_kind(value: &str) -> Result<ItemKind, GoogleSyncRepositoryError> {
+    match value {
+        "event" => Ok(ItemKind::Event),
+        "task" => Ok(ItemKind::Task),
+        "habit" => Ok(ItemKind::Habit),
+        "routine" => Ok(ItemKind::Routine),
+        "goal" => Ok(ItemKind::Goal),
+        "project" => Ok(ItemKind::Project),
+        "break" => Ok(ItemKind::Break),
         _ => Err(GoogleSyncRepositoryError::Internal),
     }
 }
@@ -10287,6 +10472,92 @@ const fn status_name(status: ItemStatus) -> &'static str {
         ItemStatus::Completed => "completed",
         ItemStatus::Skipped => "skipped",
         ItemStatus::Cancelled => "cancelled",
+        ItemStatus::Blocked => "blocked",
+    }
+}
+
+const fn duration_kind_name(kind: DurationKind) -> &'static str {
+    match kind {
+        DurationKind::Unknown => "unknown",
+        DurationKind::Exact => "exact",
+        DurationKind::Range => "range",
+    }
+}
+
+fn parse_duration_kind(value: &str) -> Result<DurationKind, GoogleSyncRepositoryError> {
+    match value {
+        "unknown" => Ok(DurationKind::Unknown),
+        "exact" => Ok(DurationKind::Exact),
+        "range" => Ok(DurationKind::Range),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+const fn duration_source_name(source: DurationSource) -> &'static str {
+    match source {
+        DurationSource::User => "user",
+        DurationSource::Assistant => "assistant",
+        DurationSource::Learned => "learned",
+        DurationSource::Imported => "imported",
+    }
+}
+
+fn parse_duration_source(value: &str) -> Result<DurationSource, GoogleSyncRepositoryError> {
+    match value {
+        "user" => Ok(DurationSource::User),
+        "assistant" => Ok(DurationSource::Assistant),
+        "learned" => Ok(DurationSource::Learned),
+        "imported" => Ok(DurationSource::Imported),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+const fn deadline_kind_name(kind: DeadlineKind) -> &'static str {
+    match kind {
+        DeadlineKind::None => "none",
+        DeadlineKind::Date => "date",
+        DeadlineKind::DateTime => "date_time",
+    }
+}
+
+fn parse_deadline_kind(value: &str) -> Result<DeadlineKind, GoogleSyncRepositoryError> {
+    match value {
+        "none" => Ok(DeadlineKind::None),
+        "date" => Ok(DeadlineKind::Date),
+        "date_time" => Ok(DeadlineKind::DateTime),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+const fn deadline_strength_name(strength: DeadlineStrength) -> &'static str {
+    match strength {
+        DeadlineStrength::Hard => "hard",
+        DeadlineStrength::Soft => "soft",
+    }
+}
+
+fn parse_deadline_strength(value: &str) -> Result<DeadlineStrength, GoogleSyncRepositoryError> {
+    match value {
+        "hard" => Ok(DeadlineStrength::Hard),
+        "soft" => Ok(DeadlineStrength::Soft),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+const fn blocked_reason_kind_name(kind: BlockedReasonKind) -> &'static str {
+    match kind {
+        BlockedReasonKind::Dependency => "dependency",
+        BlockedReasonKind::Manual => "manual",
+        BlockedReasonKind::External => "external",
+    }
+}
+
+fn parse_blocked_reason_kind(value: &str) -> Result<BlockedReasonKind, GoogleSyncRepositoryError> {
+    match value {
+        "dependency" => Ok(BlockedReasonKind::Dependency),
+        "manual" => Ok(BlockedReasonKind::Manual),
+        "external" => Ok(BlockedReasonKind::External),
+        _ => Err(GoogleSyncRepositoryError::Internal),
     }
 }
 
@@ -13675,8 +13946,16 @@ mod tests {
                 title: title.to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(3600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some(now + Duration::hours(1)),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(now),
                 recurrence: None,
                 flexible_constraints: json!({"dayweave_firm_block": {
@@ -13684,11 +13963,15 @@ mod tests {
                     "starts_at": now,
                     "ends_at": now + Duration::hours(1)
                 }}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             now,
         )
@@ -13705,16 +13988,28 @@ mod tests {
                 title: title.to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(1_800),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(now),
                 recurrence: None,
                 flexible_constraints: json!({}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             now,
         )
@@ -13751,8 +14046,16 @@ mod tests {
                 title: title.to_owned(),
                 notes: (!sensitive).then(|| "Public context".to_owned()),
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(3600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some(end),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(start),
                 recurrence: None,
                 flexible_constraints: json!({
@@ -13764,11 +14067,15 @@ mod tests {
                         "source_calendar_id": null
                     }
                 }),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             }),
         }
     }
@@ -13930,8 +14237,16 @@ mod tests {
                     title: "Valid occurrence".to_owned(),
                     notes: None,
                     timezone_name: "UTC".to_owned(),
+                    duration_kind: None,
                     duration_seconds: Some(3600),
+                    duration_min_seconds: None,
+                    duration_max_seconds: None,
+                    duration_source: None,
+                    deadline_kind: None,
+                    deadline_date: None,
                     deadline_at: Some(end),
+                    deadline_strength: None,
+                    deadline_soft_weight: None,
                     earliest_start_at: Some(start),
                     recurrence: None,
                     flexible_constraints: json!({"calendar_event": {
@@ -13941,11 +14256,15 @@ mod tests {
                         "all_day": false,
                         "source_calendar_id": null
                     }}),
+                    has_own_effort: None,
                     split_policy: SplitPolicy::Indivisible,
                     importance: 0,
                     urgency: 0,
                     parent_id: None,
                     sibling_order: 0,
+                    blocked_reason_kind: None,
+                    blocked_by_item_id: None,
+                    blocked_reason: None,
                 }),
             }],
             rejected: Vec::new(),
@@ -14360,7 +14679,6 @@ mod tests {
         .fetch_one(&fixture.database.pool)
         .await
         .expect("initial occurrence mapping");
-
         sqlx::query("DELETE FROM items WHERE workspace_id = $1 AND id = $2")
             .bind(fixture.scope.workspace_id)
             .bind(initial_item_id)
@@ -15572,6 +15890,51 @@ mod tests {
         .fetch_one(&fixture.database.pool)
         .await
         .expect("initial occurrence mapping");
+        let mut parent_input = remote_task(
+            fixture.account_id,
+            fixture.collection.id,
+            fixture.collection.revision,
+            "calendar-local-parent-fixture",
+            "Calendar occurrence parent",
+            ItemStatus::Planned,
+            [110; 32],
+        )
+        .item
+        .expect("calendar parent input");
+        let parent_id = Uuid::new_v4();
+        parent_input.id = parent_id;
+        let parent = Item::new(parent_input, fixture.now).expect("calendar parent is valid");
+        let mut parent_transaction = fixture.database.pool.begin().await.expect("parent tx");
+        insert_imported_item(&mut parent_transaction, fixture.scope, &parent)
+            .await
+            .expect("insert calendar parent fixture");
+        record_import_mutation(
+            &mut parent_transaction,
+            fixture.scope,
+            parent.id,
+            1,
+            "upsert",
+            serde_json::to_value(&parent).expect("parent JSON"),
+            "item.created",
+            None,
+            fixture.now,
+        )
+        .await
+        .expect("record calendar parent fixture");
+        sqlx::query(
+            "INSERT INTO item_hierarchy (workspace_id, parent_item_id, child_item_id, position) \
+             VALUES ($1,$2,$3,0)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .bind(item_id)
+        .execute(&mut *parent_transaction)
+        .await
+        .expect("attach calendar occurrence to parent");
+        parent_transaction
+            .commit()
+            .await
+            .expect("commit calendar parent fixture");
         let projection_index_predicate: String = sqlx::query_scalar(
             "SELECT pg_get_expr(index.indpred, index.indrelid) \
              FROM pg_index index JOIN pg_class class ON class.oid = index.indexrelid \
@@ -15640,6 +16003,30 @@ mod tests {
         .await
         .expect("mutations after first absence");
         assert_eq!(first_mutation_counts.1, 1);
+        let first_tombstone_parent: Option<Uuid> = sqlx::query_scalar(
+            "SELECT (payload ->> 'parent_id')::uuid FROM item_changes \
+             WHERE workspace_id = $1 AND item_id = $2 AND change_kind = 'tombstone' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("calendar tombstone retains parent identity");
+        assert_eq!(first_tombstone_parent, Some(parent_id));
+        let parent_after_absence: (i64, bool) = sqlx::query_as(
+            "SELECT item.revision, (change.payload ->> 'is_executable')::boolean \
+             FROM items AS item JOIN LATERAL (SELECT payload FROM item_changes \
+               WHERE workspace_id = item.workspace_id AND item_id = item.id \
+               ORDER BY sequence DESC LIMIT 1) AS change ON true \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("parent refresh after calendar absence");
+        assert_eq!(parent_after_absence, (2, true));
 
         for offset in 2..=4 {
             let quiescent = fixture
@@ -15725,6 +16112,32 @@ mod tests {
             restored_identity,
             (mapping_id, item_id, 3, None, "synced".to_owned())
         );
+        let restored_delta_executable: bool = sqlx::query_scalar(
+            "SELECT (payload ->> 'is_executable')::boolean FROM item_changes \
+             WHERE workspace_id = $1 AND item_id = $2 ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("restored occurrence delta projection");
+        assert!(
+            restored_delta_executable,
+            "restored leaf occurrence delta must match the live executable projection"
+        );
+        let parent_after_reappearance: (i64, bool) = sqlx::query_as(
+            "SELECT item.revision, (change.payload ->> 'is_executable')::boolean \
+             FROM items AS item JOIN LATERAL (SELECT payload FROM item_changes \
+               WHERE workspace_id = item.workspace_id AND item_id = item.id \
+               ORDER BY sequence DESC LIMIT 1) AS change ON true \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("parent refresh after calendar reappearance");
+        assert_eq!(parent_after_reappearance, (3, false));
 
         let second_absence = fixture
             .repository
@@ -17732,6 +18145,25 @@ mod tests {
             .apply_remote_item(&fixture.claim, restored, fixture.now + Duration::seconds(3))
             .await
             .expect("restored task");
+        let restored_task_projection: (bool, bool) = sqlx::query_as(
+            "SELECT item.trashed_at IS NULL, \
+                    (change.payload ->> 'is_executable')::boolean \
+             FROM provider_sync_mappings AS mapping \
+             JOIN items AS item ON item.workspace_id = mapping.workspace_id \
+                 AND item.id = mapping.local_entity_id \
+             JOIN LATERAL (SELECT payload FROM item_changes \
+                 WHERE workspace_id = item.workspace_id AND item_id = item.id \
+                 ORDER BY sequence DESC LIMIT 1) AS change ON true \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+                 AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task_list.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("restored task delta projection");
+        assert_eq!(restored_task_projection, (true, true));
         fixture
             .repository
             .apply_remote_item(
@@ -18024,6 +18456,56 @@ mod tests {
             fixture.now + Duration::seconds(8),
         )
         .await;
+
+        // Preserve a locally-authored hierarchy edge on the provider item. The
+        // provider owns content/lifecycle, not DayWeave's structural parent.
+        let mut parent_input = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            "local-parent-fixture",
+            "Locally owned parent",
+            ItemStatus::Planned,
+            [125; 32],
+        )
+        .item
+        .expect("parent input");
+        let parent_id = Uuid::new_v4();
+        parent_input.id = parent_id;
+        let parent = Item::new(parent_input, fixture.now + Duration::seconds(8))
+            .expect("local parent is valid");
+        let mut parent_transaction = fixture.database.pool.begin().await.expect("parent tx");
+        insert_imported_item(&mut parent_transaction, fixture.scope, &parent)
+            .await
+            .expect("insert local parent fixture");
+        record_import_mutation(
+            &mut parent_transaction,
+            fixture.scope,
+            parent.id,
+            1,
+            "upsert",
+            serde_json::to_value(&parent).expect("parent JSON"),
+            "item.created",
+            None,
+            fixture.now + Duration::seconds(8),
+        )
+        .await
+        .expect("record local parent fixture");
+        sqlx::query(
+            "INSERT INTO item_hierarchy (workspace_id, parent_item_id, child_item_id, position) \
+             VALUES ($1,$2,$3,0)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .bind(deleted_item_id)
+        .execute(&mut *parent_transaction)
+        .await
+        .expect("attach imported child to local parent");
+        parent_transaction
+            .commit()
+            .await
+            .expect("commit parent fixture");
+
         assert_eq!(
             fixture
                 .repository
@@ -18042,6 +18524,103 @@ mod tests {
                 .expect("delete after lease close"),
             ImportOutcome::Deleted
         );
+        let tombstone_parent: Option<Uuid> = sqlx::query_scalar(
+            "SELECT (payload ->> 'parent_id')::uuid FROM item_changes \
+             WHERE workspace_id = $1 AND item_id = $2 AND change_kind = 'tombstone' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(deleted_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("provider tombstone retains canonical parent identity");
+        assert_eq!(tombstone_parent, Some(parent_id));
+        let parent_after_delete: (i64, bool) = sqlx::query_as(
+            "SELECT item.revision, (change.payload ->> 'is_executable')::boolean \
+             FROM items AS item JOIN LATERAL (SELECT payload FROM item_changes \
+               WHERE workspace_id = item.workspace_id AND item_id = item.id \
+               ORDER BY sequence DESC LIMIT 1) AS change ON true \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("parent refresh after provider delete");
+        assert_eq!(parent_after_delete, (2, true));
+
+        let parent_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            parent_id,
+            "active",
+            fixture.now + Duration::seconds(10),
+        )
+        .await;
+        let restore_change = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            deleted_remote_id,
+            "Restored beneath parent",
+            ItemStatus::Planned,
+            [126; 32],
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    restore_change.clone(),
+                    fixture.now + Duration::seconds(11),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ItemExecutionActive),
+            "provider restore cannot make the actively executing parent non-leaf"
+        );
+        let blocked_restore: (Option<DateTime<Utc>>, i64) = sqlx::query_as(
+            "SELECT trashed_at, revision FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(deleted_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("blocked restore rolls back");
+        assert_eq!(blocked_restore.1, 2);
+        assert!(blocked_restore.0.is_some());
+
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            parent_session,
+            fixture.now + Duration::seconds(12),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    restore_change,
+                    fixture.now + Duration::seconds(13),
+                )
+                .await
+                .expect("restore after parent lease closes"),
+            ImportOutcome::Updated
+        );
+        let parent_after_restore: (i64, bool) = sqlx::query_as(
+            "SELECT item.revision, (change.payload ->> 'is_executable')::boolean \
+             FROM items AS item JOIN LATERAL (SELECT payload FROM item_changes \
+               WHERE workspace_id = item.workspace_id AND item_id = item.id \
+               ORDER BY sequence DESC LIMIT 1) AS change ON true \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("parent refresh after provider restore");
+        assert_eq!(parent_after_restore, (3, false));
         fixture.database.destroy().await;
     }
 
@@ -19590,8 +20169,16 @@ mod tests {
                 title: "DayWeave firm block".to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(3600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some(now + Duration::hours(1)),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(now),
                 recurrence: None,
                 flexible_constraints: json!({"dayweave_firm_block": {
@@ -19599,11 +20186,15 @@ mod tests {
                     "starts_at": now,
                     "ends_at": now + Duration::hours(1)
                 }}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             now,
         )
@@ -19951,8 +20542,16 @@ mod tests {
                 title: "Stale queued block".to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(3600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some(now + Duration::hours(2)),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(now + Duration::hours(1)),
                 recurrence: None,
                 flexible_constraints: json!({"dayweave_firm_block": {
@@ -19960,11 +20559,15 @@ mod tests {
                     "starts_at": now + Duration::hours(1),
                     "ends_at": now + Duration::hours(2)
                 }}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             now,
         )
@@ -20768,8 +21371,16 @@ mod tests {
                 title: title.to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(3600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some("2026-08-29T11:00:00Z".parse().expect("end")),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some("2026-08-29T10:00:00Z".parse().expect("start")),
                 recurrence: None,
                 flexible_constraints: json!({"calendar_event": {
@@ -20779,11 +21390,15 @@ mod tests {
                     "all_day": false,
                     "source_calendar_id": null
                 }}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             }),
         }
     }
@@ -20826,16 +21441,28 @@ mod tests {
                 title: title.to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(1_800),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: None,
                 recurrence: None,
                 flexible_constraints: json!({}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             }),
         }
     }

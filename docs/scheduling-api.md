@@ -519,9 +519,41 @@ is returned exactly once.
 ## Canonical scheduling metadata
 
 The canonical item fields remain the source of truth for duration, deadline,
-earliest start, priority, hierarchy, recurrence, and split bounds. Optional
-advanced data lives in `flexible_constraints`. Its top-level schema is strict;
-new and replacement `/v1/items` writes validate it before persistence. Unknown,
+earliest start, priority, hierarchy, recurrence, and split bounds. The item
+contract distinguishes `event`, `task`, `habit`, `routine`, `goal`, `project`,
+and `break`; `blocked` is a first-class nonterminal status rather than a hidden
+scheduling flag.
+
+Duration intent is one exact shape:
+
+- `unknown` has no expected/minimum/maximum seconds or provenance;
+- `exact` has one positive expected value, repeats it as both bounds, and
+  records `user`, `assistant`, `learned`, or `imported` provenance; and
+- `range` records positive `minimum <= expected <= maximum`, requires a real
+  varying range, and schedules the editable expected value.
+
+Deadline intent is independently `none`, `date`, or `date_time`, and a present
+deadline is independently `hard` or weighted `soft`. A date-only deadline stays
+a local calendar date on the wire and resolves to the exclusive next local
+midnight in the item's IANA timezone. Calendar-event interval ends are not
+deadlines: events keep `deadline_kind: "none"`, even for a legacy projection
+whose interval end occupies `deadline_at`. Removing a deadline, moving an
+otherwise-equivalent deadline later, changing hard to soft, or lowering an
+otherwise-equivalent soft weight is classified as a deadline relaxation for
+proposal review; mixed tightening/relaxation is conservatively a generic
+deadline change.
+
+`has_own_effort` is explicit canonical state. Projects, goals, and routines are
+semantic containers by default and become executable only for a reviewed own
+effort component while they are leaves; topology remains authoritative for the
+derived `is_executable` projection. A `blocked` item must name either a distinct
+dependency item or a bounded manual/external explanation. Other statuses carry
+no blocker fields, and blocked or terminal items cannot start, reserve new
+flexible work, or retain an actionable deferred replacement.
+
+Optional advanced data lives in `flexible_constraints`. Its top-level schema is
+strict. New and replacement `/v1/items` writes validate it before persistence.
+Unknown,
 malformed, semantically contradictory, wrong-kind, and duplicate set-shaped
 values return `422`; the preview applies the same validator to schedulable
 canonical rows, while Inbox subtrees remain retained without interpreting their
@@ -532,6 +564,10 @@ create or alter that provider evidence. New Google Tasks keep identity and
 bounded, content-free hidden/order/completion/truncation/legacy-marker semantics
 solely in the restricted provider mapping layer; none of those fields enter
 `flexible_constraints`.
+
+MCP `search_items.project_id` matches every Project ancestor at arbitrary
+hierarchy depth. Returned summaries expose the nearest Project ancestor, never
+an unrelated immediate parent such as an intervening Goal or Task.
 
 Canonical `earliest_start_at` and `deadline_at` values must be representable at
 PostgreSQL microsecond precision. Canonical and metadata-provided earliest/latest

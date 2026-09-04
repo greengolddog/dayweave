@@ -185,7 +185,7 @@ impl ExecutionService {
                 actual: item.revision,
             });
         }
-        if !item.is_executable || item.status.is_terminal() {
+        if !item.is_executable || item.status.prevents_execution() {
             return Err(ExecutionServiceError::ItemNotExecutable);
         }
         Ok(())
@@ -286,7 +286,8 @@ mod tests {
 
     use crate::{
         items::{
-            IdempotencyKey, InMemoryItemRepository, ItemKind, ItemStatus, NewItem, SplitPolicy,
+            BlockedReasonKind, IdempotencyKey, InMemoryItemRepository, ItemKind,
+            ItemRepositoryError, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
         },
         proposals::Clock,
     };
@@ -313,6 +314,18 @@ mod tests {
     }
 
     async fn fixture() -> (ExecutionService, Arc<TestClock>, Uuid) {
+        fixture_with_status(ItemStatus::Planned).await
+    }
+
+    async fn fixture_with_status(status: ItemStatus) -> (ExecutionService, Arc<TestClock>, Uuid) {
+        fixture_with_shape(status, ItemKind::Task, false).await
+    }
+
+    async fn fixture_with_shape(
+        status: ItemStatus,
+        kind: ItemKind,
+        has_own_effort: bool,
+    ) -> (ExecutionService, Arc<TestClock>, Uuid) {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let clock = Arc::new(TestClock(RwLock::new(now)));
         let items = Arc::new(ItemService::new(
@@ -325,21 +338,39 @@ mod tests {
                 NewItem {
                     id: item_id,
                     is_sensitive: false,
-                    kind: ItemKind::Task,
-                    status: ItemStatus::Planned,
+                    kind,
+                    status,
                     title: "Write".to_owned(),
                     notes: None,
                     timezone_name: "UTC".to_owned(),
+                    duration_kind: None,
                     duration_seconds: Some(1_800),
+                    duration_min_seconds: None,
+                    duration_max_seconds: None,
+                    duration_source: None,
+                    deadline_kind: None,
+                    deadline_date: None,
                     deadline_at: None,
+                    deadline_strength: None,
+                    deadline_soft_weight: None,
                     earliest_start_at: None,
                     recurrence: None,
-                    flexible_constraints: serde_json::json!({}),
+                    flexible_constraints: if has_own_effort {
+                        serde_json::json!({"has_own_effort": true})
+                    } else {
+                        serde_json::json!({})
+                    },
+                    has_own_effort: Some(has_own_effort),
                     split_policy: SplitPolicy::Indivisible,
                     importance: 50,
                     urgency: 50,
                     parent_id: None,
                     sibling_order: 0,
+                    blocked_reason_kind: (status == ItemStatus::Blocked)
+                        .then_some(BlockedReasonKind::Manual),
+                    blocked_by_item_id: None,
+                    blocked_reason: (status == ItemStatus::Blocked)
+                        .then(|| "Waiting for input".to_owned()),
                 },
                 IdempotencyKey {
                     key: "create-item-11".to_owned(),
@@ -364,6 +395,376 @@ mod tests {
             key: format!("execution-key-{byte}"),
             fingerprint: [byte; 32],
         }
+    }
+
+    fn hierarchy_item(id: Uuid, title: &str, parent_id: Option<Uuid>) -> NewItem {
+        NewItem {
+            id,
+            is_sensitive: false,
+            kind: ItemKind::Task,
+            status: ItemStatus::Planned,
+            title: title.to_owned(),
+            notes: None,
+            timezone_name: "UTC".to_owned(),
+            duration_kind: None,
+            duration_seconds: Some(1_800),
+            duration_min_seconds: None,
+            duration_max_seconds: None,
+            duration_source: None,
+            deadline_kind: None,
+            deadline_date: None,
+            deadline_at: None,
+            deadline_strength: None,
+            deadline_soft_weight: None,
+            earliest_start_at: None,
+            recurrence: None,
+            flexible_constraints: serde_json::json!({}),
+            has_own_effort: Some(false),
+            split_policy: SplitPolicy::Indivisible,
+            importance: 50,
+            urgency: 50,
+            parent_id,
+            sibling_order: 0,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
+        }
+    }
+
+    fn hierarchy_replacement(item: &crate::items::Item, parent_id: Option<Uuid>) -> ReplaceItem {
+        ReplaceItem {
+            is_sensitive: item.is_sensitive,
+            kind: item.kind,
+            status: item.status,
+            title: item.title.clone(),
+            notes: item.notes.clone(),
+            timezone_name: item.timezone_name.clone(),
+            duration_kind: Some(item.duration_kind),
+            duration_seconds: item.duration_seconds,
+            duration_min_seconds: item.duration_min_seconds,
+            duration_max_seconds: item.duration_max_seconds,
+            duration_source: item.duration_source,
+            deadline_kind: Some(item.deadline_kind),
+            deadline_date: item.deadline_date,
+            deadline_at: item.deadline_at,
+            deadline_strength: item.deadline_strength,
+            deadline_soft_weight: item.deadline_soft_weight,
+            earliest_start_at: item.earliest_start_at,
+            recurrence: item.recurrence.clone(),
+            flexible_constraints: item.flexible_constraints.clone(),
+            has_own_effort: Some(item.has_own_effort),
+            split_policy: item.split_policy.clone(),
+            importance: item.importance,
+            urgency: item.urgency,
+            parent_id,
+            sibling_order: item.sibling_order,
+            blocked_reason_kind: item.blocked_reason_kind,
+            blocked_by_item_id: item.blocked_by_item_id,
+            blocked_reason: item.blocked_reason.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_item_cannot_start_execution() {
+        let (service, _clock, item_id) = fixture_with_status(ItemStatus::Blocked).await;
+        let result = service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: Uuid::from_u128(12),
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(13),
+                }),
+                idempotency(23),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecutionServiceError::ItemNotExecutable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn semantic_container_without_own_effort_cannot_start_execution() {
+        let (service, _clock, item_id) =
+            fixture_with_shape(ItemStatus::Planned, ItemKind::Project, false).await;
+        let result = service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: Uuid::from_u128(120),
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(130),
+                }),
+                idempotency(24),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ExecutionServiceError::ItemNotExecutable)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One in-memory lifecycle proves the cross-repository execution fence.
+    async fn active_task_cannot_be_retyped_as_a_container_without_own_effort() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let clock = Arc::new(TestClock(RwLock::new(now)));
+        let execution_repository = Arc::new(InMemoryExecutionRepository::default());
+        let operation_gate = Arc::new(Mutex::new(()));
+        let item_repository = InMemoryItemRepository::with_execution_guard(
+            execution_repository.clone(),
+            operation_gate.clone(),
+        );
+        let items = Arc::new(ItemService::new(Arc::new(item_repository), clock.clone()));
+        let item_id = Uuid::from_u128(140);
+        items
+            .create(
+                NewItem {
+                    id: item_id,
+                    is_sensitive: false,
+                    kind: ItemKind::Task,
+                    status: ItemStatus::Planned,
+                    title: "Active work".to_owned(),
+                    notes: None,
+                    timezone_name: "UTC".to_owned(),
+                    duration_kind: None,
+                    duration_seconds: Some(1_800),
+                    duration_min_seconds: None,
+                    duration_max_seconds: None,
+                    duration_source: None,
+                    deadline_kind: None,
+                    deadline_date: None,
+                    deadline_at: None,
+                    deadline_strength: None,
+                    deadline_soft_weight: None,
+                    earliest_start_at: None,
+                    recurrence: None,
+                    flexible_constraints: serde_json::json!({}),
+                    has_own_effort: Some(false),
+                    split_policy: SplitPolicy::Indivisible,
+                    importance: 50,
+                    urgency: 50,
+                    parent_id: None,
+                    sibling_order: 0,
+                    blocked_reason_kind: None,
+                    blocked_by_item_id: None,
+                    blocked_reason: None,
+                },
+                IdempotencyKey {
+                    key: "create-active-task".to_owned(),
+                    fingerprint: [31; 32],
+                },
+            )
+            .await
+            .expect("create active task fixture");
+        let execution = ExecutionService::new(execution_repository, items.clone(), clock)
+            .with_start_operation_gate(operation_gate);
+        let session_id = Uuid::from_u128(141);
+        execution
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(142),
+                }),
+                idempotency(32),
+            )
+            .await
+            .expect("start task");
+        let current = items.get(item_id).await.expect("load task");
+        let conflict = items
+            .replace(
+                item_id,
+                current.revision,
+                ReplaceItem {
+                    is_sensitive: current.is_sensitive,
+                    kind: ItemKind::Project,
+                    status: current.status,
+                    title: current.title,
+                    notes: current.notes,
+                    timezone_name: current.timezone_name,
+                    duration_kind: Some(current.duration_kind),
+                    duration_seconds: current.duration_seconds,
+                    duration_min_seconds: current.duration_min_seconds,
+                    duration_max_seconds: current.duration_max_seconds,
+                    duration_source: current.duration_source,
+                    deadline_kind: Some(current.deadline_kind),
+                    deadline_date: current.deadline_date,
+                    deadline_at: current.deadline_at,
+                    deadline_strength: current.deadline_strength,
+                    deadline_soft_weight: current.deadline_soft_weight,
+                    earliest_start_at: current.earliest_start_at,
+                    recurrence: current.recurrence,
+                    flexible_constraints: serde_json::json!({}),
+                    has_own_effort: Some(false),
+                    split_policy: current.split_policy,
+                    importance: current.importance,
+                    urgency: current.urgency,
+                    parent_id: current.parent_id,
+                    sibling_order: current.sibling_order,
+                    blocked_reason_kind: current.blocked_reason_kind,
+                    blocked_by_item_id: current.blocked_by_item_id,
+                    blocked_reason: current.blocked_reason,
+                },
+                IdempotencyKey {
+                    key: "retype-active-task".to_owned(),
+                    fingerprint: [33; 32],
+                },
+            )
+            .await
+            .expect_err("active Task cannot lose its executable component");
+        assert!(matches!(
+            conflict,
+            ItemServiceError::Repository(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: conflicted_item,
+                session_id: conflicted_session,
+            }) if conflicted_item == item_id && conflicted_session == session_id
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One scenario proves all three hierarchy mutations share the active-execution fence.
+    async fn active_parent_rejects_child_create_reparent_and_restore() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let clock = Arc::new(TestClock(RwLock::new(now)));
+        let execution_repository = Arc::new(InMemoryExecutionRepository::default());
+        let operation_gate = Arc::new(Mutex::new(()));
+        let item_repository = InMemoryItemRepository::with_execution_guard(
+            execution_repository.clone(),
+            operation_gate.clone(),
+        );
+        let items = Arc::new(ItemService::new(Arc::new(item_repository), clock.clone()));
+        let parent_id = Uuid::from_u128(150);
+        let movable_id = Uuid::from_u128(151);
+        let restorable_id = Uuid::from_u128(152);
+        for (item, key, marker) in [
+            (
+                hierarchy_item(parent_id, "Executing parent", None),
+                "create-parent",
+                41,
+            ),
+            (
+                hierarchy_item(movable_id, "Movable child", None),
+                "create-movable",
+                42,
+            ),
+            (
+                hierarchy_item(restorable_id, "Restorable child", Some(parent_id)),
+                "create-restorable",
+                43,
+            ),
+        ] {
+            items
+                .create(
+                    item,
+                    IdempotencyKey {
+                        key: key.to_owned(),
+                        fingerprint: [marker; 32],
+                    },
+                )
+                .await
+                .expect("create hierarchy fixture");
+        }
+        let restorable = items.get(restorable_id).await.expect("load restorable");
+        items
+            .trash(
+                restorable_id,
+                restorable.revision,
+                IdempotencyKey {
+                    key: "trash-restorable".to_owned(),
+                    fingerprint: [44; 32],
+                },
+            )
+            .await
+            .expect("trash restores parent leaf state");
+        let parent = items.get(parent_id).await.expect("load refreshed parent");
+        assert!(parent.is_executable);
+
+        let execution = ExecutionService::new(execution_repository, items.clone(), clock)
+            .with_start_operation_gate(operation_gate);
+        let session_id = Uuid::from_u128(153);
+        execution
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id,
+                    item_id: parent_id,
+                    item_revision: parent.revision,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(154),
+                }),
+                idempotency(45),
+            )
+            .await
+            .expect("start parent");
+
+        let create_error = items
+            .create(
+                hierarchy_item(Uuid::from_u128(155), "New child", Some(parent_id)),
+                IdempotencyKey {
+                    key: "child-under-active-parent".to_owned(),
+                    fingerprint: [46; 32],
+                },
+            )
+            .await
+            .expect_err("create cannot close an active parent's executable component");
+        let movable = items.get(movable_id).await.expect("load movable");
+        let reparent_error = items
+            .replace(
+                movable_id,
+                movable.revision,
+                hierarchy_replacement(&movable, Some(parent_id)),
+                IdempotencyKey {
+                    key: "reparent-under-active-parent".to_owned(),
+                    fingerprint: [47; 32],
+                },
+            )
+            .await
+            .expect_err("reparent cannot close an active parent's executable component");
+        let deleted = items
+            .get_including_deleted(restorable_id)
+            .await
+            .expect("load trashed child");
+        let restore_error = items
+            .restore(
+                restorable_id,
+                deleted.revision,
+                IdempotencyKey {
+                    key: "restore-under-active-parent".to_owned(),
+                    fingerprint: [48; 32],
+                },
+            )
+            .await
+            .expect_err("restore cannot close an active parent's executable component");
+
+        for error in [create_error, reparent_error, restore_error] {
+            assert!(matches!(
+                error,
+                ItemServiceError::Repository(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: conflicted_item,
+                    session_id: conflicted_session,
+                }) if conflicted_item == parent_id && conflicted_session == session_id
+            ));
+        }
+        assert!(items.get(parent_id).await.unwrap().is_executable);
+        assert!(items.get(restorable_id).await.is_err());
+        assert_eq!(items.get(movable_id).await.unwrap().parent_id, None);
     }
 
     #[tokio::test]

@@ -869,6 +869,13 @@ fn validate_kind_keys(
                 ));
             }
         }
+        CanonicalItemKind::Project => {
+            if recurrence_value.is_some() {
+                return Err(recurrence(
+                    "project does not support recurrence; use a routine or habit",
+                ));
+            }
+        }
         CanonicalItemKind::Break => {
             if recurrence_value.is_some() {
                 return Err(recurrence(

@@ -266,7 +266,11 @@ fn recurrence_of(item: &WorkItem) -> Option<&Recurrence> {
         ItemKind::RecurringTask(spec) => Some(&spec.recurrence),
         ItemKind::Habit(spec) => Some(&spec.recurrence),
         ItemKind::Routine(spec) => spec.recurrence.as_ref(),
-        _ => None,
+        ItemKind::Task
+        | ItemKind::Project
+        | ItemKind::Goal(_)
+        | ItemKind::Break(_)
+        | ItemKind::CalendarEvent(_) => None,
     }
 }
 

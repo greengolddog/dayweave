@@ -1173,18 +1173,18 @@ async fn preview_includes_implicit_existing_parent_diff() {
         return;
     };
     let fixture = ApplicationFixture::create(&database_url).await;
+    let mut existing_parent = item(
+        Uuid::new_v4(),
+        ItemKind::Goal,
+        "Existing parent",
+        false,
+        None,
+    );
+    existing_parent.flexible_constraints = json!({"has_own_effort": true});
+    existing_parent.has_own_effort = Some(true);
     let parent = fixture
         .items
-        .create(
-            item(
-                Uuid::new_v4(),
-                ItemKind::Goal,
-                "Existing parent",
-                false,
-                None,
-            ),
-            item_key("implicit-parent-create", 41),
-        )
+        .create(existing_parent, item_key("implicit-parent-create", 41))
         .await
         .expect("parent created")
         .item;
@@ -2135,16 +2135,28 @@ fn replacement(item: &Item, status: ItemStatus) -> ReplaceItem {
         title: item.title.clone(),
         notes: item.notes.clone(),
         timezone_name: item.timezone_name.clone(),
+        duration_kind: Some(item.duration_kind),
         duration_seconds: item.duration_seconds,
+        duration_min_seconds: item.duration_min_seconds,
+        duration_max_seconds: item.duration_max_seconds,
+        duration_source: item.duration_source,
+        deadline_kind: Some(item.deadline_kind),
+        deadline_date: item.deadline_date,
         deadline_at: item.deadline_at,
+        deadline_strength: item.deadline_strength,
+        deadline_soft_weight: item.deadline_soft_weight,
         earliest_start_at: item.earliest_start_at,
         recurrence: item.recurrence.clone(),
         flexible_constraints: item.flexible_constraints.clone(),
+        has_own_effort: Some(item.has_own_effort),
         split_policy: item.split_policy.clone(),
         importance: item.importance,
         urgency: item.urgency,
         parent_id: item.parent_id,
         sibling_order: item.sibling_order,
+        blocked_reason_kind: item.blocked_reason_kind,
+        blocked_by_item_id: item.blocked_by_item_id,
+        blocked_reason: item.blocked_reason.clone(),
     }
 }
 
@@ -2333,16 +2345,28 @@ fn item(
         title: title.to_owned(),
         notes: None,
         timezone_name: "Europe/Madrid".to_owned(),
+        duration_kind: None,
         duration_seconds: Some(1_800),
+        duration_min_seconds: None,
+        duration_max_seconds: None,
+        duration_source: None,
+        deadline_kind: None,
+        deadline_date: None,
         deadline_at: None,
+        deadline_strength: None,
+        deadline_soft_weight: None,
         earliest_start_at: None,
         recurrence: None,
         flexible_constraints: json!({}),
+        has_own_effort: None,
         split_policy: SplitPolicy::Indivisible,
         importance: 70,
         urgency: 40,
         parent_id,
         sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -93,6 +93,22 @@ pub struct StoredItem {
     pub kind: String,
     pub project_id: Option<String>,
     pub goal_id: Option<String>,
+    pub duration_kind: String,
+    pub duration_seconds: Option<u32>,
+    pub duration_min_seconds: Option<u32>,
+    pub duration_max_seconds: Option<u32>,
+    pub duration_source: Option<String>,
+    pub deadline_kind: String,
+    pub deadline_date: Option<NaiveDate>,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_strength: Option<String>,
+    pub deadline_soft_weight: Option<u32>,
+    pub has_own_effort: bool,
+    pub blocked_reason_kind: Option<String>,
+    pub blocked_by_item_id: Option<String>,
+    pub blocked_reason: Option<String>,
+    /// Deprecated legacy alias for `deadline_at` retained for MCP clients
+    /// that predate typed deadline shapes.
     pub deadline: Option<DateTime<Utc>>,
     pub scheduled_start: Option<DateTime<Utc>>,
     pub sensitive: bool,
@@ -113,6 +129,21 @@ pub struct ItemSummary {
     pub kind: String,
     pub project_id: Option<String>,
     pub goal_id: Option<String>,
+    pub duration_kind: String,
+    pub duration_seconds: Option<u32>,
+    pub duration_min_seconds: Option<u32>,
+    pub duration_max_seconds: Option<u32>,
+    pub duration_source: Option<String>,
+    pub deadline_kind: String,
+    pub deadline_date: Option<NaiveDate>,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_strength: Option<String>,
+    pub deadline_soft_weight: Option<u32>,
+    pub has_own_effort: bool,
+    pub blocked_reason_kind: Option<String>,
+    pub blocked_by_item_id: Option<String>,
+    pub blocked_reason: Option<String>,
+    /// Deprecated legacy alias for `deadline_at`.
     pub deadline: Option<DateTime<Utc>>,
     pub scheduled_start: Option<DateTime<Utc>>,
 }

@@ -1635,7 +1635,7 @@ async fn validate_start_item(
     expected_revision: u64,
 ) -> Result<i64, ExecutionRepositoryError> {
     let row = sqlx::query(
-        "SELECT revision, execution_epoch, status, trashed_at FROM items \
+        "SELECT revision, execution_epoch, status, kind, has_own_effort, trashed_at FROM items \
          WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
@@ -1653,6 +1653,8 @@ async fn validate_start_item(
         return Err(ExecutionRepositoryError::ItemRevisionConflict);
     }
     let status: String = row.try_get("status").map_err(internal)?;
+    let kind: String = row.try_get("kind").map_err(internal)?;
+    let has_own_effort: bool = row.try_get("has_own_effort").map_err(internal)?;
     let trashed_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
     let has_children: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM item_hierarchy AS edge JOIN items AS child \
@@ -1667,7 +1669,11 @@ async fn validate_start_item(
     .map_err(internal)?;
     if trashed_at.is_some()
         || has_children
-        || matches!(status.as_str(), "completed" | "skipped" | "cancelled")
+        || (matches!(kind.as_str(), "project" | "goal" | "routine") && !has_own_effort)
+        || matches!(
+            status.as_str(),
+            "completed" | "skipped" | "cancelled" | "blocked"
+        )
     {
         Err(ExecutionRepositoryError::ItemNotExecutable)
     } else {

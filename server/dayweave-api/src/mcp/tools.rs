@@ -27,6 +27,7 @@ use crate::{
 const TOOL_CACHE_TTL_MS: u64 = 5 * 60 * 1_000;
 const MAX_OPERATIONS: usize = 100;
 const MAX_ASSUMPTIONS: usize = 20;
+const OPERATION_PARAMETERS_DESCRIPTION: &str = "Strict parameters. create_item accepts kind (task|habit|routine|goal|project|break), title, timezone_name, and optional is_sensitive/status/notes/duration_kind/duration_seconds/duration_min_seconds/duration_max_seconds/duration_source/deadline_kind/deadline_date/deadline_at/deadline_strength/deadline_soft_weight/earliest_start_at/recurrence/flexible_constraints/has_own_effort/split_policy/importance/urgency/parent_id/sibling_order/blocked_reason_kind/blocked_by_item_id/blocked_reason; IDs are server-generated. create_event uses the same fields but kind is omitted or event. duration_kind is unknown, exact, or range and duration_source is user, assistant, learned, or imported; explicit companion fields must form one valid shape. deadline_kind is none, date, or date_time and deadline_strength is hard or soft; soft requires a bounded weight. blocked status requires a dependency, manual, or external blocked_reason_kind and its matching cause fields. Authorable recurrence supports daily, weekly, monthly, every_interval, after_completion, and frequency. Existing custom RRULE values remain readable but create, replacement, constraint-update, and application-ready proposal writes reject them until bounded RFC 5545 expansion exists. flexible_constraints is the closed DayWeave scheduling-metadata object: core hard/soft constraints, energy/tags/goals, kind-specific habit/routine/goal/break metadata, event representation, split extensions, and legacy preferred_start_minute. Semantic contradictions and unknown, semantically duplicate UUID/dependency sets, or wrong-kind fields are rejected before an application-ready proposal is accepted. Inbox may omit recurrence, duration, or event timing, but fields that are present remain strict. complete_item and delete_item require an empty object. update_constraint accepts only timezone_name, duration_kind, duration_seconds, duration_min_seconds, duration_max_seconds, duration_source, deadline_kind, deadline_date, deadline_at, deadline_strength, deadline_soft_weight, earliest_start_at, recurrence, flexible_constraints, has_own_effort, and split_policy. Unknown fields are rejected for application-ready operations.";
 
 #[derive(Clone, Debug)]
 pub struct McpRequestContext {
@@ -787,7 +788,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
             tool(
                 "search_items",
                 "Search items",
-                "Find non-sensitive tasks, habits, routines, goals, breaks, or events by text and filters without changing them.",
+                "Find non-sensitive tasks, habits, routines, goals, projects, breaks, or events by text and filters without changing them.",
                 &search_schema(),
                 &read_annotations(),
                 oauth.then_some(SCOPE_FOR_READ),
@@ -910,7 +911,7 @@ fn search_schema() -> Value {
             "text": { "type": "string" },
             "status": { "type": "string" },
             "kind": { "type": "string" },
-            "project_id": { "type": "string" },
+            "project_id": string_schema("Project UUID; matches descendants at any hierarchy depth"),
             "goal_id": { "type": "string" },
             "start": string_schema("Optional RFC 3339 scheduled-start lower bound"),
             "end": string_schema("Optional RFC 3339 scheduled-start upper bound"),
@@ -995,7 +996,22 @@ fn operation_array_schema() -> Value {
                 },
                 "parameters": {
                     "type": "object",
-                    "description": "Strict parameters. create_item accepts kind (task|habit|routine|goal|break), title, timezone_name, optional is_sensitive/status/notes/duration_seconds/deadline_at/earliest_start_at/recurrence/flexible_constraints/split_policy/importance/urgency/parent_id/sibling_order; IDs are server-generated. create_event uses the same fields but kind is omitted or event. Authorable recurrence supports daily, weekly, monthly, every_interval, after_completion, and frequency. Existing custom RRULE values remain readable but create, replacement, constraint-update, and application-ready proposal writes reject them until bounded RFC 5545 expansion exists. flexible_constraints is the closed DayWeave scheduling-metadata object: core hard/soft constraints, energy/tags/goals, kind-specific habit/routine/goal/break metadata, event representation, split extensions, and legacy preferred_start_minute. Semantic contradictions and unknown, semantically duplicate UUID/dependency sets, or wrong-kind fields are rejected before an application-ready proposal is accepted. Inbox may omit recurrence, duration, or event timing, but fields that are present remain strict. complete_item and delete_item require an empty object. update_constraint accepts only timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, flexible_constraints, and split_policy. Unknown fields are rejected for application-ready operations."
+                    "description": OPERATION_PARAMETERS_DESCRIPTION,
+                    "x-dayweave-item-contract": {
+                        "item_kinds": ["task", "event", "habit", "routine", "goal", "project", "break"],
+                        "duration_kinds": ["unknown", "exact", "range"],
+                        "duration_sources": ["user", "assistant", "learned", "imported"],
+                        "deadline_kinds": ["none", "date", "date_time"],
+                        "deadline_strengths": ["hard", "soft"],
+                        "blocked_reason_kinds": ["dependency", "manual", "external"],
+                        "update_constraint_fields": [
+                            "timezone_name", "duration_kind", "duration_seconds",
+                            "duration_min_seconds", "duration_max_seconds", "duration_source",
+                            "deadline_kind", "deadline_date", "deadline_at", "deadline_strength",
+                            "deadline_soft_weight", "earliest_start_at", "recurrence",
+                            "flexible_constraints", "has_own_effort", "split_policy"
+                        ]
+                    }
                 }
             },
             "required": ["kind"]
@@ -1015,4 +1031,37 @@ fn object_schema(properties: &Value, required: &[&str]) -> Value {
 
 fn string_schema(description: &str) -> Value {
     json!({ "type": "string", "description": description })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_schema_freezes_the_structural_item_contract() {
+        let schema = operation_array_schema();
+        let parameters = &schema["items"]["properties"]["parameters"];
+        assert_eq!(
+            parameters["x-dayweave-item-contract"],
+            json!({
+                "item_kinds": ["task", "event", "habit", "routine", "goal", "project", "break"],
+                "duration_kinds": ["unknown", "exact", "range"],
+                "duration_sources": ["user", "assistant", "learned", "imported"],
+                "deadline_kinds": ["none", "date", "date_time"],
+                "deadline_strengths": ["hard", "soft"],
+                "blocked_reason_kinds": ["dependency", "manual", "external"],
+                "update_constraint_fields": [
+                    "timezone_name", "duration_kind", "duration_seconds",
+                    "duration_min_seconds", "duration_max_seconds", "duration_source",
+                    "deadline_kind", "deadline_date", "deadline_at", "deadline_strength",
+                    "deadline_soft_weight", "earliest_start_at", "recurrence",
+                    "flexible_constraints", "has_own_effort", "split_policy"
+                ]
+            })
+        );
+        assert_eq!(
+            parameters["description"],
+            Value::String(OPERATION_PARAMETERS_DESCRIPTION.to_owned())
+        );
+    }
 }

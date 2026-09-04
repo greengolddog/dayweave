@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, Offset as _, TimeZone as _, Utc};
 use chrono_tz::Tz;
 use dayweave_core::{
-    AvailabilityWindow, BreakCategory, BreakSpec, DailyTimeWindow, DurationEstimate, EnergyLevel,
-    FixedBlock, FixedBlockSource, GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind,
-    Minutes, OccurrenceId, PlanRequest, PreviousAssignment, PreviousBlock, Priority, Qualified,
-    Recurrence, RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector,
-    RecurrenceOccurrenceIdentity, RecurringTaskSpec, RoutineSpec, SchedulerConfig,
-    SchedulingConstraints, SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus,
-    ZonedDayBoundary,
+    AvailabilityWindow, BreakCategory, BreakSpec, ConstraintStrength, DailyTimeWindow,
+    DurationEstimate, EnergyLevel, EstimateSource, FixedBlock, FixedBlockSource, GoalSpec,
+    HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
+    PreviousAssignment, PreviousBlock, Priority, Qualified, Recurrence, RecurrenceContext,
+    RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity,
+    RecurringTaskSpec, RoutineSpec, SchedulerConfig, SchedulingConstraints,
+    SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus, ZonedDayBoundary,
 };
 use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
@@ -19,10 +19,11 @@ use crate::metadata::{
     SchedulingMetadataInput, validate_scheduling_metadata,
 };
 use crate::model::{
-    AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
-    ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    IgnoredPreviousAssignment, ManualPlacementInput, PreparedSchedule, PreviousAssignmentInput,
-    RejectedScheduleItem,
+    AvailabilityInput, CanonicalBlockedReasonKind, CanonicalDeadlineKind,
+    CanonicalDeadlineStrength, CanonicalDurationKind, CanonicalDurationSource, CanonicalItem,
+    CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy, ComposeScheduleRequest,
+    EnergyInput, FixedBlockInput, FixedBlockSourceInput, IgnoredPreviousAssignment,
+    ManualPlacementInput, PreparedSchedule, PreviousAssignmentInput, RejectedScheduleItem,
 };
 
 pub const MAX_CANONICAL_ITEMS: usize = 10_000;
@@ -45,6 +46,8 @@ pub const MAX_WEIGHT: u32 = 1_000_000;
 pub const MAX_BLOCK_TITLE_CHARACTERS: usize = 500;
 const MAX_NOTES_CHARACTERS: usize = 100_000;
 const MAX_DURATION_SECONDS: u32 = 366 * 24 * 60 * 60;
+const MAX_DEADLINE_YEAR: i32 = 9_999;
+const MAX_BLOCKED_REASON_CHARACTERS: usize = 1_000;
 const MAX_SIBLING_ORDER: u32 = 1_000_000;
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
@@ -400,6 +403,9 @@ pub fn prepare_canonical_schedule(
     if source_items.len() > MAX_CANONICAL_ITEMS {
         return Err(PrepareScheduleError::TooManyItems);
     }
+    for item in &mut source_items {
+        normalize_legacy_structural_fields(item)?;
+    }
     source_items.sort_by_key(|item| item.id);
     for pair in source_items.windows(2) {
         if pair[0].id == pair[1].id {
@@ -527,7 +533,70 @@ pub fn prepare_canonical_schedule(
 /// Re-establishes the storage invariants that the server repository normally
 /// guarantees. A local process boundary must not treat a corrupt cached DTO as
 /// an authoritative canonical snapshot.
+fn normalize_legacy_structural_fields(
+    item: &mut CanonicalItem,
+) -> Result<(), PrepareScheduleError> {
+    if item.duration_kind.is_none() {
+        if item.duration_min_seconds.is_some()
+            || item.duration_max_seconds.is_some()
+            || item.duration_source.is_some()
+        {
+            return Err(PrepareScheduleError::InvalidCanonicalItem(item.id));
+        }
+        if let Some(expected) = item.duration_seconds {
+            item.duration_kind = Some(CanonicalDurationKind::Exact);
+            item.duration_min_seconds = Some(expected);
+            item.duration_max_seconds = Some(expected);
+            item.duration_source = Some(if has_legacy_import_evidence(item) {
+                CanonicalDurationSource::Imported
+            } else {
+                CanonicalDurationSource::User
+            });
+        } else {
+            item.duration_kind = Some(CanonicalDurationKind::Unknown);
+        }
+    }
+    if item.deadline_kind.is_none() {
+        if item.deadline_date.is_some()
+            || item.deadline_strength.is_some()
+            || item.deadline_soft_weight.is_some()
+        {
+            return Err(PrepareScheduleError::InvalidCanonicalItem(item.id));
+        }
+        if item.kind == CanonicalItemKind::Event || item.deadline_at.is_none() {
+            item.deadline_kind = Some(CanonicalDeadlineKind::None);
+        } else {
+            item.deadline_kind = Some(CanonicalDeadlineKind::DateTime);
+            item.deadline_strength = Some(CanonicalDeadlineStrength::Hard);
+        }
+    }
+    let legacy_own_effort = match item.flexible_constraints.get("has_own_effort") {
+        Some(serde_json::Value::Bool(value)) => Some(*value),
+        Some(_) => return Err(PrepareScheduleError::InvalidCanonicalItem(item.id)),
+        None => None,
+    };
+    if item
+        .has_own_effort
+        .zip(legacy_own_effort)
+        .is_some_and(|(explicit, legacy)| explicit != legacy)
+    {
+        return Err(PrepareScheduleError::InvalidCanonicalItem(item.id));
+    }
+    item.has_own_effort = Some(item.has_own_effort.or(legacy_own_effort).unwrap_or(false));
+    Ok(())
+}
+
+fn has_legacy_import_evidence(item: &CanonicalItem) -> bool {
+    item.flexible_constraints.as_object().is_some_and(|object| {
+        ["calendar_event", "calendar_context"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(serde_json::Value::is_object))
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Every cross-field storage invariant is audited together.
 fn validate_canonical_item(item: &CanonicalItem) -> Result<(), PrepareScheduleError> {
+    let timezone = item.timezone_name.parse::<Tz>().ok();
     let recurrence_is_valid = item.recurrence.as_ref().is_none_or(|value| {
         value.is_object()
             && serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= MAX_RECURRENCE_BYTES)
@@ -547,6 +616,129 @@ fn validate_canonical_item(item: &CanonicalItem) -> Result<(), PrepareScheduleEr
                 && maximum_chunk_seconds <= duration
         }),
     };
+    let duration_is_valid = match item
+        .duration_kind
+        .expect("structural fields are normalized before validation")
+    {
+        CanonicalDurationKind::Unknown => {
+            item.duration_seconds.is_none()
+                && item.duration_min_seconds.is_none()
+                && item.duration_max_seconds.is_none()
+                && item.duration_source.is_none()
+        }
+        CanonicalDurationKind::Exact => item.duration_seconds.is_some_and(|expected| {
+            (1..=MAX_DURATION_SECONDS).contains(&expected)
+                && item.duration_min_seconds == Some(expected)
+                && item.duration_max_seconds == Some(expected)
+                && item.duration_source.is_some()
+        }),
+        CanonicalDurationKind::Range => item
+            .duration_min_seconds
+            .zip(item.duration_seconds)
+            .zip(item.duration_max_seconds)
+            .is_some_and(|((minimum, expected), maximum)| {
+                (1..=MAX_DURATION_SECONDS).contains(&minimum)
+                    && (1..=MAX_DURATION_SECONDS).contains(&expected)
+                    && (1..=MAX_DURATION_SECONDS).contains(&maximum)
+                    && minimum <= expected
+                    && expected <= maximum
+                    && minimum < maximum
+                    && item.duration_source.is_some()
+            }),
+    };
+    let deadline_strength_is_valid = |required: bool| match item.deadline_strength {
+        None => !required && item.deadline_soft_weight.is_none(),
+        Some(CanonicalDeadlineStrength::Hard) => required && item.deadline_soft_weight.is_none(),
+        Some(CanonicalDeadlineStrength::Soft) => {
+            required
+                && item
+                    .deadline_soft_weight
+                    .is_some_and(|weight| weight <= MAX_WEIGHT)
+        }
+    };
+    let deadline_is_valid = match item
+        .deadline_kind
+        .expect("structural fields are normalized before validation")
+    {
+        CanonicalDeadlineKind::None => {
+            item.deadline_date.is_none()
+                && deadline_strength_is_valid(false)
+                && (item.deadline_at.is_none() || item.kind == CanonicalItemKind::Event)
+        }
+        CanonicalDeadlineKind::Date => {
+            item.deadline_date.is_some_and(|date| {
+                (1..=MAX_DEADLINE_YEAR).contains(&date.year())
+                    && date
+                        .succ_opt()
+                        .is_some_and(|next| next.year() <= MAX_DEADLINE_YEAR)
+            }) && item.deadline_at.is_none()
+                && deadline_strength_is_valid(true)
+                && item.kind != CanonicalItemKind::Event
+        }
+        CanonicalDeadlineKind::DateTime => {
+            item.deadline_date.is_none()
+                && item.deadline_at.is_some()
+                && deadline_strength_is_valid(true)
+                && item.kind != CanonicalItemKind::Event
+        }
+    };
+    let earliest_precedes_deadline = item.earliest_start_at.is_none_or(|earliest| {
+        let effective_deadline = match item
+            .deadline_kind
+            .expect("structural fields are normalized before validation")
+        {
+            CanonicalDeadlineKind::None => return true,
+            CanonicalDeadlineKind::Date => item
+                .deadline_date
+                .and_then(|date| date.succ_opt())
+                .zip(timezone)
+                .and_then(|(next_date, timezone)| zoned_midnight(timezone, next_date).ok()),
+            CanonicalDeadlineKind::DateTime => {
+                item.deadline_at.and_then(|value| to_time(value).ok())
+            }
+        };
+        effective_deadline
+            .is_some_and(|deadline| to_time(earliest).is_ok_and(|earliest| earliest < deadline))
+    });
+    let legacy_own_effort = item
+        .flexible_constraints
+        .get("has_own_effort")
+        .map(serde_json::Value::as_bool);
+    let own_effort_is_valid = match legacy_own_effort {
+        None => !item
+            .flexible_constraints
+            .as_object()
+            .is_some_and(|object| object.contains_key("has_own_effort")),
+        Some(Some(value)) => Some(value) == item.has_own_effort,
+        Some(None) => false,
+    };
+    let blocked_reason_is_valid = item.blocked_reason.as_ref().is_none_or(|reason| {
+        !reason.is_empty()
+            && reason == reason.trim()
+            && reason.chars().count() <= MAX_BLOCKED_REASON_CHARACTERS
+            && !reason.chars().any(char::is_control)
+    });
+    let blocker_is_valid = match (
+        item.status,
+        item.blocked_reason_kind,
+        item.blocked_by_item_id,
+        item.blocked_reason.as_ref(),
+    ) {
+        (
+            CanonicalItemStatus::Blocked,
+            Some(CanonicalBlockedReasonKind::Dependency),
+            Some(blocker_id),
+            _,
+        ) => blocker_id != item.id && blocked_reason_is_valid,
+        (
+            CanonicalItemStatus::Blocked,
+            Some(CanonicalBlockedReasonKind::Manual | CanonicalBlockedReasonKind::External),
+            None,
+            Some(_),
+        ) => blocked_reason_is_valid,
+        (status, None, None, None) if status != CanonicalItemStatus::Blocked => true,
+        _ => false,
+    };
     let valid = item.deleted_at.is_none()
         && item.revision > 0
         && !item.title.is_empty()
@@ -556,14 +748,12 @@ fn validate_canonical_item(item: &CanonicalItem) -> Result<(), PrepareScheduleEr
             .notes
             .as_ref()
             .is_none_or(|notes| notes.chars().count() <= MAX_NOTES_CHARACTERS)
-        && item.timezone_name.parse::<Tz>().is_ok()
-        && item
-            .duration_seconds
-            .is_none_or(|value| (1..=MAX_DURATION_SECONDS).contains(&value))
-        && item
-            .earliest_start_at
-            .zip(item.deadline_at)
-            .is_none_or(|(earliest, deadline)| earliest < deadline)
+        && timezone.is_some()
+        && duration_is_valid
+        && deadline_is_valid
+        && own_effort_is_valid
+        && blocker_is_valid
+        && earliest_precedes_deadline
         && recurrence_is_valid
         && constraints_are_valid
         && split_is_valid
@@ -687,7 +877,7 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
     if metadata.calendar_context.is_some() {
         return Ok(MappedScheduleItem::ContextOnly);
     }
-    let duration = item.duration_seconds.map(duration_estimate);
+    let duration = map_duration(item)?;
     let mut constraints = metadata.constraints.clone();
     if let Some(earliest) = item.earliest_start_at {
         if constraints.earliest_start.is_some() {
@@ -699,13 +889,11 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
             to_time_in_timezone(earliest, item_timezone).map_err(|error| error.to_string())?,
         ));
     }
-    if let Some(deadline) = item.deadline_at {
+    if let Some(deadline) = map_deadline(item, item_timezone)? {
         if constraints.latest_finish.is_some() {
             return Err("deadline is defined in both the canonical field and metadata".into());
         }
-        constraints.latest_finish = Some(Qualified::hard(
-            to_time_in_timezone(deadline, item_timezone).map_err(|error| error.to_string())?,
-        ));
+        constraints.latest_finish = Some(deadline);
     }
     if let Some(preferred_start) = metadata.preferred_start_minute {
         add_legacy_preferred_window(
@@ -727,7 +915,15 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
         status: map_status(item.status),
         parent_id: item.parent_id.map(ItemId),
         sibling_order: Some(item.sibling_order),
-        has_own_effort: metadata.has_own_effort,
+        // A non-leaf parent's independent component needs its own durable
+        // work-unit identity before execution can complete that component
+        // without completing the parent. Until that graph slice exists, the
+        // repository's `is_executable=false` projection suppresses only the
+        // parent's own demand while retaining it for hierarchy roll-up.
+        has_own_effort: item.is_executable
+            && item
+                .has_own_effort
+                .expect("structural fields are normalized before mapping"),
         goal_ids: metadata.goal_ids.into_iter().map(ItemId).collect(),
         priority: Priority {
             importance: normalize_priority(item.importance),
@@ -806,6 +1002,10 @@ fn map_kind(
                 weekly_allocation: metadata.goal_weekly_allocation,
             }))
         }
+        CanonicalItemKind::Project => {
+            reject_recurrence(recurrence.as_ref(), "project")?;
+            Ok(PlanningItemKind::Project)
+        }
         CanonicalItemKind::Break => {
             reject_recurrence(recurrence.as_ref(), "break")?;
             Ok(PlanningItemKind::Break(BreakSpec {
@@ -846,8 +1046,95 @@ fn map_split_policy(
     }
 }
 
-fn duration_estimate(seconds: u32) -> DurationEstimate {
-    DurationEstimate::exact(seconds_to_minutes(seconds).get())
+fn map_duration(item: &CanonicalItem) -> Result<Option<DurationEstimate>, String> {
+    let source = item.duration_source.map(|source| match source {
+        CanonicalDurationSource::User => EstimateSource::User,
+        CanonicalDurationSource::Assistant => EstimateSource::Ai,
+        CanonicalDurationSource::Learned => EstimateSource::Learned,
+        CanonicalDurationSource::Imported => EstimateSource::Imported,
+    });
+    match item
+        .duration_kind
+        .expect("structural fields are normalized before mapping")
+    {
+        CanonicalDurationKind::Unknown => Ok(None),
+        CanonicalDurationKind::Exact => DurationEstimate::try_exact(
+            seconds_to_minutes(
+                item.duration_seconds
+                    .ok_or_else(|| "exact duration is incomplete".to_owned())?,
+            ),
+            source.ok_or_else(|| "duration source is missing".to_owned())?,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string()),
+        CanonicalDurationKind::Range => {
+            let minimum = seconds_to_minutes(
+                item.duration_min_seconds
+                    .ok_or_else(|| "duration minimum is missing".to_owned())?,
+            );
+            let expected = seconds_to_minutes(
+                item.duration_seconds
+                    .ok_or_else(|| "duration expected value is missing".to_owned())?,
+            );
+            let maximum = seconds_to_minutes(
+                item.duration_max_seconds
+                    .ok_or_else(|| "duration maximum is missing".to_owned())?,
+            );
+            let source = source.ok_or_else(|| "duration source is missing".to_owned())?;
+            if minimum == maximum {
+                DurationEstimate::try_exact(expected, source)
+            } else {
+                DurationEstimate::try_range(minimum, expected, maximum, source)
+            }
+            .map(Some)
+            .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn map_deadline(
+    item: &CanonicalItem,
+    timezone: Tz,
+) -> Result<Option<Qualified<OffsetDateTime>>, String> {
+    let strength = || {
+        item.deadline_strength
+            .map(|strength| match strength {
+                CanonicalDeadlineStrength::Hard => ConstraintStrength::Hard,
+                CanonicalDeadlineStrength::Soft => ConstraintStrength::Soft {
+                    weight: item
+                        .deadline_soft_weight
+                        .expect("validated soft deadline has a weight"),
+                },
+            })
+            .ok_or_else(|| "deadline strength is missing".to_owned())
+    };
+    match item
+        .deadline_kind
+        .expect("structural fields are normalized before mapping")
+    {
+        CanonicalDeadlineKind::None => Ok(None),
+        CanonicalDeadlineKind::Date => {
+            let date = item
+                .deadline_date
+                .ok_or_else(|| "deadline date is missing".to_owned())?;
+            let next_date = date
+                .succ_opt()
+                .ok_or_else(|| "deadline date is outside the supported range".to_owned())?;
+            Ok(Some(Qualified {
+                value: zoned_midnight(timezone, next_date).map_err(|error| error.to_string())?,
+                strength: strength()?,
+            }))
+        }
+        CanonicalDeadlineKind::DateTime => Ok(Some(Qualified {
+            value: to_time_in_timezone(
+                item.deadline_at
+                    .ok_or_else(|| "deadline date-time is missing".to_owned())?,
+                timezone,
+            )
+            .map_err(|error| error.to_string())?,
+            strength: strength()?,
+        })),
+    }
 }
 
 const fn seconds_to_minutes(seconds: u32) -> Minutes {
@@ -867,6 +1154,7 @@ const fn map_status(status: CanonicalItemStatus) -> WorkStatus {
         CanonicalItemStatus::Completed => WorkStatus::Completed,
         CanonicalItemStatus::Skipped => WorkStatus::Skipped,
         CanonicalItemStatus::Cancelled => WorkStatus::Canceled,
+        CanonicalItemStatus::Blocked => WorkStatus::Blocked,
     }
 }
 
@@ -1192,4 +1480,139 @@ fn to_time_in_timezone(
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, PrepareScheduleError> {
     Err(PrepareScheduleError::InvalidRequest(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_minute_range_projects_to_valid_exact_minutes_without_mutating_seconds() {
+        let now = Utc::now();
+        let item = CanonicalItem {
+            id: Uuid::from_u128(1),
+            is_sensitive: false,
+            kind: CanonicalItemKind::Task,
+            status: CanonicalItemStatus::Planned,
+            title: "Sub-minute range".to_owned(),
+            notes: None,
+            timezone_name: "UTC".to_owned(),
+            duration_kind: Some(CanonicalDurationKind::Range),
+            duration_seconds: Some(30),
+            duration_min_seconds: Some(1),
+            duration_max_seconds: Some(59),
+            duration_source: Some(CanonicalDurationSource::Assistant),
+            deadline_kind: Some(CanonicalDeadlineKind::None),
+            deadline_date: None,
+            deadline_at: None,
+            deadline_strength: None,
+            deadline_soft_weight: None,
+            earliest_start_at: None,
+            recurrence: None,
+            flexible_constraints: serde_json::json!({}),
+            has_own_effort: Some(false),
+            split_policy: CanonicalSplitPolicy::Indivisible,
+            importance: 0,
+            urgency: 0,
+            parent_id: None,
+            sibling_order: 0,
+            is_executable: true,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            deleted_at: None,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
+        };
+
+        let projected = map_duration(&item)
+            .expect("valid canonical seconds")
+            .expect("known duration");
+        assert_eq!(projected.minimum, Minutes(1));
+        assert_eq!(projected.expected, Minutes(1));
+        assert_eq!(projected.maximum, Minutes(1));
+        assert_eq!(projected.source, EstimateSource::Ai);
+        assert_eq!(item.duration_min_seconds, Some(1));
+        assert_eq!(item.duration_seconds, Some(30));
+        assert_eq!(item.duration_max_seconds, Some(59));
+
+        let mut inverted_date_deadline = item.clone();
+        inverted_date_deadline.timezone_name = "America/New_York".to_owned();
+        inverted_date_deadline.deadline_kind = Some(CanonicalDeadlineKind::Date);
+        inverted_date_deadline.deadline_date = NaiveDate::from_ymd_opt(2026, 9, 3);
+        inverted_date_deadline.deadline_strength = Some(CanonicalDeadlineStrength::Hard);
+        inverted_date_deadline.earliest_start_at =
+            Some("2026-09-04T04:00:00Z".parse().expect("boundary instant"));
+        assert!(matches!(
+            validate_canonical_item(&inverted_date_deadline),
+            Err(PrepareScheduleError::InvalidCanonicalItem(id))
+                if id == inverted_date_deadline.id
+        ));
+
+        let mut unsupported_deadline = item;
+        unsupported_deadline.deadline_kind = Some(CanonicalDeadlineKind::Date);
+        unsupported_deadline.deadline_date = NaiveDate::from_ymd_opt(9_999, 12, 31);
+        unsupported_deadline.deadline_strength = Some(CanonicalDeadlineStrength::Hard);
+        assert!(matches!(
+            validate_canonical_item(&unsupported_deadline),
+            Err(PrepareScheduleError::InvalidCanonicalItem(id)) if id == unsupported_deadline.id
+        ));
+    }
+
+    #[test]
+    fn legacy_google_task_duration_is_user_authored_not_provider_imported() {
+        let now = Utc::now();
+        let mut item = CanonicalItem {
+            id: Uuid::from_u128(2),
+            is_sensitive: false,
+            kind: CanonicalItemKind::Task,
+            status: CanonicalItemStatus::Planned,
+            title: "Legacy mapped task".to_owned(),
+            notes: None,
+            timezone_name: "UTC".to_owned(),
+            duration_kind: None,
+            duration_seconds: Some(900),
+            duration_min_seconds: None,
+            duration_max_seconds: None,
+            duration_source: None,
+            deadline_kind: None,
+            deadline_date: None,
+            deadline_at: None,
+            deadline_strength: None,
+            deadline_soft_weight: None,
+            earliest_start_at: None,
+            recurrence: None,
+            flexible_constraints: serde_json::json!({"google_sync": {}}),
+            has_own_effort: None,
+            split_policy: CanonicalSplitPolicy::Indivisible,
+            importance: 0,
+            urgency: 0,
+            parent_id: None,
+            sibling_order: 0,
+            is_executable: true,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            deleted_at: None,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
+        };
+        normalize_legacy_structural_fields(&mut item).expect("legacy normalization");
+        assert_eq!(item.duration_source, Some(CanonicalDurationSource::User));
+
+        item.duration_kind = None;
+        item.duration_min_seconds = None;
+        item.duration_max_seconds = None;
+        item.duration_source = None;
+        item.flexible_constraints = serde_json::json!({"calendar_context": {}});
+        normalize_legacy_structural_fields(&mut item).expect("calendar normalization");
+        assert_eq!(
+            item.duration_source,
+            Some(CanonicalDurationSource::Imported)
+        );
+    }
 }

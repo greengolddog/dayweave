@@ -133,6 +133,14 @@ impl ScheduleQueryPort for InMemoryScheduleQueryPort {
                 redacted_count += 1;
                 continue;
             }
+            let visible_blocked_by_item_id = item.blocked_by_item_id.as_ref().and_then(|id| {
+                (access.include_sensitive
+                    || self
+                        .items
+                        .iter()
+                        .any(|candidate| &candidate.id == id && !candidate.sensitive))
+                .then(|| id.clone())
+            });
             if text
                 .as_ref()
                 .is_some_and(|text| !item.title.to_lowercase().contains(text))
@@ -165,6 +173,20 @@ impl ScheduleQueryPort for InMemoryScheduleQueryPort {
                 kind: item.kind.clone(),
                 project_id: item.project_id.clone(),
                 goal_id: item.goal_id.clone(),
+                duration_kind: item.duration_kind.clone(),
+                duration_seconds: item.duration_seconds,
+                duration_min_seconds: item.duration_min_seconds,
+                duration_max_seconds: item.duration_max_seconds,
+                duration_source: item.duration_source.clone(),
+                deadline_kind: item.deadline_kind.clone(),
+                deadline_date: item.deadline_date,
+                deadline_at: item.deadline_at,
+                deadline_strength: item.deadline_strength.clone(),
+                deadline_soft_weight: item.deadline_soft_weight,
+                has_own_effort: item.has_own_effort,
+                blocked_reason_kind: item.blocked_reason_kind.clone(),
+                blocked_by_item_id: visible_blocked_by_item_id,
+                blocked_reason: item.blocked_reason.clone(),
                 deadline: item.deadline,
                 scheduled_start: item.scheduled_start,
             });

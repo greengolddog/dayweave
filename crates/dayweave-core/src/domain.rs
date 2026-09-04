@@ -159,6 +159,42 @@ impl Minutes {
     }
 }
 
+/// Maximum persisted lag for one dependency edge: 366 days in whole minutes.
+///
+/// Keeping the bound in the domain prevents direct/offline callers from
+/// constructing edges that the public compose boundary cannot represent.
+pub const MAX_DEPENDENCY_LAG_MINUTES: u32 = 527_040;
+
+/// Maximum persisted objective weight accepted for any soft structural rule.
+pub const MAX_SOFT_CONSTRAINT_WEIGHT: u32 = 1_000_000;
+
+/// Compatibility name for the soft-weight bound applied to dependencies.
+pub const MAX_DEPENDENCY_WEIGHT: u32 = MAX_SOFT_CONSTRAINT_WEIGHT;
+
+/// Explicit duration shape exposed to editors and persistence projections.
+///
+/// [`DurationKind::Unknown`] corresponds to `WorkItem::duration == None`;
+/// unknown duration is deliberately distinct from a zero-minute estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurationKind {
+    Unknown,
+    Exact,
+    Range,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DurationEstimateError {
+    #[error("duration minimum must be greater than zero")]
+    ZeroMinimum,
+    #[error("duration must satisfy minimum <= expected <= maximum")]
+    InvalidRange,
+    #[error("ranged duration must have minimum < maximum")]
+    RangeMustVary,
+    #[error("remaining duration cannot exceed maximum")]
+    RemainingExceedsMaximum,
+}
+
 /// A range records estimation uncertainty while `expected` remains the amount
 /// the deterministic planner reserves. `remaining` accounts for partial work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +219,76 @@ impl DurationEstimate {
         }
     }
 
+    /// Constructs a validated exact estimate with explicit provenance.
+    ///
+    /// The original [`Self::exact`] constructor remains available for source
+    /// compatibility; scheduler validation still rejects its zero value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurationEstimateError::ZeroMinimum`] for a zero-minute value.
+    pub fn try_exact(
+        value: Minutes,
+        source: EstimateSource,
+    ) -> Result<Self, DurationEstimateError> {
+        let estimate = Self {
+            minimum: value,
+            expected: value,
+            maximum: value,
+            remaining: None,
+            source,
+        };
+        estimate.validate()?;
+        Ok(estimate)
+    }
+
+    /// Constructs a validated range whose `expected` value is reserved by the
+    /// deterministic planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurationEstimateError`] when the range is empty or unordered.
+    pub fn try_range(
+        minimum: Minutes,
+        expected: Minutes,
+        maximum: Minutes,
+        source: EstimateSource,
+    ) -> Result<Self, DurationEstimateError> {
+        let estimate = Self {
+            minimum,
+            expected,
+            maximum,
+            remaining: None,
+            source,
+        };
+        estimate.validate()?;
+        if minimum == maximum {
+            return Err(DurationEstimateError::RangeMustVary);
+        }
+        Ok(estimate)
+    }
+
+    /// Applies a validated remaining-work override after partial execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurationEstimateError::RemainingExceedsMaximum`] when the
+    /// remaining value is larger than the estimate's maximum.
+    pub fn try_with_remaining(mut self, remaining: Minutes) -> Result<Self, DurationEstimateError> {
+        self.remaining = Some(remaining);
+        self.validate()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> DurationKind {
+        if self.minimum.0 == self.expected.0 && self.expected.0 == self.maximum.0 {
+            DurationKind::Exact
+        } else {
+            DurationKind::Range
+        }
+    }
+
     #[must_use]
     pub const fn planning_minutes(self) -> Minutes {
         match self.remaining {
@@ -191,18 +297,23 @@ impl DurationEstimate {
         }
     }
 
-    pub(crate) fn validate(self) -> Result<(), &'static str> {
+    /// Validates all duration ordering and remaining-work invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violated [`DurationEstimateError`] invariant.
+    pub fn validate(self) -> Result<(), DurationEstimateError> {
         if self.minimum.is_zero() {
-            return Err("duration minimum must be greater than zero");
+            return Err(DurationEstimateError::ZeroMinimum);
         }
         if self.minimum > self.expected || self.expected > self.maximum {
-            return Err("duration must satisfy minimum <= expected <= maximum");
+            return Err(DurationEstimateError::InvalidRange);
         }
         if self
             .remaining
             .is_some_and(|remaining| remaining > self.maximum)
         {
-            return Err("remaining duration cannot exceed maximum");
+            return Err(DurationEstimateError::RemainingExceedsMaximum);
         }
         Ok(())
     }
@@ -262,12 +373,21 @@ impl WorkStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Skipped | Self::Canceled)
     }
+
+    /// Only completed work proves that a prerequisite was accomplished.
+    /// Skipping or canceling work is terminal for scheduling, but it does not
+    /// satisfy a hard dependency owned by another item.
+    #[must_use]
+    pub const fn satisfies_prerequisite(self) -> bool {
+        matches!(self, Self::Completed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ItemKind {
     Task,
+    Project,
     RecurringTask(RecurringTaskSpec),
     Habit(HabitSpec),
     Routine(RoutineSpec),
@@ -444,11 +564,18 @@ impl WorkItem {
     pub fn occupies_time(&self, has_children: bool) -> bool {
         match self.kind {
             ItemKind::CalendarEvent(_) => true,
-            // Goals and routines are semantic containers even before their
-            // first child is created.
-            ItemKind::Goal(_) | ItemKind::Routine(_) => self.has_own_effort,
+            // Projects, goals, and routines are semantic containers even
+            // before their first child is created. An explicit independent
+            // effort component remains schedulable alongside their roll-up.
+            ItemKind::Project | ItemKind::Goal(_) | ItemKind::Routine(_) => self.has_own_effort,
             _ => !has_children || self.has_own_effort,
         }
+    }
+
+    #[must_use]
+    pub fn duration_kind(&self) -> DurationKind {
+        self.duration
+            .map_or(DurationKind::Unknown, DurationEstimate::kind)
     }
 }
 
@@ -522,6 +649,74 @@ impl<T> Qualified<T> {
             strength: ConstraintStrength::Soft { weight },
         }
     }
+}
+
+/// User-authored deadline intent before platform time-zone resolution.
+///
+/// A date-only deadline remains a calendar date instead of being coerced to an
+/// arbitrary midnight instant. The composing boundary resolves it against the
+/// item's IANA time zone before populating scheduler `latest_finish` bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Deadline {
+    #[default]
+    None,
+    Date {
+        #[serde(with = "iso_date")]
+        date: time::Date,
+        strength: ConstraintStrength,
+    },
+    DateTime {
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+        strength: ConstraintStrength,
+    },
+}
+
+impl Deadline {
+    #[must_use]
+    pub const fn date(date: time::Date, strength: ConstraintStrength) -> Self {
+        Self::Date { date, strength }
+    }
+
+    #[must_use]
+    pub const fn date_time(at: OffsetDateTime, strength: ConstraintStrength) -> Self {
+        Self::DateTime { at, strength }
+    }
+
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    #[must_use]
+    pub const fn strength(self) -> Option<ConstraintStrength> {
+        match self {
+            Self::None => None,
+            Self::Date { strength, .. } | Self::DateTime { strength, .. } => Some(strength),
+        }
+    }
+
+    /// Validates deadline policy bounds without resolving date-only intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeadlineError::WeightTooLarge`] when a soft deadline exceeds
+    /// the persisted objective-weight bound.
+    pub fn validate(self) -> Result<(), DeadlineError> {
+        if let Some(ConstraintStrength::Soft { weight }) = self.strength()
+            && weight > MAX_SOFT_CONSTRAINT_WEIGHT
+        {
+            return Err(DeadlineError::WeightTooLarge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineError {
+    #[error("deadline soft weight must be at most {MAX_SOFT_CONSTRAINT_WEIGHT}")]
+    WeightTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -631,6 +826,61 @@ pub struct Dependency {
     pub relation: DependencyRelation,
     pub minimum_lag: Minutes,
     pub strength: ConstraintStrength,
+}
+
+impl Dependency {
+    /// Constructs an edge after validating its lag and soft weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DependencyError`] when the lag or soft weight exceeds its
+    /// persisted domain bound.
+    pub fn try_new(
+        item_id: ItemId,
+        relation: DependencyRelation,
+        minimum_lag: Minutes,
+        strength: ConstraintStrength,
+    ) -> Result<Self, DependencyError> {
+        let dependency = Self {
+            item_id,
+            relation,
+            minimum_lag,
+            strength,
+        };
+        dependency.validate(None)?;
+        Ok(dependency)
+    }
+
+    /// Validates an edge and, when supplied, rejects an owner self-reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DependencyError`] for a self-reference, excessive lag, or
+    /// excessive soft weight.
+    pub fn validate(&self, owner_id: Option<ItemId>) -> Result<(), DependencyError> {
+        if owner_id == Some(self.item_id) {
+            return Err(DependencyError::SelfReference);
+        }
+        if self.minimum_lag.get() > MAX_DEPENDENCY_LAG_MINUTES {
+            return Err(DependencyError::LagTooLarge);
+        }
+        if let ConstraintStrength::Soft { weight } = self.strength
+            && weight > MAX_DEPENDENCY_WEIGHT
+        {
+            return Err(DependencyError::WeightTooLarge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyError {
+    #[error("dependency cannot reference its owning item")]
+    SelfReference,
+    #[error("dependency lag must be at most {MAX_DEPENDENCY_LAG_MINUTES} minutes")]
+    LagTooLarge,
+    #[error("dependency soft weight must be at most {MAX_DEPENDENCY_WEIGHT}")]
+    WeightTooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1107,7 +1357,9 @@ pub enum HierarchyError {
 
 /// Calculates expected duration for every parent without scheduling parents as
 /// extra work. A parent's own estimate is included only when `has_own_effort`
-/// is true; a leaf always includes its own estimate.
+/// is true. Actionable leaves include their own estimate, while semantic
+/// project, goal, and routine containers require explicit own effort even when
+/// they have no children yet.
 ///
 /// # Errors
 ///
@@ -1166,7 +1418,7 @@ fn visit_rollup(
     let item = by_id[&id];
     let child_ids = children.get(&id).map_or(&[][..], Vec::as_slice);
     let mut total = 0_u32;
-    if child_ids.is_empty() || item.has_own_effort {
+    if item.occupies_time(!child_ids.is_empty()) {
         total = item
             .duration
             .map_or(0, |duration| duration.planning_minutes().get());

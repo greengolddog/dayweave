@@ -4,7 +4,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    items::{Item, ItemRepositoryError},
+    items::{DeadlineKind, DeadlineStrength, Item, ItemRepositoryError},
     proposals::{
         Clock, DecisionKind, MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, Proposal,
         ProposalApplicationReceipt, ProposalApplicationStatus, ProposalAppliedMember,
@@ -1059,16 +1059,28 @@ fn changed_fields(before: Option<&Item>, after: Option<&Item>) -> Vec<ProposalIt
             ProposalItemField::Title,
             ProposalItemField::Notes,
             ProposalItemField::TimezoneName,
+            ProposalItemField::DurationKind,
             ProposalItemField::DurationSeconds,
+            ProposalItemField::DurationMinSeconds,
+            ProposalItemField::DurationMaxSeconds,
+            ProposalItemField::DurationSource,
+            ProposalItemField::DeadlineKind,
+            ProposalItemField::DeadlineDate,
             ProposalItemField::DeadlineAt,
+            ProposalItemField::DeadlineStrength,
+            ProposalItemField::DeadlineSoftWeight,
             ProposalItemField::EarliestStartAt,
             ProposalItemField::Recurrence,
             ProposalItemField::FlexibleConstraints,
+            ProposalItemField::HasOwnEffort,
             ProposalItemField::SplitPolicy,
             ProposalItemField::Importance,
             ProposalItemField::Urgency,
             ProposalItemField::ParentId,
             ProposalItemField::SiblingOrder,
+            ProposalItemField::BlockedReasonKind,
+            ProposalItemField::BlockedByItemId,
+            ProposalItemField::BlockedReason,
             ProposalItemField::IsExecutable,
             ProposalItemField::Revision,
             ProposalItemField::CompletedAt,
@@ -1092,21 +1104,152 @@ fn changed_fields(before: Option<&Item>, after: Option<&Item>) -> Vec<ProposalIt
     changed!(title, Title);
     changed!(notes, Notes);
     changed!(timezone_name, TimezoneName);
+    changed!(duration_kind, DurationKind);
     changed!(duration_seconds, DurationSeconds);
+    changed!(duration_min_seconds, DurationMinSeconds);
+    changed!(duration_max_seconds, DurationMaxSeconds);
+    changed!(duration_source, DurationSource);
+    changed!(deadline_kind, DeadlineKind);
+    changed!(deadline_date, DeadlineDate);
     changed!(deadline_at, DeadlineAt);
+    changed!(deadline_strength, DeadlineStrength);
+    changed!(deadline_soft_weight, DeadlineSoftWeight);
     changed!(earliest_start_at, EarliestStartAt);
     changed!(recurrence, Recurrence);
     changed!(flexible_constraints, FlexibleConstraints);
+    changed!(has_own_effort, HasOwnEffort);
     changed!(split_policy, SplitPolicy);
     changed!(importance, Importance);
     changed!(urgency, Urgency);
     changed!(parent_id, ParentId);
     changed!(sibling_order, SiblingOrder);
+    changed!(blocked_reason_kind, BlockedReasonKind);
+    changed!(blocked_by_item_id, BlockedByItemId);
+    changed!(blocked_reason, BlockedReason);
     changed!(is_executable, IsExecutable);
     changed!(revision, Revision);
     changed!(completed_at, CompletedAt);
     changed!(deleted_at, DeletedAt);
     fields
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeadlineRiskShape {
+    kind: DeadlineKind,
+    date: Option<NaiveDate>,
+    instant: Option<DateTime<Utc>>,
+    strength: Option<DeadlineStrength>,
+    soft_weight: Option<u32>,
+}
+
+impl DeadlineRiskShape {
+    fn new(
+        kind: DeadlineKind,
+        date: Option<NaiveDate>,
+        instant: Option<DateTime<Utc>>,
+        strength: Option<DeadlineStrength>,
+        soft_weight: Option<u32>,
+    ) -> Self {
+        match kind {
+            DeadlineKind::None => Self {
+                kind,
+                date: None,
+                instant: None,
+                strength: None,
+                soft_weight: None,
+            },
+            DeadlineKind::Date => Self {
+                kind,
+                date,
+                instant: None,
+                strength,
+                soft_weight: (strength == Some(DeadlineStrength::Soft))
+                    .then_some(soft_weight)
+                    .flatten(),
+            },
+            DeadlineKind::DateTime => Self {
+                kind,
+                date: None,
+                instant,
+                strength,
+                soft_weight: (strength == Some(DeadlineStrength::Soft))
+                    .then_some(soft_weight)
+                    .flatten(),
+            },
+        }
+    }
+
+    fn from_item(item: &Item) -> Self {
+        Self::new(
+            item.deadline_kind,
+            item.deadline_date,
+            item.deadline_at,
+            item.deadline_strength,
+            item.deadline_soft_weight,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadlineRiskChange {
+    Changed,
+    Relaxed,
+}
+
+fn deadline_risk_change(before: &Item, after: &Item) -> Option<DeadlineRiskChange> {
+    classify_deadline_risk_change(
+        &DeadlineRiskShape::from_item(before),
+        &DeadlineRiskShape::from_item(after),
+    )
+}
+
+fn classify_deadline_risk_change(
+    before: &DeadlineRiskShape,
+    after: &DeadlineRiskShape,
+) -> Option<DeadlineRiskChange> {
+    if before == after {
+        return None;
+    }
+
+    let mut relaxed = false;
+    let mut tightened = false;
+    match (before.kind, after.kind) {
+        (DeadlineKind::None, DeadlineKind::Date | DeadlineKind::DateTime) => tightened = true,
+        (DeadlineKind::Date | DeadlineKind::DateTime, DeadlineKind::None) => relaxed = true,
+        (DeadlineKind::Date, DeadlineKind::Date) => {
+            if let (Some(old), Some(new)) = (before.date, after.date) {
+                relaxed |= new > old;
+                tightened |= new < old;
+            }
+        }
+        (DeadlineKind::DateTime, DeadlineKind::DateTime) => {
+            if let (Some(old), Some(new)) = (before.instant, after.instant) {
+                relaxed |= new > old;
+                tightened |= new < old;
+            }
+        }
+        _ => {}
+    }
+
+    if before.kind != DeadlineKind::None && after.kind != DeadlineKind::None {
+        match (before.strength, after.strength) {
+            (Some(DeadlineStrength::Hard), Some(DeadlineStrength::Soft)) => relaxed = true,
+            (Some(DeadlineStrength::Soft), Some(DeadlineStrength::Hard)) => tightened = true,
+            (Some(DeadlineStrength::Soft), Some(DeadlineStrength::Soft)) => {
+                if let (Some(old), Some(new)) = (before.soft_weight, after.soft_weight) {
+                    relaxed |= new < old;
+                    tightened |= new > old;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(if relaxed && !tightened {
+        DeadlineRiskChange::Relaxed
+    } else {
+        DeadlineRiskChange::Changed
+    })
 }
 
 #[allow(clippy::too_many_lines)] // Each material field class is deliberately explicit in the approval model.
@@ -1191,11 +1334,8 @@ fn proposal_risks(
         };
         let after = &effect.after;
         let mut material = Vec::new();
-        if before.deadline_at != after.deadline_at {
-            let relaxed = before.deadline_at.is_some()
-                && after
-                    .deadline_at
-                    .is_none_or(|deadline| before.deadline_at.is_some_and(|old| deadline > old));
+        if let Some(deadline_change) = deadline_risk_change(before, after) {
+            let relaxed = deadline_change == DeadlineRiskChange::Relaxed;
             material.push((
                 if relaxed {
                     ProposalRiskCode::RelaxesDeadline
@@ -2567,4 +2707,99 @@ fn validation(message: impl Into<String>) -> ProposalApplicationError {
 
 fn internal<T>(_error: T) -> ProposalApplicationError {
     ProposalApplicationError::Internal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_risk_classification_uses_the_typed_shape_and_partial_order() {
+        let first_instant = Some("2026-09-04T09:00:00Z".parse().unwrap());
+        let second_instant = Some("2026-09-04T10:00:00Z".parse().unwrap());
+        let no_deadline_before = DeadlineRiskShape::new(
+            DeadlineKind::None,
+            None,
+            first_instant,
+            Some(DeadlineStrength::Hard),
+            None,
+        );
+        let no_deadline_after = DeadlineRiskShape::new(
+            DeadlineKind::None,
+            None,
+            second_instant,
+            Some(DeadlineStrength::Soft),
+            Some(1),
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&no_deadline_before, &no_deadline_after),
+            None,
+            "an event interval end is not a deadline when deadline_kind is none"
+        );
+
+        let first_date = NaiveDate::from_ymd_opt(2026, 9, 4);
+        let second_date = NaiveDate::from_ymd_opt(2026, 9, 5);
+        let hard_first = DeadlineRiskShape::new(
+            DeadlineKind::Date,
+            first_date,
+            None,
+            Some(DeadlineStrength::Hard),
+            None,
+        );
+        let hard_second = DeadlineRiskShape::new(
+            DeadlineKind::Date,
+            second_date,
+            None,
+            Some(DeadlineStrength::Hard),
+            None,
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&hard_first, &hard_second),
+            Some(DeadlineRiskChange::Relaxed),
+            "a later date-only deadline is a relaxation"
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&hard_second, &hard_first),
+            Some(DeadlineRiskChange::Changed),
+            "an earlier deadline is a material tightening"
+        );
+
+        let soft_high = DeadlineRiskShape::new(
+            DeadlineKind::Date,
+            first_date,
+            None,
+            Some(DeadlineStrength::Soft),
+            Some(90),
+        );
+        let soft_low = DeadlineRiskShape::new(
+            DeadlineKind::Date,
+            first_date,
+            None,
+            Some(DeadlineStrength::Soft),
+            Some(20),
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&soft_high, &soft_low),
+            Some(DeadlineRiskChange::Relaxed),
+            "lowering a soft-deadline weight is a relaxation"
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&hard_first, &soft_low),
+            Some(DeadlineRiskChange::Relaxed),
+            "changing a hard deadline to soft is a relaxation"
+        );
+
+        let hard_later = DeadlineRiskShape::new(
+            DeadlineKind::Date,
+            second_date,
+            None,
+            Some(DeadlineStrength::Hard),
+            None,
+        );
+        assert_eq!(
+            classify_deadline_risk_change(&soft_high, &hard_later),
+            Some(DeadlineRiskChange::Changed),
+            "mixed tightening and relaxation is not mislabeled as a pure relaxation"
+        );
+    }
 }

@@ -116,6 +116,296 @@ async fn deferred_start_requires_immutable_schedule_attestation() {
     scenario.expect("PostgreSQL deferred Start scenario task succeeds");
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end scenario exercises API, repository, and DB execution seals.
+async fn semantic_container_without_own_effort_is_not_executable() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; container Start test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(
+        pool,
+        "execution-container-owner",
+        "execution-container-workspace",
+    )
+    .await;
+    let now = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(now));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let item_id = Uuid::new_v4();
+    let created = items
+        .create(
+            NewItem {
+                id: item_id,
+                is_sensitive: false,
+                kind: ItemKind::Project,
+                status: ItemStatus::Planned,
+                title: "Container without own effort".to_owned(),
+                notes: None,
+                timezone_name: "UTC".to_owned(),
+                duration_kind: None,
+                duration_seconds: Some(3_600),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
+                deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
+                earliest_start_at: None,
+                recurrence: None,
+                flexible_constraints: json!({}),
+                has_own_effort: Some(false),
+                split_policy: SplitPolicy::Indivisible,
+                importance: 50,
+                urgency: 50,
+                parent_id: None,
+                sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
+            },
+            ItemIdempotencyKey {
+                key: "execution-container-item-001".to_owned(),
+                fingerprint: [0xC1; 32],
+            },
+        )
+        .await
+        .expect("create semantic container");
+    assert!(!created.item.is_executable);
+
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    );
+    let rejected = execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id: Uuid::new_v4(),
+                item_id,
+                item_revision: created.item.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-container-start-001", 0xC2),
+        )
+        .await
+        .expect_err("default Project cannot Start");
+    assert!(matches!(rejected, ExecutionServiceError::ItemNotExecutable));
+    assert!(
+        raw_active_start(
+            pool,
+            scope,
+            item_id,
+            i64::try_from(created.item.revision).unwrap(),
+            None,
+            0,
+            None,
+            now,
+        )
+        .await
+        .is_err(),
+        "database semantic seal must reject a bypassed Start"
+    );
+
+    let mut add_own_effort = item_replacement(&created.item, ItemStatus::Planned);
+    add_own_effort.flexible_constraints = json!({"has_own_effort": true});
+    add_own_effort.has_own_effort = Some(true);
+    let executable = items
+        .replace(
+            item_id,
+            created.item.revision,
+            add_own_effort,
+            ItemIdempotencyKey {
+                key: "execution-container-own-effort-001".to_owned(),
+                fingerprint: [0xC3; 32],
+            },
+        )
+        .await
+        .expect("add explicit own component");
+    assert!(executable.item.is_executable);
+    let session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id,
+                item_id,
+                item_revision: executable.item.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-container-own-start-001", 0xC4),
+        )
+        .await
+        .expect("explicit Project own component can Start while it is a leaf");
+
+    let mut remove_own_effort = item_replacement(&executable.item, ItemStatus::Planned);
+    remove_own_effort.flexible_constraints = json!({});
+    remove_own_effort.has_own_effort = Some(false);
+    let conflict = items
+        .replace(
+            item_id,
+            executable.item.revision,
+            remove_own_effort,
+            ItemIdempotencyKey {
+                key: "execution-container-remove-own-effort-001".to_owned(),
+                fingerprint: [0xC5; 32],
+            },
+        )
+        .await
+        .expect_err("active own component cannot be removed");
+    assert!(matches!(
+        conflict,
+        ItemServiceError::Repository(ItemRepositoryError::ActiveExecutionConflict {
+            item_id: conflicted_item,
+            session_id: conflicted_session,
+        }) if conflicted_item == item_id && conflicted_session == session_id
+    ));
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One lifecycle proves all three hierarchy transitions share the execution fence.
+async fn active_parent_rejects_child_create_reparent_and_restore() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; active-parent hierarchy test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(
+        pool,
+        "execution-active-parent-owner",
+        "execution-active-parent-workspace",
+    )
+    .await;
+    let now = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(now));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let parent_id = Uuid::new_v4();
+    let movable_id = Uuid::new_v4();
+    let restorable_id = Uuid::new_v4();
+    create_item(&items, parent_id, "Executing parent", 0xD1).await;
+    create_item(&items, movable_id, "Movable child", 0xD2).await;
+    let restorable = items
+        .create(
+            execution_item(restorable_id, "Restorable child", Some(parent_id)),
+            ItemIdempotencyKey {
+                key: "execution-active-parent-restorable-create-001".to_owned(),
+                fingerprint: [0xD3; 32],
+            },
+        )
+        .await
+        .expect("create restorable child");
+    let deleted = items
+        .trash(
+            restorable_id,
+            restorable.item.revision,
+            ItemIdempotencyKey {
+                key: "execution-active-parent-restorable-trash-001".to_owned(),
+                fingerprint: [0xD4; 32],
+            },
+        )
+        .await
+        .expect("trash child so parent is a leaf");
+    let parent = items.get(parent_id).await.expect("load refreshed parent");
+    assert!(parent.is_executable);
+
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock,
+    );
+    let session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id,
+                item_id: parent_id,
+                item_revision: parent.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-active-parent-start-001", 0xD5),
+        )
+        .await
+        .expect("start parent");
+
+    let create_error = items
+        .create(
+            execution_item(Uuid::new_v4(), "New child", Some(parent_id)),
+            ItemIdempotencyKey {
+                key: "execution-active-parent-child-create-001".to_owned(),
+                fingerprint: [0xD6; 32],
+            },
+        )
+        .await
+        .expect_err("child create must not close active parent");
+    let movable = items.get(movable_id).await.expect("load movable child");
+    let mut reparent = item_replacement(&movable, movable.status);
+    reparent.parent_id = Some(parent_id);
+    let reparent_error = items
+        .replace(
+            movable_id,
+            movable.revision,
+            reparent,
+            ItemIdempotencyKey {
+                key: "execution-active-parent-reparent-001".to_owned(),
+                fingerprint: [0xD7; 32],
+            },
+        )
+        .await
+        .expect_err("reparent must not close active parent");
+    let restore_error = items
+        .restore(
+            restorable_id,
+            deleted.item.revision,
+            ItemIdempotencyKey {
+                key: "execution-active-parent-restore-001".to_owned(),
+                fingerprint: [0xD8; 32],
+            },
+        )
+        .await
+        .expect_err("restore must not close active parent");
+
+    for error in [create_error, reparent_error, restore_error] {
+        assert!(matches!(
+            error,
+            ItemServiceError::Repository(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: conflicted_item,
+                session_id: conflicted_session,
+            }) if conflicted_item == parent_id && conflicted_session == session_id
+        ));
+    }
+    assert!(items.get(parent_id).await.unwrap().is_executable);
+    assert_eq!(items.get(movable_id).await.unwrap().parent_id, None);
+    assert!(items.get(restorable_id).await.is_err());
+
+    test_database.destroy().await;
+}
+
 async fn run_terminal_projection_races(pool: PgPool) {
     MIGRATOR.run(&pool).await.expect("migrations apply");
     start_holds_execution_state_before_terminal_projection(&pool).await;
@@ -1864,12 +2154,22 @@ async fn run_legacy_clock_upgrade(pool: PgPool) {
     .await;
     let latest = postgres_now(&pool).await;
     let clock = Arc::new(TestClock::new(latest));
-    let items = Arc::new(ItemService::new(
-        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
-        clock.clone(),
-    ));
     let item_id = Uuid::new_v4();
-    create_item(&items, item_id, "Legacy clock task", 40).await;
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, notes, \
+         timezone_name, duration_seconds, scheduling_constraints, importance, urgency, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'task', 'planned', 'Legacy clock task', \
+         'PostgreSQL execution integration fixture', 'Europe/Madrid', 3600, \
+         '{\"energy\":\"deep\"}'::jsonb, 80, 60, $4, $4)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(latest)
+    .execute(&pool)
+    .await
+    .expect("insert pre-structural legacy task without using the current repository");
     let older_session = Uuid::from_u128(4_000);
     sqlx::query(
         "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, occurrence_id, \
@@ -1936,8 +2236,22 @@ async fn run_legacy_clock_upgrade(pool: PgPool) {
     ))
     .await
     .expect("execution progress ledger migration applies");
+    for migration in [
+        include_str!("../migrations/0021_execution_defer_approval.sql"),
+        include_str!("../migrations/0022_google_schedule_publication.sql"),
+        include_str!("../migrations/0023_google_task_provider_metadata.sql"),
+        include_str!("../migrations/0024_structural_item_fields.sql"),
+    ] {
+        pool.execute(migration)
+            .await
+            .expect("post-ledger migration applies");
+    }
 
     clock.set(legacy_active_start + Duration::seconds(10));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items,
@@ -3572,25 +3886,7 @@ fn assert_revision_conflict(error: &ExecutionServiceError) {
 async fn create_item(service: &ItemService, id: Uuid, title: &str, marker: u8) {
     service
         .create(
-            NewItem {
-                id,
-                is_sensitive: false,
-                kind: ItemKind::Task,
-                status: ItemStatus::Planned,
-                title: title.to_owned(),
-                notes: Some("PostgreSQL execution integration fixture".to_owned()),
-                timezone_name: "Europe/Madrid".to_owned(),
-                duration_seconds: Some(3600),
-                deadline_at: None,
-                earliest_start_at: None,
-                recurrence: None,
-                flexible_constraints: json!({"energy": "deep"}),
-                split_policy: SplitPolicy::Indivisible,
-                importance: 80,
-                urgency: 60,
-                parent_id: None,
-                sibling_order: 0,
-            },
+            execution_item(id, title, None),
             ItemIdempotencyKey {
                 key: format!("execution-item-{marker:03}"),
                 fingerprint: [marker; 32],
@@ -3598,6 +3894,40 @@ async fn create_item(service: &ItemService, id: Uuid, title: &str, marker: u8) {
         )
         .await
         .unwrap();
+}
+
+fn execution_item(id: Uuid, title: &str, parent_id: Option<Uuid>) -> NewItem {
+    NewItem {
+        id,
+        is_sensitive: false,
+        kind: ItemKind::Task,
+        status: ItemStatus::Planned,
+        title: title.to_owned(),
+        notes: Some("PostgreSQL execution integration fixture".to_owned()),
+        timezone_name: "Europe/Madrid".to_owned(),
+        duration_kind: None,
+        duration_seconds: Some(3600),
+        duration_min_seconds: None,
+        duration_max_seconds: None,
+        duration_source: None,
+        deadline_kind: None,
+        deadline_date: None,
+        deadline_at: None,
+        deadline_strength: None,
+        deadline_soft_weight: None,
+        earliest_start_at: None,
+        recurrence: None,
+        flexible_constraints: json!({"energy": "deep"}),
+        has_own_effort: None,
+        split_policy: SplitPolicy::Indivisible,
+        importance: 80,
+        urgency: 60,
+        parent_id,
+        sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
+    }
 }
 
 fn item_replacement(item: &dayweave_api::items::Item, status: ItemStatus) -> ReplaceItem {
@@ -3608,16 +3938,28 @@ fn item_replacement(item: &dayweave_api::items::Item, status: ItemStatus) -> Rep
         title: item.title.clone(),
         notes: item.notes.clone(),
         timezone_name: item.timezone_name.clone(),
+        duration_kind: Some(item.duration_kind),
         duration_seconds: item.duration_seconds,
+        duration_min_seconds: item.duration_min_seconds,
+        duration_max_seconds: item.duration_max_seconds,
+        duration_source: item.duration_source,
+        deadline_kind: Some(item.deadline_kind),
+        deadline_date: item.deadline_date,
         deadline_at: item.deadline_at,
+        deadline_strength: item.deadline_strength,
+        deadline_soft_weight: item.deadline_soft_weight,
         earliest_start_at: item.earliest_start_at,
         recurrence: item.recurrence.clone(),
         flexible_constraints: item.flexible_constraints.clone(),
+        has_own_effort: Some(item.has_own_effort),
         split_policy: item.split_policy.clone(),
         importance: item.importance,
         urgency: item.urgency,
         parent_id: item.parent_id,
         sibling_order: item.sibling_order,
+        blocked_reason_kind: item.blocked_reason_kind,
+        blocked_by_item_id: item.blocked_by_item_id,
+        blocked_reason: item.blocked_reason.clone(),
     }
 }
 

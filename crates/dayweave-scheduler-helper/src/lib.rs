@@ -992,6 +992,45 @@ mod tests {
     }
 
     #[test]
+    fn project_kind_is_payload_free_and_preserves_explicit_own_effort() {
+        let mut value: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+        value["request"]["items"][0]["kind"] = serde_json::json!({"type": "project"});
+
+        let container = process_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(container.exit_code, SUCCESS_EXIT_CODE);
+        let container: serde_json::Value = serde_json::from_slice(&container.stdout).unwrap();
+        assert!(
+            container["result"]["plan"]["blocks"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            container["result"]["plan"]["decisions"][0]["kind"],
+            "container_rolled_up"
+        );
+
+        value["request"]["items"][0]["has_own_effort"] = serde_json::json!(true);
+        let own_effort = process_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(own_effort.exit_code, SUCCESS_EXIT_CODE);
+        let own_effort: serde_json::Value = serde_json::from_slice(&own_effort.stdout).unwrap();
+        assert_eq!(
+            own_effort["result"]["plan"]["blocks"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        value["request"]["items"][0]["kind"] = serde_json::json!({
+            "type": "project",
+            "recurrence": {"type": "daily", "times_per_day": 1}
+        });
+        assert_eq!(
+            error_code(&process_bytes(&serde_json::to_vec(&value).unwrap())),
+            "invalid_request"
+        );
+    }
+
+    #[test]
     fn schema_error_classification_never_depends_on_input_text() {
         let mut value: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
         value["request"]["as_of"] = serde_json::json!("unknown field");

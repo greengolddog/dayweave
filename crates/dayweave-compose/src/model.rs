@@ -23,13 +23,25 @@ pub struct CanonicalItem {
     pub title: String,
     pub notes: Option<String>,
     pub timezone_name: String,
+    #[serde(default)]
+    pub duration_kind: Option<CanonicalDurationKind>,
     pub duration_seconds: Option<u32>,
+    pub duration_min_seconds: Option<u32>,
+    pub duration_max_seconds: Option<u32>,
+    pub duration_source: Option<CanonicalDurationSource>,
+    #[serde(default)]
+    pub deadline_kind: Option<CanonicalDeadlineKind>,
+    pub deadline_date: Option<chrono::NaiveDate>,
     pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_strength: Option<CanonicalDeadlineStrength>,
+    pub deadline_soft_weight: Option<u32>,
     pub earliest_start_at: Option<DateTime<Utc>>,
     #[schema(value_type = Option<Object>)]
     pub recurrence: Option<Value>,
     #[schema(value_type = Object)]
     pub flexible_constraints: Value,
+    #[serde(default)]
+    pub has_own_effort: Option<bool>,
     pub split_policy: CanonicalSplitPolicy,
     pub importance: u8,
     pub urgency: u8,
@@ -41,6 +53,9 @@ pub struct CanonicalItem {
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
+    pub blocked_reason_kind: Option<CanonicalBlockedReasonKind>,
+    pub blocked_by_item_id: Option<Uuid>,
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -51,6 +66,7 @@ pub enum CanonicalItemKind {
     Habit,
     Routine,
     Goal,
+    Project,
     Break,
 }
 
@@ -65,6 +81,47 @@ pub enum CanonicalItemStatus {
     Completed,
     Skipped,
     Cancelled,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalDurationKind {
+    Unknown,
+    Exact,
+    Range,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalDurationSource {
+    User,
+    Assistant,
+    Learned,
+    Imported,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalDeadlineKind {
+    None,
+    Date,
+    DateTime,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalDeadlineStrength {
+    Hard,
+    Soft,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalBlockedReasonKind {
+    Dependency,
+    Manual,
+    External,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, ToSchema)]

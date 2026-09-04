@@ -242,11 +242,25 @@ fn item_fixture() -> Vec<StoredItem> {
         StoredItem {
             id: "item-public".to_owned(),
             title: "Write weekly plan".to_owned(),
-            status: "scheduled".to_owned(),
+            status: "blocked".to_owned(),
             kind: "task".to_owned(),
             project_id: Some("project-1".to_owned()),
             goal_id: None,
-            deadline: Some("2026-08-30T18:00:00Z".parse().unwrap()),
+            duration_kind: "range".to_owned(),
+            duration_seconds: Some(3_600),
+            duration_min_seconds: Some(1_800),
+            duration_max_seconds: Some(7_200),
+            duration_source: Some("assistant".to_owned()),
+            deadline_kind: "date".to_owned(),
+            deadline_date: Some("2026-08-30".parse().unwrap()),
+            deadline_at: None,
+            deadline_strength: Some("soft".to_owned()),
+            deadline_soft_weight: Some(42),
+            has_own_effort: false,
+            blocked_reason_kind: Some("dependency".to_owned()),
+            blocked_by_item_id: Some("item-private".to_owned()),
+            blocked_reason: Some("Waiting for prerequisite".to_owned()),
+            deadline: None,
             scheduled_start: Some("2026-08-29T09:00:00Z".parse().unwrap()),
             sensitive: false,
         },
@@ -257,6 +271,20 @@ fn item_fixture() -> Vec<StoredItem> {
             kind: "calendar_event".to_owned(),
             project_id: None,
             goal_id: None,
+            duration_kind: "unknown".to_owned(),
+            duration_seconds: None,
+            duration_min_seconds: None,
+            duration_max_seconds: None,
+            duration_source: None,
+            deadline_kind: "none".to_owned(),
+            deadline_date: None,
+            deadline_at: None,
+            deadline_strength: None,
+            deadline_soft_weight: None,
+            has_own_effort: false,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
             deadline: None,
             scheduled_start: Some("2026-08-29T10:00:00Z".parse().unwrap()),
             sensitive: true,
@@ -809,6 +837,16 @@ async fn read_tools_return_grounded_data_without_leaking_sensitive_canaries() {
             .len(),
         1
     );
+    let summary = &search["result"]["structuredContent"]["items"][0];
+    assert_eq!(summary["duration_kind"], "range");
+    assert_eq!(summary["duration_source"], "assistant");
+    assert_eq!(summary["deadline_kind"], "date");
+    assert_eq!(summary["deadline_date"], "2026-08-30");
+    assert!(summary["deadline_at"].is_null());
+    assert_eq!(summary["deadline_strength"], "soft");
+    assert_eq!(summary["deadline_soft_weight"], 42);
+    assert_eq!(summary["blocked_reason_kind"], "dependency");
+    assert!(summary["blocked_by_item_id"].is_null());
 
     let explanation = send(
         &fixture.app,

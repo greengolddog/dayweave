@@ -70,6 +70,7 @@ struct DurationEstimateShape {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ItemKindShape {
     Task {},
+    Project {},
     RecurringTask {
         recurrence: IgnoredAny,
     },

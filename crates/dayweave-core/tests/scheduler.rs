@@ -312,6 +312,38 @@ fn empty_goal_is_a_container_until_independent_effort_is_enabled() {
 }
 
 #[test]
+fn project_is_a_container_until_independent_effort_is_enabled() {
+    let mut project = item(25, "Project", 60);
+    project.kind = ItemKind::Project;
+
+    let container_plan = Scheduler.plan(&request(vec![project.clone()])).unwrap();
+    assert!(planned(&container_plan, &project).is_empty());
+    assert_eq!(
+        roll_up_expected_durations(&[project.clone()]).unwrap()[&project.id],
+        Minutes::ZERO
+    );
+
+    project.has_own_effort = true;
+    let own_effort_plan = Scheduler.plan(&request(vec![project.clone()])).unwrap();
+    assert_eq!(planned(&own_effort_plan, &project).len(), 1);
+    assert_eq!(
+        roll_up_expected_durations(&[project.clone()]).unwrap()[&project.id],
+        Minutes(60)
+    );
+
+    let mut child = item(26, "Project action", 30);
+    child.parent_id = Some(project.id);
+    let items = vec![project.clone(), child.clone()];
+    assert_eq!(
+        roll_up_expected_durations(&items).unwrap()[&project.id],
+        Minutes(90)
+    );
+    let combined_plan = Scheduler.plan(&request(items)).unwrap();
+    assert_eq!(planned(&combined_plan, &project).len(), 1);
+    assert_eq!(planned(&combined_plan, &child).len(), 1);
+}
+
+#[test]
 fn ordered_routine_children_follow_their_declared_order() {
     let mut routine = item(30, "Morning routine", 1);
     routine.kind = ItemKind::Routine(RoutineSpec {
@@ -372,6 +404,364 @@ fn hard_dependency_cycle_is_reported_without_guessing() {
             .iter()
             .all(|work| work.reason == UnscheduledReason::DependencyCycle)
     );
+}
+
+#[test]
+fn only_completed_terminal_work_satisfies_a_hard_finish_to_start_prerequisite() {
+    for (status, satisfies) in [
+        (WorkStatus::Completed, true),
+        (WorkStatus::Skipped, false),
+        (WorkStatus::Canceled, false),
+    ] {
+        let mut predecessor = item(42, "Prerequisite", 20);
+        predecessor.status = status;
+        let mut successor = item(43, "Dependent work", 20);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: predecessor.id,
+            relation: DependencyRelation::FinishToStart,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+
+        let plan = Scheduler
+            .plan(&request(vec![predecessor, successor.clone()]))
+            .unwrap();
+        assert_eq!(!planned(&plan, &successor).is_empty(), satisfies);
+        assert_eq!(
+            plan.unscheduled.iter().any(|work| {
+                work.item_id == successor.id
+                    && work.reason == UnscheduledReason::DependencyUnavailable
+            }),
+            !satisfies
+        );
+    }
+}
+
+#[test]
+fn blocked_predecessor_makes_hard_dependency_unavailable() {
+    let mut predecessor = item(48, "Blocked prerequisite", 20);
+    predecessor.status = WorkStatus::Blocked;
+    let mut successor = item(49, "Dependent work", 20);
+    successor.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+
+    let plan = Scheduler
+        .plan(&request(vec![predecessor.clone(), successor.clone()]))
+        .unwrap();
+
+    assert!(plan.blocks_for(predecessor.id).next().is_none());
+    assert!(plan.blocks_for(successor.id).next().is_none());
+    assert!(plan.unscheduled.iter().any(|work| {
+        work.item_id == predecessor.id && work.reason == UnscheduledReason::Blocked
+    }));
+    assert!(plan.unscheduled.iter().any(|work| {
+        work.item_id == successor.id && work.reason == UnscheduledReason::DependencyUnavailable
+    }));
+}
+
+#[test]
+fn blocked_semantic_container_without_own_effort_has_no_phantom_demand() {
+    let mut project = item(48_001, "Blocked project container", 180);
+    project.kind = ItemKind::Project;
+    project.status = WorkStatus::Blocked;
+
+    let plan = Scheduler.plan(&request(vec![project.clone()])).unwrap();
+
+    assert!(plan.blocks_for(project.id).next().is_none());
+    assert!(
+        plan.unscheduled
+            .iter()
+            .all(|work| work.item_id != project.id)
+    );
+    assert_eq!(plan.score.unscheduled_minutes, 0);
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.item_id == project.id && decision.kind == DecisionKind::ContainerRolledUp
+    }));
+
+    project.has_own_effort = true;
+    let own_effort = Scheduler.plan(&request(vec![project.clone()])).unwrap();
+    assert!(own_effort.unscheduled.iter().any(|work| {
+        work.item_id == project.id
+            && work.reason == UnscheduledReason::Blocked
+            && work.remaining == Minutes(180)
+    }));
+}
+
+#[test]
+fn inactive_calendar_events_do_not_reserve_time_and_dependency_assessments_agree() {
+    for (status, predecessor_is_satisfied) in [
+        (WorkStatus::Completed, true),
+        (WorkStatus::Skipped, false),
+        (WorkStatus::Canceled, false),
+        (WorkStatus::Blocked, false),
+    ] {
+        let event = WorkItem {
+            id: id(48_010),
+            is_sensitive: false,
+            revision: 1,
+            title: "Inactive fixed predecessor".to_owned(),
+            kind: ItemKind::CalendarEvent(CalendarEventSpec {
+                start: DAY + Duration::hours(9),
+                end: DAY + Duration::hours(10),
+                immutable: true,
+                all_day: false,
+                source_calendar_id: Some("work".to_owned()),
+            }),
+            status,
+            parent_id: None,
+            sibling_order: None,
+            has_own_effort: false,
+            goal_ids: BTreeSet::new(),
+            priority: Priority::NONE,
+            duration: None,
+            constraints: SchedulingConstraints::default(),
+            split_policy: SplitPolicy::Indivisible,
+            energy: None,
+            tags: BTreeSet::new(),
+            created_at: DAY,
+            updated_at: DAY,
+        };
+
+        let free_work = item(48_011, "Uses released event time", 60);
+        let mut occupancy_request = request(vec![event.clone(), free_work.clone()]);
+        occupancy_request.availability = vec![availability(9, 10)];
+        let occupancy_plan = Scheduler.plan(&occupancy_request).unwrap();
+        assert_eq!(planned(&occupancy_plan, &free_work).len(), 1);
+        assert!(occupancy_plan.blocks_for(event.id).next().is_none());
+
+        let mut successor = item(48_012, "Depends on inactive event", 30);
+        successor.constraints.dependencies.push(Dependency {
+            item_id: event.id,
+            relation: DependencyRelation::FinishToStart,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+        let mut ordinary_request = request(vec![event.clone(), successor.clone()]);
+        ordinary_request.availability = vec![availability(10, 11)];
+        let ordinary = Scheduler.plan(&ordinary_request).unwrap();
+        assert_eq!(
+            !planned(&ordinary, &successor).is_empty(),
+            predecessor_is_satisfied
+        );
+
+        let placement_id = Uuid::from_u128(48_013);
+        let mut manual_request = request(vec![event, successor.clone()]);
+        manual_request.availability = vec![availability(10, 11)];
+        manual_request.previous_assignments = vec![PreviousAssignment {
+            item_id: successor.id,
+            occurrence_id: None,
+            blocks: vec![PreviousBlock {
+                start: DAY + Duration::hours(10),
+                end: DAY + Duration::hours(10) + Duration::minutes(30),
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id: Some(placement_id),
+        }];
+        let manual = Scheduler.plan(&manual_request).unwrap();
+        let dependency_violation = manual.manual_placement_assessments[0]
+            .violations
+            .iter()
+            .any(|violation| violation.code == ManualPlacementViolationCode::Dependency);
+        assert_eq!(dependency_violation, !predecessor_is_satisfied);
+    }
+}
+
+#[test]
+fn fixed_calendar_event_remains_a_valid_hard_dependency_predecessor() {
+    let meeting = WorkItem {
+        id: id(50),
+        is_sensitive: false,
+        revision: 1,
+        title: "Fixed predecessor".to_owned(),
+        kind: ItemKind::CalendarEvent(CalendarEventSpec {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(11),
+            immutable: true,
+            all_day: false,
+            source_calendar_id: Some("work".to_owned()),
+        }),
+        status: WorkStatus::Scheduled,
+        parent_id: None,
+        sibling_order: None,
+        has_own_effort: false,
+        goal_ids: BTreeSet::new(),
+        priority: Priority::NONE,
+        duration: None,
+        constraints: SchedulingConstraints::default(),
+        split_policy: SplitPolicy::Indivisible,
+        energy: None,
+        tags: BTreeSet::new(),
+        created_at: DAY,
+        updated_at: DAY,
+    };
+    let mut successor = item(51, "After meeting", 30);
+    successor.constraints.dependencies.push(Dependency {
+        item_id: meeting.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+
+    let plan = Scheduler
+        .plan(&request(vec![meeting, successor.clone()]))
+        .unwrap();
+
+    let successor_blocks = planned(&plan, &successor);
+    let [block] = successor_blocks.as_slice() else {
+        panic!("the dependent work must be scheduled once");
+    };
+    assert!(block.start >= DAY + Duration::hours(11));
+}
+
+#[test]
+fn out_of_horizon_calendar_event_dependency_uses_its_authoritative_interval() {
+    let event = |value: u128, start: OffsetDateTime, end: OffsetDateTime| WorkItem {
+        id: id(value),
+        is_sensitive: false,
+        revision: 1,
+        title: "Out-of-horizon predecessor".to_owned(),
+        kind: ItemKind::CalendarEvent(CalendarEventSpec {
+            start,
+            end,
+            immutable: true,
+            all_day: false,
+            source_calendar_id: Some("work".to_owned()),
+        }),
+        status: WorkStatus::Scheduled,
+        parent_id: None,
+        sibling_order: None,
+        has_own_effort: false,
+        goal_ids: BTreeSet::new(),
+        priority: Priority::NONE,
+        duration: None,
+        constraints: SchedulingConstraints::default(),
+        split_policy: SplitPolicy::Indivisible,
+        energy: None,
+        tags: BTreeSet::new(),
+        created_at: DAY,
+        updated_at: DAY,
+    };
+    let dependent = |value: u128, predecessor: ItemId| {
+        let mut item = item(value, "Event-dependent work", 30);
+        item.constraints.dependencies.push(Dependency {
+            item_id: predecessor,
+            relation: DependencyRelation::FinishToStart,
+            minimum_lag: Minutes::ZERO,
+            strength: ConstraintStrength::Hard,
+        });
+        item
+    };
+
+    let past_event = event(52, DAY - Duration::hours(2), DAY - Duration::hours(1));
+    let past_dependent = dependent(53, past_event.id);
+    let past_plan = Scheduler
+        .plan(&request(vec![past_event.clone(), past_dependent.clone()]))
+        .unwrap();
+    assert_eq!(planned(&past_plan, &past_dependent).len(), 1);
+
+    let mut manual_past = request(vec![past_event, past_dependent.clone()]);
+    manual_past.previous_assignments = vec![PreviousAssignment {
+        item_id: past_dependent.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(8),
+            end: DAY + Duration::hours(8) + Duration::minutes(30),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(Uuid::from_u128(54)),
+    }];
+    let manual_past_plan = Scheduler.plan(&manual_past).unwrap();
+    assert!(
+        manual_past_plan.manual_placement_assessments[0]
+            .violations
+            .iter()
+            .all(|violation| violation.code != ManualPlacementViolationCode::Dependency)
+    );
+
+    let future_event = event(
+        55,
+        DAY + Duration::days(3),
+        DAY + Duration::days(3) + Duration::hours(1),
+    );
+    let future_dependent = dependent(56, future_event.id);
+    let future_plan = Scheduler
+        .plan(&request(vec![
+            future_event.clone(),
+            future_dependent.clone(),
+        ]))
+        .unwrap();
+    assert!(planned(&future_plan, &future_dependent).is_empty());
+
+    let mut manual_future = request(vec![future_event, future_dependent.clone()]);
+    manual_future.previous_assignments = vec![PreviousAssignment {
+        item_id: future_dependent.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(8),
+            end: DAY + Duration::hours(8) + Duration::minutes(30),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(Uuid::from_u128(57)),
+    }];
+    let manual_future_plan = Scheduler.plan(&manual_future).unwrap();
+    assert!(
+        manual_future_plan.manual_placement_assessments[0]
+            .violations
+            .iter()
+            .any(|violation| violation.code == ManualPlacementViolationCode::Dependency)
+    );
+}
+
+#[test]
+fn planning_boundary_rejects_invalid_dependency_edges() {
+    let mut self_referencing = item(44, "Self reference", 20);
+    self_referencing.constraints.dependencies.push(Dependency {
+        item_id: self_referencing.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    });
+    assert!(matches!(
+        Scheduler.plan(&request(vec![self_referencing])),
+        Err(ScheduleError::InvalidItem { message, .. })
+            if message == "dependency cannot reference its owning item"
+    ));
+
+    let predecessor = item(45, "Predecessor", 20);
+    let mut excessive_lag = item(46, "Excessive lag", 20);
+    excessive_lag.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::StartToFinish,
+        minimum_lag: Minutes(MAX_DEPENDENCY_LAG_MINUTES + 1),
+        strength: ConstraintStrength::Hard,
+    });
+    assert!(matches!(
+        Scheduler.plan(&request(vec![predecessor.clone(), excessive_lag])),
+        Err(ScheduleError::InvalidItem { message, .. })
+            if message.contains("dependency lag must be at most")
+    ));
+
+    let mut excessive_weight = item(47, "Excessive weight", 20);
+    excessive_weight.constraints.dependencies.push(Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Soft {
+            weight: MAX_DEPENDENCY_WEIGHT + 1,
+        },
+    });
+    assert!(matches!(
+        Scheduler.plan(&request(vec![predecessor, excessive_weight])),
+        Err(ScheduleError::InvalidItem { message, .. })
+            if message.contains("dependency soft weight must be at most")
+    ));
 }
 
 #[test]
@@ -642,6 +1032,33 @@ fn malformed_manual_placement_cannot_be_treated_as_a_stability_hint() {
         Scheduler.plan(&input),
         Err(ScheduleError::InvalidItem { item_id, .. }) if item_id == task.id
     ));
+}
+
+#[test]
+fn blocked_work_rejects_manual_and_ordinary_pinned_assignments() {
+    let mut blocked = item(860, "Blocked pinned work", 60);
+    blocked.status = WorkStatus::Blocked;
+
+    for manual_placement_id in [None, Some(Uuid::from_u128(861))] {
+        let mut input = request(vec![blocked.clone()]);
+        input.previous_assignments = vec![PreviousAssignment {
+            item_id: blocked.id,
+            occurrence_id: None,
+            blocks: vec![PreviousBlock {
+                start: DAY + Duration::hours(10),
+                end: DAY + Duration::hours(11),
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id,
+        }];
+
+        assert!(matches!(
+            Scheduler.plan(&input),
+            Err(ScheduleError::InvalidItem { item_id, message })
+                if item_id == blocked.id && message.contains("executable work")
+        ));
+    }
 }
 
 #[test]
@@ -1083,6 +1500,22 @@ fn defer_candidate_rounds_credit_once_and_replaces_only_the_source_session() {
         .unwrap()
         .insert("untrusted_extra".to_owned(), serde_json::json!(true));
     assert!(serde_json::from_value::<DeferCandidateAssessmentInput>(encoded).is_err());
+}
+
+#[test]
+fn defer_candidate_rejects_a_blocked_source_item() {
+    let mut task = item(30_003, "Blocked defer source", 60);
+    task.status = WorkStatus::Blocked;
+    let input = request(vec![task.clone()]);
+    let execution = execution_context(vec![in_flight_defer_work(task.id, 60)]);
+    let candidate = defer_candidate(task.id);
+
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &candidate),
+        Err(ScheduleError::InvalidDeferCandidate { placement_id, message })
+            if placement_id == candidate.placement_id
+                && message.contains("executable work")
+    ));
 }
 
 #[test]

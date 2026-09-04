@@ -18,11 +18,13 @@ pub use metadata::{
 };
 
 pub use model::{
-    AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
-    ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    IgnoredPreviousAssignment, ManualPlacementAssignmentInput, ManualPlacementInput,
-    ManualPlacementReleaseInput, PreparedSchedule, PreviousAssignmentInput, PreviousBlockInput,
-    RejectedScheduleItem, SchedulerConfigInput,
+    AvailabilityInput, CanonicalBlockedReasonKind, CanonicalDeadlineKind,
+    CanonicalDeadlineStrength, CanonicalDurationKind, CanonicalDurationSource, CanonicalItem,
+    CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy, ComposeScheduleRequest,
+    EnergyInput, FixedBlockInput, FixedBlockSourceInput, IgnoredPreviousAssignment,
+    ManualPlacementAssignmentInput, ManualPlacementInput, ManualPlacementReleaseInput,
+    PreparedSchedule, PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem,
+    SchedulerConfigInput,
 };
 pub use prepare::{
     MAX_CANONICAL_ITEMS, MAX_MANUAL_ASSIGNMENTS, MAX_MANUAL_BLOCKS, MAX_MANUAL_PLACEMENT_RELEASES,

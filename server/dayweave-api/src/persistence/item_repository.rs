@@ -6,18 +6,21 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 
 use crate::items::{
-    DeltaChange, IdempotencyContext, Item, ItemDeltaPage, ItemKind, ItemMutation, ItemQuery,
-    ItemRepository, ItemRepositoryError, ItemStatus, ItemTombstone, NewItem, ReplaceItem,
-    SplitPolicy,
+    BlockedReasonKind, DeadlineKind, DeadlineStrength, DeltaChange, DurationKind, DurationSource,
+    IdempotencyContext, Item, ItemDeltaPage, ItemKind, ItemMutation, ItemQuery, ItemRepository,
+    ItemRepositoryError, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy,
 };
 
 use super::{DatabaseScope, database::lock_canonical_item_space};
 
 const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
-     item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
-     item.scheduling_constraints, item.split_allowed, item.minimum_chunk_seconds, \
+     item.duration_kind, item.duration_seconds, item.duration_min_seconds, item.duration_max_seconds, \
+     item.duration_source, item.deadline_kind, item.deadline_date, item.deadline_at, \
+     item.deadline_strength, item.deadline_soft_weight, item.earliest_start_at, item.recurrence, \
+     item.scheduling_constraints, item.has_own_effort, item.split_allowed, item.minimum_chunk_seconds, \
      item.maximum_chunk_seconds, item.importance, item.urgency, item.revision, \
      item.created_at, item.updated_at, item.completed_at, item.trashed_at, \
+     item.blocked_reason_kind, item.blocked_by_item_id, item.blocked_reason, \
      hierarchy.parent_item_id, \
      CASE WHEN hierarchy.child_item_id IS NULL THEN item.sibling_order ELSE hierarchy.position END \
          AS effective_sibling_order, \
@@ -99,12 +102,35 @@ impl ItemRepository for PostgresItemRepository {
                 replayed: true,
             });
         }
+        // Execution Start takes the execution-state lock before the canonical
+        // item-space lock. Adding a child must take the same order because it
+        // makes the parent non-executable.
+        let active_execution = if item.parent_id.is_some() {
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?
+        } else {
+            None
+        };
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
         validate_parent(
             &mut transaction,
             self.scope.workspace_id,
             item.id,
             item.parent_id,
+        )
+        .await?;
+        if let Some(parent_id) = item.parent_id
+            && let Some((session_id, active_item_id)) = active_execution
+            && active_item_id == parent_id
+        {
+            return Err(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: parent_id,
+                session_id,
+            });
+        }
+        validate_blocked_by(
+            &mut transaction,
+            self.scope.workspace_id,
+            item.blocked_by_item_id,
         )
         .await?;
         insert_item(&mut transaction, self.scope, &item).await?;
@@ -208,11 +234,14 @@ impl ItemRepository for PostgresItemRepository {
                 replayed: true,
             });
         }
-        // Execution Start locks `execution_state` before canonical items. A terminal item
-        // projection must take the same order so either Start observes the terminal item or
-        // this replacement observes the open lease, without an item/state deadlock. Exact
-        // idempotency replays intentionally return before taking this current-state guard.
-        let active_execution = if replacement.status.is_terminal() {
+        // Execution Start locks `execution_state` before canonical items. A state that prevents
+        // execution must take the same order so either Start observes that state or this
+        // replacement observes the open lease, without an item/state deadlock. Exact idempotency
+        // replays intentionally return before taking this current-state guard.
+        let active_execution = if replacement.status.prevents_execution()
+            || replacement.may_remove_executable_component()
+            || replacement.parent_id.is_some()
+        {
             lock_active_execution(&mut transaction, self.scope.workspace_id).await?
         } else {
             None
@@ -224,8 +253,8 @@ impl ItemRepository for PostgresItemRepository {
         let previous_parent_id = current.parent_id;
         let previous_sibling_order = current.sibling_order;
         let item = current.replaced(replacement, now)?;
-        if !current.status.is_terminal()
-            && item.status.is_terminal()
+        if ((!current.status.prevents_execution() && item.status.prevents_execution())
+            || (current.is_executable && !item.execution_is_allowed(false)))
             && let Some((session_id, active_item_id)) = active_execution
             && active_item_id == id
         {
@@ -239,6 +268,22 @@ impl ItemRepository for PostgresItemRepository {
             self.scope.workspace_id,
             id,
             item.parent_id,
+        )
+        .await?;
+        if previous_parent_id != item.parent_id
+            && let Some(parent_id) = item.parent_id
+            && let Some((session_id, active_item_id)) = active_execution
+            && active_item_id == parent_id
+        {
+            return Err(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: parent_id,
+                session_id,
+            });
+        }
+        validate_blocked_by(
+            &mut transaction,
+            self.scope.workspace_id,
+            item.blocked_by_item_id,
         )
         .await?;
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await?
@@ -362,6 +407,8 @@ impl ItemRepository for PostgresItemRepository {
                 replayed: true,
             });
         }
+        let active_execution =
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, true).await?;
@@ -380,6 +427,15 @@ impl ItemRepository for PostgresItemRepository {
             ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
             other => other,
         })?;
+        if let Some(parent_id) = current.parent_id
+            && let Some((session_id, active_item_id)) = active_execution
+            && active_item_id == parent_id
+        {
+            return Err(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: parent_id,
+                session_id,
+            });
+        }
         let item = current.restored(now)?;
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await?
             && item.status.is_executing_state()
@@ -482,7 +538,7 @@ pub(crate) async fn lock_item_batch_tx(
 
 /// Locks execution state before the canonical item space. Proposal preview,
 /// apply, and undo retain this order for every command in their transaction so
-/// terminal writes serialize with execution Start without a lock cycle.
+/// execution-preventing writes serialize with execution Start without a lock cycle.
 pub(crate) async fn lock_execution_item_batch_tx(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -534,6 +590,9 @@ pub(crate) async fn apply_item_command_tx(
         TransactionalItemCommand::Create(input) => {
             let item = Item::new(input, now)?;
             validate_parent(transaction, scope.workspace_id, item.id, item.parent_id).await?;
+            reject_parent_for_active_execution(transaction, scope.workspace_id, item.parent_id)
+                .await?;
+            validate_blocked_by(transaction, scope.workspace_id, item.blocked_by_item_id).await?;
             insert_item(transaction, scope, &item).await?;
             replace_hierarchy_edge(
                 transaction,
@@ -588,6 +647,11 @@ pub(crate) async fn apply_item_command_tx(
             )
             .await?;
             validate_parent(transaction, scope.workspace_id, item_id, item.parent_id).await?;
+            if previous_parent_id != item.parent_id {
+                reject_parent_for_active_execution(transaction, scope.workspace_id, item.parent_id)
+                    .await?;
+            }
+            validate_blocked_by(transaction, scope.workspace_id, item.blocked_by_item_id).await?;
             if has_active_children(transaction, scope.workspace_id, item_id).await?
                 && item.status.is_executing_state()
             {
@@ -692,6 +756,8 @@ pub(crate) async fn apply_item_command_tx(
                     ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
                     other => other,
                 })?;
+            reject_parent_for_active_execution(transaction, scope.workspace_id, current.parent_id)
+                .await?;
             let item = current.restored(now)?;
             if has_active_children(transaction, scope.workspace_id, item_id).await?
                 && item.status.is_executing_state()
@@ -768,6 +834,11 @@ async fn restore_item_snapshot_tx(
     .await?;
     if snapshot.deleted_at.is_none() {
         validate_parent(transaction, scope.workspace_id, item_id, snapshot.parent_id).await?;
+        if current.deleted_at.is_some() || current.parent_id != snapshot.parent_id {
+            reject_parent_for_active_execution(transaction, scope.workspace_id, snapshot.parent_id)
+                .await?;
+        }
+        validate_blocked_by(transaction, scope.workspace_id, snapshot.blocked_by_item_id).await?;
         if has_active_children(transaction, scope.workspace_id, item_id).await?
             && snapshot.status.is_executing_state()
         {
@@ -834,11 +905,15 @@ async fn insert_item(
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
     let result = sqlx::query(
         "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
-         timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, \
-         scheduling_constraints, split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, \
-         importance, urgency, revision, created_at, updated_at, completed_at, trashed_at, \
-         tombstoned_at, sibling_order) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $24, $25)",
+         timezone_name, duration_kind, duration_seconds, duration_min_seconds, duration_max_seconds, \
+         duration_source, deadline_kind, deadline_date, deadline_at, deadline_strength, \
+         deadline_soft_weight, earliest_start_at, recurrence, scheduling_constraints, has_own_effort, \
+         split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, importance, urgency, revision, \
+         created_at, updated_at, completed_at, trashed_at, tombstoned_at, sibling_order, \
+         blocked_reason_kind, blocked_by_item_id, blocked_reason) VALUES \
+         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+         $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, \
+         $33, $33, $34, $35, $36, $37)",
     )
     .bind(item.id)
     .bind(scope.workspace_id)
@@ -849,14 +924,32 @@ async fn insert_item(
     .bind(&item.title)
     .bind(&item.notes)
     .bind(&item.timezone_name)
+    .bind(duration_kind_name(item.duration_kind))
     .bind(
         item.duration_seconds
             .map(|value| i32::try_from(value).expect("validated duration")),
     )
+    .bind(
+        item.duration_min_seconds
+            .map(|value| i32::try_from(value).expect("validated duration minimum")),
+    )
+    .bind(
+        item.duration_max_seconds
+            .map(|value| i32::try_from(value).expect("validated duration maximum")),
+    )
+    .bind(item.duration_source.map(duration_source_name))
+    .bind(deadline_kind_name(item.deadline_kind))
+    .bind(item.deadline_date)
     .bind(item.deadline_at)
+    .bind(item.deadline_strength.map(deadline_strength_name))
+    .bind(
+        item.deadline_soft_weight
+            .map(|value| i32::try_from(value).expect("validated deadline soft weight")),
+    )
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
     .bind(&item.flexible_constraints)
+    .bind(item.has_own_effort)
     .bind(split_allowed)
     .bind(minimum_chunk)
     .bind(maximum_chunk)
@@ -868,6 +961,9 @@ async fn insert_item(
     .bind(item.completed_at)
     .bind(item.deleted_at)
     .bind(i32::try_from(item.sibling_order).expect("validated sibling order"))
+    .bind(item.blocked_reason_kind.map(blocked_reason_kind_name))
+    .bind(item.blocked_by_item_id)
+    .bind(&item.blocked_reason)
     .execute(&mut **transaction)
     .await;
     match result {
@@ -885,11 +981,15 @@ async fn update_item(
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
     sqlx::query(
         "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
-         duration_seconds = $9, deadline_at = $10, earliest_start_at = $11, recurrence = $12, \
-         scheduling_constraints = $13, split_allowed = $14, minimum_chunk_seconds = $15, \
-         maximum_chunk_seconds = $16, importance = $17, urgency = $18, revision = $19, \
-         updated_at = $20, completed_at = $21, trashed_at = $22, tombstoned_at = $22, \
-         sibling_order = $23 WHERE workspace_id = $1 AND id = $2",
+         duration_kind = $9, duration_seconds = $10, duration_min_seconds = $11, \
+         duration_max_seconds = $12, duration_source = $13, deadline_kind = $14, \
+         deadline_date = $15, deadline_at = $16, deadline_strength = $17, \
+         deadline_soft_weight = $18, earliest_start_at = $19, recurrence = $20, \
+         scheduling_constraints = $21, has_own_effort = $22, split_allowed = $23, \
+         minimum_chunk_seconds = $24, maximum_chunk_seconds = $25, importance = $26, \
+         urgency = $27, revision = $28, updated_at = $29, completed_at = $30, \
+         trashed_at = $31, tombstoned_at = $31, sibling_order = $32, blocked_reason_kind = $33, \
+         blocked_by_item_id = $34, blocked_reason = $35 WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
     .bind(item.id)
@@ -899,14 +999,32 @@ async fn update_item(
     .bind(&item.title)
     .bind(&item.notes)
     .bind(&item.timezone_name)
+    .bind(duration_kind_name(item.duration_kind))
     .bind(
         item.duration_seconds
             .map(|value| i32::try_from(value).expect("validated duration")),
     )
+    .bind(
+        item.duration_min_seconds
+            .map(|value| i32::try_from(value).expect("validated duration minimum")),
+    )
+    .bind(
+        item.duration_max_seconds
+            .map(|value| i32::try_from(value).expect("validated duration maximum")),
+    )
+    .bind(item.duration_source.map(duration_source_name))
+    .bind(deadline_kind_name(item.deadline_kind))
+    .bind(item.deadline_date)
     .bind(item.deadline_at)
+    .bind(item.deadline_strength.map(deadline_strength_name))
+    .bind(
+        item.deadline_soft_weight
+            .map(|value| i32::try_from(value).expect("validated deadline soft weight")),
+    )
     .bind(item.earliest_start_at)
     .bind(&item.recurrence)
     .bind(&item.flexible_constraints)
+    .bind(item.has_own_effort)
     .bind(split_allowed)
     .bind(minimum_chunk)
     .bind(maximum_chunk)
@@ -917,6 +1035,9 @@ async fn update_item(
     .bind(item.completed_at)
     .bind(item.deleted_at)
     .bind(i32::try_from(item.sibling_order).expect("validated sibling order"))
+    .bind(item.blocked_reason_kind.map(blocked_reason_kind_name))
+    .bind(item.blocked_by_item_id)
+    .bind(&item.blocked_reason)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -1029,9 +1150,11 @@ async fn reject_closing_transition_for_active_execution(
     current: &Item,
     replacement: &Item,
 ) -> Result<(), ItemRepositoryError> {
-    let becomes_terminal = !current.status.is_terminal() && replacement.status.is_terminal();
+    let prevents_execution = (!current.status.prevents_execution()
+        && replacement.status.prevents_execution())
+        || (current.is_executable && !replacement.execution_is_allowed(false));
     let becomes_trashed = current.deleted_at.is_none() && replacement.deleted_at.is_some();
-    if !becomes_terminal && !becomes_trashed {
+    if !prevents_execution && !becomes_trashed {
         return Ok(());
     }
     if let Some((session_id, active_item_id)) = active_execution(transaction, workspace_id).await?
@@ -1045,7 +1168,26 @@ async fn reject_closing_transition_for_active_execution(
     Ok(())
 }
 
-async fn validate_parent(
+async fn reject_parent_for_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<(), ItemRepositoryError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    if let Some((session_id, active_item_id)) = active_execution(transaction, workspace_id).await?
+        && active_item_id == parent_id
+    {
+        return Err(ItemRepositoryError::ActiveExecutionConflict {
+            item_id: parent_id,
+            session_id,
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn validate_parent(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     item_id: Uuid,
@@ -1091,6 +1233,34 @@ async fn validate_parent(
         Err(ItemRepositoryError::HierarchyCycle)
     } else {
         Ok(())
+    }
+}
+
+/// Soft deletion intentionally does not invalidate a blocker identity. This
+/// mirrors the composite `PostgreSQL` foreign key and keeps historical causes
+/// visible through include-deleted reads.
+async fn validate_blocked_by(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    blocked_by_item_id: Option<Uuid>,
+) -> Result<(), ItemRepositoryError> {
+    let Some(blocked_by_item_id) = blocked_by_item_id else {
+        return Ok(());
+    };
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = $1 AND id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(blocked_by_item_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ItemRepositoryError::BlockedByItemNotFound(
+            blocked_by_item_id,
+        ))
     }
 }
 
@@ -1145,7 +1315,7 @@ async fn replace_hierarchy_edge(
     Ok(())
 }
 
-async fn refresh_parents(
+pub(super) async fn refresh_parents(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     parent_ids: impl IntoIterator<Item = Option<Uuid>>,
@@ -1167,9 +1337,8 @@ async fn refresh_parents_with_mode(
     for parent_id in parent_ids {
         let current =
             fetch_item_transaction(transaction, scope.workspace_id, parent_id, false).await?;
-        let is_executable =
-            !has_active_children(transaction, scope.workspace_id, parent_id).await?;
-        let parent = current.refreshed_execution(is_executable, now)?;
+        let has_children = has_active_children(transaction, scope.workspace_id, parent_id).await?;
+        let parent = current.refreshed_execution(has_children, now)?;
         update_item(transaction, scope.workspace_id, &parent).await?;
         let parent =
             fetch_item_transaction(transaction, scope.workspace_id, parent_id, false).await?;
@@ -1362,9 +1531,16 @@ async fn record_mutation(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Decodes the complete flat canonical item row without hidden defaults.
 fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
     let revision: i64 = row.try_get("revision").map_err(internal)?;
+    let duration_kind = parse_duration_kind(
+        &row.try_get::<String, _>("duration_kind")
+            .map_err(internal)?,
+    )?;
     let duration: Option<i32> = row.try_get("duration_seconds").map_err(internal)?;
+    let duration_minimum: Option<i32> = row.try_get("duration_min_seconds").map_err(internal)?;
+    let duration_maximum: Option<i32> = row.try_get("duration_max_seconds").map_err(internal)?;
     let importance: i16 = row.try_get("importance").map_err(internal)?;
     let urgency: i16 = row.try_get("urgency").map_err(internal)?;
     let split_allowed: bool = row.try_get("split_allowed").map_err(internal)?;
@@ -1382,22 +1558,57 @@ fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
     };
     let has_children: bool = row.try_get("has_children").map_err(internal)?;
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
+    let kind = parse_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?;
+    let has_own_effort: bool = row.try_get("has_own_effort").map_err(internal)?;
     Ok(Item {
         id: row.try_get("id").map_err(internal)?,
         is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
-        kind: parse_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?,
+        kind,
         status: parse_status(&row.try_get::<String, _>("status").map_err(internal)?)?,
         title: row.try_get("title").map_err(internal)?,
         notes: row.try_get("notes").map_err(internal)?,
         timezone_name: row.try_get("timezone_name").map_err(internal)?,
+        duration_kind,
         duration_seconds: duration
             .map(u32::try_from)
             .transpose()
             .map_err(|_| ItemRepositoryError::Internal)?,
+        duration_min_seconds: duration_minimum
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ItemRepositoryError::Internal)?,
+        duration_max_seconds: duration_maximum
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ItemRepositoryError::Internal)?,
+        duration_source: row
+            .try_get::<Option<String>, _>("duration_source")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_duration_source)
+            .transpose()?,
+        deadline_kind: parse_deadline_kind(
+            &row.try_get::<String, _>("deadline_kind")
+                .map_err(internal)?,
+        )?,
+        deadline_date: row.try_get("deadline_date").map_err(internal)?,
         deadline_at: row.try_get("deadline_at").map_err(internal)?,
+        deadline_strength: row
+            .try_get::<Option<String>, _>("deadline_strength")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_deadline_strength)
+            .transpose()?,
+        deadline_soft_weight: row
+            .try_get::<Option<i32>, _>("deadline_soft_weight")
+            .map_err(internal)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ItemRepositoryError::Internal)?,
         earliest_start_at: row.try_get("earliest_start_at").map_err(internal)?,
         recurrence: row.try_get("recurrence").map_err(internal)?,
         flexible_constraints: row.try_get("scheduling_constraints").map_err(internal)?,
+        has_own_effort,
         split_policy,
         importance: u8::try_from(importance).map_err(|_| ItemRepositoryError::Internal)?,
         urgency: u8::try_from(urgency).map_err(|_| ItemRepositoryError::Internal)?,
@@ -1407,12 +1618,22 @@ fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
                 .map_err(internal)?,
         )
         .map_err(|_| ItemRepositoryError::Internal)?,
-        is_executable: deleted_at.is_none() && !has_children,
+        is_executable: deleted_at.is_none()
+            && !has_children
+            && kind.has_executable_component(has_own_effort),
         revision: u64::try_from(revision).map_err(|_| ItemRepositoryError::Internal)?,
         created_at: row.try_get("created_at").map_err(internal)?,
         updated_at: row.try_get("updated_at").map_err(internal)?,
         completed_at: row.try_get("completed_at").map_err(internal)?,
         deleted_at,
+        blocked_reason_kind: row
+            .try_get::<Option<String>, _>("blocked_reason_kind")
+            .map_err(internal)?
+            .as_deref()
+            .map(parse_blocked_reason_kind)
+            .transpose()?,
+        blocked_by_item_id: row.try_get("blocked_by_item_id").map_err(internal)?,
+        blocked_reason: row.try_get("blocked_reason").map_err(internal)?,
     })
 }
 
@@ -1437,6 +1658,7 @@ const fn kind_name(kind: ItemKind) -> &'static str {
         ItemKind::Habit => "habit",
         ItemKind::Routine => "routine",
         ItemKind::Goal => "goal",
+        ItemKind::Project => "project",
         ItemKind::Break => "break",
     }
 }
@@ -1448,6 +1670,7 @@ fn parse_kind(value: &str) -> Result<ItemKind, ItemRepositoryError> {
         "habit" => Ok(ItemKind::Habit),
         "routine" => Ok(ItemKind::Routine),
         "goal" => Ok(ItemKind::Goal),
+        "project" => Ok(ItemKind::Project),
         "break" => Ok(ItemKind::Break),
         _ => Err(ItemRepositoryError::Internal),
     }
@@ -1463,6 +1686,7 @@ const fn status_name(status: ItemStatus) -> &'static str {
         ItemStatus::Completed => "completed",
         ItemStatus::Skipped => "skipped",
         ItemStatus::Cancelled => "cancelled",
+        ItemStatus::Blocked => "blocked",
     }
 }
 
@@ -1476,6 +1700,92 @@ fn parse_status(value: &str) -> Result<ItemStatus, ItemRepositoryError> {
         "completed" => Ok(ItemStatus::Completed),
         "skipped" => Ok(ItemStatus::Skipped),
         "cancelled" => Ok(ItemStatus::Cancelled),
+        "blocked" => Ok(ItemStatus::Blocked),
+        _ => Err(ItemRepositoryError::Internal),
+    }
+}
+
+const fn duration_kind_name(kind: DurationKind) -> &'static str {
+    match kind {
+        DurationKind::Unknown => "unknown",
+        DurationKind::Exact => "exact",
+        DurationKind::Range => "range",
+    }
+}
+
+fn parse_duration_kind(value: &str) -> Result<DurationKind, ItemRepositoryError> {
+    match value {
+        "unknown" => Ok(DurationKind::Unknown),
+        "exact" => Ok(DurationKind::Exact),
+        "range" => Ok(DurationKind::Range),
+        _ => Err(ItemRepositoryError::Internal),
+    }
+}
+
+const fn duration_source_name(source: DurationSource) -> &'static str {
+    match source {
+        DurationSource::User => "user",
+        DurationSource::Assistant => "assistant",
+        DurationSource::Learned => "learned",
+        DurationSource::Imported => "imported",
+    }
+}
+
+fn parse_duration_source(value: &str) -> Result<DurationSource, ItemRepositoryError> {
+    match value {
+        "user" => Ok(DurationSource::User),
+        "assistant" => Ok(DurationSource::Assistant),
+        "learned" => Ok(DurationSource::Learned),
+        "imported" => Ok(DurationSource::Imported),
+        _ => Err(ItemRepositoryError::Internal),
+    }
+}
+
+const fn deadline_kind_name(kind: DeadlineKind) -> &'static str {
+    match kind {
+        DeadlineKind::None => "none",
+        DeadlineKind::Date => "date",
+        DeadlineKind::DateTime => "date_time",
+    }
+}
+
+fn parse_deadline_kind(value: &str) -> Result<DeadlineKind, ItemRepositoryError> {
+    match value {
+        "none" => Ok(DeadlineKind::None),
+        "date" => Ok(DeadlineKind::Date),
+        "date_time" => Ok(DeadlineKind::DateTime),
+        _ => Err(ItemRepositoryError::Internal),
+    }
+}
+
+const fn deadline_strength_name(strength: DeadlineStrength) -> &'static str {
+    match strength {
+        DeadlineStrength::Hard => "hard",
+        DeadlineStrength::Soft => "soft",
+    }
+}
+
+fn parse_deadline_strength(value: &str) -> Result<DeadlineStrength, ItemRepositoryError> {
+    match value {
+        "hard" => Ok(DeadlineStrength::Hard),
+        "soft" => Ok(DeadlineStrength::Soft),
+        _ => Err(ItemRepositoryError::Internal),
+    }
+}
+
+const fn blocked_reason_kind_name(kind: BlockedReasonKind) -> &'static str {
+    match kind {
+        BlockedReasonKind::Dependency => "dependency",
+        BlockedReasonKind::Manual => "manual",
+        BlockedReasonKind::External => "external",
+    }
+}
+
+fn parse_blocked_reason_kind(value: &str) -> Result<BlockedReasonKind, ItemRepositoryError> {
+    match value {
+        "dependency" => Ok(BlockedReasonKind::Dependency),
+        "manual" => Ok(BlockedReasonKind::Manual),
+        "external" => Ok(BlockedReasonKind::External),
         _ => Err(ItemRepositoryError::Internal),
     }
 }

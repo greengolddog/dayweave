@@ -34,7 +34,10 @@ use crate::{
         CryptoError, GoogleOAuthService, GoogleOAuthServiceError, OAuthScope, SecretCipher,
         sync_cursor_aad,
     },
-    items::{ItemKind, ItemService, ItemServiceError, ItemStatus, NewItem, SplitPolicy},
+    items::{
+        DeadlineKind, DeadlineStrength, DurationKind, DurationSource, ItemKind, ItemService,
+        ItemServiceError, ItemStatus, NewItem, SplitPolicy,
+    },
     proposals::Clock,
 };
 
@@ -3089,16 +3092,34 @@ fn normalize_event_authenticated(
         title,
         notes,
         timezone_name,
+        duration_kind: Some(if duration_seconds.is_some() {
+            DurationKind::Exact
+        } else {
+            DurationKind::Unknown
+        }),
         duration_seconds,
+        duration_min_seconds: duration_seconds,
+        duration_max_seconds: duration_seconds,
+        duration_source: duration_seconds.map(|_| DurationSource::Imported),
+        // For events these legacy fields are the exact interval boundary,
+        // never a task deadline.
+        deadline_kind: Some(DeadlineKind::None),
+        deadline_date: None,
         deadline_at: Some(ends_at),
+        deadline_strength: None,
+        deadline_soft_weight: None,
         earliest_start_at: Some(starts_at),
         recurrence: None,
         flexible_constraints: constraints,
+        has_own_effort: Some(false),
         split_policy: SplitPolicy::Indivisible,
         importance: 0,
         urgency: 0,
         parent_id: None,
         sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     };
     validate_normalized_item(&item)?;
     let remote_projection_hash = calendar_occurrence_projection_hash(Some(&item))?;
@@ -3181,13 +3202,14 @@ fn event_disposition(
     collection.calendar_policy.confirmed_busy
 }
 
+#[allow(clippy::too_many_lines)] // Validates and projects one complete provider task envelope.
 fn normalize_task(
     collection: &GoogleSyncCollection,
     task: GoogleTask,
 ) -> Result<RemoteItemChange, NormalizationError> {
     validate_remote_id(&task.id).map_err(|_| NormalizationError::Rejected("invalid_remote_id"))?;
     let remote_hash = payload_hash(&task)?;
-    let remote_projection_hash = projection_hash(remote_hash, collection)?;
+    let remote_projection_hash = task_projection_hash(remote_hash, collection)?;
     // Google Tasks exposes notes to every client and offers no private
     // extended-property namespace. Never interpret visible text as ownership
     // proof, and never let a legacy raw item UUID flow into canonical notes.
@@ -3221,7 +3243,16 @@ fn normalize_task(
     } else {
         (None, false)
     };
-    let due = task.due.as_deref().map(parse_timestamp).transpose()?;
+    // Google Tasks documents `due` as carrying only a calendar date even
+    // though the wire representation is an RFC 3339 timestamp. Preserve that
+    // intent instead of turning provider midnight into an exact latest finish
+    // at the start of the due day.
+    let due_date = task
+        .due
+        .as_deref()
+        .map(parse_timestamp)
+        .transpose()?
+        .map(|due| due.date_naive());
     let provider_completed_at = parse_optional_timestamp(task.completed.as_deref())?;
     let completed = task.status.as_deref() == Some("completed") || provider_completed_at.is_some();
     // Provider identity and projection evidence live only in the sync mapping layer. Keeping the
@@ -3249,16 +3280,32 @@ fn normalize_task(
         title,
         notes,
         timezone_name: "UTC".to_owned(),
+        duration_kind: Some(DurationKind::Unknown),
         duration_seconds: None,
-        deadline_at: due,
+        duration_min_seconds: None,
+        duration_max_seconds: None,
+        duration_source: None,
+        deadline_kind: Some(if due_date.is_some() {
+            DeadlineKind::Date
+        } else {
+            DeadlineKind::None
+        }),
+        deadline_date: due_date,
+        deadline_at: None,
+        deadline_strength: due_date.map(|_| DeadlineStrength::Hard),
+        deadline_soft_weight: None,
         earliest_start_at: None,
         recurrence: None,
         flexible_constraints: json!({}),
+        has_own_effort: Some(false),
         split_policy: SplitPolicy::Indivisible,
         importance: 0,
         urgency: 0,
         parent_id: None,
         sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     };
     validate_normalized_item(&item)?;
     Ok(RemoteItemChange {
@@ -3776,6 +3823,24 @@ fn prepare_task_outbound(
     if item.deleted_at.is_some() {
         return Err(GoogleSyncServiceError::InvalidOutboundItem);
     }
+    let due = match (
+        item.deadline_kind,
+        item.deadline_date,
+        item.deadline_strength,
+    ) {
+        (DeadlineKind::None, None, None) => None,
+        (DeadlineKind::Date, Some(date), Some(DeadlineStrength::Hard)) => Some(
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                date.and_hms_opt(0, 0, 0)
+                    .ok_or(GoogleSyncServiceError::InvalidOutboundItem)?,
+                Utc,
+            )
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        ),
+        // Google Tasks cannot represent a time-of-day or DayWeave's soft
+        // deadline weight. Reject rather than silently weaken or shift intent.
+        _ => return Err(GoogleSyncServiceError::InvalidOutboundItem),
+    };
     let task = GoogleTask {
         id: String::new(),
         etag: None,
@@ -3788,7 +3853,7 @@ fn prepare_task_outbound(
         } else {
             "needsAction".to_owned()
         }),
-        due: item.deadline_at.map(|value| value.to_rfc3339()),
+        due,
         completed: item.completed_at.map(|value| value.to_rfc3339()),
         updated: None,
         parent: None,
@@ -4993,6 +5058,22 @@ fn projection_hash(
 ) -> Result<[u8; 32], NormalizationError> {
     payload_hash(&(
         "dayweave.google.canonical-projection.v2",
+        remote_hash,
+        collection.visible,
+        collection.sync_role,
+        collection.calendar_policy,
+    ))
+}
+
+fn task_projection_hash(
+    remote_hash: [u8; 32],
+    collection: &GoogleSyncCollection,
+) -> Result<[u8; 32], NormalizationError> {
+    payload_hash(&(
+        // Tasks previously shared the generic v2 domain with calendar-series
+        // imports. v3 forces unchanged due values through date normalization
+        // without churning unrelated Calendar mappings.
+        "dayweave.google.task_canonical_projection.v3",
         remote_hash,
         collection.visible,
         collection.sync_role,
@@ -6482,8 +6563,16 @@ mod tests {
                 title: "Policy fixture".to_owned(),
                 notes: Some("Synthetic details".to_owned()),
                 timezone_name: timezone_name.to_owned(),
+                duration_kind: None,
                 duration_seconds: Some(duration_seconds),
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: Some(ends_at),
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: Some(starts_at),
                 recurrence: None,
                 flexible_constraints: json!({"dayweave_firm_block": {
@@ -6494,11 +6583,15 @@ mod tests {
                     "tentative": tentative,
                     "busy": busy,
                 }}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             starts_at - Duration::hours(1),
         )
@@ -7136,7 +7229,70 @@ mod tests {
         assert_eq!(item.status, ItemStatus::Completed);
         assert_eq!(change.remote_parent_id.as_deref(), Some("parent-1"));
         assert_eq!(item.flexible_constraints, json!({}));
-        assert!(item.deadline_at.is_some());
+        assert_eq!(item.deadline_kind, Some(DeadlineKind::Date));
+        assert_eq!(
+            item.deadline_date,
+            Some(NaiveDate::from_ymd_opt(2026, 8, 30).expect("valid due date"))
+        );
+        assert!(item.deadline_at.is_none());
+        assert_eq!(item.deadline_strength, Some(DeadlineStrength::Hard));
+    }
+
+    #[test]
+    fn google_task_due_round_trips_as_a_hard_date_without_losing_intent() {
+        let mut tasks_collection = collection(GoogleSyncRole::Writable, true);
+        tasks_collection.kind = GoogleCollectionKind::TaskList;
+        let provider_task = GoogleTask {
+            id: "task-date".to_owned(),
+            etag: Some("etag-date".to_owned()),
+            title: "Date only".to_owned(),
+            notes: None,
+            status: Some("needsAction".to_owned()),
+            due: Some("2026-08-30T00:00:00.000Z".to_owned()),
+            completed: None,
+            updated: Some("2026-08-29T12:00:00Z".to_owned()),
+            parent: None,
+            position: None,
+            links: None,
+            deleted: false,
+            hidden: false,
+        };
+        let legacy_v2_hash = projection_hash(
+            payload_hash(&provider_task).expect("provider payload hash"),
+            &tasks_collection,
+        )
+        .expect("legacy projection hash");
+        let change = normalize_task(&tasks_collection, provider_task).expect("date-only task");
+        assert_ne!(
+            change.remote_projection_hash, legacy_v2_hash,
+            "the task-only projection version must re-normalize unchanged v2 due values"
+        );
+        let normalized = change.item.expect("upsert");
+        let item = crate::items::Item::new(normalized, Utc::now()).expect("canonical task");
+        let prepared = prepare_task_outbound(item.clone(), OutboundOperation::Upsert)
+            .expect("hard date is representable");
+        assert_eq!(prepared.payload["due"], "2026-08-30T00:00:00.000Z");
+
+        let mut soft = item.clone();
+        soft.deadline_strength = Some(DeadlineStrength::Soft);
+        soft.deadline_soft_weight = Some(1);
+        assert!(matches!(
+            prepare_task_outbound(soft, OutboundOperation::Upsert),
+            Err(GoogleSyncServiceError::InvalidOutboundItem)
+        ));
+
+        let mut exact = item;
+        exact.deadline_kind = DeadlineKind::DateTime;
+        exact.deadline_date = None;
+        exact.deadline_at = Some(
+            "2026-08-30T12:00:00Z"
+                .parse()
+                .expect("valid exact timestamp"),
+        );
+        assert!(matches!(
+            prepare_task_outbound(exact, OutboundOperation::Upsert),
+            Err(GoogleSyncServiceError::InvalidOutboundItem)
+        ));
     }
 
     #[test]
@@ -7150,8 +7306,16 @@ mod tests {
             title: "Focus".to_owned(),
             notes: None,
             timezone_name: "UTC".to_owned(),
+            duration_kind: None,
             duration_seconds: Some(3600),
+            duration_min_seconds: None,
+            duration_max_seconds: None,
+            duration_source: None,
+            deadline_kind: None,
+            deadline_date: None,
             deadline_at: Some(now + Duration::hours(1)),
+            deadline_strength: None,
+            deadline_soft_weight: None,
             earliest_start_at: Some(now),
             recurrence: None,
             flexible_constraints: json!({"dayweave_firm_block": {
@@ -7159,11 +7323,15 @@ mod tests {
                 "starts_at": now,
                 "ends_at": now + Duration::hours(1),
             }}),
+            has_own_effort: None,
             split_policy: SplitPolicy::Indivisible,
             importance: 0,
             urgency: 0,
             parent_id: None,
             sibling_order: 0,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
         };
         let item = crate::items::Item::new(input, now).expect("item");
         let collection = collection(GoogleSyncRole::Writable, true);
@@ -7622,16 +7790,28 @@ mod tests {
                 title: "Bound task".to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
+                duration_kind: None,
                 duration_seconds: None,
+                duration_min_seconds: None,
+                duration_max_seconds: None,
+                duration_source: None,
+                deadline_kind: None,
+                deadline_date: None,
                 deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
                 earliest_start_at: None,
                 recurrence: None,
                 flexible_constraints: json!({}),
+                has_own_effort: None,
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
                 parent_id: None,
                 sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
             },
             now,
         )

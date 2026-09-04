@@ -2,11 +2,13 @@ use std::collections::BTreeSet;
 
 use chrono::{TimeZone as _, Utc};
 use dayweave_compose::{
-    AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
-    ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    ManualPlacementAssignmentInput, ManualPlacementInput, ManualPlacementReleaseInput,
-    PrepareScheduleError, PreviousAssignmentInput, PreviousBlockInput, SchedulerConfigInput,
-    prepare_canonical_schedule, validate_schedule_request,
+    AvailabilityInput, CanonicalBlockedReasonKind, CanonicalDeadlineKind,
+    CanonicalDeadlineStrength, CanonicalDurationKind, CanonicalDurationSource, CanonicalItem,
+    CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy, ComposeScheduleRequest,
+    EnergyInput, FixedBlockInput, FixedBlockSourceInput, ManualPlacementAssignmentInput,
+    ManualPlacementInput, ManualPlacementReleaseInput, PrepareScheduleError,
+    PreviousAssignmentInput, PreviousBlockInput, SchedulerConfigInput, prepare_canonical_schedule,
+    validate_schedule_request,
 };
 use dayweave_core::{
     ConstraintStrength, EnergyLevel, FixedBlockSource, ItemId, ItemKind, Minutes, Recurrence,
@@ -26,11 +28,20 @@ fn canonical_item(value: u128) -> CanonicalItem {
         title: format!("Canonical item {value}"),
         notes: None,
         timezone_name: "Europe/Madrid".into(),
+        duration_kind: Some(CanonicalDurationKind::Exact),
         duration_seconds: Some(3_600),
+        duration_min_seconds: Some(3_600),
+        duration_max_seconds: Some(3_600),
+        duration_source: Some(CanonicalDurationSource::User),
+        deadline_kind: Some(CanonicalDeadlineKind::DateTime),
+        deadline_date: None,
         deadline_at: Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap()),
+        deadline_strength: Some(CanonicalDeadlineStrength::Hard),
+        deadline_soft_weight: None,
         earliest_start_at: None,
         recurrence: None,
         flexible_constraints: json!({}),
+        has_own_effort: Some(false),
         split_policy: CanonicalSplitPolicy::Indivisible,
         importance: 80,
         urgency: 60,
@@ -42,6 +53,9 @@ fn canonical_item(value: u128) -> CanonicalItem {
         updated_at: Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap(),
         completed_at: None,
         deleted_at: None,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     }
 }
 
@@ -105,6 +119,8 @@ fn manual_placement(
 fn maps_canonical_fields_without_running_the_scheduler() {
     let mut item = canonical_item(1);
     item.duration_seconds = Some(121);
+    item.duration_min_seconds = Some(121);
+    item.duration_max_seconds = Some(121);
     item.importance = 81;
     item.urgency = 1;
     item.earliest_start_at = Some(Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap());
@@ -169,6 +185,7 @@ fn canonical_source_order_cannot_change_preparation_output() {
     let mut root = canonical_item(30);
     root.is_sensitive = true;
     root.flexible_constraints = json!({"has_own_effort": true});
+    root.has_own_effort = Some(true);
     let mut child = canonical_item(20);
     child.parent_id = Some(root.id);
     let mut invalid_high = canonical_item(90);
@@ -196,6 +213,28 @@ fn canonical_source_order_cannot_change_preparation_output() {
         vec![Uuid::from_u128(10), Uuid::from_u128(90)]
     );
     assert!(first.effective_sensitivity[&Uuid::from_u128(20)]);
+}
+
+#[test]
+fn non_leaf_parent_own_effort_is_deferred_until_it_has_a_distinct_work_unit() {
+    let mut project = canonical_item(31);
+    project.kind = CanonicalItemKind::Project;
+    project.flexible_constraints = json!({"has_own_effort": true});
+    project.has_own_effort = Some(true);
+    project.is_executable = false;
+    let mut child = canonical_item(32);
+    child.parent_id = Some(project.id);
+
+    let prepared = prepare_canonical_schedule(vec![project.clone(), child], preview_request())
+        .expect("non-leaf project remains a valid structural item");
+    let projected = prepared
+        .plan_request
+        .items
+        .iter()
+        .find(|item| item.id.0 == project.id)
+        .expect("project stays in hierarchy projection");
+    assert!(!projected.has_own_effort);
+    assert!(!projected.occupies_time(true));
 }
 
 #[test]
@@ -344,10 +383,15 @@ fn maps_all_statuses_exactly() {
         (CanonicalItemStatus::Completed, Some(WorkStatus::Completed)),
         (CanonicalItemStatus::Skipped, Some(WorkStatus::Skipped)),
         (CanonicalItemStatus::Cancelled, Some(WorkStatus::Canceled)),
+        (CanonicalItemStatus::Blocked, Some(WorkStatus::Blocked)),
     ];
     for (index, (status, expected)) in cases.into_iter().enumerate() {
         let mut item = canonical_item(400 + index as u128);
         item.status = status;
+        if status == CanonicalItemStatus::Blocked {
+            item.blocked_reason_kind = Some(CanonicalBlockedReasonKind::Manual);
+            item.blocked_reason = Some("Waiting for a decision".to_owned());
+        }
         let prepared = prepare_canonical_schedule(vec![item], preview_request()).unwrap();
         match expected {
             Some(expected) => assert_eq!(prepared.plan_request.items[0].status, expected),
@@ -366,15 +410,25 @@ fn maps_every_canonical_kind_and_legacy_recurrence_defaults() {
     let mut routine = canonical_item(502);
     routine.kind = CanonicalItemKind::Routine;
     routine.flexible_constraints = json!({"has_own_effort": true, "routine_ordered": true});
+    routine.has_own_effort = Some(true);
     let mut goal = canonical_item(503);
     goal.kind = CanonicalItemKind::Goal;
     goal.flexible_constraints = json!({"has_own_effort": true});
-    let mut break_item = canonical_item(504);
+    goal.has_own_effort = Some(true);
+    let mut project = canonical_item(504);
+    project.kind = CanonicalItemKind::Project;
+    let mut break_item = canonical_item(505);
     break_item.kind = CanonicalItemKind::Break;
-    let mut event = canonical_item(505);
+    let mut event = canonical_item(506);
     event.kind = CanonicalItemKind::Event;
+    event.duration_kind = Some(CanonicalDurationKind::Unknown);
     event.duration_seconds = None;
+    event.duration_min_seconds = None;
+    event.duration_max_seconds = None;
+    event.duration_source = None;
+    event.deadline_kind = Some(CanonicalDeadlineKind::None);
     event.deadline_at = None;
+    event.deadline_strength = None;
     event.flexible_constraints = json!({
         "calendar_event": {
             "start": "2026-09-01T10:00:00+02:00",
@@ -386,7 +440,7 @@ fn maps_every_canonical_kind_and_legacy_recurrence_defaults() {
     });
 
     let prepared = prepare_canonical_schedule(
-        vec![event, break_item, goal, routine, habit, task],
+        vec![event, break_item, project, goal, routine, habit, task],
         preview_request(),
     )
     .unwrap();
@@ -414,16 +468,23 @@ fn maps_every_canonical_kind_and_legacy_recurrence_defaults() {
     ));
     assert!(matches!(kinds[2], ItemKind::Routine(_)));
     assert!(matches!(kinds[3], ItemKind::Goal(_)));
-    assert!(matches!(kinds[4], ItemKind::Break(_)));
-    assert!(matches!(kinds[5], ItemKind::CalendarEvent(_)));
+    assert!(matches!(kinds[4], ItemKind::Project));
+    assert!(matches!(kinds[5], ItemKind::Break(_)));
+    assert!(matches!(kinds[6], ItemKind::CalendarEvent(_)));
 }
 
 #[test]
 fn calendar_context_counts_as_accepted_without_becoming_work() {
     let mut context = canonical_item(600);
     context.kind = CanonicalItemKind::Event;
+    context.duration_kind = Some(CanonicalDurationKind::Unknown);
     context.duration_seconds = None;
+    context.duration_min_seconds = None;
+    context.duration_max_seconds = None;
+    context.duration_source = None;
+    context.deadline_kind = Some(CanonicalDeadlineKind::None);
     context.deadline_at = None;
+    context.deadline_strength = None;
     context.flexible_constraints = json!({
         "calendar_context": {
             "start": "2026-09-01T10:00:00+02:00",

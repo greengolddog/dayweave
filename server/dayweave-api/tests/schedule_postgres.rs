@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderValue, Request, StatusCode, header},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use dayweave_api::{
     AppState,
     auth::{Authenticator, RuntimeAuthenticator, Scope},
@@ -21,7 +21,8 @@ use dayweave_api::{
     },
     http::router,
     items::{
-        IdempotencyKey, Item, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
+        BlockedReasonKind, DeadlineKind, DeadlineStrength, IdempotencyKey, Item, ItemKind,
+        ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
     },
     persistence::{
         DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresExecutionRepository,
@@ -131,6 +132,8 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     let public_task = Uuid::new_v4();
     let private_parent = Uuid::new_v4();
     let private_child = Uuid::new_v4();
+    let private_blocker_parent = Uuid::new_v4();
+    let private_blocker_child = Uuid::new_v4();
     for (item, marker) in [
         (goal(public_goal_a, "Goal A", false, None), 1),
         (goal(public_goal_b, "Goal B", false, None), 2),
@@ -155,12 +158,89 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             ),
             5,
         ),
+        (
+            goal(private_blocker_parent, "Private blocker parent", true, None),
+            211,
+        ),
+        (
+            goal(
+                private_blocker_child,
+                "Private inherited blocker",
+                false,
+                Some(private_blocker_parent),
+            ),
+            212,
+        ),
     ] {
         items
             .create(item, idempotency(marker))
             .await
             .expect("create canonical item");
     }
+
+    let outer_project = Uuid::new_v4();
+    let inner_project = Uuid::new_v4();
+    let nested_goal = Uuid::new_v4();
+    let nested_project_task = Uuid::new_v4();
+    let mut outer_project_item = goal(outer_project, "Outer project", false, None);
+    outer_project_item.kind = ItemKind::Project;
+    items
+        .create(outer_project_item, idempotency(11))
+        .await
+        .expect("create outer project");
+    let mut inner_project_item = goal(inner_project, "Inner project", false, Some(outer_project));
+    inner_project_item.kind = ItemKind::Project;
+    items
+        .create(inner_project_item, idempotency(12))
+        .await
+        .expect("create inner project");
+    items
+        .create(
+            goal(
+                nested_goal,
+                "Nested project goal",
+                false,
+                Some(inner_project),
+            ),
+            idempotency(13),
+        )
+        .await
+        .expect("create nested project goal");
+    let mut nested_task = task(
+        nested_project_task,
+        "Nested project search task",
+        false,
+        Some(nested_goal),
+        json!({}),
+    );
+    nested_task.status = ItemStatus::Blocked;
+    nested_task.blocked_reason_kind = Some(BlockedReasonKind::Manual);
+    nested_task.blocked_reason = Some("Waiting for a manual decision".to_owned());
+    items
+        .create(nested_task, idempotency(14))
+        .await
+        .expect("create deeply nested project task");
+
+    let visible_blocked = Uuid::new_v4();
+    let mut blocked = task(
+        visible_blocked,
+        "Visible blocked task",
+        false,
+        None,
+        json!({}),
+    );
+    blocked.status = ItemStatus::Blocked;
+    blocked.deadline_kind = Some(DeadlineKind::Date);
+    blocked.deadline_date = NaiveDate::from_ymd_opt(2026, 9, 1);
+    blocked.deadline_at = None;
+    blocked.deadline_strength = Some(DeadlineStrength::Hard);
+    blocked.blocked_reason_kind = Some(BlockedReasonKind::Dependency);
+    blocked.blocked_by_item_id = Some(private_blocker_child);
+    blocked.blocked_reason = Some("Waiting for prerequisite".to_owned());
+    items
+        .create(blocked, idempotency(9))
+        .await
+        .expect("create visible item blocked by private descendant");
 
     let conflict_canary = Uuid::new_v4();
     let mut impossible = task(
@@ -974,6 +1054,98 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             .iter()
             .all(|item| item.id != private_child.to_string())
     );
+    let public_summary = search
+        .items
+        .iter()
+        .find(|item| item.id == public_task.to_string())
+        .expect("public task summary");
+    assert_eq!(public_summary.duration_kind, "exact");
+    assert_eq!(public_summary.duration_source.as_deref(), Some("user"));
+    assert_eq!(public_summary.deadline_kind, "date_time");
+    assert_eq!(public_summary.deadline_strength.as_deref(), Some("hard"));
+
+    for project_id in [outer_project, inner_project] {
+        let project_search = schedules
+            .search_items(
+                &access,
+                ItemSearchQuery {
+                    text: Some("Nested project search task".to_owned()),
+                    status: None,
+                    kind: None,
+                    project_id: Some(project_id.to_string()),
+                    goal_id: None,
+                    start: None,
+                    end: None,
+                    limit: 20,
+                },
+            )
+            .await
+            .expect("search by a project ancestor at any depth");
+        assert_eq!(project_search.items.len(), 1);
+        assert_eq!(project_search.items[0].id, nested_project_task.to_string());
+        assert_eq!(
+            project_search.items[0].project_id,
+            Some(inner_project.to_string()),
+            "the summary exposes the nearest project while every project ancestor remains searchable"
+        );
+    }
+
+    let unrestricted = schedules
+        .search_items(
+            &access,
+            ItemSearchQuery {
+                text: Some("Visible blocked task".to_owned()),
+                status: Some("blocked".to_owned()),
+                kind: Some("task".to_owned()),
+                project_id: None,
+                goal_id: None,
+                start: None,
+                end: None,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let blocked_summary = unrestricted.items.first().expect("visible blocked summary");
+    assert_eq!(
+        blocked_summary.blocked_reason_kind.as_deref(),
+        Some("dependency")
+    );
+    assert_eq!(blocked_summary.deadline_kind, "date");
+    assert_eq!(
+        blocked_summary.deadline_date,
+        NaiveDate::from_ymd_opt(2026, 9, 1)
+    );
+    assert!(blocked_summary.deadline_at.is_none());
+    assert!(
+        blocked_summary.blocked_by_item_id.is_none(),
+        "search must not leak a transitively private blocker UUID"
+    );
+    let privileged = ScheduleAccess {
+        include_sensitive: true,
+        ..access.clone()
+    };
+    let privileged_blocked = schedules
+        .search_items(
+            &privileged,
+            ItemSearchQuery {
+                text: Some("Visible blocked task".to_owned()),
+                status: Some("blocked".to_owned()),
+                kind: Some("task".to_owned()),
+                project_id: None,
+                goal_id: None,
+                start: None,
+                end: None,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let private_child_text = private_blocker_child.to_string();
+    assert_eq!(
+        privileged_blocked.items[0].blocked_by_item_id.as_deref(),
+        Some(private_child_text.as_str())
+    );
 
     for denied in [
         ScheduleAccess {
@@ -1027,16 +1199,28 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 title: "Public task changed after lost response".to_owned(),
                 notes: current_public.notes,
                 timezone_name: current_public.timezone_name,
+                duration_kind: Some(current_public.duration_kind),
                 duration_seconds: current_public.duration_seconds,
+                duration_min_seconds: current_public.duration_min_seconds,
+                duration_max_seconds: current_public.duration_max_seconds,
+                duration_source: current_public.duration_source,
+                deadline_kind: Some(current_public.deadline_kind),
+                deadline_date: current_public.deadline_date,
                 deadline_at: current_public.deadline_at,
+                deadline_strength: current_public.deadline_strength,
+                deadline_soft_weight: current_public.deadline_soft_weight,
                 earliest_start_at: current_public.earliest_start_at,
                 recurrence: current_public.recurrence,
                 flexible_constraints: current_public.flexible_constraints,
+                has_own_effort: Some(current_public.has_own_effort),
                 split_policy: current_public.split_policy,
                 importance: current_public.importance,
                 urgency: current_public.urgency,
                 parent_id: current_public.parent_id,
                 sibling_order: current_public.sibling_order,
+                blocked_reason_kind: current_public.blocked_reason_kind,
+                blocked_by_item_id: current_public.blocked_by_item_id,
+                blocked_reason: current_public.blocked_reason,
             },
             idempotency(10),
         )
@@ -2475,16 +2659,28 @@ async fn manual_placement_approval_and_carry_forward_are_durable() {
                 title: current.title,
                 notes: current.notes,
                 timezone_name: current.timezone_name,
+                duration_kind: Some(current.duration_kind),
                 duration_seconds: Some(5_400),
+                duration_min_seconds: Some(5_400),
+                duration_max_seconds: Some(5_400),
+                duration_source: current.duration_source,
+                deadline_kind: Some(current.deadline_kind),
+                deadline_date: current.deadline_date,
                 deadline_at: current.deadline_at,
+                deadline_strength: current.deadline_strength,
+                deadline_soft_weight: current.deadline_soft_weight,
                 earliest_start_at: current.earliest_start_at,
                 recurrence: current.recurrence,
                 flexible_constraints: current.flexible_constraints,
+                has_own_effort: Some(current.has_own_effort),
                 split_policy: current.split_policy,
                 importance: current.importance,
                 urgency: current.urgency,
                 parent_id: current.parent_id,
                 sibling_order: current.sibling_order,
+                blocked_reason_kind: current.blocked_reason_kind,
+                blocked_by_item_id: current.blocked_by_item_id,
+                blocked_reason: current.blocked_reason,
             },
             idempotency(222),
         )
@@ -3405,6 +3601,233 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One lifecycle scenario proves dormant and explicitly unblocked claim behavior.
+async fn blocked_defer_claim_stays_dormant_until_explicit_unblock() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; blocked claim test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
+    let item_id = Uuid::new_v4();
+    items
+        .create(
+            task(item_id, "Blocked deferred work", false, None, json!({})),
+            idempotency(210),
+        )
+        .await
+        .expect("create deferred item");
+    // This test exercises the planning read predicates rather than the defer
+    // command authorizer. Seed one internally coherent historical claim while
+    // bypassing the newer assessment-evidence trigger used by live commands.
+    sqlx::query(
+        "ALTER TABLE execution_defer_replacement_claims \
+         ALTER COLUMN authorization_schema_version SET DEFAULT 0, \
+         ALTER COLUMN authorization_kind SET DEFAULT 'legacy_unassessed'",
+    )
+    .execute(&test_database.pool)
+    .await
+    .expect("temporarily restore legacy claim defaults");
+    sqlx::query(
+        "ALTER TABLE execution_defer_replacement_claims \
+         DISABLE TRIGGER execution_defer_replacement_claims_guard",
+    )
+    .execute(&test_database.pool)
+    .await
+    .expect("disable live claim authorizer for fixture");
+    insert_live_legacy_claim(
+        &test_database.pool,
+        scope,
+        item_id,
+        "2026-08-31T06:00:00Z".parse().unwrap(),
+        "2026-09-01T11:00:00Z".parse().unwrap(),
+    )
+    .await;
+    sqlx::query(
+        "ALTER TABLE execution_defer_replacement_claims \
+         ENABLE TRIGGER execution_defer_replacement_claims_guard",
+    )
+    .execute(&test_database.pool)
+    .await
+    .expect("restore live claim authorizer");
+    sqlx::query(
+        "ALTER TABLE execution_defer_replacement_claims \
+         ALTER COLUMN authorization_schema_version DROP DEFAULT, \
+         ALTER COLUMN authorization_kind DROP DEFAULT",
+    )
+    .execute(&test_database.pool)
+    .await
+    .expect("remove temporary legacy claim defaults");
+    sqlx::query(
+        "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
+         VALUES ($1, 1, NULL, '2026-08-31T06:00:01Z'::timestamptz) \
+         ON CONFLICT (workspace_id) DO UPDATE SET revision = 1, active_session_id = NULL, \
+         updated_at = EXCLUDED.updated_at",
+    )
+    .bind(scope.workspace_id)
+    .execute(&test_database.pool)
+    .await
+    .expect("seed execution evidence revision");
+    sqlx::query(
+        "UPDATE items SET status = 'blocked', blocked_reason_kind = 'manual', \
+         blocked_reason = 'Waiting for explicit unblock', revision = revision + 1, \
+         updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .execute(&test_database.pool)
+    .await
+    .expect("block claimed work");
+
+    let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
+    let access = owner_access(scope, "auth0|blocked-claim-owner");
+    let mut request = compose_request();
+    request.fixed_blocks.clear();
+    let blocked_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("blocked claim is dormant");
+    assert!(
+        blocked_preview
+            .plan
+            .blocks
+            .iter()
+            .all(|block| { block.item_id.is_none_or(|candidate| candidate.0 != item_id) })
+    );
+    let blocked_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [210; 32],
+                input_digest: digest_bytes(&blocked_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
+                result: blocked_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("blocked claim does not become a required publication");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, blocked_publication.revision.id).await,
+        0
+    );
+
+    sqlx::query(
+        "UPDATE items SET status = 'planned', blocked_reason_kind = NULL, \
+         blocked_by_item_id = NULL, blocked_reason = NULL, revision = revision + 1, \
+         updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .execute(&test_database.pool)
+    .await
+    .expect("explicitly unblock claimed work");
+    let unblocked_preview = compose_canonical_schedule(&items, &schedules, request)
+        .await
+        .expect("unblocked claim becomes actionable again");
+    let replacement = unblocked_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+                && serde_json::to_value(block.kind).is_ok_and(|kind| kind == json!("pinned"))
+        })
+        .expect("unblocked replacement is restored");
+    assert_eq!(replacement.session_index, 1);
+    assert_eq!(
+        serde_json::to_value(replacement.kind).unwrap(),
+        json!("pinned")
+    );
+
+    let unblocked = items.get(item_id).await.expect("load unblocked task");
+    let no_own_effort = items
+        .replace(
+            item_id,
+            unblocked.revision,
+            ReplaceItem {
+                is_sensitive: unblocked.is_sensitive,
+                kind: ItemKind::Goal,
+                status: unblocked.status,
+                title: unblocked.title,
+                notes: unblocked.notes,
+                timezone_name: unblocked.timezone_name,
+                duration_kind: Some(unblocked.duration_kind),
+                duration_seconds: unblocked.duration_seconds,
+                duration_min_seconds: unblocked.duration_min_seconds,
+                duration_max_seconds: unblocked.duration_max_seconds,
+                duration_source: unblocked.duration_source,
+                deadline_kind: Some(unblocked.deadline_kind),
+                deadline_date: unblocked.deadline_date,
+                deadline_at: unblocked.deadline_at,
+                deadline_strength: unblocked.deadline_strength,
+                deadline_soft_weight: unblocked.deadline_soft_weight,
+                earliest_start_at: unblocked.earliest_start_at,
+                recurrence: None,
+                flexible_constraints: json!({}),
+                has_own_effort: Some(false),
+                split_policy: unblocked.split_policy,
+                importance: unblocked.importance,
+                urgency: unblocked.urgency,
+                parent_id: unblocked.parent_id,
+                sibling_order: unblocked.sibling_order,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
+            },
+            idempotency(211),
+        )
+        .await
+        .expect("remove the deferred work's executable component");
+    assert!(!no_own_effort.item.is_executable);
+    let dormant_preview = compose_canonical_schedule(&items, &schedules, compose_request())
+        .await
+        .expect("claim becomes dormant when its executable component is removed");
+    assert!(
+        dormant_preview
+            .plan
+            .blocks
+            .iter()
+            .all(|block| { block.item_id.is_none_or(|candidate| candidate.0 != item_id) })
+    );
+    let dormant_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [211; 32],
+                input_digest: digest_bytes(&dormant_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
+                result: dormant_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("dormant non-executable claim is not required by the database seal");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, dormant_publication.revision.id).await,
+        0
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // Exercises all three dynamic claim-retirement paths in one isolated workspace.
 async fn non_executable_claims_retire_without_blocking_publication() {
     let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
@@ -3420,28 +3843,27 @@ async fn non_executable_claims_retire_without_blocking_publication() {
             .expect("pre-authorization migration applies");
     }
     let scope = seed_scope(&test_database.pool).await;
-    let items = Arc::new(ItemService::new(
-        Arc::new(PostgresItemRepository::new(
-            test_database.pool.clone(),
-            scope,
-        )),
-        Arc::new(SystemClock),
-    ));
     let nonleaf_item = Uuid::new_v4();
     let terminal_item = Uuid::new_v4();
     let trashed_item = Uuid::new_v4();
-    for (item_id, title, marker) in [
-        (nonleaf_item, "Claim becomes non-leaf", 201),
-        (terminal_item, "Claim becomes completed", 202),
-        (trashed_item, "Claim becomes trashed", 203),
+    for (item_id, title) in [
+        (nonleaf_item, "Claim becomes non-leaf"),
+        (terminal_item, "Claim becomes completed"),
+        (trashed_item, "Claim becomes trashed"),
     ] {
-        items
-            .create(
-                task(item_id, title, false, None, json!({})),
-                idempotency(marker),
-            )
-            .await
-            .expect("create claim liveness item");
+        sqlx::query(
+            "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+             timezone_name, duration_seconds, deadline_at, scheduling_constraints, \
+             importance, urgency) VALUES ($1,$2,$3,'task','planned',$4,'Europe/Madrid',3600, \
+             '2026-09-01T17:00:00Z'::timestamptz,'{}'::jsonb,80,60)",
+        )
+        .bind(item_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(title)
+        .execute(&test_database.pool)
+        .await
+        .expect("insert pre-structural claim liveness item");
     }
     let terminal_at: chrono::DateTime<Utc> = "2026-08-31T06:00:00Z".parse().unwrap();
     insert_live_legacy_claim(
@@ -3479,6 +3901,16 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         ))
         .await
         .expect("execution defer authorization migration applies");
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| (22..=24).contains(&migration.version))
+    {
+        test_database
+            .pool
+            .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("post-authorization migration applies");
+    }
     sqlx::query(
         "UPDATE execution_state SET revision = 1, active_session_id = NULL, updated_at = $2 \
          WHERE workspace_id = $1",
@@ -3489,6 +3921,13 @@ async fn non_executable_claims_retire_without_blocking_publication() {
     .await
     .expect("advance claim liveness execution clock");
 
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
     let child_id = Uuid::new_v4();
     items
         .create(
@@ -3572,27 +4011,19 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
             .expect("pre-ledger migration applies");
     }
     let scope = seed_scope(&test_database.pool).await;
-    let items = Arc::new(ItemService::new(
-        Arc::new(PostgresItemRepository::new(
-            test_database.pool.clone(),
-            scope,
-        )),
-        Arc::new(SystemClock),
-    ));
     let item_id = Uuid::new_v4();
-    items
-        .create(
-            task(
-                item_id,
-                "Never reuse a passive migrated index",
-                false,
-                None,
-                json!({}),
-            ),
-            idempotency(209),
-        )
-        .await
-        .expect("create migration fixture item");
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         timezone_name, duration_seconds, deadline_at, scheduling_constraints, importance, urgency) \
+         VALUES ($1,$2,$3,'task','planned','Never reuse a passive migrated index', \
+         'Europe/Madrid',3600,'2026-09-01T17:00:00Z'::timestamptz,'{}'::jsonb,80,60)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&test_database.pool)
+    .await
+    .expect("insert pre-ledger migration fixture item");
     let source_session_id = Uuid::new_v4();
     let started_at: chrono::DateTime<Utc> = "2026-08-31T06:00:00Z".parse().unwrap();
     let deferred_at: chrono::DateTime<Utc> = "2026-08-31T06:20:00Z".parse().unwrap();
@@ -3667,6 +4098,24 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
     assert_eq!(replacement_index, 10);
     assert!(!actionable);
 
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| (21..=24).contains(&migration.version))
+    {
+        test_database
+            .pool
+            .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("post-ledger migration applies");
+    }
+
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|passive-index-owner");
     let mut request = compose_request();
@@ -3735,19 +4184,19 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
             .expect("legacy migration applies");
     }
     let scope = seed_scope(&test_database.pool).await;
-    let item_repository = Arc::new(PostgresItemRepository::new(
-        test_database.pool.clone(),
-        scope,
-    ));
-    let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
     let item_id = Uuid::new_v4();
-    items
-        .create(
-            task(item_id, "Fresh publication item", false, None, json!({})),
-            idempotency(210),
-        )
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         timezone_name, duration_seconds, deadline_at, scheduling_constraints, importance, urgency) \
+         VALUES ($1,$2,$3,'task','planned','Fresh publication item','Europe/Madrid',3600, \
+         '2026-09-01T17:00:00Z'::timestamptz,'{}'::jsonb,80,60)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&test_database.pool)
+    .await
+    .expect("insert legacy publication item");
 
     let legacy_published = Uuid::new_v4();
     let legacy_published_block = Uuid::new_v4();
@@ -3873,7 +4322,24 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         ))
         .await
         .expect("execution progress ledger migration applies");
+    for migration in [
+        include_str!("../migrations/0021_execution_defer_approval.sql"),
+        include_str!("../migrations/0022_google_schedule_publication.sql"),
+        include_str!("../migrations/0023_google_task_provider_metadata.sql"),
+        include_str!("../migrations/0024_structural_item_fields.sql"),
+    ] {
+        test_database
+            .pool
+            .execute(migration)
+            .await
+            .expect("post-ledger migration applies");
+    }
 
+    let item_repository = Arc::new(PostgresItemRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
     assert!(matches!(
@@ -4931,16 +5397,28 @@ fn goal(id: Uuid, title: &str, sensitive: bool, parent_id: Option<Uuid>) -> NewI
         title: title.to_owned(),
         notes: None,
         timezone_name: "Europe/Madrid".to_owned(),
+        duration_kind: None,
         duration_seconds: None,
+        duration_min_seconds: None,
+        duration_max_seconds: None,
+        duration_source: None,
+        deadline_kind: None,
+        deadline_date: None,
         deadline_at: None,
+        deadline_strength: None,
+        deadline_soft_weight: None,
         earliest_start_at: None,
         recurrence: None,
         flexible_constraints: json!({}),
+        has_own_effort: None,
         split_policy: SplitPolicy::Indivisible,
         importance: 50,
         urgency: 50,
         parent_id,
         sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     }
 }
 
@@ -4959,16 +5437,28 @@ fn task(
         title: title.to_owned(),
         notes: None,
         timezone_name: "Europe/Madrid".to_owned(),
+        duration_kind: None,
         duration_seconds: Some(3_600),
+        duration_min_seconds: None,
+        duration_max_seconds: None,
+        duration_source: None,
+        deadline_kind: None,
+        deadline_date: None,
         deadline_at: Some("2026-09-01T17:00:00Z".parse().unwrap()),
+        deadline_strength: None,
+        deadline_soft_weight: None,
         earliest_start_at: None,
         recurrence: None,
         flexible_constraints,
+        has_own_effort: None,
         split_policy: SplitPolicy::Indivisible,
         importance: 80,
         urgency: 60,
         parent_id,
         sibling_order: 0,
+        blocked_reason_kind: None,
+        blocked_by_item_id: None,
+        blocked_reason: None,
     }
 }
 
@@ -5047,16 +5537,28 @@ async fn set_item_sensitivity(items: &ItemService, item_id: Uuid, is_sensitive: 
                 title: current.title,
                 notes: current.notes,
                 timezone_name: current.timezone_name,
+                duration_kind: Some(current.duration_kind),
                 duration_seconds: current.duration_seconds,
+                duration_min_seconds: current.duration_min_seconds,
+                duration_max_seconds: current.duration_max_seconds,
+                duration_source: current.duration_source,
+                deadline_kind: Some(current.deadline_kind),
+                deadline_date: current.deadline_date,
                 deadline_at: current.deadline_at,
+                deadline_strength: current.deadline_strength,
+                deadline_soft_weight: current.deadline_soft_weight,
                 earliest_start_at: current.earliest_start_at,
                 recurrence: current.recurrence,
                 flexible_constraints: current.flexible_constraints,
+                has_own_effort: Some(current.has_own_effort),
                 split_policy: current.split_policy,
                 importance: current.importance,
                 urgency: current.urgency,
                 parent_id: current.parent_id,
                 sibling_order: current.sibling_order,
+                blocked_reason_kind: current.blocked_reason_kind,
+                blocked_by_item_id: current.blocked_by_item_id,
+                blocked_reason: current.blocked_reason,
             },
             idempotency(marker),
         )

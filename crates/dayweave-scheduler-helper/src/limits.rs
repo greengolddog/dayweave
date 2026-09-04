@@ -237,7 +237,7 @@ fn item_has_imprecise_instant(item: &WorkItem) -> bool {
                 .recurrence
                 .as_ref()
                 .is_some_and(recurrence_has_imprecise_anchor),
-            ItemKind::Task | ItemKind::Goal(_) | ItemKind::Break(_) => false,
+            ItemKind::Task | ItemKind::Project | ItemKind::Goal(_) | ItemKind::Break(_) => false,
         }
 }
 
@@ -917,7 +917,7 @@ fn item_collection_entries(item: &WorkItem) -> Result<usize, PreflightError> {
                 .checked_add(spec.measures.len())
                 .ok_or(PreflightError::ResourceLimit)?;
         }
-        ItemKind::Task | ItemKind::Break(_) | ItemKind::CalendarEvent(_) => {}
+        ItemKind::Task | ItemKind::Project | ItemKind::Break(_) | ItemKind::CalendarEvent(_) => {}
     }
     Ok(total)
 }
@@ -977,7 +977,7 @@ fn item_string_bytes(item: &WorkItem) -> Result<usize, PreflightError> {
                 add_string_bytes(&mut total, calendar_id.len())?;
             }
         }
-        ItemKind::Task | ItemKind::Break(_) => {}
+        ItemKind::Task | ItemKind::Project | ItemKind::Break(_) => {}
     }
     Ok(total)
 }
@@ -1153,9 +1153,11 @@ fn recurrence_of(item: &WorkItem) -> Option<&Recurrence> {
         ItemKind::RecurringTask(spec) => Some(&spec.recurrence),
         ItemKind::Habit(spec) => Some(&spec.recurrence),
         ItemKind::Routine(spec) => spec.recurrence.as_ref(),
-        ItemKind::Task | ItemKind::Goal(_) | ItemKind::Break(_) | ItemKind::CalendarEvent(_) => {
-            None
-        }
+        ItemKind::Task
+        | ItemKind::Project
+        | ItemKind::Goal(_)
+        | ItemKind::Break(_)
+        | ItemKind::CalendarEvent(_) => None,
     }
 }
 

@@ -31,7 +31,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ]
     );
 
@@ -59,6 +59,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0021_execution_defer_approval.sql"),
         include_str!("../migrations/0022_google_schedule_publication.sql"),
         include_str!("../migrations/0023_google_task_provider_metadata.sql"),
+        include_str!("../migrations/0024_structural_item_fields.sql"),
     ]
     .join("\n");
     for table in [
@@ -159,6 +160,25 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("provider_sync_mappings_active_schedule_identity_uq"));
     assert!(schema.contains("google_schedule_publication_preview_changes_immutable"));
     assert!(schema.contains("google_schedule_publication_batch_aggregate_exact"));
+    for structural_contract in [
+        "ADD COLUMN duration_kind varchar(16)",
+        "ADD COLUMN deadline_kind varchar(16)",
+        "ADD COLUMN has_own_effort boolean",
+        "ADD COLUMN blocked_reason_kind varchar(16)",
+        "items_duration_shape_check",
+        "items_deadline_shape_check",
+        "items_blocked_reason_shape_check",
+        "'start_to_finish'",
+        "ADD COLUMN dependency_strength varchar(16)",
+        "item_dependencies_strength_check",
+        "duration_seconds above the supported 31622400-second maximum",
+        "item_dependencies contains lag_seconds outside the supported 0..31622400 whole-minute range",
+    ] {
+        assert!(
+            schema.contains(structural_contract),
+            "{structural_contract}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -99,6 +99,13 @@ order, then rolls the simulation back. The response shows direct diffs,
 implicit hierarchy/parent diffs, conflicts, risks, the maximum risk, whether
 explicit approval is required, and `can_apply`.
 
+Deadline risk is derived from the complete typed deadline shape: kind,
+date/date-time value, hard/soft strength, and soft weight. An event interval end
+with `deadline_kind: "none"` never becomes a deadline risk. A change is labeled
+`relaxes_deadline` only when it is a pure weakening; incomparable or mixed
+tightening/weakening changes use `changes_deadline`. Every replacement still
+requires explicit approval independently of that classification.
+
 The returned `review_hash` binds the ordered proposal IDs, revisions and
 payload hashes; normalized command hash; visible review content; `can_apply`;
 workspace and user; canonical item revisions/deletion state; active

@@ -6,11 +6,12 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use dayweave_compose::{
-    CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
-    ComposeScheduleRequest, FixedBlockSourceInput, IgnoredPreviousAssignment, MAX_CANONICAL_ITEMS,
-    ManualPlacementInput, ManualPlacementReleaseInput, PrepareScheduleError, PreparedSchedule,
-    PreviousAssignmentInput, RejectedScheduleItem, prepare_canonical_schedule,
-    validate_schedule_request,
+    CanonicalBlockedReasonKind, CanonicalDeadlineKind, CanonicalDeadlineStrength,
+    CanonicalDurationKind, CanonicalDurationSource, CanonicalItem, CanonicalItemKind,
+    CanonicalItemStatus, CanonicalSplitPolicy, ComposeScheduleRequest, FixedBlockSourceInput,
+    IgnoredPreviousAssignment, MAX_CANONICAL_ITEMS, ManualPlacementInput,
+    ManualPlacementReleaseInput, PrepareScheduleError, PreparedSchedule, PreviousAssignmentInput,
+    RejectedScheduleItem, prepare_canonical_schedule, validate_schedule_request,
 };
 use dayweave_core::{
     ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId, PlanRequest,
@@ -26,7 +27,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::items::{
-    Item, ItemKind, ItemQuery, ItemService, ItemServiceError, ItemStatus, SplitPolicy,
+    BlockedReasonKind, DeadlineKind, DeadlineStrength, DurationKind, DurationSource, Item,
+    ItemKind, ItemQuery, ItemService, ItemServiceError, ItemStatus, SplitPolicy,
 };
 
 use super::{
@@ -747,21 +749,34 @@ fn validate_manual_placement_item_revisions(
     request: &ComposeScheduleRequest,
     items: &[Item],
 ) -> Result<(), ComposeScheduleError> {
-    let revisions = items
+    let current_items = items
         .iter()
-        .map(|item| (item.id, item.revision))
+        .map(|item| (item.id, item))
         .collect::<BTreeMap<_, _>>();
     for assignment in request
         .manual_placements
         .iter()
         .flat_map(|placement| &placement.assignments)
     {
-        if revisions.get(&assignment.item_id) != Some(&assignment.item_revision) {
+        let Some(item) = current_items.get(&assignment.item_id) else {
             return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
                 format!(
                     "item {} no longer has revision {}",
                     assignment.item_id, assignment.item_revision
                 ),
+            ));
+        };
+        if item.revision != assignment.item_revision {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!(
+                    "item {} no longer has revision {}",
+                    assignment.item_id, assignment.item_revision
+                ),
+            ));
+        }
+        if item.status == ItemStatus::Blocked {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!("item {} is blocked", assignment.item_id),
             ));
         }
     }
@@ -956,6 +971,7 @@ fn retained_placement_is_actionable(
                 && !item_is_suppressed_by_hierarchy(item.id, current_items)
                 && !item.status.is_terminal()
                 && item.status != ItemStatus::InProgress
+                && item.status != ItemStatus::Blocked
                 && item.is_executable
                 && item.duration_seconds.is_some()
         })
@@ -1240,6 +1256,7 @@ fn into_canonical_item(item: Item) -> CanonicalItem {
             ItemKind::Habit => CanonicalItemKind::Habit,
             ItemKind::Routine => CanonicalItemKind::Routine,
             ItemKind::Goal => CanonicalItemKind::Goal,
+            ItemKind::Project => CanonicalItemKind::Project,
             ItemKind::Break => CanonicalItemKind::Break,
         },
         status: match item.status {
@@ -1251,15 +1268,41 @@ fn into_canonical_item(item: Item) -> CanonicalItem {
             ItemStatus::Completed => CanonicalItemStatus::Completed,
             ItemStatus::Skipped => CanonicalItemStatus::Skipped,
             ItemStatus::Cancelled => CanonicalItemStatus::Cancelled,
+            ItemStatus::Blocked => CanonicalItemStatus::Blocked,
         },
         title: item.title,
         notes: item.notes,
         timezone_name: item.timezone_name,
+        duration_kind: Some(match item.duration_kind {
+            DurationKind::Unknown => CanonicalDurationKind::Unknown,
+            DurationKind::Exact => CanonicalDurationKind::Exact,
+            DurationKind::Range => CanonicalDurationKind::Range,
+        }),
         duration_seconds: item.duration_seconds,
+        duration_min_seconds: item.duration_min_seconds,
+        duration_max_seconds: item.duration_max_seconds,
+        duration_source: item.duration_source.map(|source| match source {
+            DurationSource::User => CanonicalDurationSource::User,
+            DurationSource::Assistant => CanonicalDurationSource::Assistant,
+            DurationSource::Learned => CanonicalDurationSource::Learned,
+            DurationSource::Imported => CanonicalDurationSource::Imported,
+        }),
+        deadline_kind: Some(match item.deadline_kind {
+            DeadlineKind::None => CanonicalDeadlineKind::None,
+            DeadlineKind::Date => CanonicalDeadlineKind::Date,
+            DeadlineKind::DateTime => CanonicalDeadlineKind::DateTime,
+        }),
+        deadline_date: item.deadline_date,
         deadline_at: item.deadline_at,
+        deadline_strength: item.deadline_strength.map(|strength| match strength {
+            DeadlineStrength::Hard => CanonicalDeadlineStrength::Hard,
+            DeadlineStrength::Soft => CanonicalDeadlineStrength::Soft,
+        }),
+        deadline_soft_weight: item.deadline_soft_weight,
         earliest_start_at: item.earliest_start_at,
         recurrence: item.recurrence,
         flexible_constraints: item.flexible_constraints,
+        has_own_effort: Some(item.has_own_effort),
         split_policy: match item.split_policy {
             SplitPolicy::Indivisible => CanonicalSplitPolicy::Indivisible,
             SplitPolicy::Splittable {
@@ -1280,6 +1323,13 @@ fn into_canonical_item(item: Item) -> CanonicalItem {
         updated_at: item.updated_at,
         completed_at: item.completed_at,
         deleted_at: item.deleted_at,
+        blocked_reason_kind: item.blocked_reason_kind.map(|kind| match kind {
+            BlockedReasonKind::Dependency => CanonicalBlockedReasonKind::Dependency,
+            BlockedReasonKind::Manual => CanonicalBlockedReasonKind::Manual,
+            BlockedReasonKind::External => CanonicalBlockedReasonKind::External,
+        }),
+        blocked_by_item_id: item.blocked_by_item_id,
+        blocked_reason: item.blocked_reason,
     }
 }
 
@@ -1582,11 +1632,20 @@ mod tests {
             title: "Write schedule bridge".into(),
             notes: None,
             timezone_name: "Europe/Madrid".into(),
+            duration_kind: DurationKind::Exact,
             duration_seconds: Some(3_600),
+            duration_min_seconds: Some(3_600),
+            duration_max_seconds: Some(3_600),
+            duration_source: Some(DurationSource::User),
+            deadline_kind: DeadlineKind::DateTime,
+            deadline_date: None,
             deadline_at: Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap()),
+            deadline_strength: Some(DeadlineStrength::Hard),
+            deadline_soft_weight: None,
             earliest_start_at: None,
             recurrence: None,
             flexible_constraints: json!({"energy": "deep", "preferred_start_minute": 540}),
+            has_own_effort: false,
             split_policy: SplitPolicy::Indivisible,
             importance: 80,
             urgency: 60,
@@ -1598,7 +1657,40 @@ mod tests {
             updated_at: Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap(),
             completed_at: None,
             deleted_at: None,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
         }
+    }
+
+    fn set_exact_duration(item: &mut Item, seconds: u32) {
+        item.duration_kind = DurationKind::Exact;
+        item.duration_seconds = Some(seconds);
+        item.duration_min_seconds = Some(seconds);
+        item.duration_max_seconds = Some(seconds);
+        item.duration_source = Some(DurationSource::User);
+    }
+
+    fn set_unknown_duration(item: &mut Item) {
+        item.duration_kind = DurationKind::Unknown;
+        item.duration_seconds = None;
+        item.duration_min_seconds = None;
+        item.duration_max_seconds = None;
+        item.duration_source = None;
+    }
+
+    fn clear_deadline(item: &mut Item) {
+        item.deadline_kind = DeadlineKind::None;
+        item.deadline_date = None;
+        item.deadline_at = None;
+        item.deadline_strength = None;
+        item.deadline_soft_weight = None;
+    }
+
+    fn make_context_event(item: &mut Item) {
+        item.kind = ItemKind::Event;
+        set_unknown_duration(item);
+        clear_deadline(item);
     }
 
     fn preview_request() -> ComposeScheduleRequest {
@@ -1639,8 +1731,8 @@ mod tests {
     #[test]
     fn production_composition_reuses_bounded_scheduler_preflight() {
         let mut item = canonical_item(Uuid::from_u128(500));
-        item.duration_seconds = Some(366 * 24 * 60 * 60);
-        item.deadline_at = None;
+        set_exact_duration(&mut item, 366 * 24 * 60 * 60);
+        clear_deadline(&mut item);
         item.flexible_constraints = json!({});
         item.split_policy = SplitPolicy::Splittable {
             minimum_chunk_seconds: 60,
@@ -1955,7 +2047,7 @@ mod tests {
     #[test]
     fn changed_shape_requires_release_and_can_be_replaced_atomically() {
         let mut item = canonical_item(Uuid::from_u128(50));
-        item.duration_seconds = Some(5_400);
+        set_exact_duration(&mut item, 5_400);
         item.revision = 4;
         let published_revision_id = Uuid::from_u128(51);
         let retained_placement_id = Uuid::from_u128(52);
@@ -2056,7 +2148,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // One scenario covers both under- and over-credit normalization.
     fn manual_move_normalizes_an_executed_split_session_to_remaining_demand() {
         let mut item = canonical_item(Uuid::from_u128(55));
-        item.duration_seconds = Some(7_200);
+        set_exact_duration(&mut item, 7_200);
         item.split_policy = SplitPolicy::Splittable {
             minimum_chunk_seconds: 1_800,
             maximum_chunk_seconds: 3_600,
@@ -2183,7 +2275,7 @@ mod tests {
         }];
         let over_credit_item = canonical_item(Uuid::from_u128(55));
         let mut over_credit_item = over_credit_item;
-        over_credit_item.duration_seconds = Some(7_200);
+        set_exact_duration(&mut over_credit_item, 7_200);
         over_credit_item.split_policy = SplitPolicy::Splittable {
             minimum_chunk_seconds: 1_800,
             maximum_chunk_seconds: 3_600,
@@ -2216,7 +2308,7 @@ mod tests {
     #[test]
     fn manual_move_can_preserve_a_partial_published_split_and_add_fresh_capacity() {
         let mut item = canonical_item(Uuid::from_u128(551));
-        item.duration_seconds = Some(7_200);
+        set_exact_duration(&mut item, 7_200);
         item.split_policy = SplitPolicy::Splittable {
             minimum_chunk_seconds: 1_800,
             maximum_chunk_seconds: 3_600,
@@ -2389,10 +2481,54 @@ mod tests {
     }
 
     #[test]
+    fn blocked_item_is_not_actionable_retained_demand() {
+        let mut item = canonical_item(Uuid::from_u128(63));
+        item.status = ItemStatus::Blocked;
+        item.blocked_reason_kind = Some(BlockedReasonKind::Manual);
+        item.blocked_reason = Some("Waiting for a decision".to_owned());
+        let placement = ManualPlacementInput {
+            id: Uuid::from_u128(64),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+                    session_index: 0,
+                }],
+            }],
+        };
+        let current_items = BTreeMap::from([(item.id, &item)]);
+        let plannable_item_ids = BTreeSet::from([item.id]);
+
+        assert!(!retained_placement_is_actionable(
+            &placement,
+            &current_items,
+            &plannable_item_ids,
+        ));
+
+        let mut request = preview_request();
+        request.manual_placements = vec![placement];
+        let error = apply_manual_placement_lifecycle(
+            &mut request,
+            &AuthoritativePlanningEvidence::default(),
+            std::slice::from_ref(&item),
+        )
+        .expect_err("a fresh placement cannot reintroduce blocked demand");
+        assert!(matches!(
+            error,
+            ComposeScheduleError::AuthoritativeManualPlacementChanged(message)
+                if message.contains("is blocked")
+        ));
+    }
+
+    #[test]
     fn inbox_ancestor_prunes_a_retained_leaf_pin() {
         let mut parent = canonical_item(Uuid::from_u128(70));
         parent.status = ItemStatus::Inbox;
-        parent.duration_seconds = None;
+        set_unknown_duration(&mut parent);
         parent.is_executable = false;
         let mut leaf = canonical_item(Uuid::from_u128(71));
         leaf.parent_id = Some(parent.id);
@@ -2533,6 +2669,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exhaustively mirrors every canonical wire field and enum.
     fn item_to_canonical_item_conversion_is_lossless_and_exhaustive() {
         let item = Item {
             id: Uuid::from_u128(900),
@@ -2542,11 +2679,20 @@ mod tests {
             title: "Lossless conversion".into(),
             notes: Some("Every canonical field crosses the crate boundary.".into()),
             timezone_name: "America/New_York".into(),
+            duration_kind: DurationKind::Exact,
             duration_seconds: Some(7_201),
+            duration_min_seconds: Some(7_201),
+            duration_max_seconds: Some(7_201),
+            duration_source: Some(DurationSource::Imported),
+            deadline_kind: DeadlineKind::None,
+            deadline_date: None,
             deadline_at: Some(Utc.with_ymd_and_hms(2026, 9, 3, 18, 0, 0).unwrap()),
+            deadline_strength: None,
+            deadline_soft_weight: None,
             earliest_start_at: Some(Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap()),
             recurrence: Some(json!({"type": "monthly", "times_per_month": 2})),
             flexible_constraints: json!({"tags": ["boundary"], "has_own_effort": true}),
+            has_own_effort: true,
             split_policy: SplitPolicy::Splittable {
                 minimum_chunk_seconds: 601,
                 maximum_chunk_seconds: 3_601,
@@ -2561,6 +2707,9 @@ mod tests {
             updated_at: Utc.with_ymd_and_hms(2026, 8, 2, 4, 5, 6).unwrap(),
             completed_at: Some(Utc.with_ymd_and_hms(2026, 8, 3, 7, 8, 9).unwrap()),
             deleted_at: Some(Utc.with_ymd_and_hms(2026, 8, 4, 10, 11, 12).unwrap()),
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
         };
         let expected = CanonicalItem {
             id: item.id,
@@ -2570,11 +2719,20 @@ mod tests {
             title: item.title.clone(),
             notes: item.notes.clone(),
             timezone_name: item.timezone_name.clone(),
+            duration_kind: Some(CanonicalDurationKind::Exact),
             duration_seconds: item.duration_seconds,
+            duration_min_seconds: item.duration_min_seconds,
+            duration_max_seconds: item.duration_max_seconds,
+            duration_source: Some(CanonicalDurationSource::Imported),
+            deadline_kind: Some(CanonicalDeadlineKind::None),
+            deadline_date: None,
             deadline_at: item.deadline_at,
+            deadline_strength: None,
+            deadline_soft_weight: None,
             earliest_start_at: item.earliest_start_at,
             recurrence: item.recurrence.clone(),
             flexible_constraints: item.flexible_constraints.clone(),
+            has_own_effort: Some(true),
             split_policy: CanonicalSplitPolicy::Splittable {
                 minimum_chunk_seconds: 601,
                 maximum_chunk_seconds: 3_601,
@@ -2589,6 +2747,9 @@ mod tests {
             updated_at: item.updated_at,
             completed_at: item.completed_at,
             deleted_at: item.deleted_at,
+            blocked_reason_kind: None,
+            blocked_by_item_id: None,
+            blocked_reason: None,
         };
         assert_eq!(into_canonical_item(item), expected);
 
@@ -2598,6 +2759,7 @@ mod tests {
             (ItemKind::Habit, CanonicalItemKind::Habit),
             (ItemKind::Routine, CanonicalItemKind::Routine),
             (ItemKind::Goal, CanonicalItemKind::Goal),
+            (ItemKind::Project, CanonicalItemKind::Project),
             (ItemKind::Break, CanonicalItemKind::Break),
         ] {
             let mut item = canonical_item(Uuid::new_v4());
@@ -2613,6 +2775,7 @@ mod tests {
             (ItemStatus::Completed, CanonicalItemStatus::Completed),
             (ItemStatus::Skipped, CanonicalItemStatus::Skipped),
             (ItemStatus::Cancelled, CanonicalItemStatus::Cancelled),
+            (ItemStatus::Blocked, CanonicalItemStatus::Blocked),
         ] {
             let mut item = canonical_item(Uuid::new_v4());
             item.status = status;
@@ -2911,9 +3074,7 @@ mod tests {
     #[test]
     fn calendar_event_metadata_accepts_rfc3339_instants() {
         let mut item = canonical_item(Uuid::from_u128(4));
-        item.kind = ItemKind::Event;
-        item.duration_seconds = None;
-        item.deadline_at = None;
+        make_context_event(&mut item);
         item.flexible_constraints = json!({
             "calendar_event": {
                 "start": "2026-09-01T10:00:00+02:00",
@@ -2934,9 +3095,7 @@ mod tests {
     fn exact_calendar_event_reserves_capacity_without_provider_identifiers() {
         let event_id = Uuid::from_u128(40);
         let mut item = canonical_item(event_id);
-        item.kind = ItemKind::Event;
-        item.duration_seconds = None;
-        item.deadline_at = None;
+        make_context_event(&mut item);
         item.flexible_constraints = json!({
             "calendar_event": {
                 "start": "2026-09-01T10:00:00+02:00",
@@ -2969,9 +3128,7 @@ mod tests {
     fn legacy_owned_google_block_reserves_capacity_exactly_once() {
         let event_id = Uuid::from_u128(401);
         let mut owned = canonical_item(event_id);
-        owned.kind = ItemKind::Event;
-        owned.duration_seconds = None;
-        owned.deadline_at = None;
+        make_context_event(&mut owned);
         owned.flexible_constraints = json!({
             "dayweave_firm_block": {
                 "owned": true,
@@ -3009,9 +3166,7 @@ mod tests {
     fn calendar_context_counts_as_accepted_without_reserving_capacity() {
         let context_id = Uuid::from_u128(41);
         let mut context = canonical_item(context_id);
-        context.kind = ItemKind::Event;
-        context.duration_seconds = None;
-        context.deadline_at = None;
+        make_context_event(&mut context);
         context.flexible_constraints = json!({
             "calendar_context": {
                 "start": "2026-09-01T10:00:00+02:00",
@@ -3047,9 +3202,7 @@ mod tests {
     fn malformed_provider_constraints_are_rejected_without_leaking_values() {
         const RAW_PROVIDER_ID: &str = "SYNTHETIC-REMOTE-ID-MUST-NOT-LEAK";
         let mut malformed = canonical_item(Uuid::from_u128(43));
-        malformed.kind = ItemKind::Event;
-        malformed.duration_seconds = None;
-        malformed.deadline_at = None;
+        make_context_event(&mut malformed);
         malformed.flexible_constraints = json!({
             "calendar_context": {
                 "start": "2026-09-01T10:00:00+02:00",
@@ -3077,9 +3230,7 @@ mod tests {
     fn calendar_context_requires_one_valid_root_occurrence() {
         fn context_item(id: u128) -> Item {
             let mut item = canonical_item(Uuid::from_u128(id));
-            item.kind = ItemKind::Event;
-            item.duration_seconds = None;
-            item.deadline_at = None;
+            make_context_event(&mut item);
             item.flexible_constraints = json!({
                 "calendar_context": {
                     "start": "2026-09-01T10:00:00+02:00",
@@ -3117,7 +3268,7 @@ mod tests {
     #[test]
     fn nested_constraints_and_recurrence_context_use_strict_rfc3339() {
         let mut item = canonical_item(Uuid::from_u128(5));
-        item.deadline_at = None;
+        clear_deadline(&mut item);
         item.flexible_constraints = json!({
             "constraints": {
                 "earliest_start": {
