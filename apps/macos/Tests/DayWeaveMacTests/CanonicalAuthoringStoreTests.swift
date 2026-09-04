@@ -68,6 +68,66 @@ struct CanonicalAuthoringStoreTests {
         #expect(PlannerStore.canonicalTrashRetentionInterval == 30 * 24 * 60 * 60)
     }
 
+    @Test("a typed ranged-duration response completes its authoring journal")
+    func rangedDurationResponseReconciles() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID()
+        let draft = DayWeaveCanonicalItemDraft(
+            title: "Variable research",
+            timezoneName: "UTC",
+            durationKind: .range,
+            durationMinimumSeconds: 1_200,
+            durationSeconds: 1_800,
+            durationMaximumSeconds: 2_700,
+            durationSource: .assistant
+        )
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false
+        )
+        let queued = try store.enqueueCanonicalCreate(itemID: itemID, draft: draft)
+        #expect(store.beginCanonicalSync())
+        try store.prepareCanonicalSync(
+            configurationIdentifier: Self.configurationIdentifier
+        )
+        _ = try store.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: Self.configurationIdentifier
+        )
+        _ = try store.markCanonicalAuthoringMutationSubmitted(queued.id)
+
+        let responseData = Data(#"""
+        {
+          "id":"\#(itemID.uuidString.lowercased())","is_sensitive":false,
+          "kind":"task","status":"inbox","title":"Variable research",
+          "notes":null,"timezone_name":"UTC","duration_kind":"range",
+          "duration_min_seconds":1200,"duration_seconds":1800,
+          "duration_max_seconds":2700,"duration_source":"assistant",
+          "deadline_kind":"none","deadline_at":null,"deadline_date":null,
+          "deadline_strength":null,"deadline_soft_weight":null,
+          "earliest_start_at":null,"recurrence":null,"flexible_constraints":{},
+          "split_policy":{"type":"indivisible"},"importance":50,"urgency":50,
+          "parent_id":null,"sibling_order":0,"has_own_effort":false,
+          "blocked_reason_kind":null,"blocked_by_item_id":null,"blocked_reason":null,
+          "is_executable":true,"revision":1,
+          "created_at":"2027-01-15T10:00:00Z","updated_at":"2027-01-15T10:00:00Z",
+          "completed_at":null,"deleted_at":null
+        }
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let response = try decoder.decode(DayWeaveCanonicalItem.self, from: responseData)
+
+        #expect(response.hasExplicitStructuralMetadata)
+        #expect(response.supportsCanonicalAuthoringReplacement)
+        try store.applyCanonicalAuthoringResponse(queued.id, item: response)
+        store.endCanonicalSync()
+
+        #expect(store.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(store.canonicalItem(id: itemID) == response)
+    }
+
     @Test("scheduled Will do later journals an optimistic canonical earliest start")
     func scheduledMoveLaterUsesCanonicalReplacementJournal() throws {
         let context = try Self.makePersistence()

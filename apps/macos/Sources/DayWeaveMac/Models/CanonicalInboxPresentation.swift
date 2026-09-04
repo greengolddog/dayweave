@@ -455,15 +455,13 @@ private extension CanonicalInboxPresentation {
                 depth: depth,
                 breadcrumb: breadcrumb,
                 sensitivityPresentation: sensitivityPresentation,
-                durationKind: structuralItem?.durationKind
-                    ?? (draft.durationSeconds == nil ? .unknown : .exact),
+                durationKind: structuralItem?.durationKind ?? draft.durationKind,
                 durationMinimumSeconds: structuralItem?.durationMinimumSeconds
-                    ?? draft.durationSeconds,
+                    ?? draft.durationMinimumSeconds,
                 durationSeconds: draft.durationSeconds,
                 durationMaximumSeconds: structuralItem?.durationMaximumSeconds
-                    ?? draft.durationSeconds,
-                durationSource: structuralItem?.durationSource
-                    ?? (draft.durationSeconds == nil ? nil : .user),
+                    ?? draft.durationMaximumSeconds,
+                durationSource: structuralItem?.durationSource ?? draft.durationSource,
                 deadlineKind: structuralItem?.deadlineKind ?? inferredDeadlineKind,
                 deadlineAt: draft.deadlineAt,
                 deadlineDate: structuralItem?.deadlineDate,

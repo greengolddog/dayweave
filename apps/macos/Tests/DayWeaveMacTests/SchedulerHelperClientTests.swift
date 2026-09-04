@@ -75,7 +75,7 @@ struct SchedulerHelperClientTests {
         let item = try decodeItem(itemObject(
             kind: "habit",
             recurrence: #"{"type":"daily","times_per_day":2}"#,
-            flexibleConstraints: #"{"maximum_sessions":3,"minimum_gap_minutes":5}"#
+            flexibleConstraints: #"{"habit_minimum_spacing_minutes":90,"maximum_sessions":3,"minimum_gap_minutes":5}"#
         ))
         #expect(item.hasNonRoundTrippableJSONNumber)
         let runner = RecordingSchedulerHelperRunner(
@@ -99,6 +99,44 @@ struct SchedulerHelperClientTests {
         #expect(recurrence["times_per_day"] as? Int == 2)
         #expect(constraints["maximum_sessions"] as? Int == 3)
         #expect(constraints["minimum_gap_minutes"] as? Int == 5)
+        #expect(constraints["habit_minimum_spacing_minutes"] as? Int == 90)
+    }
+
+    @Test("rich duration metadata crosses the local helper boundary losslessly")
+    func richDurationMetadataIsProjected() throws {
+        var object = try #require(
+            JSONSerialization.jsonObject(with: Data(itemObject().utf8)) as? [String: Any]
+        )
+        object["duration_kind"] = "range"
+        object["duration_min_seconds"] = 1_200
+        object["duration_seconds"] = 1_800
+        object["duration_max_seconds"] = 2_700
+        object["duration_source"] = "learned"
+        object["deadline_kind"] = "date_time"
+        object["deadline_date"] = NSNull()
+        object["deadline_strength"] = "hard"
+        object["deadline_soft_weight"] = NSNull()
+        object["has_own_effort"] = false
+        object["blocked_reason_kind"] = NSNull()
+        object["blocked_by_item_id"] = NSNull()
+        object["blocked_reason"] = NSNull()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let item = try decoder.decode(
+            DayWeaveCanonicalItem.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        #expect(item.hasExplicitStructuralMetadata)
+        let projected = try SchedulerHelperCanonicalItemWire(validating: item)
+        let encoded = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(projected)
+        ) as? [String: Any]
+        #expect(encoded?["duration_kind"] as? String == "range")
+        #expect(encoded?["duration_min_seconds"] as? Int == 1_200)
+        #expect(encoded?["duration_seconds"] as? Int == 1_800)
+        #expect(encoded?["duration_max_seconds"] as? Int == 2_700)
+        #expect(encoded?["duration_source"] as? String == "learned")
     }
 
     @Test("one response is required and helper text is never echoed")

@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalTrashRetentionPolicy
+import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
@@ -61,40 +62,54 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V17 -> decodeCurrentSnapshot(
+            PlannerSnapshotFormats.JSON_V18 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+                requireCanonicalStructuralFields = true,
+                requireHabitLedgerField = true,
+                requireCanonicalDraftDurationFields = true,
+            )
+            PlannerSnapshotFormats.JSON_V17 -> decodeCurrentSnapshot(
+                payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                 requireGoogleSchedulePublicationField = true,
                 requireOnboardingFirstItemAnchorField = true,
                 requireCanonicalStructuralFields = true,
                 requireHabitLedgerField = true,
             )
             PlannerSnapshotFormats.JSON_V16 -> decodeCurrentSnapshot(
-                payload = snapshot.payload,
+                payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                 requireGoogleSchedulePublicationField = true,
                 requireOnboardingFirstItemAnchorField = true,
                 requireCanonicalStructuralFields = true,
             )
             PlannerSnapshotFormats.JSON_V15 -> decodeCurrentSnapshot(
-                payload = snapshot.payload,
+                payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                 requireGoogleSchedulePublicationField = true,
                 requireOnboardingFirstItemAnchorField = true,
             )
             PlannerSnapshotFormats.JSON_V14 -> decodeCurrentSnapshot(
-                payload = snapshot.payload,
+                payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                 requireGoogleSchedulePublicationField = true,
             )
-            PlannerSnapshotFormats.JSON_V13 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V13 -> decodeCurrentSnapshot(
+                migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
+            )
             PlannerSnapshotFormats.JSON_V12 -> decodeCurrentSnapshot(
-                migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
+                migrateLegacyDurationAuthoringSnapshot(
+                    migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
+                ),
             )
             PlannerSnapshotFormats.JSON_V11 -> decodeCurrentSnapshot(
-                payload = migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
+                payload = migrateLegacyDurationAuthoringSnapshot(
+                    migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
+                ),
                 requireFirmHorizonDaysField = false,
                 // V11 provenance was one-day only; a relabeled newer record has no authority.
             ).copy(localScheduleCompositionProvenance = null)
             PlannerSnapshotFormats.JSON_V10 -> {
                 decodeCurrentSnapshot(
-                    payload = snapshot.payload,
+                    payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                     requireGoogleCalendarOutboundField = false,
                     requireFirmHorizonDaysField = false,
                 ).copy(
@@ -105,7 +120,7 @@ class RoomPlannerStateRepository(
             }
             PlannerSnapshotFormats.JSON_V9 -> {
                 decodeCurrentSnapshot(
-                    payload = snapshot.payload,
+                    payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
                     requireGoogleCalendarOutboundField = false,
@@ -113,7 +128,7 @@ class RoomPlannerStateRepository(
             }
             PlannerSnapshotFormats.JSON_V8 -> {
                 decodeCurrentSnapshot(
-                    payload = snapshot.payload,
+                    payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
@@ -123,7 +138,7 @@ class RoomPlannerStateRepository(
             }
             PlannerSnapshotFormats.JSON_V7 -> {
                 decodeCurrentSnapshot(
-                    payload = snapshot.payload,
+                    payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
                     requirePublicationProofField = false,
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
@@ -197,6 +212,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
@@ -211,6 +227,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
@@ -231,7 +248,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V17 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V18 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -262,7 +279,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V17,
+                payloadFormat = PlannerSnapshotFormats.JSON_V18,
             ),
         )
     }
@@ -289,6 +306,42 @@ class RoomPlannerStateRepository(
         )
     }
 
+    /**
+     * V17 drafts knew only one legacy duration value and no habit-wide spacing. Strip injected
+     * newer fields before defaults infer the historical unknown/exact user-authored shape.
+     */
+    private fun migrateLegacyDurationAuthoringSnapshot(payload: String): String {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val mutations = root["pendingCanonicalAuthoringMutations"] as? JsonArray ?: return payload
+        val migratedMutations = mutations.map { element ->
+            val mutation = element as? JsonObject ?: return@map element
+            val draft = mutation["draft"] as? JsonObject ?: return@map element
+            val constraints = draft["constraints"] as? JsonObject
+            val legacyConstraints = constraints?.let {
+                JsonObject(it - "habitMinimumSpacingMinutes")
+            }
+            val legacyDraft = JsonObject(
+                (draft - CANONICAL_DRAFT_DURATION_FIELDS) +
+                    listOfNotNull(
+                        legacyConstraints?.let { "constraints" to it },
+                    ),
+            )
+            JsonObject(
+                mutation + mapOf(
+                    "draft" to legacyDraft,
+                    "durationRequestShapeVersion" to JsonPrimitive(
+                        PendingCanonicalAuthoringMutation
+                            .LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+                    ),
+                ),
+            )
+        }
+        return SNAPSHOT_JSON.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(root + ("pendingCanonicalAuthoringMutations" to JsonArray(migratedMutations))),
+        )
+    }
+
     private fun decodeCurrentSnapshot(
         payload: String,
         requireProposalApplicationFields: Boolean = true,
@@ -303,6 +356,7 @@ class RoomPlannerStateRepository(
         requireOnboardingFirstItemAnchorField: Boolean = false,
         requireCanonicalStructuralFields: Boolean = false,
         requireHabitLedgerField: Boolean = false,
+        requireCanonicalDraftDurationFields: Boolean = false,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -443,6 +497,9 @@ class RoomPlannerStateRepository(
         if (requireCanonicalStructuralFields) {
             requireCanonicalStructuralItemFields(root)
         }
+        if (requireCanonicalDraftDurationFields) {
+            requireCanonicalDraftDurationFields(root)
+        }
         if (requireHabitLedgerField && !root.containsKey("habitLedger")) {
             throw SerializationException("Current habit ledger recovery state is required")
         }
@@ -570,6 +627,38 @@ class RoomPlannerStateRepository(
             val nested = (element as? JsonObject)?.get("lastKnownItem")
             if (nested != null && nested !is JsonNull) {
                 requireItem(nested, "canonicalRecentlyDeleted[$index].lastKnownItem")
+            }
+        }
+    }
+
+    private fun requireCanonicalDraftDurationFields(root: JsonObject) {
+        (root["pendingCanonicalAuthoringMutations"] as? JsonArray)?.forEachIndexed {
+                index,
+                element,
+            ->
+            val draft = (element as? JsonObject)?.get("draft")
+            if (draft == null || draft is JsonNull) return@forEachIndexed
+            val draftObject = draft as? JsonObject ?: throw SerializationException(
+                "pendingCanonicalAuthoringMutations[$index].draft must be an object",
+            )
+            if (!draftObject.keys.containsAll(CANONICAL_DRAFT_DURATION_FIELDS)) {
+                throw SerializationException(
+                    "pendingCanonicalAuthoringMutations[$index].draft is missing duration metadata",
+                )
+            }
+            if (!(element as JsonObject).containsKey("durationRequestShapeVersion")) {
+                throw SerializationException(
+                    "pendingCanonicalAuthoringMutations[$index] is missing its duration request shape",
+                )
+            }
+            val constraints = draftObject["constraints"] as? JsonObject
+                ?: throw SerializationException(
+                    "pendingCanonicalAuthoringMutations[$index].draft constraints are missing",
+                )
+            if (!constraints.containsKey("habitMinimumSpacingMinutes")) {
+                throw SerializationException(
+                    "pendingCanonicalAuthoringMutations[$index].draft is missing habit spacing",
+                )
             }
         }
     }
@@ -1196,6 +1285,12 @@ class RoomPlannerStateRepository(
             "blockedByItemId",
             "blockedReason",
             "hasExplicitStructuralMetadata",
+        )
+        val CANONICAL_DRAFT_DURATION_FIELDS = setOf(
+            "durationKind",
+            "durationMinSeconds",
+            "durationMaxSeconds",
+            "durationSource",
         )
         val CURRENT_HABIT_LEDGER_FIELDS = setOf(
             "schemaVersion",

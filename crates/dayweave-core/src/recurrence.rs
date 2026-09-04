@@ -642,10 +642,11 @@ fn expand_series(
                 .copied()
                 .unwrap_or(item.created_at),
             interval.get(),
+            spacing,
             "interval",
         ),
         Recurrence::AfterCompletion { interval } => {
-            expand_after_completion(request, item, *interval)
+            expand_after_completion(request, item, *interval, spacing)
         }
         Recurrence::Frequency {
             target,
@@ -710,6 +711,7 @@ fn expand_series(
                         anchor,
                         *target,
                         24 * 60,
+                        spacing,
                         "frequency-rolling-day",
                     ),
                     RecurrencePeriod::Week => expand_rolling_frequency(
@@ -718,10 +720,11 @@ fn expand_series(
                         anchor,
                         *target,
                         7 * 24 * 60,
+                        spacing,
                         "frequency-rolling-week",
                     ),
                     RecurrencePeriod::Month => {
-                        expand_rolling_months(request, item, anchor, *target, days)
+                        expand_rolling_months(request, item, anchor, *target, spacing, days)
                     }
                 }
             }
@@ -985,6 +988,7 @@ fn expand_rolling_minutes(
     item: &WorkItem,
     anchor: OffsetDateTime,
     interval_minutes: u32,
+    minimum_spacing: Minutes,
     label: &str,
 ) -> Result<Vec<Occurrence>, RecurrenceError> {
     if interval_minutes == 0 {
@@ -1014,8 +1018,10 @@ fn expand_rolling_minutes(
         if u32::try_from(index).is_err() {
             return Err(RecurrenceError::DateOutOfRange);
         }
-        let nominal_end = start
+        let natural_end = start
             .checked_add(interval)
+            .ok_or(RecurrenceError::DateOutOfRange)?;
+        let nominal_end = occurrence_end_with_spacing(start, natural_end, minimum_spacing)
             .ok_or(RecurrenceError::DateOutOfRange)?;
         let end = nominal_end.min(request.horizon_end);
         let key = format!(
@@ -1057,6 +1063,7 @@ fn expand_rolling_frequency(
     anchor: OffsetDateTime,
     target: u16,
     period_minutes: u32,
+    minimum_spacing: Minutes,
     label: &str,
 ) -> Result<Vec<Occurrence>, RecurrenceError> {
     if target == 0 || u32::from(target) > period_minutes {
@@ -1096,7 +1103,9 @@ fn expand_rolling_frequency(
         let next = index
             .checked_add(1)
             .ok_or(RecurrenceError::DateOutOfRange)?;
-        let nominal_end = rolling_frequency_instant(anchor, target, period_minutes, next)?;
+        let natural_end = rolling_frequency_instant(anchor, target, period_minutes, next)?;
+        let nominal_end = occurrence_end_with_spacing(start, natural_end, minimum_spacing)
+            .ok_or(RecurrenceError::DateOutOfRange)?;
         let key = format!(
             "{label}:{}:{target}:{period_minutes}:{index}",
             anchor.unix_timestamp_nanos()
@@ -1148,6 +1157,7 @@ fn expand_after_completion(
     request: &PlanRequest,
     item: &WorkItem,
     interval: Minutes,
+    minimum_spacing: Minutes,
 ) -> Result<Vec<Occurrence>, RecurrenceError> {
     let anchor = request
         .recurrence_context
@@ -1155,8 +1165,9 @@ fn expand_after_completion(
         .get(&item.id)
         .copied()
         .unwrap_or(item.created_at);
+    let effective_interval = interval.max(minimum_spacing);
     let due = anchor
-        .checked_add(Duration::minutes(i64::from(interval.get())))
+        .checked_add(Duration::minutes(i64::from(effective_interval.get())))
         .ok_or(RecurrenceError::DateOutOfRange)?;
     let nominal_end = due
         .checked_add(Duration::minutes(i64::from(interval.get())))
@@ -1185,6 +1196,7 @@ fn expand_rolling_months(
     item: &WorkItem,
     anchor: OffsetDateTime,
     target: u16,
+    minimum_spacing: Minutes,
     days: &[ZonedDayBoundary],
 ) -> Result<Vec<Occurrence>, RecurrenceError> {
     // The recurrence anchor carries its own offset, so its calendar date is stable even when the
@@ -1220,7 +1232,7 @@ fn expand_rolling_months(
                         .and_then(|value| cycle_start.checked_add(value))
                         .ok_or(RecurrenceError::DateOutOfRange)?
                 };
-                let end = if index + 1 == target {
+                let natural_end = if index + 1 == target {
                     cycle_end
                 } else {
                     duration
@@ -1229,6 +1241,8 @@ fn expand_rolling_months(
                         .and_then(|value| cycle_start.checked_add(value))
                         .ok_or(RecurrenceError::DateOutOfRange)?
                 };
+                let end = occurrence_end_with_spacing(start, natural_end, minimum_spacing)
+                    .ok_or(RecurrenceError::DateOutOfRange)?;
                 if start < request.horizon_end && request.horizon_start < end {
                     let key = format!(
                         "frequency-rolling-month:{}:{target}:{cycle}:{index}",
@@ -1619,6 +1633,7 @@ fn validated_identity_name(
             effective_rolling_anchor(request, item, None),
             anchor,
             interval.get(),
+            minimum_spacing(request, item.id),
             index,
             "interval",
         ),
@@ -1632,7 +1647,10 @@ fn validated_identity_name(
                 .get(&item.id)
                 .copied()
                 .unwrap_or(item.created_at);
-            let due = effective_anchor.checked_add(Duration::minutes(i64::from(interval.get())))?;
+            let spacing = minimum_spacing(request, item.id);
+            let effective_interval = (*interval).max(spacing);
+            let due = effective_anchor
+                .checked_add(Duration::minutes(i64::from(effective_interval.get())))?;
             let expected_end = due.checked_add(Duration::minutes(i64::from(interval.get())))?;
             (anchor == effective_anchor
                 && anchor.offset() == effective_anchor.offset()
@@ -1776,19 +1794,14 @@ fn validated_identity_name(
                 anchor: identity_anchor,
             },
         ) if matches!(period, RecurrencePeriod::Day | RecurrencePeriod::Week) => {
-            let (period_minutes, label) = match period {
-                RecurrencePeriod::Day => (24 * 60, "frequency-rolling-day"),
-                RecurrencePeriod::Week => (7 * 24 * 60, "frequency-rolling-week"),
-                RecurrencePeriod::Month => unreachable!(),
-            };
             validated_rolling_frequency_name(
                 source,
                 effective_rolling_anchor(request, item, *anchor),
                 identity_anchor,
                 *target,
-                period_minutes,
+                *period,
+                minimum_spacing(request, item.id),
                 index,
-                label,
             )
         }
         (
@@ -1815,6 +1828,7 @@ fn validated_identity_name(
                     cycle,
                     index,
                     *target,
+                    minimum_spacing(request, item.id),
                 )
                 && source.local_date.is_none();
             nominal_dates_match.then(|| {
@@ -1871,6 +1885,7 @@ fn validated_rolling_minute_name(
     anchor: OffsetDateTime,
     identity_anchor: OffsetDateTime,
     interval_minutes: u32,
+    minimum_spacing: Minutes,
     index: i64,
     label: &str,
 ) -> Option<(String, Option<Date>)> {
@@ -1878,7 +1893,8 @@ fn validated_rolling_minute_name(
     let interval = Duration::minutes(i64::from(interval_minutes));
     let elapsed = interval.checked_mul(index)?;
     let expected_start = anchor.checked_add(elapsed)?;
-    let expected_end = expected_start.checked_add(interval)?;
+    let natural_end = expected_start.checked_add(interval)?;
+    let expected_end = occurrence_end_with_spacing(expected_start, natural_end, minimum_spacing)?;
     (identity_anchor == anchor
         && identity_anchor.offset() == anchor.offset()
         && source.nominal_start == expected_start
@@ -1902,13 +1918,19 @@ fn validated_rolling_frequency_name(
     anchor: OffsetDateTime,
     identity_anchor: OffsetDateTime,
     target: u16,
-    period_minutes: u32,
+    period: RecurrencePeriod,
+    minimum_spacing: Minutes,
     index: i64,
-    label: &str,
 ) -> Option<(String, Option<Date>)> {
+    let (period_minutes, label) = match period {
+        RecurrencePeriod::Day => (24 * 60, "frequency-rolling-day"),
+        RecurrencePeriod::Week => (7 * 24 * 60, "frequency-rolling-week"),
+        RecurrencePeriod::Month => return None,
+    };
     let expected_start = rolling_frequency_instant(anchor, target, period_minutes, index).ok()?;
-    let expected_end =
+    let natural_end =
         rolling_frequency_instant(anchor, target, period_minutes, index.checked_add(1)?).ok()?;
+    let expected_end = occurrence_end_with_spacing(expected_start, natural_end, minimum_spacing)?;
     (identity_anchor == anchor
         && identity_anchor.offset() == anchor.offset()
         && source.nominal_start == expected_start
@@ -2061,6 +2083,7 @@ fn rolling_month_source_matches(
     cycle: i64,
     index: u16,
     target: u16,
+    minimum_spacing: Minutes,
 ) -> bool {
     let Some(next_cycle) = cycle.checked_add(1) else {
         return false;
@@ -2087,7 +2110,7 @@ fn rolling_month_source_matches(
     let Some(expected_start) = cycle_start.checked_add(start_offset) else {
         return false;
     };
-    let expected_end = if index + 1 == target {
+    let natural_end = if index + 1 == target {
         cycle_end
     } else {
         let Some(end_offset) = duration
@@ -2101,10 +2124,24 @@ fn rolling_month_source_matches(
         };
         end
     };
+    let Some(expected_end) =
+        occurrence_end_with_spacing(expected_start, natural_end, minimum_spacing)
+    else {
+        return false;
+    };
     source.nominal_start == expected_start
         && source.nominal_start.offset() == expected_start.offset()
         && source.nominal_end == expected_end
         && source.nominal_end.offset() == expected_end.offset()
+}
+
+fn occurrence_end_with_spacing(
+    start: OffsetDateTime,
+    natural_end: OffsetDateTime,
+    minimum_spacing: Minutes,
+) -> Option<OffsetDateTime> {
+    let spacing_end = start.checked_add(Duration::minutes(i64::from(minimum_spacing.get())))?;
+    Some(natural_end.max(spacing_end))
 }
 
 fn calendar_occurrence_bounds(
@@ -2164,8 +2201,16 @@ fn minimum_spacing(request: &PlanRequest, item_id: ItemId) -> Minutes {
                 .iter()
                 .find(|item| item.id == item_id)
                 .and_then(|item| match &item.kind {
-                    ItemKind::Habit(spec) if !spec.minimum_spacing.is_zero() => {
-                        Some(spec.minimum_spacing)
+                    ItemKind::Habit(spec) => {
+                        let recurrence_spacing = recurrence_of(item)
+                            .and_then(|recurrence| match recurrence {
+                                Recurrence::Frequency {
+                                    minimum_spacing, ..
+                                } => Some(*minimum_spacing),
+                                _ => None,
+                            })
+                            .unwrap_or(Minutes::ZERO);
+                        Some(spec.minimum_spacing.max(recurrence_spacing))
                     }
                     _ => recurrence_of(item).and_then(|recurrence| match recurrence {
                         Recurrence::Frequency {

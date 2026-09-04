@@ -53,6 +53,8 @@ import com.greengolddog.dayweave.model.CanonicalConstraintStrengthDraft
 import com.greengolddog.dayweave.model.CanonicalDailyWindowDraft
 import com.greengolddog.dayweave.model.CanonicalDependencyDraft
 import com.greengolddog.dayweave.model.CanonicalDependencyRelation
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalEventTimingDraft
 import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalGoalMeasureDraft
@@ -605,6 +607,13 @@ internal data class CanonicalItemEditorForm(
     val timezoneName: String,
     val hasDuration: Boolean,
     val durationSeconds: String,
+    val durationKind: CanonicalDurationKind = if (hasDuration) {
+        CanonicalDurationKind.EXACT
+    } else {
+        CanonicalDurationKind.UNKNOWN
+    },
+    val durationMinSeconds: String = durationSeconds,
+    val durationMaxSeconds: String = durationSeconds,
     val earliestStartAt: String,
     val deadlineAt: String,
     val recurrenceKind: CanonicalRecurrenceKind?,
@@ -652,6 +661,7 @@ internal data class CanonicalItemEditorForm(
     val habitTargetUnit: String,
     val preservesStreakWhenPaused: Boolean,
     val preservesStreakSpecified: Boolean,
+    val habitMinimumSpacingMinutes: String = "0",
     val routineOrdered: Boolean,
     val routineOrderedSpecified: Boolean,
     val goalMeasures: List<CanonicalGoalMeasureForm>,
@@ -721,10 +731,41 @@ internal data class CanonicalItemEditorForm(
     )
 
     fun draft(itemId: String): Result<CanonicalItemDraft> = runCatching {
-        val ordinaryDuration = if (hasDuration) {
-            durationSeconds.requiredLong("Duration")
-        } else {
-            null
+        val ordinaryDurationKind = when {
+            !hasDuration -> CanonicalDurationKind.UNKNOWN
+            durationKind == CanonicalDurationKind.UNKNOWN -> CanonicalDurationKind.EXACT
+            else -> durationKind
+        }
+        val ordinaryDuration = when (ordinaryDurationKind) {
+            CanonicalDurationKind.UNKNOWN -> null
+            CanonicalDurationKind.EXACT,
+            CanonicalDurationKind.RANGE,
+            -> durationSeconds.requiredLong("Expected duration")
+            else -> error("Unsupported duration kind is read-only")
+        }
+        val ordinaryDurationMinimum = when (ordinaryDurationKind) {
+            CanonicalDurationKind.UNKNOWN -> null
+            CanonicalDurationKind.EXACT -> ordinaryDuration
+            CanonicalDurationKind.RANGE -> durationMinSeconds.requiredLong("Minimum duration")
+            else -> error("Unsupported duration kind is read-only")
+        }
+        val ordinaryDurationMaximum = when (ordinaryDurationKind) {
+            CanonicalDurationKind.UNKNOWN -> null
+            CanonicalDurationKind.EXACT -> ordinaryDuration
+            CanonicalDurationKind.RANGE -> durationMaxSeconds.requiredLong("Maximum duration")
+            else -> error("Unsupported duration kind is read-only")
+        }
+        val ordinaryDurationUnchanged = ordinaryDurationKind == source.durationKind &&
+            ordinaryDuration == source.durationSeconds &&
+            ordinaryDurationMinimum == source.durationMinSeconds &&
+            ordinaryDurationMaximum == source.durationMaxSeconds
+        val ordinaryDurationSource = when (ordinaryDurationKind) {
+            CanonicalDurationKind.UNKNOWN -> null
+            else -> if (ordinaryDurationUnchanged) {
+                source.durationSource
+            } else {
+                CanonicalDurationSource.USER
+            }
         }
         val hasEventTiming = eventStart.isNotBlank() || eventEnd.isNotBlank()
         val event = if (
@@ -771,6 +812,28 @@ internal data class CanonicalItemEditorForm(
             else -> null
         }
         val duration = if (event == null) ordinaryDuration else eventDuration
+        val resolvedDurationKind = when {
+            event == null -> ordinaryDurationKind
+            eventBoundsUnchanged -> source.durationKind
+            eventDuration == null -> CanonicalDurationKind.UNKNOWN
+            else -> CanonicalDurationKind.EXACT
+        }
+        val resolvedDurationMinimum = when {
+            event == null -> ordinaryDurationMinimum
+            eventBoundsUnchanged -> source.durationMinSeconds
+            else -> eventDuration
+        }
+        val resolvedDurationMaximum = when {
+            event == null -> ordinaryDurationMaximum
+            eventBoundsUnchanged -> source.durationMaxSeconds
+            else -> eventDuration
+        }
+        val resolvedDurationSource = when {
+            event == null -> ordinaryDurationSource
+            eventBoundsUnchanged -> source.durationSource
+            eventDuration == null -> null
+            else -> CanonicalDurationSource.USER
+        }
         val recurrence = recurrenceKind?.let { recurrenceType ->
             when (recurrenceType) {
                 CanonicalRecurrenceKind.DAILY,
@@ -889,6 +952,11 @@ internal data class CanonicalItemEditorForm(
                 preservesStreakWhenPaused = if (
                     kind == ItemKind.HABIT && preservesStreakSpecified
                 ) preservesStreakWhenPaused else null,
+                habitMinimumSpacingMinutes = if (kind == ItemKind.HABIT) {
+                    habitMinimumSpacingMinutes.optionalLong("Habit minimum spacing") ?: 0
+                } else {
+                    0
+                },
                 routineOrdered = if (
                     kind == ItemKind.ROUTINE && routineOrderedSpecified
                 ) routineOrdered else null,
@@ -936,6 +1004,10 @@ internal data class CanonicalItemEditorForm(
             notes = notes,
             timezoneName = timezoneName,
             durationSeconds = duration,
+            durationKind = resolvedDurationKind,
+            durationMinSeconds = resolvedDurationMinimum,
+            durationMaxSeconds = resolvedDurationMaximum,
+            durationSource = resolvedDurationSource,
             deadlineAt = when {
                 event == null -> deadlineAt.optional("Deadline")
                 eventBoundsUnchanged -> source.deadlineAt
@@ -973,6 +1045,11 @@ internal data class CanonicalItemEditorForm(
                 timezoneName = draft.timezoneName,
                 hasDuration = draft.durationSeconds != null,
                 durationSeconds = (draft.durationSeconds ?: 30L * 60L).toString(),
+                durationKind = draft.durationKind,
+                durationMinSeconds =
+                    (draft.durationMinSeconds ?: draft.durationSeconds ?: 15L * 60L).toString(),
+                durationMaxSeconds =
+                    (draft.durationMaxSeconds ?: draft.durationSeconds ?: 45L * 60L).toString(),
                 earliestStartAt = draft.earliestStartAt.orEmpty(),
                 deadlineAt = draft.deadlineAt.orEmpty(),
                 recurrenceKind = draft.recurrence?.kind,
@@ -1051,6 +1128,8 @@ internal data class CanonicalItemEditorForm(
                     draft.constraints.preservesStreakWhenPaused ?: true,
                 preservesStreakSpecified =
                     draft.constraints.preservesStreakWhenPaused != null,
+                habitMinimumSpacingMinutes =
+                    draft.constraints.habitMinimumSpacingMinutes.toString(),
                 routineOrdered = draft.constraints.routineOrdered ?: false,
                 routineOrderedSpecified = draft.constraints.routineOrdered != null,
                 goalMeasures = draft.constraints.goalMeasures.orEmpty().map(
@@ -1184,17 +1263,53 @@ internal fun CanonicalItemEditorSheet(
                     singleLine = true,
                 )
                 if (form.kind != ItemKind.EVENT) {
-                    LabeledSwitch(
-                        title = "Duration estimate",
-                        detail = "Inbox may stay unknown; schedulable Planned work needs an estimate.",
-                        checked = form.hasDuration,
-                        onCheckedChange = { form = form.copy(hasDuration = it) },
-                    )
-                    if (form.hasDuration) {
+                    Text("Duration shape", style = MaterialTheme.typography.labelLarge)
+                    ChoiceRow {
+                        listOf(
+                            CanonicalDurationKind.UNKNOWN to "Unknown",
+                            CanonicalDurationKind.EXACT to "Exact",
+                            CanonicalDurationKind.RANGE to "Range",
+                        ).forEach { (kind, label) ->
+                            FilterChip(
+                                selected = form.durationKind == kind,
+                                onClick = {
+                                    form = form.copy(
+                                        hasDuration = kind != CanonicalDurationKind.UNKNOWN,
+                                        durationKind = kind,
+                                    )
+                                },
+                                label = { Text(label) },
+                            )
+                        }
+                    }
+                    if (form.durationKind == CanonicalDurationKind.EXACT) {
                         NumberField(
                             value = form.durationSeconds,
                             onValueChange = { form = form.copy(durationSeconds = it) },
                             label = "Duration (seconds)",
+                        )
+                    } else if (form.durationKind == CanonicalDurationKind.RANGE) {
+                        NumberField(
+                            value = form.durationMinSeconds,
+                            onValueChange = { form = form.copy(durationMinSeconds = it) },
+                            label = "Minimum duration (seconds)",
+                        )
+                        NumberField(
+                            value = form.durationSeconds,
+                            onValueChange = { form = form.copy(durationSeconds = it) },
+                            label = "Expected duration (seconds)",
+                        )
+                        NumberField(
+                            value = form.durationMaxSeconds,
+                            onValueChange = { form = form.copy(durationMaxSeconds = it) },
+                            label = "Maximum duration (seconds)",
+                        )
+                    }
+                    currentDraft.getOrNull()?.durationSource?.let { source ->
+                        Text(
+                            "Estimate source: ${source.wireValue}; changing duration marks it as user-authored.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     InstantField(
@@ -1323,7 +1438,7 @@ internal fun CanonicalItemEditorSheet(
                                 onValueChange = {
                                     form = form.copy(recurrenceMinimumSpacingMinutes = it)
                                 },
-                                label = "Minimum spacing (minutes, max 527,040)",
+                                label = "Frequency-window spacing (minutes, max 527,040)",
                             )
                             if (form.recurrenceSemantics == CanonicalRecurrenceSemantics.ROLLING) {
                                 InstantField(
@@ -1384,6 +1499,17 @@ internal fun CanonicalItemEditorSheet(
 
             when (form.kind) {
                 ItemKind.HABIT -> EditorSection("Habit behavior") {
+                    NumberField(
+                        form.habitMinimumSpacingMinutes,
+                        { form = form.copy(habitMinimumSpacingMinutes = it) },
+                        "Minimum time between habit occurrences (minutes)",
+                    )
+                    Text(
+                        "Applies to every recurrence type; frequency-window spacing above only " +
+                            "defines that recurrence rule.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     LabeledSwitch(
                         title = "Quantity target",
                         detail = "Track a measurable amount for every habit occurrence.",

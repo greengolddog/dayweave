@@ -440,10 +440,13 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// schedule-revision-bound Google Calendar publication recovery journal,
     /// and version 22 persists inferred or server-explicit typed duration,
     /// deadline, own-effort, and blocker metadata without discarding v21 caches.
+    /// Version 23 adds rich duration fields to locally authored drafts; the
+    /// schema fence keeps older binaries from collapsing a range back to an
+    /// exact duration when they rewrite an otherwise familiar v1 journal.
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 22
+    static let currentSchemaVersion = 23
 
     let schemaVersion: Int
     let savedAt: Date
@@ -709,12 +712,14 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
-        case 21:
+        case 21, 22:
             // Canonical structural metadata was previously nested or implicit,
             // while unknown-field retention could forward-capture the complete
             // server wire shape. The schema-aware item decoder either infers a
             // zero-key legacy row or preserves a complete captured shape (and
-            // rejects partial shapes); rewriting makes that decision durable.
+            // rejects partial shapes). Schema 22 also predates rich fields in
+            // authoring drafts. Rewriting makes both upgrades durable and
+            // establishes the rollback fence before a ranged draft is saved.
             return try PlannerSnapshot(
                 savedAt: savedAt,
                 destination: destination,

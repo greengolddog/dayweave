@@ -1,5 +1,7 @@
 package com.greengolddog.dayweave.network
 
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -616,6 +618,10 @@ class OkHttpCanonicalPlannerTransportTest {
         assertEquals(TASK_ID, body["id"]?.jsonPrimitive?.content)
         assertEquals("true", body["is_sensitive"]?.jsonPrimitive?.content)
         assertEquals("planned", body["status"]?.jsonPrimitive?.content)
+        assertEquals("exact", body["duration_kind"]?.jsonPrimitive?.content)
+        assertEquals("assistant", body["duration_source"]?.jsonPrimitive?.content)
+        assertEquals("3600", body["duration_min_seconds"]?.jsonPrimitive?.content)
+        assertEquals("3600", body["duration_max_seconds"]?.jsonPrimitive?.content)
         assertFalse("item" in body)
 
         server.enqueue(jsonResponse("""{"item":${itemJson()}}"""))
@@ -629,6 +635,48 @@ class OkHttpCanonicalPlannerTransportTest {
             }
         }
         assertEquals(200, wrongStatus.statusCode)
+    }
+
+    @Test
+    fun legacyDurationRequestsRetainSecondsAndOmitEveryRichField() = runBlocking {
+        server.enqueue(
+            MockResponse.Builder()
+                .code(201)
+                .addHeader("Content-Type", "application/json")
+                .body("""{"item":${itemJson()}}""")
+                .build(),
+        )
+        server.enqueue(jsonResponse("""{"item":${itemJson()}}"""))
+        val legacy = createRequest().copy(
+            durationKind = null,
+            durationMinSeconds = null,
+            durationMaxSeconds = null,
+            durationSource = null,
+        )
+        val key = "android-item-33333333-3333-4333-8333-333333333333"
+
+        transport.createItem(configuration(), key, legacy)
+        transport.replaceItem(
+            configuration(),
+            TASK_ID,
+            key,
+            ReplaceCanonicalItemRequest(7, legacy.toReplacement()),
+        )
+
+        val createBody = Json.parseToJsonElement(
+            requireNotNull(server.takeRequest().body).utf8(),
+        ) as JsonObject
+        val replaceEnvelope = Json.parseToJsonElement(
+            requireNotNull(server.takeRequest().body).utf8(),
+        ) as JsonObject
+        val replaceBody = replaceEnvelope.getValue("item") as JsonObject
+        for (body in listOf(createBody, replaceBody)) {
+            assertEquals("3600", body["duration_seconds"]?.jsonPrimitive?.content)
+            assertFalse("duration_kind" in body)
+            assertFalse("duration_min_seconds" in body)
+            assertFalse("duration_max_seconds" in body)
+            assertFalse("duration_source" in body)
+        }
     }
 
     @Test
@@ -917,6 +965,10 @@ class OkHttpCanonicalPlannerTransportTest {
         notes = "Server-owned canonical task",
         timezoneName = "Europe/Madrid",
         durationSeconds = 3_600,
+        durationKind = CanonicalDurationKind.EXACT,
+        durationMinSeconds = 3_600,
+        durationMaxSeconds = 3_600,
+        durationSource = CanonicalDurationSource.ASSISTANT,
         deadlineAt = "2026-09-01T12:00:00Z",
         flexibleConstraints = buildJsonObject { put("energy", "deep") },
         splitPolicy = buildJsonObject { put("type", "indivisible") },
@@ -933,6 +985,10 @@ class OkHttpCanonicalPlannerTransportTest {
         notes = notes,
         timezoneName = timezoneName,
         durationSeconds = durationSeconds,
+        durationKind = durationKind,
+        durationMinSeconds = durationMinSeconds,
+        durationMaxSeconds = durationMaxSeconds,
+        durationSource = durationSource,
         deadlineAt = deadlineAt,
         earliestStartAt = earliestStartAt,
         recurrence = recurrence,

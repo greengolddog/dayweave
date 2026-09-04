@@ -8,6 +8,8 @@ import com.greengolddog.dayweave.model.CanonicalConstraintLevel
 import com.greengolddog.dayweave.model.CanonicalConstraintStrengthDraft
 import com.greengolddog.dayweave.model.CanonicalDependencyDraft
 import com.greengolddog.dayweave.model.CanonicalDependencyRelation
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalEventTimingDraft
 import com.greengolddog.dayweave.model.CanonicalItemDraft
@@ -34,6 +36,60 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CanonicalItemEditorFormTest {
+    @Test
+    fun rangedHabitDurationAndIndependentSpacingRoundTripWithoutLosingProvenance() {
+        val source = CanonicalItemDraft(
+            placement = CanonicalDraftPlacement.PLANNED,
+            kind = ItemKind.HABIT,
+            title = "Practice scales",
+            timezoneName = "UTC",
+            durationSeconds = 1_800,
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 1_200,
+            durationMaxSeconds = 2_400,
+            durationSource = CanonicalDurationSource.ASSISTANT,
+            recurrence = CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.FREQUENCY,
+                occurrencesPerPeriod = 3,
+                period = CanonicalRecurrencePeriod.DAY,
+                semantics = CanonicalRecurrenceSemantics.CALENDAR,
+                minimumSpacingMinutes = 30,
+            ),
+            constraints = CanonicalFlexibleConstraintsDraft(
+                habitMinimumSpacingMinutes = 90,
+            ),
+        )
+
+        val form = CanonicalItemEditorForm.from(source)
+        val unrelatedEdit = form.copy(title = "Practice piano scales")
+            .draft(ITEM_ID).getOrThrow()
+
+        assertEquals(CanonicalDurationKind.RANGE, unrelatedEdit.durationKind)
+        assertEquals(1_200L, unrelatedEdit.durationMinSeconds)
+        assertEquals(1_800L, unrelatedEdit.durationSeconds)
+        assertEquals(2_400L, unrelatedEdit.durationMaxSeconds)
+        assertEquals(CanonicalDurationSource.ASSISTANT, unrelatedEdit.durationSource)
+        assertEquals(30L, unrelatedEdit.recurrence?.minimumSpacingMinutes)
+        assertEquals(90L, unrelatedEdit.constraints.habitMinimumSpacingMinutes)
+        assertEquals(
+            90L,
+            unrelatedEdit.constraints.toCanonicalJson(null, unrelatedEdit.durationSeconds)
+                .getValue("habit_minimum_spacing_minutes").toString().toLong(),
+        )
+
+        val durationEdit = form.copy(durationSeconds = "2100")
+            .draft(ITEM_ID).getOrThrow()
+        assertEquals(CanonicalDurationKind.RANGE, durationEdit.durationKind)
+        assertEquals(CanonicalDurationSource.USER, durationEdit.durationSource)
+
+        val unknown = form.copy(hasDuration = false).draft(ITEM_ID).getOrThrow()
+        assertEquals(CanonicalDurationKind.UNKNOWN, unknown.durationKind)
+        assertNull(unknown.durationMinSeconds)
+        assertNull(unknown.durationSeconds)
+        assertNull(unknown.durationMaxSeconds)
+        assertNull(unknown.durationSource)
+    }
+
     @Test
     fun formRoundTripsTheTypedDraftContractWithoutJsonEditing() {
         val draft = CanonicalItemDraft(

@@ -1317,6 +1317,124 @@ struct CanonicalItemEditorStateTests {
         #expect(state.validationIssue?.contains("Earliest start") == true)
     }
 
+    @Test("duration metadata survives unrelated edits and duration edits become user sourced")
+    func testRichDurationEditingProvenance() {
+        let itemID = Self.id(1_301)
+        let source = DayWeaveCanonicalItemDraft(
+            kind: .habit,
+            status: .planned,
+            title: "Practice",
+            timezoneName: "UTC",
+            durationKind: .range,
+            durationMinimumSeconds: 1_200,
+            durationSeconds: 1_800,
+            durationMaximumSeconds: 2_700,
+            durationSource: .assistant,
+            recurrence: .object([
+                "type": .string("daily"),
+                "times_per_day": .number(JSONNumber(UInt64(1))),
+            ])
+        )
+        var state = CanonicalItemEditorState(itemID: itemID, draft: source)
+
+        #expect(state.durationKind == .range)
+        state.title = "Practice deliberately"
+        #expect(state.draft.durationKind == .range)
+        #expect(state.draft.durationMinimumSeconds == 1_200)
+        #expect(state.draft.durationSeconds == 1_800)
+        #expect(state.draft.durationMaximumSeconds == 2_700)
+        #expect(state.draft.durationSource == .assistant)
+
+        state.durationMaximumSeconds = 3_600
+        #expect(state.draft.durationKind == .range)
+        #expect(state.draft.durationMaximumSeconds == 3_600)
+        #expect(state.draft.durationSource == .user)
+
+        state.durationKind = .exact
+        #expect(state.draft.durationMinimumSeconds == 1_800)
+        #expect(state.draft.durationMaximumSeconds == 1_800)
+        #expect(state.draft.durationSource == .user)
+    }
+
+    @Test("an unrelated event edit preserves ranged duration provenance")
+    func testRangedEventDurationProvenance() {
+        let itemID = Self.id(1_303)
+        let start = Self.date("2026-09-03T09:00:00Z")
+        let end = Self.date("2026-09-03T09:30:00Z")
+        let source = DayWeaveCanonicalItemDraft(
+            kind: .event,
+            status: .planned,
+            title: "Flexible appointment",
+            timezoneName: "UTC",
+            durationKind: .range,
+            durationMinimumSeconds: 1_200,
+            durationSeconds: 1_800,
+            durationMaximumSeconds: 2_700,
+            durationSource: .assistant,
+            deadlineAt: end,
+            earliestStartAt: start,
+            flexibleConstraints: .object([
+                "dayweave_firm_block": .object([
+                    "owned": .bool(true),
+                    "starts_at": .string("2026-09-03T09:00:00Z"),
+                    "ends_at": .string("2026-09-03T09:30:00Z"),
+                    "all_day": .bool(false),
+                    "tentative": .bool(false),
+                    "busy": .bool(true),
+                ]),
+            ])
+        )
+        var state = CanonicalItemEditorState(itemID: itemID, draft: source)
+
+        #expect(state.readOnlyDiagnostic == nil)
+        state.title = "Flexible appointment renamed"
+        #expect(state.draft.durationKind == .range)
+        #expect(state.draft.durationMinimumSeconds == 1_200)
+        #expect(state.draft.durationSeconds == 1_800)
+        #expect(state.draft.durationMaximumSeconds == 2_700)
+        #expect(state.draft.durationSource == .assistant)
+    }
+
+    @Test("general habit spacing is independent from frequency recurrence spacing")
+    func testIndependentHabitSpacing() {
+        let itemID = Self.id(1_302)
+        let source = DayWeaveCanonicalItemDraft(
+            kind: .habit,
+            status: .planned,
+            title: "Hydrate",
+            timezoneName: "UTC",
+            durationSeconds: 300,
+            recurrence: .object([
+                "type": .string("frequency"),
+                "target": .number(JSONNumber(UInt64(4))),
+                "period": .string("day"),
+                "semantics": .string("calendar"),
+                "minimum_spacing": .number(JSONNumber(UInt64(45))),
+            ]),
+            flexibleConstraints: .object([
+                "habit_minimum_spacing_minutes": .number(JSONNumber(UInt64(90))),
+            ])
+        )
+        var state = CanonicalItemEditorState(itemID: itemID, draft: source)
+
+        #expect(state.readOnlyDiagnostic == nil)
+        #expect(state.recurrenceMinimumSpacingMinutes == 45)
+        #expect(state.habitMinimumSpacingMinutes == 90)
+
+        state.habitMinimumSpacingMinutes = 120
+        guard case let .object(recurrence)? = state.draft.recurrence,
+              case let .object(constraints) = state.draft.flexibleConstraints else {
+            Issue.record("Expected independent recurrence and habit metadata")
+            return
+        }
+        #expect(recurrence["minimum_spacing"] == .number(JSONNumber(UInt64(45))))
+        #expect(
+            constraints["habit_minimum_spacing_minutes"]
+                == .number(JSONNumber(UInt64(120)))
+        )
+        #expect(state.validationIssue == nil)
+    }
+
     private static func id(_ value: Int) -> UUID {
         UUID(uuidString: String(format: "00000000-0000-4000-8000-%012llx", Int64(value)))!
     }

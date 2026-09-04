@@ -12,6 +12,13 @@ enum CanonicalAuthoringOperation: String, Codable, Equatable, Sendable {
     case restore
 }
 
+/// Selects the exact item-request shape bound to an idempotency key. A legacy
+/// submitted journal must keep omitting rich duration fields after upgrade.
+enum CanonicalAuthoringDurationWireShape: String, Codable, Equatable, Sendable {
+    case legacyV1 = "legacy_v1"
+    case richV2 = "rich_v2"
+}
+
 /// A complete, typed item body retained in encrypted local storage before any
 /// canonical authoring request can leave the Mac. It deliberately excludes
 /// server-owned revision and timestamp fields.
@@ -38,7 +45,45 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
     var title: String
     var notes: String?
     var timezoneName: String
-    var durationSeconds: UInt32?
+    var durationKind: DayWeaveDurationKind
+    var durationMinimumSeconds: UInt32? {
+        didSet {
+            if case .range = durationKind { durationSource = .user }
+        }
+    }
+    var durationSeconds: UInt32? {
+        didSet {
+            switch durationKind {
+            case .unknown:
+                guard let durationSeconds else { return }
+                durationKind = .exact
+                durationMinimumSeconds = durationSeconds
+                durationMaximumSeconds = durationSeconds
+                durationSource = .user
+            case .exact:
+                guard let durationSeconds else {
+                    durationKind = .unknown
+                    durationMinimumSeconds = nil
+                    durationMaximumSeconds = nil
+                    durationSource = nil
+                    return
+                }
+                durationMinimumSeconds = durationSeconds
+                durationMaximumSeconds = durationSeconds
+                durationSource = .user
+            case .range:
+                durationSource = .user
+            case .unsupported:
+                break
+            }
+        }
+    }
+    var durationMaximumSeconds: UInt32? {
+        didSet {
+            if case .range = durationKind { durationSource = .user }
+        }
+    }
+    var durationSource: DayWeaveDurationSource?
     var deadlineAt: Date?
     var earliestStartAt: Date?
     var recurrence: JSONValue?
@@ -53,7 +98,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         case kind, status, title, notes, recurrence, importance, urgency
         case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
+        case durationKind = "duration_kind"
+        case durationMinimumSeconds = "duration_min_seconds"
         case durationSeconds = "duration_seconds"
+        case durationMaximumSeconds = "duration_max_seconds"
+        case durationSource = "duration_source"
         case deadlineAt = "deadline_at"
         case earliestStartAt = "earliest_start_at"
         case flexibleConstraints = "flexible_constraints"
@@ -69,7 +118,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         title: String,
         notes: String? = nil,
         timezoneName: String,
+        durationKind: DayWeaveDurationKind? = nil,
+        durationMinimumSeconds: UInt32? = nil,
         durationSeconds: UInt32? = nil,
+        durationMaximumSeconds: UInt32? = nil,
+        durationSource: DayWeaveDurationSource? = nil,
         deadlineAt: Date? = nil,
         earliestStartAt: Date? = nil,
         recurrence: JSONValue? = nil,
@@ -86,7 +139,20 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         self.title = title
         self.notes = notes
         self.timezoneName = timezoneName
+        let inferredDurationKind: DayWeaveDurationKind = durationSeconds == nil
+            ? .unknown
+            : .exact
+        self.durationKind = durationKind ?? inferredDurationKind
+        self.durationMinimumSeconds = durationKind == nil
+            ? durationSeconds
+            : durationMinimumSeconds
         self.durationSeconds = durationSeconds
+        self.durationMaximumSeconds = durationKind == nil
+            ? durationSeconds
+            : durationMaximumSeconds
+        self.durationSource = durationKind == nil
+            ? (durationSeconds == nil ? nil : durationSource ?? .user)
+            : durationSource
         self.deadlineAt = deadlineAt
         self.earliestStartAt = earliestStartAt
         self.recurrence = recurrence
@@ -106,7 +172,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             title: item.title,
             notes: item.notes,
             timezoneName: item.timezoneName,
+            durationKind: item.durationKind,
+            durationMinimumSeconds: item.durationMinimumSeconds,
             durationSeconds: item.durationSeconds,
+            durationMaximumSeconds: item.durationMaximumSeconds,
+            durationSource: item.durationSource,
             deadlineAt: item.deadlineAt,
             earliestStartAt: item.earliestStartAt,
             recurrence: item.recurrence,
@@ -117,6 +187,114 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             parentID: item.parentID,
             siblingOrder: item.siblingOrder
         )
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let durationSeconds = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .durationSeconds
+        )
+        let richDurationKeys: [CodingKeys] = [
+            .durationKind,
+            .durationMinimumSeconds,
+            .durationMaximumSeconds,
+            .durationSource,
+        ]
+        let presentRichDurationKeys = richDurationKeys.filter(container.contains)
+        let snapshotSchemaVersion = decoder.userInfo[
+            .dayWeavePlannerSnapshotSchemaVersion
+        ] as? Int
+        let usesRichDurationShape: Bool
+        if snapshotSchemaVersion.map({ $0 <= 22 }) == true {
+            guard presentRichDurationKeys.isEmpty else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationKind,
+                    in: container,
+                    debugDescription: "Legacy authoring drafts cannot acquire injected rich-duration fields"
+                )
+            }
+            usesRichDurationShape = false
+        } else if snapshotSchemaVersion.map({ $0 >= 23 }) == true
+                    || !presentRichDurationKeys.isEmpty {
+            guard presentRichDurationKeys.count == richDurationKeys.count,
+                  container.contains(.durationSeconds) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationKind,
+                    in: container,
+                    debugDescription: "Rich duration metadata must be emitted atomically"
+                )
+            }
+            usesRichDurationShape = true
+        } else {
+            // Standalone legacy journals have no enclosing snapshot schema.
+            usesRichDurationShape = false
+        }
+        self.init(
+            isSensitive: try container.decode(Bool.self, forKey: .isSensitive),
+            kind: try container.decode(DayWeaveCanonicalItemKind.self, forKey: .kind),
+            status: try container.decode(DayWeaveCanonicalItemStatus.self, forKey: .status),
+            title: try container.decode(String.self, forKey: .title),
+            notes: try container.decodeIfPresent(String.self, forKey: .notes),
+            timezoneName: try container.decode(String.self, forKey: .timezoneName),
+            durationKind: usesRichDurationShape
+                ? try container.decode(DayWeaveDurationKind.self, forKey: .durationKind)
+                : nil,
+            durationMinimumSeconds: usesRichDurationShape
+                ? try container.decodeIfPresent(UInt32.self, forKey: .durationMinimumSeconds)
+                : nil,
+            durationSeconds: durationSeconds,
+            durationMaximumSeconds: usesRichDurationShape
+                ? try container.decodeIfPresent(UInt32.self, forKey: .durationMaximumSeconds)
+                : nil,
+            durationSource: usesRichDurationShape
+                ? try container.decodeIfPresent(DayWeaveDurationSource.self, forKey: .durationSource)
+                : nil,
+            deadlineAt: try container.decodeIfPresent(Date.self, forKey: .deadlineAt),
+            earliestStartAt: try container.decodeIfPresent(Date.self, forKey: .earliestStartAt),
+            recurrence: try container.decodeIfPresent(JSONValue.self, forKey: .recurrence),
+            flexibleConstraints: try container.decode(
+                JSONValue.self,
+                forKey: .flexibleConstraints
+            ),
+            splitPolicy: try container.decode(DayWeaveSplitPolicy.self, forKey: .splitPolicy),
+            importance: try container.decode(UInt8.self, forKey: .importance),
+            urgency: try container.decode(UInt8.self, forKey: .urgency),
+            parentID: try container.decodeIfPresent(UUID.self, forKey: .parentID),
+            siblingOrder: try container.decode(UInt32.self, forKey: .siblingOrder)
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(isSensitive, forKey: .isSensitive)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(status, forKey: .status)
+        try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(notes, forKey: .notes)
+        try container.encode(timezoneName, forKey: .timezoneName)
+        try container.encode(durationKind, forKey: .durationKind)
+        try container.encodeIfPresent(durationMinimumSeconds, forKey: .durationMinimumSeconds)
+        if durationMinimumSeconds == nil {
+            try container.encodeNil(forKey: .durationMinimumSeconds)
+        }
+        try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
+        if durationSeconds == nil { try container.encodeNil(forKey: .durationSeconds) }
+        try container.encodeIfPresent(durationMaximumSeconds, forKey: .durationMaximumSeconds)
+        if durationMaximumSeconds == nil {
+            try container.encodeNil(forKey: .durationMaximumSeconds)
+        }
+        try container.encodeIfPresent(durationSource, forKey: .durationSource)
+        if durationSource == nil { try container.encodeNil(forKey: .durationSource) }
+        try container.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
+        try container.encodeIfPresent(earliestStartAt, forKey: .earliestStartAt)
+        try container.encodeIfPresent(recurrence, forKey: .recurrence)
+        try container.encode(flexibleConstraints, forKey: .flexibleConstraints)
+        try container.encode(splitPolicy, forKey: .splitPolicy)
+        try container.encode(importance, forKey: .importance)
+        try container.encode(urgency, forKey: .urgency)
+        try container.encodeIfPresent(parentID, forKey: .parentID)
+        try container.encode(siblingOrder, forKey: .siblingOrder)
     }
 
     var normalized: Self {
@@ -149,9 +327,41 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         guard let timeZone = Self.supportedTimeZone(identifier: value.timezoneName) else {
             return "Choose a valid IANA timezone."
         }
-        if let duration = value.durationSeconds,
-           duration == 0 || duration > Self.maximumDurationSeconds {
-            return "Duration must be between one second and 366 days."
+        let durationValues = [
+            value.durationMinimumSeconds,
+            value.durationSeconds,
+            value.durationMaximumSeconds,
+        ].compactMap { $0 }
+        guard durationValues.allSatisfy({ $0 > 0 && $0 <= Self.maximumDurationSeconds }) else {
+            return "Duration values must be between one second and 366 days."
+        }
+        switch value.durationKind {
+        case .unknown:
+            guard durationValues.isEmpty, value.durationSource == nil else {
+                return "Unknown duration cannot define duration values or a source."
+            }
+        case .exact:
+            guard let duration = value.durationSeconds,
+                  value.durationMinimumSeconds == duration,
+                  value.durationMaximumSeconds == duration,
+                  value.durationSource != nil else {
+                return "Exact duration requires one matching minimum, preferred, and maximum value plus a source."
+            }
+        case .range:
+            guard let minimum = value.durationMinimumSeconds,
+                  let preferred = value.durationSeconds,
+                  let maximum = value.durationMaximumSeconds,
+                  minimum < maximum,
+                  minimum <= preferred,
+                  preferred <= maximum,
+                  value.durationSource != nil else {
+                return "Ranged duration requires ordered minimum, preferred, and maximum values plus a source."
+            }
+        case .unsupported:
+            return "This duration form is read-only in this version of DayWeave."
+        }
+        if case .unsupported? = value.durationSource {
+            return "This duration source is read-only in this version of DayWeave."
         }
         if [value.earliestStartAt, value.deadlineAt].contains(where: { date in
             date.map { CanonicalRFC3339Instant(date: $0) == nil } == true
@@ -351,7 +561,14 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
     }
 
     var requestFields: DayWeaveCanonicalItemFields {
+        requestFields(durationWireShape: .richV2)
+    }
+
+    func requestFields(
+        durationWireShape: CanonicalAuthoringDurationWireShape
+    ) -> DayWeaveCanonicalItemFields {
         let value = normalized
+        let emitsRichDuration = durationWireShape == .richV2
         return DayWeaveCanonicalItemFields(
             isSensitive: value.isSensitive,
             kind: value.kind,
@@ -359,7 +576,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             title: value.title,
             notes: value.notes,
             timezoneName: value.timezoneName,
+            durationKind: emitsRichDuration ? value.durationKind : nil,
+            durationMinimumSeconds: emitsRichDuration ? value.durationMinimumSeconds : nil,
             durationSeconds: value.durationSeconds,
+            durationMaximumSeconds: emitsRichDuration ? value.durationMaximumSeconds : nil,
+            durationSource: emitsRichDuration ? value.durationSource : nil,
             deadlineAt: value.deadlineAt,
             earliestStartAt: value.earliestStartAt,
             recurrence: value.recurrence,
@@ -380,7 +601,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             && item.title == value.title
             && item.notes == value.notes
             && item.timezoneName == value.timezoneName
+            && item.durationKind == value.durationKind
+            && item.durationMinimumSeconds == value.durationMinimumSeconds
             && item.durationSeconds == value.durationSeconds
+            && item.durationMaximumSeconds == value.durationMaximumSeconds
+            && item.durationSource == value.durationSource
             && item.deadlineAt == value.deadlineAt
             && item.earliestStartAt == value.earliestStartAt
             && item.recurrence == value.recurrence
@@ -407,6 +632,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
     let baseItem: DayWeaveCanonicalItem?
     let idempotencyKey: String
     let createdAt: Date
+    let durationWireShape: CanonicalAuthoringDurationWireShape
     var configurationIdentifier: String?
     var hasBeenSubmitted: Bool
     var disposition: CanonicalAuthoringDisposition
@@ -420,6 +646,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         expectedRevision: UInt64? = nil,
         baseItem: DayWeaveCanonicalItem? = nil,
         createdAt: Date = Date(),
+        durationWireShape: CanonicalAuthoringDurationWireShape = .richV2,
         configurationIdentifier: String? = nil,
         hasBeenSubmitted: Bool = false,
         disposition: CanonicalAuthoringDisposition = .pending,
@@ -434,17 +661,97 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         self.baseItem = baseItem
         idempotencyKey = "mac-item-\(id.uuidString.lowercased())"
         self.createdAt = createdAt
+        self.durationWireShape = durationWireShape
         self.configurationIdentifier = configurationIdentifier
         self.hasBeenSubmitted = hasBeenSubmitted
         self.disposition = disposition
         self.diagnostic = diagnostic
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case version, id, itemID, operation, draft, expectedRevision, baseItem
+        case idempotencyKey, createdAt, durationWireShape
+        case configurationIdentifier, hasBeenSubmitted, disposition, diagnostic
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let hasBeenSubmitted = try container.decode(Bool.self, forKey: .hasBeenSubmitted)
+        let operation = try container.decode(
+            CanonicalAuthoringOperation.self,
+            forKey: .operation
+        )
+        let submittedBodyMutation = hasBeenSubmitted
+            && (operation == .create || operation == .replace)
+        let snapshotSchemaVersion = decoder.userInfo[
+            .dayWeavePlannerSnapshotSchemaVersion
+        ] as? Int
+        let durationWireShape: CanonicalAuthoringDurationWireShape
+        if snapshotSchemaVersion.map({ $0 <= 22 }) == true {
+            guard !container.contains(.durationWireShape) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .durationWireShape,
+                    in: container,
+                    debugDescription: "Legacy journals cannot acquire an injected request shape"
+                )
+            }
+            durationWireShape = submittedBodyMutation ? .legacyV1 : .richV2
+        } else if snapshotSchemaVersion.map({ $0 >= 23 }) == true {
+            durationWireShape = try container.decode(
+                CanonicalAuthoringDurationWireShape.self,
+                forKey: .durationWireShape
+            )
+        } else {
+            durationWireShape = try container.decodeIfPresent(
+                CanonicalAuthoringDurationWireShape.self,
+                forKey: .durationWireShape
+            ) ?? (submittedBodyMutation ? .legacyV1 : .richV2)
+        }
+
+        version = try container.decode(Int.self, forKey: .version)
+        id = try container.decode(UUID.self, forKey: .id)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        self.operation = operation
+        draft = try container.decodeIfPresent(DayWeaveCanonicalItemDraft.self, forKey: .draft)
+        expectedRevision = try container.decodeIfPresent(UInt64.self, forKey: .expectedRevision)
+        baseItem = try container.decodeIfPresent(DayWeaveCanonicalItem.self, forKey: .baseItem)
+        idempotencyKey = try container.decode(String.self, forKey: .idempotencyKey)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.durationWireShape = durationWireShape
+        configurationIdentifier = try container.decodeIfPresent(
+            String.self,
+            forKey: .configurationIdentifier
+        )
+        self.hasBeenSubmitted = hasBeenSubmitted
+        disposition = try container.decode(CanonicalAuthoringDisposition.self, forKey: .disposition)
+        diagnostic = try container.decodeIfPresent(String.self, forKey: .diagnostic)
+    }
+
     var isValid: Bool {
         guard version == Self.currentVersion,
               idempotencyKey == "mac-item-\(id.uuidString.lowercased())",
+              durationWireShape == .richV2 || hasBeenSubmitted,
               configurationIdentifier.map({ !$0.isEmpty && $0.utf8.count <= 4_096 }) ?? true,
               disposition == .pending || diagnostic?.isEmpty == false else { return false }
+        if durationWireShape == .legacyV1 {
+            guard operation == .create || operation == .replace,
+                  let draft else { return false }
+            let value = draft.normalized
+            switch value.durationKind {
+            case .unknown:
+                guard value.durationMinimumSeconds == nil,
+                      value.durationSeconds == nil,
+                      value.durationMaximumSeconds == nil,
+                      value.durationSource == nil else { return false }
+            case .exact:
+                guard let duration = value.durationSeconds,
+                      value.durationMinimumSeconds == duration,
+                      value.durationMaximumSeconds == duration,
+                      value.durationSource == .user else { return false }
+            case .range, .unsupported:
+                return false
+            }
+        }
         switch operation {
         case .create:
             return expectedRevision == nil
@@ -594,7 +901,7 @@ extension DayWeaveCanonicalItem {
     /// intentionally keeps using the stricter lossless-replacement predicate.
     var supportsCanonicalAuthoringReplacement: Bool {
         guard unsupportedFields.isEmpty,
-              !hasExplicitStructuralMetadata,
+              hasCanonicalAuthoringCompatibleStructuralMetadata,
               retainedUnrepresentableDeadlineAt == nil,
               retainedUnrepresentableEarliestStartAt == nil,
               splitPolicy.isSupportedForWrite else { return false }
@@ -730,7 +1037,8 @@ extension JSONValue {
         guard case let .object(object) = self else { return false }
         let allowed: Set<String> = [
             "constraints", "energy", "tags", "goal_ids", "has_own_effort", "habit_target",
-            "preserves_streak_when_paused", "routine_ordered", "goal_measures",
+            "preserves_streak_when_paused", "habit_minimum_spacing_minutes",
+            "routine_ordered", "goal_measures",
             "goal_weekly_allocation", "break_category", "break_mandatory",
             "break_prompt_to_resume", "maximum_sessions", "minimum_gap_minutes",
             "maximum_split_days", "preferred_start_minute", "calendar_event",
@@ -794,6 +1102,10 @@ extension JSONValue {
             case "has_own_effort", "routine_ordered", "preserves_streak_when_paused",
                  "break_mandatory", "break_prompt_to_resume":
                 guard case .bool = value else { return false }
+            case "habit_minimum_spacing_minutes":
+                guard value.canonicalUnsigned.map({
+                    $0 <= DayWeaveCanonicalItemDraft.maximumSchedulingOffsetMinutes
+                }) == true else { return false }
             case "break_category":
                 if value == .null { continue }
                 guard case let .string(category) = value,
@@ -1071,7 +1383,10 @@ extension JSONValue {
             return "Calendar event metadata is only valid for event items."
         }
         if kind != .habit,
-           hasAny(["habit_target", "preserves_streak_when_paused"]) {
+           hasAny([
+            "habit_target", "preserves_streak_when_paused",
+            "habit_minimum_spacing_minutes",
+           ]) {
             return "Habit metadata is only valid for habit items."
         }
         if kind != .routine, root["routine_ordered"] != nil {

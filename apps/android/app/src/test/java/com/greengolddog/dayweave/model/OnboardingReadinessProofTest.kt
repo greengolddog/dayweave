@@ -95,10 +95,12 @@ class OnboardingReadinessProofTest {
         val goalWithOwnEffort = item.copy(
             kind = "goal",
             flexibleConstraintsJson = """{"has_own_effort":true}""",
+            hasOwnEffort = true,
         )
         val routineWithOwnEffort = item.copy(
             kind = "routine",
             flexibleConstraintsJson = """{"has_own_effort":true}""",
+            hasOwnEffort = true,
         )
         assertTrue(goalWithOwnEffort.createsPlanningDemand(listOf(goalWithOwnEffort)))
         assertTrue(routineWithOwnEffort.createsPlanningDemand(listOf(routineWithOwnEffort)))
@@ -117,6 +119,7 @@ class OnboardingReadinessProofTest {
         assertFalse(item.createsPlanningDemand(listOf(item, child)))
         val taskWithOwnEffort = taskParent.copy(
             flexibleConstraintsJson = """{"has_own_effort":true}""",
+            hasOwnEffort = true,
         )
         assertTrue(taskWithOwnEffort.createsPlanningDemand(listOf(taskWithOwnEffort, child)))
         val goalParent = goalWithOwnEffort.copy(isExecutable = false)
@@ -196,7 +199,10 @@ class OnboardingReadinessProofTest {
             OnboardingFirstItemCheck.CANONICAL_ITEM,
             canonical.copy(
                 canonicalItems = listOf(
-                    item.copy(flexibleConstraintsJson = """{"has_own_effort":true}"""),
+                    item.copy(
+                        flexibleConstraintsJson = """{"has_own_effort":true}""",
+                        hasOwnEffort = true,
+                    ),
                 ),
                 pendingCanonicalAuthoringMutations = listOf(childCreate),
             ).validatedOnboardingFirstItemCheck(),
@@ -259,7 +265,10 @@ class OnboardingReadinessProofTest {
             OnboardingFirstItemCheck.CANONICAL_ITEM,
             anchored.copy(
                 canonicalItems = listOf(
-                    leafParent.copy(flexibleConstraintsJson = """{"has_own_effort":true}"""),
+                    leafParent.copy(
+                        flexibleConstraintsJson = """{"has_own_effort":true}""",
+                        hasOwnEffort = true,
+                    ),
                     rootChild,
                 ),
                 pendingCanonicalAuthoringMutations = listOf(moveIntoParent),

@@ -92,9 +92,20 @@ class CanonicalAuthoringStoreTest {
             store.bindCanonicalAuthoringMutation(MUTATION_ID, ORIGIN, CONFIGURATION_ID),
         ).mutation
         assertEquals(queued.idempotencyKey, bound.idempotencyKey)
+        val upgradedStore = PlannerStore(
+            store.state.value.copy(
+                pendingCanonicalAuthoringMutations = listOf(
+                    bound.copy(
+                        durationRequestShapeVersion = PendingCanonicalAuthoringMutation
+                            .LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+                    ),
+                ),
+            ),
+            nowEpochMillis = { NOW_MILLIS },
+        )
 
         val updated = requireNotNull(
-            store.updateCanonicalAuthoringDraft(
+            upgradedStore.updateCanonicalAuthoringDraft(
                 MUTATION_ID,
                 taskDraft().copy(title = "Edited before the first send"),
             ),
@@ -108,7 +119,11 @@ class CanonicalAuthoringStoreTest {
         assertNull(updated.syncOrigin)
         assertNull(updated.configurationId)
         assertFalse(updated.isSubmitted)
-        assertEquals(updated, store.state.value.pendingCanonicalAuthoringMutations.single())
+        assertEquals(
+            PendingCanonicalAuthoringMutation.CURRENT_DURATION_REQUEST_SHAPE_VERSION,
+            updated.durationRequestShapeVersion,
+        )
+        assertEquals(updated, upgradedStore.state.value.pendingCanonicalAuthoringMutations.single())
     }
 
     @Test

@@ -134,8 +134,16 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
     let status: DayWeaveCanonicalItemStatus
     let title: String
     let timezoneName: String
+    let durationKind: DayWeaveDurationKind
+    let durationMinimumSeconds: UInt32?
     let durationSeconds: UInt32?
+    let durationMaximumSeconds: UInt32?
+    let durationSource: DayWeaveDurationSource?
+    let deadlineKind: DayWeaveDeadlineKind
+    let deadlineDate: String?
     let deadlineAt: Date?
+    let deadlineStrength: DayWeaveDeadlineStrength?
+    let deadlineSoftWeight: UInt32?
     let earliestStartAt: Date?
     let recurrence: JSONValue?
     let flexibleConstraints: JSONValue
@@ -144,29 +152,45 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
     let urgency: UInt8
     let parentID: UUID?
     let siblingOrder: UInt32
+    let hasOwnEffort: Bool
     let isExecutable: Bool
     let revision: UInt64
     let createdAt: Date
     let updatedAt: Date
     let completedAt: Date?
     let deletedAt: Date?
+    let blockedReasonKind: DayWeaveBlockedReasonKind?
+    let blockedByItemID: UUID?
+    let blockedReason: String?
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, status, title, notes, recurrence, importance, urgency, revision
         case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
+        case durationKind = "duration_kind"
+        case durationMinimumSeconds = "duration_min_seconds"
         case durationSeconds = "duration_seconds"
+        case durationMaximumSeconds = "duration_max_seconds"
+        case durationSource = "duration_source"
+        case deadlineKind = "deadline_kind"
+        case deadlineDate = "deadline_date"
         case deadlineAt = "deadline_at"
+        case deadlineStrength = "deadline_strength"
+        case deadlineSoftWeight = "deadline_soft_weight"
         case earliestStartAt = "earliest_start_at"
         case flexibleConstraints = "flexible_constraints"
         case splitPolicy = "split_policy"
         case parentID = "parent_id"
         case siblingOrder = "sibling_order"
+        case hasOwnEffort = "has_own_effort"
         case isExecutable = "is_executable"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case completedAt = "completed_at"
         case deletedAt = "deleted_at"
+        case blockedReasonKind = "blocked_reason_kind"
+        case blockedByItemID = "blocked_by_item_id"
+        case blockedReason = "blocked_reason"
     }
 
     init(validating item: DayWeaveCanonicalItem) throws {
@@ -175,7 +199,8 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         // reproduce arbitrary JSON tokens byte-for-byte, so decoded numeric
         // values in known recurrence/constraint fields remain usable.
         guard item.unsupportedFields.isEmpty,
-              !item.hasExplicitStructuralMetadata,
+              item.retainedUnrepresentableDeadlineAt == nil,
+              item.retainedUnrepresentableEarliestStartAt == nil,
               item.revision > 0 else {
             throw SchedulerHelperClientError.unsupportedCanonicalItem
         }
@@ -188,6 +213,21 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         if case .unknown = item.splitPolicy {
             throw SchedulerHelperClientError.unsupportedCanonicalItem
         }
+        if case .unsupported = item.durationKind {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        if case .unsupported? = item.durationSource {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        if case .unsupported = item.deadlineKind {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        if case .unsupported? = item.deadlineStrength {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        if case .unsupported? = item.blockedReasonKind {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
 
         id = item.id
         isSensitive = item.isSensitive
@@ -195,8 +235,16 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         status = item.status
         title = item.title
         timezoneName = item.timezoneName
+        durationKind = item.durationKind
+        durationMinimumSeconds = item.durationMinimumSeconds
         durationSeconds = item.durationSeconds
+        durationMaximumSeconds = item.durationMaximumSeconds
+        durationSource = item.durationSource
+        deadlineKind = item.deadlineKind
+        deadlineDate = item.deadlineDate
         deadlineAt = item.deadlineAt
+        deadlineStrength = item.deadlineStrength
+        deadlineSoftWeight = item.deadlineSoftWeight
         earliestStartAt = item.earliestStartAt
         recurrence = item.recurrence
         flexibleConstraints = item.flexibleConstraints
@@ -205,12 +253,16 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         urgency = item.urgency
         parentID = item.parentID
         siblingOrder = item.siblingOrder
+        hasOwnEffort = item.hasOwnEffort
         isExecutable = item.isExecutable
         revision = item.revision
         createdAt = item.createdAt
         updatedAt = item.updatedAt
         completedAt = item.completedAt
         deletedAt = item.deletedAt
+        blockedReasonKind = item.blockedReasonKind
+        blockedByItemID = item.blockedByItemID
+        blockedReason = item.blockedReason
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -222,10 +274,28 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         try container.encode(title, forKey: .title)
         try container.encodeNil(forKey: .notes)
         try container.encode(timezoneName, forKey: .timezoneName)
+        try container.encode(durationKind, forKey: .durationKind)
+        try container.encodeIfPresent(durationMinimumSeconds, forKey: .durationMinimumSeconds)
+        if durationMinimumSeconds == nil {
+            try container.encodeNil(forKey: .durationMinimumSeconds)
+        }
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
         if durationSeconds == nil { try container.encodeNil(forKey: .durationSeconds) }
+        try container.encodeIfPresent(durationMaximumSeconds, forKey: .durationMaximumSeconds)
+        if durationMaximumSeconds == nil {
+            try container.encodeNil(forKey: .durationMaximumSeconds)
+        }
+        try container.encodeIfPresent(durationSource, forKey: .durationSource)
+        if durationSource == nil { try container.encodeNil(forKey: .durationSource) }
+        try container.encode(deadlineKind, forKey: .deadlineKind)
+        try container.encodeIfPresent(deadlineDate, forKey: .deadlineDate)
+        if deadlineDate == nil { try container.encodeNil(forKey: .deadlineDate) }
         try container.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
         if deadlineAt == nil { try container.encodeNil(forKey: .deadlineAt) }
+        try container.encodeIfPresent(deadlineStrength, forKey: .deadlineStrength)
+        if deadlineStrength == nil { try container.encodeNil(forKey: .deadlineStrength) }
+        try container.encodeIfPresent(deadlineSoftWeight, forKey: .deadlineSoftWeight)
+        if deadlineSoftWeight == nil { try container.encodeNil(forKey: .deadlineSoftWeight) }
         try container.encodeIfPresent(earliestStartAt, forKey: .earliestStartAt)
         if earliestStartAt == nil { try container.encodeNil(forKey: .earliestStartAt) }
         try container.encodeIfPresent(recurrence, forKey: .recurrence)
@@ -237,6 +307,7 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(parentID, forKey: .parentID)
         if parentID == nil { try container.encodeNil(forKey: .parentID) }
         try container.encode(siblingOrder, forKey: .siblingOrder)
+        try container.encode(hasOwnEffort, forKey: .hasOwnEffort)
         try container.encode(isExecutable, forKey: .isExecutable)
         try container.encode(revision, forKey: .revision)
         try container.encode(createdAt, forKey: .createdAt)
@@ -245,6 +316,12 @@ struct SchedulerHelperCanonicalItemWire: Encodable, Equatable, Sendable {
         if completedAt == nil { try container.encodeNil(forKey: .completedAt) }
         try container.encodeIfPresent(deletedAt, forKey: .deletedAt)
         if deletedAt == nil { try container.encodeNil(forKey: .deletedAt) }
+        try container.encodeIfPresent(blockedReasonKind, forKey: .blockedReasonKind)
+        if blockedReasonKind == nil { try container.encodeNil(forKey: .blockedReasonKind) }
+        try container.encodeIfPresent(blockedByItemID, forKey: .blockedByItemID)
+        if blockedByItemID == nil { try container.encodeNil(forKey: .blockedByItemID) }
+        try container.encodeIfPresent(blockedReason, forKey: .blockedReason)
+        if blockedReason == nil { try container.encodeNil(forKey: .blockedReason) }
     }
 }
 

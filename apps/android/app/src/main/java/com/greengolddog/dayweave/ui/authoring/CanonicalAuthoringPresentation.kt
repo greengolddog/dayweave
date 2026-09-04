@@ -463,23 +463,23 @@ private data class AuthoringNode(
                 parentId = decoded?.parentId ?: item.parentId,
                 siblingOrder = decoded?.siblingOrder ?: item.siblingOrder,
                 durationKind = if (usesPendingDraft) {
-                    inferredDurationKind(presentedDuration)
+                    requireNotNull(decoded).durationKind
                 } else {
                     item.durationKind
                 },
                 durationMinSeconds = if (usesPendingDraft) {
-                    presentedDuration
+                    requireNotNull(decoded).durationMinSeconds
                 } else {
                     item.durationMinSeconds
                 },
                 durationSeconds = presentedDuration,
                 durationMaxSeconds = if (usesPendingDraft) {
-                    presentedDuration
+                    requireNotNull(decoded).durationMaxSeconds
                 } else {
                     item.durationMaxSeconds
                 },
                 durationSource = if (usesPendingDraft) {
-                    inferredDurationSource(presentedDuration)
+                    requireNotNull(decoded).durationSource
                 } else {
                     item.durationSource
                 },
@@ -522,11 +522,11 @@ private data class AuthoringNode(
             placement = draft.placement,
             parentId = draft.parentId,
             siblingOrder = draft.siblingOrder,
-            durationKind = inferredDurationKind(draft.durationSeconds),
-            durationMinSeconds = draft.durationSeconds,
+            durationKind = draft.durationKind,
+            durationMinSeconds = draft.durationMinSeconds,
             durationSeconds = draft.durationSeconds,
-            durationMaxSeconds = draft.durationSeconds,
-            durationSource = inferredDurationSource(draft.durationSeconds),
+            durationMaxSeconds = draft.durationMaxSeconds,
+            durationSource = draft.durationSource,
             deadlineKind = inferredDeadlineKind(draft.kind.name.lowercase(), draft.deadlineAt),
             deadlineAt = draft.deadlineAt,
             deadlineDate = null,

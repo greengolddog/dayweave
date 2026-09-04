@@ -2102,6 +2102,8 @@ class PlannerStore(
             ) { "Only an unsent create or replacement draft can be edited" }
             val replacement = existing.copy(
                 draft = draft.normalized(),
+                durationRequestShapeVersion = PendingCanonicalAuthoringMutation
+                    .CURRENT_DURATION_REQUEST_SHAPE_VERSION,
                 // A crash can leave a persistently bound request before its submission
                 // generation. Editing is safe only because no network byte left; make the
                 // next sync bind the changed body again under the active credentials.

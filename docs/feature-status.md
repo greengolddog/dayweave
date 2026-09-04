@@ -72,8 +72,8 @@ integration, or verification checkpoint; the notes state what prevents 100%.
 
 | In-progress feature slice | Approx. complete | Evidence and next checkpoint |
 | --- | ---: | --- |
-| Native rich duration shape and provenance | **90%** | Exact, ranged, and unknown durations are implemented across both native editors and persistence migrations; complete the full macOS and Android regression gates and commit the verified slice. |
-| General habit minimum spacing | **90%** | Shared stricter-floor scheduling semantics and both native authoring paths are implemented; complete cross-platform contract/build verification and commit the slice. |
+| Native rich duration shape and provenance | **95%** | Exact, ranged, and unknown durations, provenance, rollback-safe persistence, and request replay are covered by the full macOS and Android gates; close the controlled native/service contract run and device acceptance. |
+| General habit minimum spacing | **95%** | Both native authoring paths and every shared recurrence family enforce the stricter applicable floor with explicit unmet demand; close the controlled native/service run and device acceptance. |
 | Missed-occurrence skip/carry/reduce/ask workflow | **55%** | Core policies and lifecycle primitives exist and the durable server resolution path is under integration; finish contextual validation, scheduling effects, native review/action surfaces, and end-to-end tests. |
 | Controlled native-client/service habit integration | **35%** | The real HTTP/PostgreSQL service path is covered independently and native transports have contract coverage; run both native clients against the same controlled service and prove convergence. |
 | Full habit lifecycle on macOS and Android | **65%** | Occurrence, correction, pause, analytics, invalidation, offline replay, conflict, and recomposition behavior has broad automated coverage; close the controlled-service and native UI acceptance matrix. |
@@ -101,11 +101,11 @@ percentage.
 | Product area | Status | Approx. complete | Work still required for full acceptance |
 | --- | --- | ---: | --- |
 | Identity and accounts (`ID`) | **In progress** | **60%** | Finish session inventory/revocation UI, recovery flow, integration disconnect/reconnect parity, and final managed Codex login verification on both platforms. |
-| Common item model (`DOM`) | **In progress** | **65%** | Complete every rich field, template, bulk operation, progress mode, audit/undo presentation, and cross-platform editing path. |
+| Common item model (`DOM`) | **In progress** | **70%** | Complete the remaining rich fields, templates, bulk operations, progress modes, audit/undo presentation, and cross-platform editing paths. |
 | Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
-| Scheduling restrictions and profiles (`CON`) | **In progress** | **60%** | Close every per-item hard/soft restriction, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence case. |
+| Scheduling restrictions and profiles (`CON`) | **In progress** | **65%** | Close the remaining per-item hard/soft restrictions, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence cases. |
 | Scheduler intelligence (`SCH`) | **In progress** | **55%** | Complete configurable objective ordering, movement-cost tuning, alternatives/what-if, overload resolution, fragile-deadline warnings, “Why here?”, learned preference controls, and 90-day performance proof. |
-| Habits (`HAB`) | **In progress** | **80%** | Preserve rich duration shape/provenance during native edits, expose general minimum spacing, complete the missed-occurrence policy workflow, run native-client/service E2E, verify macOS and Pixel 11 builds, and finish the seven-day trial. |
+| Habits (`HAB`) | **In progress** | **85%** | Complete the missed-occurrence policy workflow, run native-client/service E2E, verify macOS and Pixel 11 builds, and finish the seven-day trial. |
 | Active execution (`EXE`) | **In progress** | **65%** | Add Focus/DND mappings, inactivity correction, duration-learning controls, Pomodoro/mandatory-break settings, and full cross-device/UI coverage. |
 | Google Calendar (`GCAL`) | **In progress** | **45%** | Complete full bidirectional parity for series scopes, attendees/RSVP, conferencing, attachments, flexible-event moves, birthdays/observances, OOO/free/tentative policy, conflicts, travel, density, and notification ownership. |
 | Google Tasks (`GTASK`) | **In progress** | **45%** | Finish bidirectional field/list parity, external completion/deletion/due-date reactions, shared conflict/undo behavior, and controlled real-account tests. |

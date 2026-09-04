@@ -83,7 +83,7 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(ledger, restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V17, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V18, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("Good start"))
         assertTrue(restored.habitLedger.toString().contains("content=<redacted>"))
         assertTrue(
@@ -103,7 +103,7 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(HabitLedgerSnapshot(), restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V17, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V18, dao.snapshot?.payloadFormat)
     }
 
     @Test

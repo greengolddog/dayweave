@@ -729,8 +729,13 @@ struct DayWeaveAPIClientTests {
         #expect((create["split_policy"] as? [String: Any])?["type"] as? String == "splittable")
         let replace = try #require(requests[1].jsonBody)
         #expect((replace["expected_revision"] as? NSNumber)?.uint64Value == 1)
-        #expect((replace["item"] as? [String: Any])?["status"] as? String == "paused")
-        #expect((replace["item"] as? [String: Any])?["is_sensitive"] as? Bool == false)
+        let replaceItem = try #require(replace["item"] as? [String: Any])
+        #expect(replaceItem["status"] as? String == "paused")
+        #expect(replaceItem["is_sensitive"] as? Bool == false)
+        #expect(replaceItem["duration_kind"] == nil)
+        #expect(replaceItem["duration_min_seconds"] == nil)
+        #expect(replaceItem["duration_max_seconds"] == nil)
+        #expect(replaceItem["duration_source"] == nil)
     }
 
     @Test("canonical list carries exact filters and decodes items")

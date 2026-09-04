@@ -1,6 +1,8 @@
 package com.greengolddog.dayweave.scheduler
 
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import java.util.concurrent.CountDownLatch
@@ -40,6 +42,47 @@ class RustScheduleComposerTest {
         assertTrue(encoded.contains("\"notes\":null"))
         assertTrue(encoded.contains("\"operation\":\"compose\""))
         assertTrue(encoded.contains("\"split_policy\":{\"type\":\"indivisible\"}"))
+    }
+
+    @Test
+    fun `request preserves ranged duration provenance and general habit spacing`() {
+        val richHabit = item().copy(
+            kind = "habit",
+            durationSeconds = 1_800,
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 1_200,
+            durationMaxSeconds = 2_400,
+            durationSource = CanonicalDurationSource.LEARNED,
+            flexibleConstraintsJson = "{\"habit_minimum_spacing_minutes\":90}",
+            hasExplicitStructuralMetadata = true,
+        )
+
+        val encoded = RustScheduleComposer(bridge = { error("not called") })
+            .encodeRequest(listOf(richHabit), request())
+            .toString(Charsets.UTF_8)
+
+        assertTrue(encoded.contains("\"duration_kind\":\"range\""))
+        assertTrue(encoded.contains("\"duration_min_seconds\":1200"))
+        assertTrue(encoded.contains("\"duration_seconds\":1800"))
+        assertTrue(encoded.contains("\"duration_max_seconds\":2400"))
+        assertTrue(encoded.contains("\"duration_source\":\"learned\""))
+        assertTrue(encoded.contains("\"habit_minimum_spacing_minutes\":90"))
+    }
+
+    @Test
+    fun `future duration provenance remains outside the local composer boundary`() {
+        val future = item().copy(
+            durationSource = CanonicalDurationSource("future_estimator_v2"),
+            hasExplicitStructuralMetadata = true,
+        )
+
+        try {
+            RustScheduleComposer(bridge = { error("not called") })
+                .encodeRequest(listOf(future), request())
+            fail("Future duration provenance was composed")
+        } catch (error: LocalScheduleCompositionRequestException) {
+            assertNull(error.cause)
+        }
     }
 
     @Test

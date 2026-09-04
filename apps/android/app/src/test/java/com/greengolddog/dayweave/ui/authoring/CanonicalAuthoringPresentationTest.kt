@@ -110,6 +110,53 @@ class CanonicalAuthoringPresentationTest {
     }
 
     @Test
+    fun pendingCreateAndReplacePresentTheirRangedAssistantDurationExactly() {
+        val rangedDraft = CanonicalItemDraft(
+            placement = CanonicalDraftPlacement.PLANNED,
+            title = "Ranged draft",
+            timezoneName = "UTC",
+            durationSeconds = 3_600,
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 1_800,
+            durationMaxSeconds = 5_400,
+            durationSource = CanonicalDurationSource.ASSISTANT,
+        )
+        val create = PendingCanonicalAuthoringMutation(
+            id = CONFLICT_MUTATION_ID,
+            itemId = CONFLICT_ITEM_ID,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = rangedDraft,
+            createdAt = NOW,
+        )
+        val createRow = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(pendingCanonicalAuthoringMutations = listOf(create)),
+        ).planned.single()
+        assertEquals(CanonicalDurationKind.RANGE, createRow.durationKind)
+        assertEquals(CanonicalDurationSource.ASSISTANT, createRow.durationSource)
+        assertEquals("30m–90m · expected 1h · Assistant", canonicalDurationLabel(createRow))
+
+        val canonical = item(PARENT_ID, "Server exact", "planned")
+        val replace = PendingCanonicalAuthoringMutation(
+            id = REPLACE_MUTATION_ID,
+            itemId = canonical.id,
+            operation = CanonicalAuthoringOperation.REPLACE,
+            draft = rangedDraft.copy(title = "Ranged replacement"),
+            expectedRevision = canonical.revision,
+            baseItem = canonical,
+            createdAt = NOW,
+        )
+        val replaceRow = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(
+                canonicalItems = listOf(canonical),
+                pendingCanonicalAuthoringMutations = listOf(replace),
+            ),
+        ).planned.single()
+        assertEquals(CanonicalDurationKind.RANGE, replaceRow.durationKind)
+        assertEquals(CanonicalDurationSource.ASSISTANT, replaceRow.durationSource)
+        assertEquals("30m–90m · expected 1h · Assistant", canonicalDurationLabel(replaceRow))
+    }
+
+    @Test
     fun graphAuthorityMetadataRemainsVisibleWithClearReadOnlyDiagnostic() {
         val item = item(PARENT_ID, "Linked task", "inbox").copy(
             flexibleConstraintsJson =

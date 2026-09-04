@@ -937,6 +937,7 @@ data class CanonicalFlexibleConstraintsDraft(
     val goalIds: List<String> = emptyList(),
     val habitTarget: CanonicalHabitTargetDraft? = null,
     val preservesStreakWhenPaused: Boolean? = null,
+    val habitMinimumSpacingMinutes: Long = 0,
     val routineOrdered: Boolean? = null,
     val goalMeasures: List<CanonicalGoalMeasureDraft>? = null,
     val goalWeeklyAllocation: CanonicalWeeklyAllocationDraft? = null,
@@ -989,6 +990,9 @@ data class CanonicalFlexibleConstraintsDraft(
             "Goal references must identify distinct items"
         }
         habitTarget?.requireValid()
+        require(habitMinimumSpacingMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES) {
+            "Habit minimum spacing must be at most $MAX_SCHEDULING_OFFSET_MINUTES minutes"
+        }
         goalMeasures?.forEach(CanonicalGoalMeasureDraft::requireValid)
         goalWeeklyAllocation?.requireValid()
         if (eventTiming != null) {
@@ -997,6 +1001,7 @@ data class CanonicalFlexibleConstraintsDraft(
                     minimumGapMinutes == 0L && maximumSessions == null &&
                     maximumSplitDays == null && energyStrength == null && scheduling == null &&
                     hasOwnEffort == null && habitTarget == null &&
+                    habitMinimumSpacingMinutes == 0L &&
                     goalIds.isEmpty() &&
                     preservesStreakWhenPaused == null && routineOrdered == null &&
                     goalMeasures == null && goalWeeklyAllocation == null &&
@@ -1035,6 +1040,9 @@ data class CanonicalFlexibleConstraintsDraft(
             }
             habitTarget?.let { put("habit_target", it.toCanonicalJson()) }
             preservesStreakWhenPaused?.let { put("preserves_streak_when_paused", it) }
+            if (habitMinimumSpacingMinutes > 0) {
+                put("habit_minimum_spacing_minutes", habitMinimumSpacingMinutes)
+            }
             routineOrdered?.let { put("routine_ordered", it) }
             goalMeasures?.let { measures ->
                 put("goal_measures", JsonArray(measures.map { it.toCanonicalJson() }))
@@ -1110,6 +1118,18 @@ data class CanonicalItemDraft(
     val notes: String? = null,
     val timezoneName: String,
     val durationSeconds: Long? = null,
+    val durationKind: CanonicalDurationKind = if (durationSeconds == null) {
+        CanonicalDurationKind.UNKNOWN
+    } else {
+        CanonicalDurationKind.EXACT
+    },
+    val durationMinSeconds: Long? = durationSeconds,
+    val durationMaxSeconds: Long? = durationSeconds,
+    val durationSource: CanonicalDurationSource? = if (durationSeconds == null) {
+        null
+    } else {
+        CanonicalDurationSource.USER
+    },
     val deadlineAt: String? = null,
     val earliestStartAt: String? = null,
     val recurrence: CanonicalRecurrenceDraft? = null,
@@ -1121,12 +1141,35 @@ data class CanonicalItemDraft(
     val siblingOrder: Long = 0,
     val eventTiming: CanonicalEventTimingDraft? = null,
 ) {
-    fun normalized(): CanonicalItemDraft = copy(
-        title = title.trim(),
-        notes = notes?.takeUnless(String::isBlank),
-        recurrence = recurrence?.normalized(),
-        constraints = constraints.normalized(),
-    )
+    fun normalized(): CanonicalItemDraft {
+        val normalizedDuration = when {
+            durationKind == CanonicalDurationKind.EXACT && durationSeconds == null ->
+                CanonicalDraftDuration.unknown()
+            durationKind == CanonicalDurationKind.UNKNOWN && durationSeconds != null ->
+                CanonicalDraftDuration.exact(durationSeconds)
+            durationKind == CanonicalDurationKind.EXACT &&
+                (durationMinSeconds != durationSeconds || durationMaxSeconds != durationSeconds) ->
+                CanonicalDraftDuration.exact(requireNotNull(durationSeconds))
+            else -> CanonicalDraftDuration(
+                durationKind,
+                durationMinSeconds,
+                durationSeconds,
+                durationMaxSeconds,
+                durationSource,
+            )
+        }
+        return copy(
+            title = title.trim(),
+            notes = notes?.takeUnless(String::isBlank),
+            durationKind = normalizedDuration.kind,
+            durationMinSeconds = normalizedDuration.minimum,
+            durationSeconds = normalizedDuration.expected,
+            durationMaxSeconds = normalizedDuration.maximum,
+            durationSource = normalizedDuration.source,
+            recurrence = recurrence?.normalized(),
+            constraints = constraints.normalized(),
+        )
+    }
 
     fun requireValid(itemId: String) {
         val value = normalized()
@@ -1138,7 +1181,7 @@ data class CanonicalItemDraft(
             (value.notes?.let { it.codePointCount(0, it.length) } ?: 0) <= MAX_NOTES_CHARS,
         )
         requireCanonicalTimezoneName(value.timezoneName)
-        require(value.durationSeconds == null || value.durationSeconds in 1..MAX_DURATION_SECONDS)
+        requireCanonicalDraftDuration(value)
         val earliest = value.earliestStartAt?.let {
             requireCanonicalInstant(it, "canonical earliest start")
         }
@@ -1183,6 +1226,9 @@ data class CanonicalItemDraft(
             requireCanonicalUuid(it, "canonical draft parent")
             require(it != itemId) { "An item cannot be its own parent" }
         }
+        require(
+            value.kind == ItemKind.HABIT || value.constraints.habitMinimumSpacingMinutes == 0L,
+        ) { "Habit minimum spacing is only valid for habit items" }
         when (value.kind) {
             ItemKind.PROJECT -> error(
                 "Project structure is read-only until typed structural authoring is available",
@@ -1316,7 +1362,7 @@ data class CanonicalItemDraft(
             value.timezoneName,
             value.durationSeconds,
         )
-        !item.hasExplicitStructuralMetadata && item.deletedAt == null &&
+        item.deletedAt == null && item.supportsCanonicalDraftStructure() &&
             item.kind == value.kind.name.lowercase() &&
             item.status == value.placement.wireValue &&
             item.isSensitive == value.isSensitive &&
@@ -1324,6 +1370,10 @@ data class CanonicalItemDraft(
             item.notes == value.notes &&
             item.timezoneName == value.timezoneName &&
             item.durationSeconds == value.durationSeconds &&
+            item.durationKind == value.durationKind &&
+            item.durationMinSeconds == value.durationMinSeconds &&
+            item.durationMaxSeconds == value.durationMaxSeconds &&
+            item.durationSource == value.durationSource &&
             sameInstant(item.deadlineAt, value.deadlineAt) &&
             sameInstant(item.earliestStartAt, value.earliestStartAt) &&
             normalizedRecurrenceJson(item.recurrenceJson) ==
@@ -1391,6 +1441,7 @@ data class PendingCanonicalAuthoringMutation(
     val baseItem: CanonicalItemSnapshot? = null,
     val idempotencyKey: String = "android-item-$id",
     val createdAt: String,
+    val durationRequestShapeVersion: Int = CURRENT_DURATION_REQUEST_SHAPE_VERSION,
     val syncOrigin: String? = null,
     val configurationId: String? = null,
     val submittedAt: String? = null,
@@ -1404,6 +1455,10 @@ data class PendingCanonicalAuthoringMutation(
         requireCanonicalUuid(id, "canonical authoring mutation")
         requireCanonicalUuid(itemId, "canonical authoring item")
         require(idempotencyKey == "android-item-$id")
+        require(durationRequestShapeVersion in setOf(
+            LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+            CURRENT_DURATION_REQUEST_SHAPE_VERSION,
+        ))
         val created = requireCanonicalInstant(createdAt, "canonical authoring creation")
         require(syncOrigin != null || configurationId == null)
         syncOrigin?.let(::requireCanonicalOrigin)
@@ -1445,8 +1500,33 @@ data class PendingCanonicalAuthoringMutation(
                         baseItem.revision == expectedRevision && baseItem.deletedAt != null),
             )
         }
+        if (durationRequestShapeVersion == LEGACY_DURATION_REQUEST_SHAPE_VERSION) {
+            require(operation == CanonicalAuthoringOperation.CREATE ||
+                operation == CanonicalAuthoringOperation.REPLACE)
+            val value = requireNotNull(draft).normalized()
+            require(
+                value.durationKind == CanonicalDurationKind.UNKNOWN &&
+                    value.durationMinSeconds == null && value.durationSeconds == null &&
+                    value.durationMaxSeconds == null && value.durationSource == null ||
+                    value.durationKind == CanonicalDurationKind.EXACT &&
+                    value.durationSeconds != null &&
+                    value.durationMinSeconds == value.durationSeconds &&
+                    value.durationMaxSeconds == value.durationSeconds &&
+                    value.durationSource == CanonicalDurationSource.USER,
+            ) { "Legacy duration request shape can represent only unknown or exact user duration" }
+        }
         require(expectedRevision == null || expectedRevision > 0)
-        draft?.requireValid(itemId)
+        draft?.let { rawDraft ->
+            val normalizedDraft = rawDraft.normalized()
+            require(
+                rawDraft.durationKind == normalizedDraft.durationKind &&
+                    rawDraft.durationMinSeconds == normalizedDraft.durationMinSeconds &&
+                    rawDraft.durationSeconds == normalizedDraft.durationSeconds &&
+                    rawDraft.durationMaxSeconds == normalizedDraft.durationMaxSeconds &&
+                    rawDraft.durationSource == normalizedDraft.durationSource,
+            ) { "Persisted duration metadata must already be canonical" }
+            rawDraft.requireValid(itemId)
+        }
         baseItem?.requireCanonicalAuthoringShape()
         require(
             canonicalAuthoringMutationBytes(this) <=
@@ -1456,9 +1536,87 @@ data class PendingCanonicalAuthoringMutation(
 
     companion object {
         const val CURRENT_VERSION = 1
+        const val LEGACY_DURATION_REQUEST_SHAPE_VERSION = 1
+        const val CURRENT_DURATION_REQUEST_SHAPE_VERSION = 2
         private const val MAX_BINDING_BYTES = 4_096
         const val MAX_DIAGNOSTIC_CHARS = 500
     }
+}
+
+private data class CanonicalDraftDuration(
+    val kind: CanonicalDurationKind,
+    val minimum: Long?,
+    val expected: Long?,
+    val maximum: Long?,
+    val source: CanonicalDurationSource?,
+) {
+    companion object {
+        fun unknown() = CanonicalDraftDuration(
+            CanonicalDurationKind.UNKNOWN,
+            null,
+            null,
+            null,
+            null,
+        )
+
+        fun exact(value: Long) = CanonicalDraftDuration(
+            CanonicalDurationKind.EXACT,
+            value,
+            value,
+            value,
+            CanonicalDurationSource.USER,
+        )
+    }
+}
+
+private fun requireCanonicalDraftDuration(value: CanonicalItemDraft) {
+    require(value.durationKind.isSupported) { "Unsupported duration kind is read-only" }
+    require(value.durationSource?.isSupported != false) {
+        "Unsupported duration source is read-only"
+    }
+    val values = listOfNotNull(
+        value.durationMinSeconds,
+        value.durationSeconds,
+        value.durationMaxSeconds,
+    )
+    require(values.all { it in 1..CanonicalItemDraft.MAX_DURATION_SECONDS }) {
+        "Duration must be positive and within the supported maximum"
+    }
+    when (value.durationKind) {
+        CanonicalDurationKind.UNKNOWN -> require(
+            value.durationMinSeconds == null && value.durationSeconds == null &&
+                value.durationMaxSeconds == null && value.durationSource == null,
+        ) { "Unknown duration cannot carry duration values or a source" }
+        CanonicalDurationKind.EXACT -> require(
+            value.durationSeconds != null && value.durationMinSeconds == value.durationSeconds &&
+                value.durationMaxSeconds == value.durationSeconds && value.durationSource != null,
+        ) { "Exact duration requires one value and a source" }
+        CanonicalDurationKind.RANGE -> require(
+            value.durationMinSeconds != null && value.durationSeconds != null &&
+                value.durationMaxSeconds != null &&
+                value.durationMinSeconds < value.durationMaxSeconds &&
+                value.durationMinSeconds <= value.durationSeconds &&
+                value.durationSeconds <= value.durationMaxSeconds &&
+                value.durationSource != null,
+        ) { "Ranged duration requires minimum, expected, maximum, and source" }
+        else -> error("Unsupported duration kind is read-only")
+    }
+}
+
+/** Structural fields that this editor can round-trip without erasing richer server semantics. */
+private fun CanonicalItemSnapshot.supportsCanonicalDraftStructure(): Boolean {
+    if (!durationKind.isSupported || durationSource?.isSupported == false) return false
+    if (!deadlineKind.isSupported || deadlineStrength?.isSupported == false) return false
+    if (blockedReasonKind?.isSupported == false) return false
+    val legacyDeadline = if (kind == "event" || deadlineAt == null) {
+        deadlineKind == CanonicalDeadlineKind.NONE && deadlineDate == null &&
+            deadlineStrength == null && deadlineSoftWeight == null
+    } else {
+        deadlineKind == CanonicalDeadlineKind.DATE_TIME && deadlineDate == null &&
+            deadlineStrength == CanonicalDeadlineStrength.HARD && deadlineSoftWeight == null
+    }
+    return legacyDeadline && legacyHasOwnEffort(flexibleConstraintsJson) == hasOwnEffort &&
+        blockedReasonKind == null && blockedByItemId == null && blockedReason == null
 }
 
 @Serializable
@@ -1530,6 +1688,10 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
         notes = notes,
         timezoneName = timezoneName,
         durationSeconds = durationSeconds,
+        durationKind = durationKind,
+        durationMinSeconds = durationMinSeconds,
+        durationMaxSeconds = durationMaxSeconds,
+        durationSource = durationSource,
         deadlineAt = deadlineAt,
         earliestStartAt = earliestStartAt,
         recurrence = recurrenceValue,
@@ -1574,8 +1736,8 @@ internal fun CanonicalItemSnapshot.decodeCanonicalFlexibleConstraints():
  * row must remain trashable (and an exact tombstone restorable).
  */
 internal fun CanonicalItemSnapshot.requireCanonicalReplacementSupport(): CanonicalItemDraft {
-    require(!hasExplicitStructuralMetadata) {
-        "Typed structural metadata is read-only until full-item authoring supports it"
+    require(supportsCanonicalDraftStructure()) {
+        "Unsupported typed structural metadata is read-only"
     }
     val roundTripped = toCanonicalDraft()
     require(roundTripped.matches(this)) {
@@ -1706,7 +1868,8 @@ private fun decodeCanonicalConstraints(
     val knownKeys = setOf(
         "energy", "tags", "preferred_start_minute", "minimum_gap_minutes",
         "maximum_sessions", "maximum_split_days", "constraints", "has_own_effort", "goal_ids",
-        "habit_target", "preserves_streak_when_paused", "routine_ordered",
+        "habit_target", "preserves_streak_when_paused", "habit_minimum_spacing_minutes",
+        "routine_ordered",
         "goal_measures", "goal_weekly_allocation", "break_category", "break_mandatory",
         "break_prompt_to_resume", "calendar_event", "calendar_context", "dayweave_firm_block",
     )
@@ -1791,6 +1954,10 @@ private fun decodeCanonicalConstraints(
             )
         },
         preservesStreakWhenPaused = objectValue.optionalBoolean("preserves_streak_when_paused"),
+        habitMinimumSpacingMinutes = objectValue.defaultLong(
+            "habit_minimum_spacing_minutes",
+            0,
+        ),
         routineOrdered = objectValue.optionalBoolean("routine_ordered"),
         goalMeasures = goalMeasures,
         goalWeeklyAllocation = objectValue.nullableObject("goal_weekly_allocation")?.let { allocation ->
@@ -1958,7 +2125,12 @@ private fun JsonObject.requireKindMetadataKeys(kind: ItemKind) {
         }
     }
     rejectUnless(ItemKind.EVENT, "calendar_event", "calendar_context", "dayweave_firm_block")
-    rejectUnless(ItemKind.HABIT, "habit_target", "preserves_streak_when_paused")
+    rejectUnless(
+        ItemKind.HABIT,
+        "habit_target",
+        "preserves_streak_when_paused",
+        "habit_minimum_spacing_minutes",
+    )
     rejectUnless(ItemKind.ROUTINE, "routine_ordered")
     rejectUnless(ItemKind.GOAL, "goal_measures", "goal_weekly_allocation")
     rejectUnless(

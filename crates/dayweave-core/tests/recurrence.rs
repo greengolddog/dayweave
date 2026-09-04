@@ -2097,6 +2097,249 @@ fn minimum_spacing_is_enforced_between_occurrence_starts() {
 }
 
 #[test]
+fn habit_and_frequency_minimum_spacing_use_the_stricter_floor() {
+    let mut item = habit_item(
+        140,
+        Recurrence::Frequency {
+            target: 3,
+            period: RecurrencePeriod::Day,
+            semantics: RecurrenceSemantics::Calendar,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes(600),
+            anchor: None,
+        },
+    );
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.minimum_spacing = Minutes(30);
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.availability = all_day_availability(START, 1);
+
+    let plan = Scheduler.plan(&input).unwrap();
+    let blocks: Vec<_> = plan.blocks_for(item.id).collect();
+    assert_eq!(blocks.len(), 3);
+    assert!((blocks[1].start - blocks[0].start) >= Duration::hours(10));
+    assert!((blocks[2].start - blocks[1].start) >= Duration::hours(10));
+}
+
+#[test]
+fn habit_minimum_spacing_extends_every_interval_occurrence_windows() {
+    let mut item = habit_item(
+        141,
+        Recurrence::EveryInterval {
+            interval: Minutes(120),
+        },
+    );
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.minimum_spacing = Minutes(600);
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.availability = all_day_availability(START, 1);
+
+    let occurrences = expand_occurrences(&input).unwrap();
+    assert_eq!(occurrences.len(), 12);
+    assert!(occurrences.iter().all(|occurrence| {
+        occurrence.nominal_end - occurrence.nominal_start == Duration::hours(10)
+    }));
+    let plan = Scheduler.plan(&input).unwrap();
+    let blocks = plan.blocks_for(item.id).collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(plan.unscheduled.len(), 10);
+    assert!(
+        plan.unscheduled
+            .iter()
+            .all(|work| { work.occurrence_id.is_some() && !work.message.is_empty() })
+    );
+    assert_eq!(
+        plan.unscheduled
+            .iter()
+            .filter(|work| work.reason == UnscheduledReason::NoCapacity)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        plan.unscheduled
+            .iter()
+            .filter(|work| work.reason == UnscheduledReason::DependencyUnavailable)
+            .count(),
+        9,
+    );
+    assert!(
+        blocks
+            .windows(2)
+            .all(|pair| { pair[1].start - pair[0].start >= Duration::hours(10) })
+    );
+
+    let source = occurrences[0];
+    let moved_start = START + Duration::hours(20);
+    let mut moved = input;
+    moved
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::minutes(30),
+                source: move_source(&item, &source),
+            },
+        });
+    assert!(expand_occurrences(&moved).is_ok());
+}
+
+#[test]
+fn habit_minimum_spacing_delays_after_completion_due_without_broadening_its_window() {
+    let mut item = habit_item(
+        142,
+        Recurrence::AfterCompletion {
+            interval: Minutes(180),
+        },
+    );
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.minimum_spacing = Minutes(600);
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input
+        .recurrence_context
+        .completion_anchors
+        .insert(item.id, START);
+
+    let occurrence = expand_occurrences(&input).unwrap()[0];
+    assert_eq!(occurrence.nominal_start, START + Duration::hours(10));
+    assert_eq!(occurrence.nominal_end, START + Duration::hours(13));
+
+    let moved_start = START + Duration::hours(20);
+    input
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: occurrence.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::minutes(30),
+                source: move_source(&item, &occurrence),
+            },
+        });
+    assert!(expand_occurrences(&input).is_ok());
+}
+
+#[test]
+fn habit_minimum_spacing_extends_rolling_frequency_occurrence_windows() {
+    let mut item = habit_item(
+        143,
+        Recurrence::Frequency {
+            target: 3,
+            period: RecurrencePeriod::Day,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes(600),
+            anchor: Some(START),
+        },
+    );
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.minimum_spacing = Minutes(30);
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.availability = all_day_availability(START, 1);
+
+    let occurrences = expand_occurrences(&input).unwrap();
+    assert_eq!(occurrences.len(), 3);
+    assert!(occurrences.iter().all(|occurrence| {
+        occurrence.nominal_end - occurrence.nominal_start == Duration::hours(10)
+    }));
+    let plan = Scheduler.plan(&input).unwrap();
+    let blocks = plan.blocks_for(item.id).collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 3);
+    assert!(
+        blocks
+            .windows(2)
+            .all(|pair| { pair[1].start - pair[0].start >= Duration::hours(10) })
+    );
+
+    let source = occurrences[0];
+    let moved_start = START + Duration::hours(20);
+    let mut moved = input;
+    moved
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::minutes(30),
+                source: move_source(&item, &source),
+            },
+        });
+    assert!(expand_occurrences(&moved).is_ok());
+}
+
+#[test]
+fn habit_minimum_spacing_extends_rolling_month_occurrence_windows() {
+    let mut item = habit_item(
+        144,
+        Recurrence::Frequency {
+            target: 4,
+            period: RecurrencePeriod::Month,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes(60),
+            anchor: Some(START),
+        },
+    );
+    let ItemKind::Habit(spec) = &mut item.kind else {
+        unreachable!();
+    };
+    spec.minimum_spacing = Minutes(14_400);
+    let mut input = request(item.clone(), START, datetime!(2026-10-01 0:00 UTC));
+    input.availability = all_day_availability(START, 30);
+
+    let occurrences = expand_occurrences(&input).unwrap();
+    assert_eq!(occurrences.len(), 4);
+    assert!(occurrences.iter().all(|occurrence| {
+        occurrence.nominal_end - occurrence.nominal_start == Duration::days(10)
+    }));
+    let plan = Scheduler.plan(&input).unwrap();
+    let blocks = plan.blocks_for(item.id).collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(plan.unscheduled.len(), 1);
+    assert!(
+        plan.unscheduled
+            .iter()
+            .all(|work| { work.occurrence_id.is_some() && !work.message.is_empty() })
+    );
+    assert_eq!(plan.unscheduled[0].reason, UnscheduledReason::NoCapacity);
+    assert!(
+        blocks
+            .windows(2)
+            .all(|pair| { pair[1].start - pair[0].start >= Duration::days(10) })
+    );
+
+    let source = occurrences[0];
+    let moved_start = START + Duration::days(20);
+    let mut moved = input;
+    moved
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::minutes(30),
+                source: move_source(&item, &source),
+            },
+        });
+    assert!(expand_occurrences(&moved).is_ok());
+}
+
+#[test]
 fn old_json_without_recurrence_fields_remains_readable() {
     let item = recurring_item(15, Recurrence::Daily { times_per_day: 1 });
     let input = request(item, START, START + Duration::days(1));

@@ -230,7 +230,7 @@ class CanonicalAuthoringModelsTest {
             ),
         )
         custom.requireValid(ITEM_ID)
-        assertEquals(custom, canonicalItem(custom).toCanonicalDraft())
+        assertEquals(custom.normalized(), canonicalItem(custom).toCanonicalDraft())
     }
 
     @Test
@@ -466,6 +466,41 @@ class CanonicalAuthoringModelsTest {
             baseItem = explicitSplitDefaults,
             createdAt = "2026-09-03T07:00:00Z",
         ).requireValid()
+    }
+
+    @Test
+    fun explicitOwnEffortMustMatchTheFlexibleConstraintBeforeReplacement() {
+        val richRoutine = canonicalItem(
+            CanonicalItemDraft(
+                placement = CanonicalDraftPlacement.PLANNED,
+                kind = ItemKind.ROUTINE,
+                title = "Assistant-sized routine",
+                timezoneName = "UTC",
+                durationSeconds = 2_700,
+                durationKind = CanonicalDurationKind.RANGE,
+                durationMinSeconds = 1_800,
+                durationMaxSeconds = 3_600,
+                durationSource = CanonicalDurationSource.ASSISTANT,
+                constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            ),
+        ).copy(
+            hasOwnEffort = true,
+            hasExplicitStructuralMetadata = true,
+        )
+
+        val replacement = richRoutine.requireCanonicalReplacementSupport()
+        assertEquals(CanonicalDurationKind.RANGE, replacement.durationKind)
+        assertEquals(CanonicalDurationSource.ASSISTANT, replacement.durationSource)
+        assertEquals(true, replacement.constraints.hasOwnEffort)
+        assertTrue(replacement.matches(richRoutine))
+
+        val missingFlexibleOwnEffort = richRoutine.copy(flexibleConstraintsJson = "{}")
+        assertThrows(IllegalArgumentException::class.java) {
+            missingFlexibleOwnEffort.requireCanonicalReplacementSupport()
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            missingFlexibleOwnEffort.toCanonicalDraft()
+        }
     }
 
     @Test
@@ -1193,7 +1228,9 @@ class CanonicalAuthoringModelsTest {
         ),
     )
 
-    private fun canonicalItem(draft: CanonicalItemDraft) = CanonicalItemSnapshot(
+    private fun canonicalItem(draft: CanonicalItemDraft): CanonicalItemSnapshot {
+        val draft = draft.normalized()
+        return CanonicalItemSnapshot(
         id = ITEM_ID,
         isSensitive = draft.isSensitive,
         kind = draft.kind.name.lowercase(),
@@ -1202,6 +1239,10 @@ class CanonicalAuthoringModelsTest {
         notes = draft.notes,
         timezoneName = draft.timezoneName,
         durationSeconds = draft.durationSeconds,
+        durationKind = draft.durationKind,
+        durationMinSeconds = draft.durationMinSeconds,
+        durationMaxSeconds = draft.durationMaxSeconds,
+        durationSource = draft.durationSource,
         deadlineAt = draft.deadlineAt,
         earliestStartAt = draft.earliestStartAt,
         recurrenceJson = draft.recurrence?.toCanonicalJson()?.toString(),
@@ -1219,7 +1260,10 @@ class CanonicalAuthoringModelsTest {
         revision = 1,
         createdAt = "2026-08-30T10:00:00Z",
         updatedAt = "2026-08-30T10:00:00Z",
-    )
+        hasExplicitStructuralMetadata = draft.durationKind == CanonicalDurationKind.RANGE ||
+            draft.durationSource !in setOf(null, CanonicalDurationSource.USER),
+        )
+    }
 
     private fun stableUuid(seed: String): String =
         UUID.nameUUIDFromBytes(seed.toByteArray()).toString()

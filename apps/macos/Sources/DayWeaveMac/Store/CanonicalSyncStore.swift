@@ -2779,7 +2779,12 @@ final class CanonicalSyncStore: ObservableObject {
                 throw PlannerCanonicalAuthoringError.invalidMutation
             }
             return try await client.createCanonicalItem(
-                DayWeaveNewCanonicalItem(id: mutation.itemID, fields: draft.requestFields),
+                DayWeaveNewCanonicalItem(
+                    id: mutation.itemID,
+                    fields: draft.requestFields(
+                        durationWireShape: mutation.durationWireShape
+                    )
+                ),
                 idempotencyKey: mutation.idempotencyKey
             )
         case .replace:
@@ -2790,7 +2795,9 @@ final class CanonicalSyncStore: ObservableObject {
             return try await client.replaceCanonicalItem(
                 mutation.itemID,
                 expectedRevision: expectedRevision,
-                item: draft.requestFields,
+                item: draft.requestFields(
+                    durationWireShape: mutation.durationWireShape
+                ),
                 idempotencyKey: mutation.idempotencyKey
             )
         case .trash:

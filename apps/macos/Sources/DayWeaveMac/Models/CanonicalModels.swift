@@ -352,8 +352,9 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     /// The exact canonical date-time spelling is retained separately from
     /// Foundation `Date`, whose cache representation cannot preserve offsets.
     let retainedCanonicalDeadlineAt: String?
-    /// Rich structural fields are read-only until full-item authoring learns
-    /// to send the same contract. Legacy inferred values keep the old path.
+    /// Records whether the server supplied the complete typed structural wire
+    /// shape. Individual authoring paths still decide which of those typed
+    /// values they can reproduce losslessly.
     let hasExplicitStructuralMetadata: Bool
     /// Future server fields are retained in the encrypted cache and make the
     /// item read-only until this client understands how to round-trip them.
@@ -450,7 +451,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             in: container
         )
         let persistedExactDeadline: String?
-        if snapshotSchemaVersion == 22 {
+        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
             persistedExactDeadline = try container.decodeIfPresent(
                 String.self,
                 forKey: .retainedCanonicalDeadlineAt
@@ -505,7 +506,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
                 )
             }
             usesExplicitStructuralWireShape = hasCompleteStructuralWireShape
-        } else if snapshotSchemaVersion == 22 {
+        } else if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
             guard hasCompleteStructuralWireShape,
                   container.contains(.hasExplicitStructuralMetadata) else {
                 throw DecodingError.dataCorruptedError(
@@ -629,7 +630,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             && blockedByItemID == nil
             && blockedReason == nil
             && status != .blocked
-        if snapshotSchemaVersion == 22 {
+        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
             hasExplicitStructuralMetadata = try container.decode(
                 Bool.self,
                 forKey: .hasExplicitStructuralMetadata
@@ -638,7 +639,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             hasExplicitStructuralMetadata = usesExplicitStructuralWireShape
                 && !typedValuesAreLegacyEquivalent
         }
-        if snapshotSchemaVersion == 22 {
+        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
             guard hasExplicitStructuralMetadata || typedValuesAreLegacyEquivalent else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .hasExplicitStructuralMetadata,
@@ -775,6 +776,37 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         if case .unsupported? = deadlineStrength { return true }
         if case .unsupported? = blockedReasonKind { return true }
         return false
+    }
+
+    /// The canonical editor now round-trips every supported duration shape,
+    /// while deadlines, own-effort, and blocking still use the legacy draft
+    /// representation. Keep those remaining fields behind a value-level fence
+    /// instead of treating the presence of the typed wire shape itself as
+    /// read-only.
+    var hasCanonicalAuthoringCompatibleStructuralMetadata: Bool {
+        guard !hasUnsupportedStructuralMetadata else { return false }
+
+        let deadlineIsPresent = deadlineAt != nil
+            || retainedUnrepresentableDeadlineAt != nil
+            || retainedCanonicalDeadlineAt != nil
+        let deadlineIsLegacyEquivalent: Bool
+        if kind == .event || !deadlineIsPresent {
+            deadlineIsLegacyEquivalent = deadlineKind == .none
+                && deadlineDate == nil
+                && deadlineStrength == nil
+                && deadlineSoftWeight == nil
+        } else {
+            deadlineIsLegacyEquivalent = deadlineKind == .dateTime
+                && deadlineDate == nil
+                && deadlineStrength == .hard
+                && deadlineSoftWeight == nil
+        }
+
+        return deadlineIsLegacyEquivalent
+            && hasOwnEffort == Self.legacyHasOwnEffort(in: flexibleConstraints)
+            && blockedReasonKind == nil
+            && blockedByItemID == nil
+            && blockedReason == nil
     }
 
     /// Compares every user-authored field, including structural values this
@@ -1149,7 +1181,11 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
     var title: String
     var notes: String?
     var timezoneName: String
+    var durationKind: DayWeaveDurationKind?
+    var durationMinimumSeconds: UInt32?
     var durationSeconds: UInt32?
+    var durationMaximumSeconds: UInt32?
+    var durationSource: DayWeaveDurationSource?
     var deadlineAt: Date?
     var earliestStartAt: Date?
     var recurrence: JSONValue?
@@ -1165,7 +1201,11 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         case kind, status, title, notes, recurrence, importance, urgency
         case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
+        case durationKind = "duration_kind"
+        case durationMinimumSeconds = "duration_min_seconds"
         case durationSeconds = "duration_seconds"
+        case durationMaximumSeconds = "duration_max_seconds"
+        case durationSource = "duration_source"
         case deadlineAt = "deadline_at"
         case earliestStartAt = "earliest_start_at"
         case flexibleConstraints = "flexible_constraints"
@@ -1181,7 +1221,14 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         title = item.title
         notes = item.notes
         timezoneName = item.timezoneName
+        // Status/privacy replacements retain the pre-structural wire shape so
+        // a response-loss replay keeps the idempotency fingerprint frozen.
+        // Rich authoring uses the explicit field initializer below.
+        durationKind = nil
+        durationMinimumSeconds = nil
         durationSeconds = item.durationSeconds
+        durationMaximumSeconds = nil
+        durationSource = nil
         deadlineAt = item.deadlineAt
         earliestStartAt = item.earliestStartAt
         recurrence = item.recurrence
@@ -1201,7 +1248,11 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         title: String,
         notes: String?,
         timezoneName: String,
+        durationKind: DayWeaveDurationKind? = nil,
+        durationMinimumSeconds: UInt32? = nil,
         durationSeconds: UInt32?,
+        durationMaximumSeconds: UInt32? = nil,
+        durationSource: DayWeaveDurationSource? = nil,
         deadlineAt: Date? = nil,
         earliestStartAt: Date? = nil,
         recurrence: JSONValue? = nil,
@@ -1218,7 +1269,11 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         self.title = title
         self.notes = notes
         self.timezoneName = timezoneName
+        self.durationKind = durationKind
+        self.durationMinimumSeconds = durationMinimumSeconds
         self.durationSeconds = durationSeconds
+        self.durationMaximumSeconds = durationMaximumSeconds
+        self.durationSource = durationSource
         self.deadlineAt = deadlineAt
         self.earliestStartAt = earliestStartAt
         self.recurrence = recurrence
@@ -1232,10 +1287,24 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         if case .unknown = kind { kindIsKnown = false } else { kindIsKnown = true }
         let statusIsKnown: Bool
         if case .unknown = status { statusIsKnown = false } else { statusIsKnown = true }
+        let durationKindIsKnown: Bool
+        if case .unsupported? = durationKind {
+            durationKindIsKnown = false
+        } else {
+            durationKindIsKnown = true
+        }
+        let durationSourceIsKnown: Bool
+        if case .unsupported? = durationSource {
+            durationSourceIsKnown = false
+        } else {
+            durationSourceIsKnown = true
+        }
         let recurrenceIsWritable = recurrence?.supportsLosslessRoundTrip ?? true
             || recurrence?.supportsCanonicalAuthoringRecurrence == true
         permitsLosslessEncoding = kindIsKnown
             && statusIsKnown
+            && durationKindIsKnown
+            && durationSourceIsKnown
             && splitPolicy.isSupportedForWrite
             && recurrenceIsWritable
             && flexibleConstraints.supportsLosslessRoundTrip
@@ -1258,7 +1327,11 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         try container.encode(title, forKey: .title)
         try container.encodeIfPresent(notes, forKey: .notes)
         try container.encode(timezoneName, forKey: .timezoneName)
+        try container.encodeIfPresent(durationKind, forKey: .durationKind)
+        try container.encodeIfPresent(durationMinimumSeconds, forKey: .durationMinimumSeconds)
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
+        try container.encodeIfPresent(durationMaximumSeconds, forKey: .durationMaximumSeconds)
+        try container.encodeIfPresent(durationSource, forKey: .durationSource)
         try container.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
         try container.encodeIfPresent(earliestStartAt, forKey: .earliestStartAt)
         try container.encodeIfPresent(recurrence, forKey: .recurrence)

@@ -258,9 +258,13 @@ struct CanonicalItemEditorView: View {
     private var planningSection: some View {
         CanonicalEditorSection(title: "Planning", symbol: "calendar.badge.clock") {
             if state.kind != .event {
-                Toggle("Estimate a duration", isOn: $state.hasDuration)
-                    .accessibilityIdentifier("canonical-editor.duration.enabled")
-                if state.hasDuration {
+                Picker("Duration", selection: $state.durationKind) {
+                    ForEach(CanonicalItemEditorDurationKind.allCases) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .accessibilityIdentifier("canonical-editor.duration.kind")
+                if state.durationKind == .exact {
                     Stepper(value: durationMinutes, in: 1...527_040, step: 5) {
                         LabeledContent(
                             "Duration",
@@ -270,6 +274,34 @@ struct CanonicalItemEditorView: View {
                         )
                     }
                     .accessibilityIdentifier("canonical-editor.duration")
+                } else if state.durationKind == .range {
+                    Stepper(value: durationMinimumMinutes, in: 1...527_040, step: 5) {
+                        LabeledContent(
+                            "Minimum",
+                            value: CanonicalItemEditorState.durationDescription(
+                                state.durationMinimumSeconds
+                            )
+                        )
+                    }
+                    .accessibilityIdentifier("canonical-editor.duration.minimum")
+                    Stepper(value: durationMinutes, in: 1...527_040, step: 5) {
+                        LabeledContent(
+                            "Preferred",
+                            value: CanonicalItemEditorState.durationDescription(
+                                state.durationSeconds
+                            )
+                        )
+                    }
+                    .accessibilityIdentifier("canonical-editor.duration.preferred")
+                    Stepper(value: durationMaximumMinutes, in: 1...527_040, step: 5) {
+                        LabeledContent(
+                            "Maximum",
+                            value: CanonicalItemEditorState.durationDescription(
+                                state.durationMaximumSeconds
+                            )
+                        )
+                    }
+                    .accessibilityIdentifier("canonical-editor.duration.maximum")
                 }
                 if state.kind == .goal || state.kind == .routine {
                     Toggle("Schedule this container's own effort", isOn: $state.hasOwnEffort)
@@ -791,6 +823,24 @@ struct CanonicalItemEditorView: View {
                     TextField("Target unit", text: $state.habitTargetUnit)
                         .textFieldStyle(.roundedBorder)
                 }
+                Stepper(
+                    value: habitMinimumSpacingMinutes,
+                    in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                    step: 5
+                ) {
+                    LabeledContent(
+                        "Minimum spacing between habit sessions",
+                        value: state.habitMinimumSpacingMinutes == 0
+                            ? "No minimum"
+                            : CanonicalItemEditorState.minuteDescription(
+                                state.habitMinimumSpacingMinutes
+                            )
+                    )
+                }
+                .accessibilityIdentifier("canonical-editor.habit-minimum-spacing")
+                Text("This applies to every habit recurrence; flexible-frequency spacing remains a separate recurrence rule.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Preserve streak while paused", isOn: $state.preservesStreakWhenPaused)
             case .routine:
                 Toggle("Run subtasks in sibling order", isOn: $state.routineOrdered)
@@ -1491,6 +1541,14 @@ struct CanonicalItemEditorView: View {
         secondsBinding(\CanonicalItemEditorState.durationSeconds)
     }
 
+    private var durationMinimumMinutes: Binding<Int> {
+        secondsBinding(\CanonicalItemEditorState.durationMinimumSeconds)
+    }
+
+    private var durationMaximumMinutes: Binding<Int> {
+        secondsBinding(\CanonicalItemEditorState.durationMaximumSeconds)
+    }
+
     private var minimumChunkMinutes: Binding<Int> {
         secondsBinding(\CanonicalItemEditorState.minimumChunkSeconds)
     }
@@ -1537,6 +1595,10 @@ struct CanonicalItemEditorView: View {
 
     private var frequencySpacingMinutes: Binding<Int> {
         intBinding($state.recurrenceMinimumSpacingMinutes)
+    }
+
+    private var habitMinimumSpacingMinutes: Binding<Int> {
+        intBinding($state.habitMinimumSpacingMinutes)
     }
 
     private var minimumNoticeMinutes: Binding<Int> {

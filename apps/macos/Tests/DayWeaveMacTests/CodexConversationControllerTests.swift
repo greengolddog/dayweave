@@ -407,6 +407,7 @@ struct CodexConversationControllerTests {
         #expect(suggestion.canonicalDraft.title == "Move launch prep")
         #expect(suggestion.canonicalDraft.kind == .task)
         #expect(suggestion.canonicalDraft.durationSeconds == 1_800)
+        #expect(suggestion.canonicalDraft.durationSource == .assistant)
         #expect(suggestion.canonicalDraft.importance == 50)
         #expect(suggestion.canonicalDraft.urgency == 50)
         #expect(suggestion.canonicalDraft.validationIssue(itemID: UUID()) == nil)

@@ -1,6 +1,12 @@
 package com.greengolddog.dayweave.scheduler
 
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
+import com.greengolddog.dayweave.model.CanonicalDurationKind
+import com.greengolddog.dayweave.model.CanonicalDurationSource
+import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.network.RemoteIgnoredPreviousAssignment
 import com.greengolddog.dayweave.network.RemotePlanDecision
 import com.greengolddog.dayweave.network.RemotePlanOccurrence
@@ -305,9 +311,10 @@ class RustScheduleComposer(
     }
 
     private fun CanonicalItemSnapshot.toHelperItem(): HelperCanonicalItem {
-        require(!hasExplicitStructuralMetadata) {
-            "The bundled scheduler cannot normalize unsupported canonical structure"
-        }
+        requireValidStructuralMetadata()
+        require(durationKind.isSupported && durationSource?.isSupported != false)
+        require(deadlineKind.isSupported && deadlineStrength?.isSupported != false)
+        require(blockedReasonKind?.isSupported != false)
         require(kind in HELPER_SUPPORTED_ITEM_KINDS && status in HELPER_SUPPORTED_ITEM_STATUSES) {
             "The bundled scheduler cannot normalize unknown canonical semantics"
         }
@@ -320,11 +327,20 @@ class RustScheduleComposer(
             // Notes do not affect deterministic placement and never cross the native boundary.
             notes = null,
             timezoneName = timezoneName,
+            durationKind = durationKind,
             durationSeconds = durationSeconds,
+            durationMinSeconds = durationMinSeconds,
+            durationMaxSeconds = durationMaxSeconds,
+            durationSource = durationSource,
+            deadlineKind = deadlineKind,
+            deadlineDate = deadlineDate,
             deadlineAt = deadlineAt,
+            deadlineStrength = deadlineStrength,
+            deadlineSoftWeight = deadlineSoftWeight,
             earliestStartAt = earliestStartAt,
             recurrence = recurrenceJson?.let(::parseStoredJson),
             flexibleConstraints = parseStoredJson(flexibleConstraintsJson),
+            hasOwnEffort = hasOwnEffort,
             splitPolicy = parseStoredJson(splitPolicyJson),
             importance = importance,
             urgency = urgency,
@@ -336,6 +352,9 @@ class RustScheduleComposer(
             updatedAt = updatedAt,
             completedAt = completedAt,
             deletedAt = deletedAt,
+            blockedReasonKind = blockedReasonKind,
+            blockedByItemId = blockedByItemId,
+            blockedReason = blockedReason,
         )
     }
 
@@ -394,11 +413,20 @@ private data class HelperCanonicalItem(
     val title: String,
     val notes: String?,
     @SerialName("timezone_name") val timezoneName: String,
+    @SerialName("duration_kind") val durationKind: CanonicalDurationKind,
     @SerialName("duration_seconds") val durationSeconds: Long?,
+    @SerialName("duration_min_seconds") val durationMinSeconds: Long?,
+    @SerialName("duration_max_seconds") val durationMaxSeconds: Long?,
+    @SerialName("duration_source") val durationSource: CanonicalDurationSource?,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind,
+    @SerialName("deadline_date") val deadlineDate: String?,
     @SerialName("deadline_at") val deadlineAt: String?,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalDeadlineStrength?,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: Long?,
     @SerialName("earliest_start_at") val earliestStartAt: String?,
     val recurrence: JsonElement?,
     @SerialName("flexible_constraints") val flexibleConstraints: JsonElement,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean,
     @SerialName("split_policy") val splitPolicy: JsonElement,
     val importance: Int,
     val urgency: Int,
@@ -410,6 +438,9 @@ private data class HelperCanonicalItem(
     @SerialName("updated_at") val updatedAt: String,
     @SerialName("completed_at") val completedAt: String?,
     @SerialName("deleted_at") val deletedAt: String?,
+    @SerialName("blocked_reason_kind") val blockedReasonKind: CanonicalBlockedReasonKind?,
+    @SerialName("blocked_by_item_id") val blockedByItemId: String?,
+    @SerialName("blocked_reason") val blockedReason: String?,
 )
 
 private class BoundedRequestOutput(

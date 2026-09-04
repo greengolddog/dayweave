@@ -62,11 +62,13 @@ object PlannerSnapshotFormats {
     const val JSON_V16 = "json-v16-canonical-structural-metadata"
     /** Habit cache, terminal delta checkpoint, and exact encrypted offline replay authority. */
     const val JSON_V17 = "json-v17-authoritative-habit-ledger"
+    /** Rich authoring duration provenance and habit-wide spacing; rollback must not erase either. */
+    const val JSON_V18 = "json-v18-duration-authoring-and-habit-spacing"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 17,
+    version = 18,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -204,6 +206,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_16_17 = object : Migration(16, 17) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. Drafts can now retain ranged duration provenance and the
+     * independent habit-wide spacing policy, so older binaries must not rewrite those fields.
+     */
+    val MIGRATION_17_18 = object : Migration(17, 18) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -260,6 +270,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_14_15,
                 PlannerDatabaseMigrations.MIGRATION_15_16,
                 PlannerDatabaseMigrations.MIGRATION_16_17,
+                PlannerDatabaseMigrations.MIGRATION_17_18,
             )
             .build()
     }

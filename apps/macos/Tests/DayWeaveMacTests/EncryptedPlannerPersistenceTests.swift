@@ -963,6 +963,362 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func schemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence() throws {
+        let base = makeSnapshot()
+        let itemID = UUID(uuidString: "a3000000-0000-4000-8000-000000000003")!
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "a4000000-0000-4000-8000-000000000004")!,
+            itemID: itemID,
+            operation: .create,
+            draft: .init(
+                title: "Legacy scalar duration",
+                timezoneName: "UTC",
+                durationSeconds: 2_700
+            ),
+            createdAt: base.savedAt
+        )
+        let legacy = PlannerSnapshot(
+            schemaVersion: 22,
+            savedAt: base.savedAt,
+            destination: .inbox,
+            selectedBlockID: nil,
+            selectedCanonicalItemID: itemID,
+            blocks: [],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "Legacy draft",
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: 2,
+            showCompleted: true,
+            pendingCanonicalAuthoringMutations: [mutation],
+            canonicalTrash: []
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var root = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema 22 draft fixture was not an object"
+        )
+        var mutations = try requireValue(
+            root["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
+            "Schema 22 draft fixture had no authoring mutation"
+        )
+        var draft = try requireValue(
+            mutations[0]["draft"] as? [String: Any],
+            "Schema 22 mutation had no draft"
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 22
+        var rejectedInjectedShape = false
+        do {
+            _ = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: root)
+            )
+        } catch is DecodingError {
+            rejectedInjectedShape = true
+        }
+        try require(
+            rejectedInjectedShape,
+            "Schema 22 draft accepted injected rich-duration authority"
+        )
+        for key in [
+            "duration_kind", "duration_min_seconds", "duration_max_seconds",
+            "duration_source",
+        ] {
+            draft.removeValue(forKey: key)
+        }
+        mutations[0].removeValue(forKey: "durationWireShape")
+        mutations[0]["draft"] = draft
+        root["pendingCanonicalAuthoringMutations"] = mutations
+
+        let migrated = try decoder.decode(
+            PlannerSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: root)
+        ).migratedToCurrentSchema()
+        let migratedDraft = try requireValue(
+            migrated.pendingCanonicalAuthoringMutations?.first?.draft,
+            "Schema 22 migration discarded its authoring draft"
+        )
+        try require(
+            migrated.pendingCanonicalAuthoringMutations?.first?.durationWireShape == .richV2,
+            "An unsubmitted schema 22 draft did not upgrade to the current request shape"
+        )
+        try require(
+            migrated.schemaVersion == 23
+                && PlannerSnapshot.currentSchemaVersion == 23,
+            "Rich authoring drafts are not protected by the schema 23 rollback fence"
+        )
+        try require(
+            migratedDraft.durationKind == .exact
+                && migratedDraft.durationMinimumSeconds == 2_700
+                && migratedDraft.durationSeconds == 2_700
+                && migratedDraft.durationMaximumSeconds == 2_700
+                && migratedDraft.durationSource == .user,
+            "Schema 22 scalar duration did not upgrade to the exact rich shape"
+        )
+        let rewritten = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(migrated)) as? [String: Any],
+            "Migrated schema 23 fixture was not an object"
+        )
+        let rewrittenDraft = try requireValue(
+            (rewritten["pendingCanonicalAuthoringMutations"] as? [[String: Any]])?
+                .first?["draft"] as? [String: Any],
+            "Migrated schema 23 fixture had no authoring draft"
+        )
+        try require(
+            rewrittenDraft["duration_kind"] as? String == "exact"
+                && rewrittenDraft["duration_min_seconds"] as? Int == 2_700
+                && rewrittenDraft["duration_max_seconds"] as? Int == 2_700
+                && rewrittenDraft["duration_source"] as? String == "user",
+            "Schema 23 rewrite did not durably persist rich duration metadata"
+        )
+
+        var partialCurrentRoot = rewritten
+        var partialCurrentMutations = try requireValue(
+            partialCurrentRoot["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
+            "Schema 23 corruption fixture had no authoring mutation"
+        )
+        var partialCurrentDraft = try requireValue(
+            partialCurrentMutations[0]["draft"] as? [String: Any],
+            "Schema 23 corruption fixture had no draft"
+        )
+        partialCurrentDraft.removeValue(forKey: "duration_kind")
+        partialCurrentMutations[0]["draft"] = partialCurrentDraft
+        partialCurrentRoot["pendingCanonicalAuthoringMutations"] = partialCurrentMutations
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 23
+        var rejectedPartialCurrentShape = false
+        do {
+            _ = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: partialCurrentRoot)
+            )
+        } catch is DecodingError {
+            rejectedPartialCurrentShape = true
+        }
+        try require(
+            rejectedPartialCurrentShape,
+            "Schema 23 draft silently normalized partial rich-duration metadata"
+        )
+    }
+
+    static func schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape() throws {
+        let base = makeSnapshot()
+        let configuration =
+            "https://api.example.com/gateway|auth=static-v1:\(String(repeating: "b", count: 64))"
+        let createItemID = UUID(uuidString: "a5000000-0000-4000-8000-000000000005")!
+        let replaceItemID = UUID(uuidString: "a6000000-0000-4000-8000-000000000006")!
+        let createDraft = DayWeaveCanonicalItemDraft(
+            title: "Lost create response",
+            timezoneName: "UTC",
+            durationSeconds: 1_800
+        )
+        let baseItemData = Data(#"""
+        {
+          "id":"\#(replaceItemID.uuidString.lowercased())","is_sensitive":false,
+          "kind":"task","status":"inbox","title":"Lost replace response",
+          "notes":null,"timezone_name":"UTC","duration_seconds":2700,
+          "deadline_at":null,"earliest_start_at":null,"recurrence":null,
+          "flexible_constraints":{},"split_policy":{"type":"indivisible"},
+          "importance":50,"urgency":50,"parent_id":null,"sibling_order":0,
+          "is_executable":true,"revision":4,
+          "created_at":"2026-09-01T10:00:00Z","updated_at":"2026-09-01T11:00:00Z",
+          "completed_at":null,"deleted_at":null
+        }
+        """#.utf8)
+        let itemDecoder = JSONDecoder()
+        itemDecoder.dateDecodingStrategy = .iso8601
+        let replaceBase = try itemDecoder.decode(
+            DayWeaveCanonicalItem.self,
+            from: baseItemData
+        )
+        let create = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "a7000000-0000-4000-8000-000000000007")!,
+            itemID: createItemID,
+            operation: .create,
+            draft: createDraft,
+            createdAt: base.savedAt,
+            configurationIdentifier: configuration,
+            hasBeenSubmitted: true
+        )
+        let replace = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "a8000000-0000-4000-8000-000000000008")!,
+            itemID: replaceItemID,
+            operation: .replace,
+            draft: DayWeaveCanonicalItemDraft(item: replaceBase),
+            expectedRevision: replaceBase.revision,
+            baseItem: replaceBase,
+            createdAt: base.savedAt,
+            configurationIdentifier: configuration,
+            hasBeenSubmitted: true
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        for submitted in [create, replace] {
+            let isReplace = submitted.operation == .replace
+            let legacy = PlannerSnapshot(
+                schemaVersion: 22,
+                savedAt: base.savedAt,
+                destination: .inbox,
+                selectedBlockID: nil,
+                selectedCanonicalItemID: submitted.itemID,
+                blocks: [],
+                suggestions: [],
+                assistantMessages: [],
+                lastScheduleMessage: "Response-loss replay",
+                protectedFreeMinutes: base.protectedFreeMinutes,
+                scheduleProfile: base.scheduleProfile,
+                freezeHours: 2,
+                showCompleted: true,
+                canonicalItems: isReplace ? [replaceBase] : [],
+                canonicalConfigurationIdentifier: configuration,
+                pendingCanonicalAuthoringMutations: [submitted],
+                canonicalTrash: []
+            )
+            var root = try requireValue(
+                JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+                "Schema 22 response-loss fixture was not an object"
+            )
+            var mutations = try requireValue(
+                root["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
+                "Schema 22 response-loss fixture had no journal"
+            )
+            var draft = try requireValue(
+                mutations[0]["draft"] as? [String: Any],
+                "Schema 22 response-loss journal had no draft"
+            )
+            for key in [
+                "duration_kind", "duration_min_seconds", "duration_max_seconds",
+                "duration_source",
+            ] {
+                draft.removeValue(forKey: key)
+            }
+            mutations[0].removeValue(forKey: "durationWireShape")
+            mutations[0]["draft"] = draft
+            root["pendingCanonicalAuthoringMutations"] = mutations
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .millisecondsSince1970
+            decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 22
+            let migrated = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: root)
+            ).migratedToCurrentSchema()
+            let journals = try requireValue(
+                migrated.pendingCanonicalAuthoringMutations,
+                "Submitted response-loss journal was discarded"
+            )
+            try require(journals.count == 1, "Response-loss migration changed journal count")
+            let journal = try requireValue(
+                journals.first,
+                "Submitted response-loss journal was discarded"
+            )
+            try require(
+                journal.durationWireShape == .legacyV1,
+                "Submitted schema 22 request did not retain its legacy wire shape"
+            )
+            let migratedDraft = try requireValue(
+                journal.draft,
+                "Migrated replay lost its item body"
+            )
+            let fieldsData = try JSONEncoder().encode(
+                migratedDraft.requestFields(durationWireShape: journal.durationWireShape)
+            )
+            let fields = try requireValue(
+                JSONSerialization.jsonObject(with: fieldsData) as? [String: Any],
+                "Migrated replay fields were not an object"
+            )
+            try require(
+                fields["duration_seconds"] != nil
+                    && fields["duration_kind"] == nil
+                    && fields["duration_min_seconds"] == nil
+                    && fields["duration_max_seconds"] == nil
+                    && fields["duration_source"] == nil,
+                "Migrated response-loss replay changed its frozen duration body"
+            )
+        }
+
+        let trash = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "a9000000-0000-4000-8000-000000000009")!,
+            itemID: replaceItemID,
+            operation: .trash,
+            expectedRevision: replaceBase.revision,
+            baseItem: replaceBase,
+            createdAt: base.savedAt,
+            configurationIdentifier: configuration,
+            hasBeenSubmitted: true
+        )
+        let restore = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "aa000000-0000-4000-8000-00000000000a")!,
+            itemID: replaceItemID,
+            operation: .restore,
+            expectedRevision: replaceBase.revision,
+            createdAt: base.savedAt,
+            configurationIdentifier: configuration,
+            hasBeenSubmitted: true
+        )
+        let deletedEntry = DayWeaveCanonicalTrashEntry(
+            id: replaceItemID,
+            revision: replaceBase.revision,
+            deletedAt: base.savedAt,
+            parentID: nil,
+            lastKnownItem: nil
+        )
+        for submitted in [trash, restore] {
+            let isRestore = submitted.operation == .restore
+            let legacy = PlannerSnapshot(
+                schemaVersion: 22,
+                savedAt: base.savedAt,
+                destination: .inbox,
+                selectedBlockID: nil,
+                selectedCanonicalItemID: submitted.itemID,
+                blocks: [],
+                suggestions: [],
+                assistantMessages: [],
+                lastScheduleMessage: "Identity-only response-loss replay",
+                protectedFreeMinutes: base.protectedFreeMinutes,
+                scheduleProfile: base.scheduleProfile,
+                freezeHours: 2,
+                showCompleted: true,
+                canonicalItems: isRestore ? [] : [replaceBase],
+                canonicalTombstoneRevisions: isRestore
+                    ? [replaceItemID: replaceBase.revision]
+                    : [:],
+                canonicalConfigurationIdentifier: configuration,
+                pendingCanonicalAuthoringMutations: [submitted],
+                canonicalTrash: isRestore ? [deletedEntry] : []
+            )
+            var root = try requireValue(
+                JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+                "Schema 22 identity-only fixture was not an object"
+            )
+            var mutations = try requireValue(
+                root["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
+                "Schema 22 identity-only fixture had no journal"
+            )
+            mutations[0].removeValue(forKey: "durationWireShape")
+            root["pendingCanonicalAuthoringMutations"] = mutations
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .millisecondsSince1970
+            decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 22
+            let migrated = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: root)
+            ).migratedToCurrentSchema()
+            let journal = try requireValue(
+                migrated.pendingCanonicalAuthoringMutations?.first,
+                "Submitted identity-only response-loss journal was discarded"
+            )
+            try require(
+                journal.operation == submitted.operation
+                    && journal.durationWireShape == .richV2
+                    && journal.isValid,
+                "Schema 22 identity-only replay acquired a body-only legacy wire shape"
+            )
+        }
+    }
+
     static func schemaNineAddsNoCanonicalAuthoringIntent() throws {
         let base = makeSnapshot()
         let legacy = PlannerSnapshot(
@@ -1256,6 +1612,7 @@ private enum EncryptedPlannerPersistenceScenarios {
             root["pendingCanonicalAuthoringMutations"] as? [[String: Any]],
             "Schema 21 forward-capture fixture had no pending authoring mutation"
         )
+        mutations[0].removeValue(forKey: "durationWireShape")
         mutations[0]["baseItem"] = richProject
         root["pendingCanonicalAuthoringMutations"] = mutations
 
@@ -1798,6 +2155,13 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
         try EncryptedPlannerPersistenceScenarios.canonicalAuthoringJournalRoundTrip()
     }
 
+    func testSchemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape()
+    }
+
     func testSchemaNineCanonicalAuthoringMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaNineAddsNoCanonicalAuthoringIntent()
     }
@@ -1937,6 +2301,14 @@ struct EncryptedPlannerPersistenceTests {
         try EncryptedPlannerPersistenceScenarios.canonicalAuthoringJournalRoundTrip()
     }
 
+    @Test("Schema 22 authoring drafts migrate behind the rich-duration rollback fence")
+    func schemaTwentyTwoAuthoringDraftMigration() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape()
+    }
+
     @Test("Schema 9 migrates without inventing canonical authoring intent")
     func schemaNineCanonicalAuthoringMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaNineAddsNoCanonicalAuthoringIntent()
@@ -1996,6 +2368,10 @@ private struct PersistenceManualTestRunner {
         try EncryptedPlannerPersistenceScenarios.corruptionFailure()
         try EncryptedPlannerPersistenceScenarios.storeRestore()
         try EncryptedPlannerPersistenceScenarios.canonicalCacheRoundTrip()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence()
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape()
         try EncryptedPlannerPersistenceScenarios.schemaTwentyOneCanonicalStructureMigratesWithoutLoss()
         try EncryptedPlannerPersistenceScenarios
             .schemaTwentyOneForwardCapturedStructureMigratesWithoutLoss()

@@ -28,6 +28,22 @@ enum CanonicalItemEditorRecurrence: String, CaseIterable, Identifiable, Sendable
     }
 }
 
+enum CanonicalItemEditorDurationKind: String, CaseIterable, Identifiable, Sendable {
+    case unknown
+    case exact
+    case range
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .unknown: "Unknown"
+        case .exact: "Exact"
+        case .range: "Range"
+        }
+    }
+}
+
 enum CanonicalItemEditorConstraintStrength: String, CaseIterable, Identifiable, Sendable {
     case hard
     case soft
@@ -296,8 +312,20 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     var readyStatus: DayWeaveCanonicalItemStatus
     var timezoneName: String
 
-    var hasDuration: Bool
+    var durationKind: CanonicalItemEditorDurationKind
+    var durationMinimumSeconds: UInt32
     var durationSeconds: UInt32
+    var durationMaximumSeconds: UInt32
+    var hasDuration: Bool {
+        get { durationKind != .unknown }
+        set {
+            if newValue {
+                if durationKind == .unknown { durationKind = .exact }
+            } else {
+                durationKind = .unknown
+            }
+        }
+    }
     var hasEarliestStart: Bool
     var earliestStart: Date
     var earliestStartStrength: CanonicalItemEditorConstraintStrength
@@ -362,6 +390,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     var hasHabitTarget: Bool
     var habitTargetAmount: UInt32
     var habitTargetUnit: String
+    var habitMinimumSpacingMinutes: UInt32
     var preservesStreakWhenPaused: Bool
     var routineOrdered: Bool
     var goalMeasures: [CanonicalItemEditorGoalMeasure]
@@ -405,6 +434,11 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     private var hadBreakPromptConstraint: Bool
     private var hadExplicitNullOccurrenceWindow: Bool
     private var retainedDependencyIDs: Set<UUID>
+    private var originalDurationKind: DayWeaveDurationKind
+    private var originalDurationMinimumSeconds: UInt32?
+    private var originalDurationSeconds: UInt32?
+    private var originalDurationMaximumSeconds: UInt32?
+    private var originalDurationSource: DayWeaveDurationSource?
     private var retainedReadOnlyDraft: DayWeaveCanonicalItemDraft?
     private(set) var readOnlyDiagnostic: String?
 
@@ -428,8 +462,18 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         isSensitive = source.isSensitive
         readyStatus = source.status
         timezoneName = source.timezoneName
-        hasDuration = source.durationSeconds != nil
+        durationKind = switch source.durationKind {
+        case .unknown, .unsupported: .unknown
+        case .exact: .exact
+        case .range: .range
+        }
+        durationMinimumSeconds = source.durationMinimumSeconds
+            ?? source.durationSeconds
+            ?? 15 * 60
         durationSeconds = source.durationSeconds ?? 30 * 60
+        durationMaximumSeconds = source.durationMaximumSeconds
+            ?? source.durationSeconds
+            ?? 60 * 60
         hasEarliestStart = source.earliestStartAt != nil
         earliestStart = source.earliestStartAt ?? now
         earliestStartStrength = .hard
@@ -491,6 +535,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         hasHabitTarget = false
         habitTargetAmount = 1
         habitTargetUnit = "times"
+        habitMinimumSpacingMinutes = 0
         preservesStreakWhenPaused = true
         routineOrdered = false
         goalMeasures = []
@@ -531,6 +576,11 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         hadBreakPromptConstraint = false
         hadExplicitNullOccurrenceWindow = false
         retainedDependencyIDs = []
+        originalDurationKind = source.durationKind
+        originalDurationMinimumSeconds = source.durationMinimumSeconds
+        originalDurationSeconds = source.durationSeconds
+        originalDurationMaximumSeconds = source.durationMaximumSeconds
+        originalDurationSource = source.durationSource
         retainedReadOnlyDraft = nil
         readOnlyDiagnostic = nil
 
@@ -552,6 +602,12 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         }
         if case .unknown = source.kind {
             markReadOnly("This item type is not editable by this version of DayWeave.")
+        }
+        if case .unsupported = source.durationKind {
+            markReadOnly("This duration form is preserved but cannot be safely edited.")
+        }
+        if case .unsupported? = source.durationSource {
+            markReadOnly("This duration source is preserved but cannot be safely edited.")
         }
         if source.parentID == itemID {
             markReadOnly("This item has an invalid self-referencing parent.")
@@ -660,6 +716,50 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         let emitsEventTiming = kind == .event
             && hasEventTiming
             && !hasEventFlexibleMetadata
+        let authoredDurationKind: DayWeaveDurationKind
+        let authoredDurationMinimum: UInt32?
+        let authoredDuration: UInt32?
+        let authoredDurationMaximum: UInt32?
+        if kind == .event {
+            if emitsEventTiming,
+               eventRangeIsUnchanged,
+               originalDurationKind == .range {
+                authoredDurationKind = originalDurationKind
+                authoredDurationMinimum = originalDurationMinimumSeconds
+                authoredDuration = originalDurationSeconds
+                authoredDurationMaximum = originalDurationMaximumSeconds
+            } else {
+                authoredDuration = emitsEventTiming ? eventDurationValue : nil
+                authoredDurationKind = authoredDuration == nil ? .unknown : .exact
+                authoredDurationMinimum = authoredDuration
+                authoredDurationMaximum = authoredDuration
+            }
+        } else {
+            switch durationKind {
+            case .unknown:
+                authoredDurationKind = .unknown
+                authoredDurationMinimum = nil
+                authoredDuration = nil
+                authoredDurationMaximum = nil
+            case .exact:
+                authoredDurationKind = .exact
+                authoredDurationMinimum = durationSeconds
+                authoredDuration = durationSeconds
+                authoredDurationMaximum = durationSeconds
+            case .range:
+                authoredDurationKind = .range
+                authoredDurationMinimum = durationMinimumSeconds
+                authoredDuration = durationSeconds
+                authoredDurationMaximum = durationMaximumSeconds
+            }
+        }
+        let durationIsUnchanged = authoredDurationKind == originalDurationKind
+            && authoredDurationMinimum == originalDurationMinimumSeconds
+            && authoredDuration == originalDurationSeconds
+            && authoredDurationMaximum == originalDurationMaximumSeconds
+        let authoredDurationSource: DayWeaveDurationSource? = authoredDurationKind == .unknown
+            ? nil
+            : (durationIsUnchanged ? originalDurationSource ?? .user : .user)
         return DayWeaveCanonicalItemDraft(
             isSensitive: isSensitive,
             kind: kind,
@@ -667,9 +767,11 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             title: title,
             notes: notes,
             timezoneName: timezoneName,
-            durationSeconds: kind == .event
-                ? (emitsEventTiming ? eventDurationValue : nil)
-                : (hasDuration ? durationSeconds : nil),
+            durationKind: authoredDurationKind,
+            durationMinimumSeconds: authoredDurationMinimum,
+            durationSeconds: authoredDuration,
+            durationMaximumSeconds: authoredDurationMaximum,
+            durationSource: authoredDurationSource,
             deadlineAt: kind == .event
                 ? (emitsEventTiming
                     ? (eventRangeIsUnchanged ? originalEvent?.canonicalDeadline : eventEnd)
@@ -712,7 +814,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         if kind == .event {
             isSplittable = false
             hasPreferredStartMinute = false
-            hasDuration = true
+            durationKind = .exact
             _ = setEventTimingEnabled(true)
             if eventEnd <= eventStart {
                 eventEnd = eventStart.addingTimeInterval(60 * 60)
@@ -1175,6 +1277,10 @@ struct CanonicalItemEditorState: Equatable, Sendable {
                 "unit": .string(habitTargetUnit),
             ])
             : nil
+        value["habit_minimum_spacing_minutes"] = kind == .habit
+                && habitMinimumSpacingMinutes > 0
+            ? number(habitMinimumSpacingMinutes)
+            : nil
         value["preserves_streak_when_paused"] = kind == .habit
                 && (!preservesStreakWhenPaused || hadPreservesStreakConstraint)
             ? .bool(preservesStreakWhenPaused)
@@ -1384,6 +1490,10 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             if habitTargetUnit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return "Habit target unit cannot be empty."
             }
+        }
+        if kind == .habit,
+           habitMinimumSpacingMinutes > Self.maximumSchedulingOffsetMinutes {
+            return "Habit spacing must be at most \(Self.maximumSchedulingOffsetMinutes) minutes."
         }
         if kind == .goal {
             if goalMeasures.contains(where: {
@@ -1698,6 +1808,14 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             hasHabitTarget = true
             habitTargetAmount = amount
             habitTargetUnit = unit
+        }
+        if let spacingValue = object.removeValue(forKey: "habit_minimum_spacing_minutes") {
+            guard let parsed = Self.unsigned(spacingValue),
+                  parsed <= Self.maximumSchedulingOffsetMinutes else {
+                markReadOnly("This habit spacing rule cannot be represented.")
+                return
+            }
+            habitMinimumSpacingMinutes = parsed
         }
         if let pauseValue = object.removeValue(forKey: "preserves_streak_when_paused") {
             guard case let .bool(parsed) = pauseValue else {

@@ -20,6 +20,54 @@ struct CanonicalAuthoringModelsTests {
         #expect(draft.status == .inbox)
     }
 
+    @Test("rich durations round-trip and legacy drafts upgrade without changing semantics")
+    func richDurationRoundTripAndLegacyUpgrade() throws {
+        let rich = DayWeaveCanonicalItemDraft(
+            title: "Variable research",
+            timezoneName: "Europe/Paris",
+            durationKind: .range,
+            durationMinimumSeconds: 1_800,
+            durationSeconds: 3_600,
+            durationMaximumSeconds: 7_200,
+            durationSource: .assistant
+        )
+        #expect(rich.validationIssue(itemID: UUID()) == nil)
+
+        let encoded = try JSONEncoder().encode(rich)
+        let decoded = try JSONDecoder().decode(
+            DayWeaveCanonicalItemDraft.self,
+            from: encoded
+        )
+        #expect(decoded == rich)
+
+        let request = try #require(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(rich.requestFields)
+        ) as? [String: Any])
+        #expect(request["duration_kind"] as? String == "range")
+        #expect(request["duration_min_seconds"] as? Int == 1_800)
+        #expect(request["duration_seconds"] as? Int == 3_600)
+        #expect(request["duration_max_seconds"] as? Int == 7_200)
+        #expect(request["duration_source"] as? String == "assistant")
+
+        var legacyObject = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "duration_kind")
+        legacyObject.removeValue(forKey: "duration_min_seconds")
+        legacyObject.removeValue(forKey: "duration_max_seconds")
+        legacyObject.removeValue(forKey: "duration_source")
+        legacyObject["duration_seconds"] = 2_700
+        let legacy = try JSONDecoder().decode(
+            DayWeaveCanonicalItemDraft.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        #expect(legacy.durationKind == .exact)
+        #expect(legacy.durationMinimumSeconds == 2_700)
+        #expect(legacy.durationSeconds == 2_700)
+        #expect(legacy.durationMaximumSeconds == 2_700)
+        #expect(legacy.durationSource == .user)
+    }
+
     @Test("preferred local start requires a same-day duration")
     func preferredStartMinuteValidation() {
         let itemID = UUID()
@@ -1026,6 +1074,65 @@ struct CanonicalAuthoringModelsTests {
 
 @Suite("Canonical Inbox presentation")
 struct CanonicalInboxPresentationTests {
+    @Test("pending creates and replacements preserve ranged assistant durations")
+    func pendingDraftsPreserveRichDurationPresentation() throws {
+        let createID = UUID()
+        let replaceID = UUID()
+        let base = try decodeItem(id: replaceID, revision: 4, deleted: false)
+        let createDraft = DayWeaveCanonicalItemDraft(
+            title: "Estimate new work",
+            timezoneName: "Europe/Madrid",
+            durationKind: .range,
+            durationMinimumSeconds: 1_200,
+            durationSeconds: 1_800,
+            durationMaximumSeconds: 2_700,
+            durationSource: .assistant
+        )
+        let replaceDraft = DayWeaveCanonicalItemDraft(
+            title: "Re-estimate existing work",
+            timezoneName: "Europe/Madrid",
+            durationKind: .range,
+            durationMinimumSeconds: 2_400,
+            durationSeconds: 3_600,
+            durationMaximumSeconds: 5_400,
+            durationSource: .assistant
+        )
+        let create = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: createID,
+            operation: .create,
+            draft: createDraft
+        )
+        let replace = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: replaceID,
+            operation: .replace,
+            draft: replaceDraft,
+            expectedRevision: base.revision,
+            baseItem: base
+        )
+
+        let presentation = CanonicalInboxPresentation.build(
+            activeItems: [base],
+            pendingMutations: [create, replace],
+            trashEntries: []
+        )
+        let rows = Dictionary(uniqueKeysWithValues: presentation.inbox.map { ($0.itemID, $0) })
+        let createRow = try #require(rows[createID])
+        let replaceRow = try #require(rows[replaceID])
+
+        #expect(createRow.source == .localCreate)
+        #expect(createRow.durationKind == .range)
+        #expect(createRow.durationMinimumSeconds == 1_200)
+        #expect(createRow.durationSeconds == 1_800)
+        #expect(createRow.durationMaximumSeconds == 2_700)
+        #expect(createRow.durationSource == .assistant)
+        #expect(replaceRow.source == .pendingReplace)
+        #expect(replaceRow.durationKind == .range)
+        #expect(replaceRow.durationMinimumSeconds == 2_400)
+        #expect(replaceRow.durationSeconds == 3_600)
+        #expect(replaceRow.durationMaximumSeconds == 5_400)
+        #expect(replaceRow.durationSource == .assistant)
+    }
+
     @Test("partial Inbox events are visible but cannot be replaced lossily")
     func partialInboxEventIsReadOnly() throws {
         let partial = try decodeItem(

@@ -288,6 +288,7 @@ struct CodexProposalEnvelopeParser {
             notes: notes,
             timezoneName: timezoneName,
             durationSeconds: durationSeconds,
+            durationSource: durationSeconds == nil ? nil : .assistant,
             deadlineAt: deadlineAt,
             earliestStartAt: earliestStartAt,
             recurrence: recurrence,

@@ -520,7 +520,7 @@ private fun legacyOwnEffortValue(raw: String): LegacyBoolean = runCatching {
     }
 }.getOrDefault(LegacyBoolean.INVALID)
 
-private fun legacyHasOwnEffort(raw: String): Boolean =
+internal fun legacyHasOwnEffort(raw: String): Boolean =
     legacyOwnEffortValue(raw) == LegacyBoolean.TRUE
 
 private fun String.isCanonicalDateOnly(): Boolean =

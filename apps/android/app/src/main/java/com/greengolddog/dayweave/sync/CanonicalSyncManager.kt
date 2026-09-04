@@ -1157,7 +1157,10 @@ class CanonicalSyncManager(
         CanonicalAuthoringOperation.CREATE -> transport.createItem(
             configuration = configuration,
             idempotencyKey = mutation.idempotencyKey,
-            request = requireNotNull(mutation.draft).toCreateCanonicalItemRequest(mutation.itemId),
+            request = requireNotNull(mutation.draft).toCreateCanonicalItemRequest(
+                mutation.itemId,
+                mutation.durationRequestShapeVersion,
+            ),
         )
         CanonicalAuthoringOperation.REPLACE -> transport.replaceItem(
             configuration = configuration,
@@ -1165,7 +1168,10 @@ class CanonicalSyncManager(
             idempotencyKey = mutation.idempotencyKey,
             request = ReplaceCanonicalItemRequest(
                 expectedRevision = requireNotNull(mutation.expectedRevision),
-                item = requireNotNull(mutation.draft).toCanonicalItemReplacement(mutation.itemId),
+                item = requireNotNull(mutation.draft).toCanonicalItemReplacement(
+                    mutation.itemId,
+                    mutation.durationRequestShapeVersion,
+                ),
             ),
         )
         CanonicalAuthoringOperation.TRASH -> transport.trashItem(
@@ -1186,8 +1192,15 @@ class CanonicalSyncManager(
 
     private fun CanonicalItemDraft.toCanonicalItemReplacement(
         itemId: String,
+        durationRequestShapeVersion: Int,
     ): CanonicalItemReplacement {
         val value = normalized().also { it.requireValid(itemId) }
+        require(durationRequestShapeVersion in setOf(
+            PendingCanonicalAuthoringMutation.LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+            PendingCanonicalAuthoringMutation.CURRENT_DURATION_REQUEST_SHAPE_VERSION,
+        ))
+        val emitsRichDuration = durationRequestShapeVersion ==
+            PendingCanonicalAuthoringMutation.CURRENT_DURATION_REQUEST_SHAPE_VERSION
         return CanonicalItemReplacement(
             isSensitive = value.isSensitive,
             kind = value.kind.name.lowercase(),
@@ -1196,6 +1209,10 @@ class CanonicalSyncManager(
             notes = value.notes,
             timezoneName = value.timezoneName,
             durationSeconds = value.durationSeconds,
+            durationKind = value.durationKind.takeIf { emitsRichDuration },
+            durationMinSeconds = value.durationMinSeconds.takeIf { emitsRichDuration },
+            durationMaxSeconds = value.durationMaxSeconds.takeIf { emitsRichDuration },
+            durationSource = value.durationSource.takeIf { emitsRichDuration },
             deadlineAt = value.deadlineAt,
             earliestStartAt = value.earliestStartAt,
             recurrence = value.recurrence?.toCanonicalJson(),
@@ -1214,8 +1231,9 @@ class CanonicalSyncManager(
 
     private fun CanonicalItemDraft.toCreateCanonicalItemRequest(
         itemId: String,
+        durationRequestShapeVersion: Int,
     ): CreateCanonicalItemRequest {
-        val fields = toCanonicalItemReplacement(itemId)
+        val fields = toCanonicalItemReplacement(itemId, durationRequestShapeVersion)
         return CreateCanonicalItemRequest(
             id = itemId,
             isSensitive = fields.isSensitive,
@@ -1225,6 +1243,10 @@ class CanonicalSyncManager(
             notes = fields.notes,
             timezoneName = fields.timezoneName,
             durationSeconds = fields.durationSeconds,
+            durationKind = fields.durationKind,
+            durationMinSeconds = fields.durationMinSeconds,
+            durationMaxSeconds = fields.durationMaxSeconds,
+            durationSource = fields.durationSource,
             deadlineAt = fields.deadlineAt,
             earliestStartAt = fields.earliestStartAt,
             recurrence = fields.recurrence,

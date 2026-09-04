@@ -653,6 +653,21 @@ sub-microsecond timestamps are invalid. `occurrence_window` is accepted as
 explicit `null` for decoding parity, but a non-null value is reserved for the
 recurrence materializer and must never be authored in canonical metadata.
 
+Habit metadata also accepts `habit_missed_policy` with `skip`, `carry`,
+`reduce_frequency`, or `ask`, and `habit_minimum_spacing_minutes` in
+`0..=527040`. The latter is a general start-to-start floor for every recurrence
+form and is distinct from the optional `minimum_spacing` embedded in a
+frequency recurrence. When both apply, composition enforces the larger of the
+two floors. Zero omits the general floor. Missed-policy actions are server-owned
+lifecycle decisions; clients configure the policy but do not invent carried
+windows or future occurrence identities. Interval and rolling rules retain
+their nominal cadence and stable identities; if the spacing floor makes the
+requested cadence impossible, the excess occurrences remain explicitly
+unscheduled until lifecycle evidence or a missed-policy resolution changes the
+demand. For completion-relative rules, the next due instant is conservatively
+bounded by `completion + max(interval, spacing)` because completion is the only
+authoritative prior-occurrence boundary in the recurrence context.
+
 A blocking event uses this metadata (recurring Google series are expanded by
 the calendar integration before composition):
 

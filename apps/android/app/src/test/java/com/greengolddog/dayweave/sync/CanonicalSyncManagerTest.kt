@@ -2,9 +2,11 @@ package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemDraft
+import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalRecurrenceDraft
 import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
 import com.greengolddog.dayweave.model.CanonicalBlockedReasonKind
@@ -23,6 +25,7 @@ import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
@@ -38,6 +41,7 @@ import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.localScheduleCompositionFingerprintComputationCount
 import com.greengolddog.dayweave.model.requireCanonicalReplacementSupport
+import com.greengolddog.dayweave.model.toCanonicalDraft
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -5013,6 +5017,186 @@ class CanonicalSyncManagerTest {
         assertEquals(1, transport.createRequests.size)
         assertEquals("planned", transport.createRequests.single().second.status)
         assertNotNull(plannerStore.state.value.publishedScheduleRevision)
+    }
+
+    @Test
+    fun queuedCreateSendsAndReconcilesTheExactRangedDurationContract() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val mutationId = "99999999-9999-4999-8999-999999999997"
+        val draft = authoredDraft().copy(
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 2_400,
+            durationSeconds = 3_600,
+            durationMaxSeconds = 5_400,
+            durationSource = CanonicalDurationSource.ASSISTANT,
+        )
+        assertTrue(
+            requireNotNull(plannerStore.enqueueCanonicalCreate(draft, TASK_ID, mutationId))
+                .persistence.awaitDurable(),
+        )
+        val created = authoredRemote(TASK_ID, revision = 1).copy(
+            durationKind = CanonicalDurationKind.RANGE,
+            durationMinSeconds = 2_400,
+            durationMaxSeconds = 5_400,
+            durationSource = CanonicalDurationSource.ASSISTANT,
+            deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+            deadlineStrength = CanonicalDeadlineStrength.HARD,
+            hasOwnEffort = false,
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "range-empty", false)
+            pages["range-empty"] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = created)),
+                "range-created",
+                false,
+            )
+            queuedPreviews += itemsPreview(emptyList())
+            queuedPreviews += itemsPreview(listOf(created))
+            createHandler = { _, request ->
+                assertEquals(CanonicalDurationKind.RANGE, request.durationKind)
+                assertEquals(2_400L, request.durationMinSeconds)
+                assertEquals(3_600L, request.durationSeconds)
+                assertEquals(5_400L, request.durationMaxSeconds)
+                assertEquals(CanonicalDurationSource.ASSISTANT, request.durationSource)
+                created
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        val cached = plannerStore.state.value.canonicalItems.single()
+        assertEquals(CanonicalDurationKind.RANGE, cached.durationKind)
+        assertEquals(CanonicalDurationSource.ASSISTANT, cached.durationSource)
+        assertEquals(CanonicalDurationKind.RANGE, cached.toCanonicalDraft().durationKind)
+    }
+
+    @Test
+    fun submittedLegacyCreateAndReplaceKeepTheirFrozenDurationRequestShape() = runBlocking {
+        val createMutation = PendingCanonicalAuthoringMutation(
+            id = "99999999-9999-4999-8999-999999999991",
+            itemId = TASK_ID,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = authoredDraft(),
+            createdAt = "2026-09-01T06:00:00Z",
+            durationRequestShapeVersion = PendingCanonicalAuthoringMutation
+                .LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+            syncOrigin = "https://api.example.test/",
+            configurationId = "connection-1",
+            submittedAt = "2026-09-01T07:00:00Z",
+        ).also(PendingCanonicalAuthoringMutation::requireValid)
+        val created = authoredRemote(TASK_ID, revision = 1)
+        val createStore = PlannerStore(
+            DayWeaveUiState(
+                canonicalSyncOrigin = "https://api.example.test/",
+                canonicalConfigurationId = "connection-1",
+                pendingCanonicalAuthoringMutations = listOf(createMutation),
+            ),
+        )
+        val createTransport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "legacy-create-empty", false)
+            pages["legacy-create-empty"] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = created)),
+                "legacy-create-applied",
+                false,
+            )
+            queuedPreviews += itemsPreview(emptyList())
+            queuedPreviews += itemsPreview(listOf(created))
+            createHandler = { _, request ->
+                assertEquals(3_600L, request.durationSeconds)
+                assertEquals(null, request.durationKind)
+                assertEquals(null, request.durationMinSeconds)
+                assertEquals(null, request.durationMaxSeconds)
+                assertEquals(null, request.durationSource)
+                created
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(createStore, createTransport).refreshAndCompose(),
+        )
+        assertTrue(createStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+
+        val base = CanonicalItemSnapshot(
+            id = TASK_ID,
+            kind = "task",
+            status = "planned",
+            title = "Compose Android timeline",
+            timezoneName = "Europe/Madrid",
+            durationSeconds = 3_600,
+            deadlineAt = "2026-09-01T12:00:00Z",
+            flexibleConstraintsJson = "{}",
+            splitPolicyJson = "{\"type\":\"indivisible\"}",
+            importance = 80,
+            urgency = 60,
+            siblingOrder = 0,
+            isExecutable = true,
+            revision = 7,
+            createdAt = "2026-09-01T07:00:00Z",
+            updatedAt = "2026-09-01T07:00:00Z",
+        )
+        val replacementDraft = base.requireCanonicalReplacementSupport().copy(
+            title = "Legacy replacement",
+        )
+        val replaceMutation = PendingCanonicalAuthoringMutation(
+            id = "99999999-9999-4999-8999-999999999992",
+            itemId = TASK_ID,
+            operation = CanonicalAuthoringOperation.REPLACE,
+            draft = replacementDraft,
+            expectedRevision = base.revision,
+            baseItem = base,
+            createdAt = "2026-09-01T06:00:00Z",
+            durationRequestShapeVersion = PendingCanonicalAuthoringMutation
+                .LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+            syncOrigin = "https://api.example.test/",
+            configurationId = "connection-1",
+            submittedAt = "2026-09-01T07:00:00Z",
+        ).also(PendingCanonicalAuthoringMutation::requireValid)
+        val remoteBase = authoredRemote(TASK_ID, revision = base.revision)
+        val replaced = authoredRemote(
+            TASK_ID,
+            revision = base.revision + 1,
+            title = replacementDraft.title,
+        )
+        val replaceStore = PlannerStore(
+            DayWeaveUiState(
+                canonicalSyncOrigin = "https://api.example.test/",
+                canonicalConfigurationId = "connection-1",
+                canonicalItems = listOf(base),
+                pendingCanonicalAuthoringMutations = listOf(replaceMutation),
+            ),
+        )
+        val replaceTransport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteBase)),
+                "legacy-replace-base",
+                false,
+            )
+            pages["legacy-replace-base"] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = replaced)),
+                "legacy-replace-applied",
+                false,
+            )
+            queuedPreviews += itemsPreview(listOf(remoteBase))
+            queuedPreviews += itemsPreview(listOf(replaced))
+            replacementHandler = { _, _, request ->
+                assertEquals(3_600L, request.item.durationSeconds)
+                assertEquals(null, request.item.durationKind)
+                assertEquals(null, request.item.durationMinSeconds)
+                assertEquals(null, request.item.durationMaxSeconds)
+                assertEquals(null, request.item.durationSource)
+                replaced
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(replaceStore, replaceTransport).refreshAndCompose(),
+        )
+        assertTrue(replaceStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals("Legacy replacement", replaceStore.state.value.canonicalItems.single().title)
     }
 
     @Test
