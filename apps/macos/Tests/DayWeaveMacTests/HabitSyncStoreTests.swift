@@ -236,6 +236,178 @@ struct HabitSyncStoreTests {
         #expect(try context.persistence.loadRevisioned().snapshot?.occurrences.first?.outcome?.note == "private note")
     }
 
+    @Test("a stream hint drains from the encrypted cursor and never installs its own token")
+    func streamHintDrainsAuthoritativeDelta() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let occurrence = Self.occurrence()
+        let authoritative = Self.occurrence(note: "authoritative delta")
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(
+                    changes: [.occurrenceUpsert(occurrence)],
+                    nextCursor: "encrypted_cursor",
+                    hasMore: false
+                ),
+                .init(
+                    changes: [.occurrenceUpsert(authoritative)],
+                    nextCursor: "authoritative_head",
+                    hasMore: false
+                ),
+            ]
+        )
+        let stream = HabitStreamTransportStub(
+            events: ["untrusted_hint"],
+            completion: .liveEndOfStream
+        )
+        let store = makeStore(context: context, transport: transport, stream: stream)
+        #expect(await store.activate() == .success)
+
+        store.startForegroundPolling(every: .seconds(60))
+        defer { store.stopForegroundPolling() }
+        try await eventually {
+            await transport.deltaCursors().count == 2
+        }
+
+        #expect(await transport.deltaCursors() == [nil, "encrypted_cursor"])
+        #expect(store.occurrences.first?.outcome?.note == "authoritative delta")
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCursor == "authoritative_head")
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCursor != "untrusted_hint")
+        #expect(await stream.resumeCursors() == ["encrypted_cursor"])
+    }
+
+    @Test("a hint equal to the encrypted cursor causes no authoritative read")
+    func alreadyCoveredStreamHintIsIgnored() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(Self.occurrence())],
+                nextCursor: "cursor_one",
+                hasMore: false
+            )]
+        )
+        let stream = HabitStreamTransportStub(
+            events: ["cursor_one"],
+            completion: .liveEndOfStream
+        )
+        let store = makeStore(context: context, transport: transport, stream: stream)
+        #expect(await store.activate() == .success)
+
+        store.startForegroundPolling(every: .seconds(60))
+        defer { store.stopForegroundPolling() }
+        try await eventually { await stream.resumeCursors().count == 1 }
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(await transport.deltaCursors() == [nil])
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCursor == "cursor_one")
+    }
+
+    @Test("a delayed hint cannot cross an API origin or auth-binding rotation")
+    func staleOriginStreamHintIsIgnored() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let firstTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(Self.occurrence(note: "origin a"))],
+                nextCursor: "cursor_a",
+                hasMore: false
+            )]
+        )
+        let secondTransport = HabitTransportStub(
+            configurationIdentifier: "origin-b|auth=device-b"
+        )
+        let gate = HabitStreamDeliveryGate()
+        let stream = HabitStreamTransportStub(
+            events: ["origin_a_hint"],
+            completion: .liveEndOfStream,
+            deliveryGate: gate
+        )
+        let selection = HabitStreamConnectionSelection(.init(
+            configurationIdentifier: firstTransport.configurationIdentifier,
+            transport: firstTransport,
+            streamTransport: stream
+        ))
+        let store = HabitSyncStore(
+            persistence: context.persistence,
+            connectionProvider: { selection.connection },
+            now: { Self.now }
+        )
+        #expect(await store.activate() == .success)
+        store.startForegroundPolling(every: .seconds(60))
+        defer { store.stopForegroundPolling() }
+        try await eventually { await stream.resumeCursors().count == 1 }
+
+        selection.connection = .init(
+            configurationIdentifier: secondTransport.configurationIdentifier,
+            transport: secondTransport
+        )
+        gate.release()
+        try await Task.sleep(for: .milliseconds(40))
+
+        #expect(await firstTransport.deltaCursors() == [nil])
+        #expect(await secondTransport.deltaCursors().isEmpty)
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCursor == "cursor_a")
+        #expect(store.occurrences.first?.outcome?.note == "origin a")
+    }
+
+    @Test("unsupported streaming leaves the independent poll catch-up active")
+    func unsupportedStreamKeepsPolling() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(
+                    changes: [.occurrenceUpsert(Self.occurrence())],
+                    nextCursor: "cursor_one",
+                    hasMore: false
+                ),
+                .init(changes: [], nextCursor: "cursor_two", hasMore: false),
+            ]
+        )
+        let stream = HabitStreamTransportStub(events: [], completion: .unsupported)
+        let store = makeStore(context: context, transport: transport, stream: stream)
+        #expect(await store.activate() == .success)
+
+        store.startForegroundPolling(every: .milliseconds(20))
+        defer { store.stopForegroundPolling() }
+        try await eventually { await transport.deltaCursors().count >= 2 }
+
+        #expect(await stream.resumeCursors() == ["cursor_one"])
+        #expect(Array((await transport.deltaCursors()).prefix(2)) == [nil, "cursor_one"])
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCursor == "cursor_two")
+    }
+
+    @Test("privacy suspension cancels an open habit stream and scrubs memory")
+    func privacyBoundaryCancelsHabitStream() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(Self.occurrence(note: "private note"))],
+                nextCursor: "cursor_one",
+                hasMore: false
+            )]
+        )
+        let stream = HabitStreamTransportStub(holdsOpenUntilCancelled: true)
+        let store = makeStore(context: context, transport: transport, stream: stream)
+        #expect(await store.activate() == .success)
+        store.startForegroundPolling(every: .seconds(60))
+        try await eventually { await stream.resumeCursors().count == 1 }
+
+        store.suspendForPrivacyBoundary()
+        try await eventually { await stream.wasCancelled() }
+
+        #expect(store.occurrences.isEmpty)
+        #expect(store.status.phase == .locked)
+        #expect(try context.persistence.loadRevisioned().snapshot?.occurrences.first?.outcome?.note == "private note")
+    }
+
     @Test("analytics refresh caches only the requested deterministic projection")
     func analyticsRefresh() async throws {
         let context = try Context()
@@ -394,19 +566,31 @@ struct HabitSyncStoreTests {
 
     private func makeStore(
         context: Context,
-        transport: HabitTransportStub
+        transport: HabitTransportStub,
+        stream: (any DayWeaveHabitStreamTransport)? = nil
     ) -> HabitSyncStore {
         HabitSyncStore(
             persistence: context.persistence,
             connectionProvider: {
                 .init(
                     configurationIdentifier: transport.configurationIdentifier,
-                    transport: transport
+                    transport: transport,
+                    streamTransport: stream
                 )
             },
             now: { Self.now },
             makeUUID: UUID.init
         )
+    }
+
+    private func eventually(
+        _ predicate: @escaping @MainActor () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(await predicate()), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await predicate())
     }
 
     nonisolated fileprivate static let now = date("2026-09-04T12:30:00.123456Z")
@@ -543,6 +727,12 @@ private final class LockedFlag: @unchecked Sendable {
 private final class HabitConnectionSelection {
     var transport: HabitTransportStub
     init(_ transport: HabitTransportStub) { self.transport = transport }
+}
+
+@MainActor
+private final class HabitStreamConnectionSelection {
+    var connection: DayWeaveHabitConnection
+    init(_ connection: DayWeaveHabitConnection) { self.connection = connection }
 }
 
 private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Sendable {
@@ -713,5 +903,81 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
     func outcomeRequests() async -> [OutcomeRequest] { state.outcomeRequests() }
     func deltaCursors() async -> [String?] { state.deltaCursors() }
     func analyticsHabitIDs() async -> [UUID] { state.analyticsIDs() }
+}
+
+private final class HabitStreamTransportStub: DayWeaveHabitStreamTransport, @unchecked Sendable {
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cursors: [String] = []
+        private var cancelled = false
+
+        func append(_ cursor: String) { lock.withLock { cursors.append(cursor) } }
+        func markCancelled() { lock.withLock { cancelled = true } }
+        func resumeCursors() -> [String] { lock.withLock { cursors } }
+        func wasCancelled() -> Bool { lock.withLock { cancelled } }
+    }
+
+    private let state = State()
+    private let events: [String]
+    private let completion: DayWeaveHabitStreamCompletion
+    private let holdsOpenUntilCancelled: Bool
+    private let deliveryGate: HabitStreamDeliveryGate?
+
+    init(
+        events: [String] = [],
+        completion: DayWeaveHabitStreamCompletion = .endOfStream,
+        holdsOpenUntilCancelled: Bool = false,
+        deliveryGate: HabitStreamDeliveryGate? = nil
+    ) {
+        self.events = events
+        self.completion = completion
+        self.holdsOpenUntilCancelled = holdsOpenUntilCancelled
+        self.deliveryGate = deliveryGate
+    }
+
+    func consumeHabitInvalidations(
+        after cursor: String,
+        _ receive: @escaping @Sendable (String) async -> Void
+    ) async throws -> DayWeaveHabitStreamCompletion {
+        state.append(cursor)
+        if let deliveryGate { await deliveryGate.wait() }
+        for event in events { await receive(event) }
+        guard holdsOpenUntilCancelled else { return completion }
+        return try await withTaskCancellationHandler {
+            try await Task.sleep(for: .seconds(3_600))
+            return completion
+        } onCancel: {
+            state.markCancelled()
+        }
+    }
+
+    func resumeCursors() async -> [String] { state.resumeCursors() }
+    func wasCancelled() async -> Bool { state.wasCancelled() }
+}
+
+private final class HabitStreamDeliveryGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isReleased = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock {
+                if isReleased { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let pending = lock.withLock {
+            isReleased = true
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume()
+    }
 }
 #endif

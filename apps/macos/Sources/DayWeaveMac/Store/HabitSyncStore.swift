@@ -3,10 +3,17 @@ import Foundation
 struct DayWeaveHabitConnection: Sendable {
     let configurationIdentifier: String
     let transport: any DayWeaveHabitTransport
+    let streamTransport: (any DayWeaveHabitStreamTransport)?
 
-    init(configurationIdentifier: String, transport: any DayWeaveHabitTransport) {
+    init(
+        configurationIdentifier: String,
+        transport: any DayWeaveHabitTransport,
+        streamTransport: (any DayWeaveHabitStreamTransport)? = nil
+    ) {
         self.configurationIdentifier = configurationIdentifier
         self.transport = transport
+        self.streamTransport = streamTransport
+            ?? (transport as? any DayWeaveHabitStreamTransport)
     }
 }
 
@@ -70,6 +77,7 @@ private enum HabitSyncControllerError: Error, LocalizedError {
 @MainActor
 final class HabitSyncStore: ObservableObject {
     static let maximumDeltaPagesPerSync = 1_000
+    static let maximumImmediateStreamDrains = 2
 
     @Published private(set) var occurrences: [DayWeaveHabitOccurrence] = []
     @Published private(set) var pauses: [DayWeaveHabitPause] = []
@@ -85,11 +93,20 @@ final class HabitSyncStore: ObservableObject {
     private let connectionProvider: @MainActor @Sendable () throws -> DayWeaveHabitConnection
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
+    private let streamSleep: @Sendable (Duration) async throws -> Void
     private var snapshot: DayWeaveHabitClientSnapshot?
     private var persistenceRevision = HabitPersistenceRevision.missing
     private var operationID: UUID?
     private var generation: UInt64 = 0
     private var foregroundPollingTask: Task<Void, Never>?
+    private var foregroundStreamTask: Task<Void, Never>?
+    private var foregroundStreamDrainTask: Task<Void, Never>?
+    private var foregroundStreamGeneration: UInt64 = 0
+    private var foregroundStreamObservationGeneration: UInt64 = 0
+    private var foregroundStreamReconciledGeneration: UInt64 = 0
+    private var foregroundStreamLatestHintCursor: String?
+    private var foregroundStreamUnavailableForActivation = false
+    private var foregroundStreamImmediateAttempts = 0
 
     init(
         configurationStore: any SuggestionAPIConfigurationStoring =
@@ -99,11 +116,15 @@ final class HabitSyncStore: ObservableObject {
         session: URLSession = makeDayWeaveEphemeralSession(),
         persistence: EncryptedHabitPersistence? = try? .applicationDefault(),
         now: @escaping @Sendable () -> Date = Date.init,
-        makeUUID: @escaping @Sendable () -> UUID = UUID.init
+        makeUUID: @escaping @Sendable () -> UUID = UUID.init,
+        streamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
     ) {
         self.persistence = persistence
         self.now = now
         self.makeUUID = makeUUID
+        self.streamSleep = streamSleep
         connectionProvider = {
             guard let configuredURL = configurationStore.loadBaseURL() else {
                 throw HabitSyncControllerError.notConfigured
@@ -117,7 +138,8 @@ final class HabitSyncStore: ObservableObject {
                 )
                 return DayWeaveHabitConnection(
                     configurationIdentifier: client.configurationIdentifier,
-                    transport: client
+                    transport: client,
+                    streamTransport: client
                 )
             }
             guard let token = try tokenStore.loadToken(boundTo: baseURL), !token.isEmpty else {
@@ -130,7 +152,8 @@ final class HabitSyncStore: ObservableObject {
             )
             return DayWeaveHabitConnection(
                 configurationIdentifier: client.configurationIdentifier,
-                transport: client
+                transport: client,
+                streamTransport: client
             )
         }
     }
@@ -139,12 +162,16 @@ final class HabitSyncStore: ObservableObject {
         persistence: EncryptedHabitPersistence?,
         connectionProvider: @escaping @MainActor @Sendable () throws -> DayWeaveHabitConnection,
         now: @escaping @Sendable () -> Date = Date.init,
-        makeUUID: @escaping @Sendable () -> UUID = UUID.init
+        makeUUID: @escaping @Sendable () -> UUID = UUID.init,
+        streamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
     ) {
         self.persistence = persistence
         self.connectionProvider = connectionProvider
         self.now = now
         self.makeUUID = makeUUID
+        self.streamSleep = streamSleep
     }
 
     var hasPendingConflict: Bool { pendingMutations.contains(where: \.conflictDetected) }
@@ -197,7 +224,7 @@ final class HabitSyncStore: ObservableObject {
         operationID = operation
         let expectedGeneration = generation
         status = .init(phase: .syncing, message: "Restoring encrypted habit progress…")
-        defer { if operationID == operation { operationID = nil } }
+        defer { releaseOperation(operation) }
 
         do {
             guard let persistence else { throw HabitPersistenceError.storageUnavailable }
@@ -256,7 +283,7 @@ final class HabitSyncStore: ObservableObject {
         let operation = makeUUID()
         operationID = operation
         status = .init(phase: .syncing, message: "Syncing habit progress…")
-        defer { if operationID == operation { operationID = nil } }
+        defer { releaseOperation(operation) }
         do {
             let connection = try connectionProvider()
             guard snapshot?.configurationIdentifier == connection.configurationIdentifier else {
@@ -435,7 +462,7 @@ final class HabitSyncStore: ObservableObject {
         let operation = makeUUID()
         operationID = operation
         status = .init(phase: .syncing, message: "Calculating private habit trends…")
-        defer { if operationID == operation { operationID = nil } }
+        defer { releaseOperation(operation) }
         do {
             let connection = try connectionProvider()
             guard snapshot?.configurationIdentifier == connection.configurationIdentifier else {
@@ -483,14 +510,28 @@ final class HabitSyncStore: ObservableObject {
 
     func startForegroundPolling(every interval: Duration) {
         guard foregroundPollingTask == nil else { return }
-        let pollingGeneration = generation
+        foregroundStreamUnavailableForActivation = false
+        foregroundStreamGeneration &+= 1
+        let pollingGeneration = foregroundStreamGeneration
         foregroundPollingTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: interval)
-                guard !Task.isCancelled,
-                      let self,
-                      self.generation == pollingGeneration else { return }
-                _ = await self.sync()
+            guard let self else { return }
+            self.startForegroundStreamIfReady(generation: pollingGeneration)
+            while self.foregroundIsCurrent(pollingGeneration) {
+                do {
+                    // Polling is intentionally independent of SSE health and
+                    // remains the bounded catch-up path when streaming is
+                    // unsupported, malformed, or transiently unavailable.
+                    try await Task.sleep(for: interval)
+                } catch {
+                    return
+                }
+                guard self.foregroundIsCurrent(pollingGeneration) else { return }
+                let outcome = await self.sync()
+                guard self.foregroundIsCurrent(pollingGeneration) else { return }
+                if outcome == .success || outcome == .conflict {
+                    self.foregroundStreamImmediateAttempts = 0
+                    self.startForegroundStreamIfReady(generation: pollingGeneration)
+                }
             }
         }
     }
@@ -498,6 +539,193 @@ final class HabitSyncStore: ObservableObject {
     func stopForegroundPolling() {
         foregroundPollingTask?.cancel()
         foregroundPollingTask = nil
+        foregroundStreamGeneration &+= 1
+        foregroundStreamTask?.cancel()
+        foregroundStreamTask = nil
+        foregroundStreamDrainTask?.cancel()
+        foregroundStreamDrainTask = nil
+        foregroundStreamObservationGeneration = 0
+        foregroundStreamReconciledGeneration = 0
+        foregroundStreamLatestHintCursor = nil
+        foregroundStreamUnavailableForActivation = false
+        foregroundStreamImmediateAttempts = 0
+    }
+
+    private func startForegroundStreamIfReady(generation: UInt64) {
+        guard foregroundIsCurrent(generation),
+              foregroundStreamTask == nil,
+              !foregroundStreamUnavailableForActivation,
+              let current = snapshot,
+              let durableCursor = current.deltaCursor,
+              DayWeaveHabitCursorContract.isValidTransportToken(durableCursor),
+              let connection = try? connectionProvider(),
+              connection.configurationIdentifier == current.configurationIdentifier,
+              connectionIsCurrent(connection),
+              connection.streamTransport != nil else { return }
+        foregroundStreamTask = Task { @MainActor [weak self] in
+            await self?.runForegroundStream(generation: generation)
+        }
+    }
+
+    private func runForegroundStream(generation: UInt64) async {
+        var retrySeconds = 1
+        defer {
+            if generation == foregroundStreamGeneration {
+                foregroundStreamTask = nil
+            }
+        }
+        while foregroundIsCurrent(generation) {
+            let connection: DayWeaveHabitConnection
+            do {
+                connection = try connectionProvider()
+            } catch {
+                return
+            }
+            guard let current = snapshot,
+                  current.configurationIdentifier == connection.configurationIdentifier,
+                  connectionIsCurrent(connection),
+                  let durableCursor = current.deltaCursor,
+                  DayWeaveHabitCursorContract.isValidTransportToken(durableCursor),
+                  let streamTransport = connection.streamTransport else { return }
+            foregroundStreamImmediateAttempts = 0
+            var reconnectDelaySeconds = 1
+            do {
+                let completion = try await streamTransport.consumeHabitInvalidations(
+                    after: durableCursor
+                ) { [weak self] cursor in
+                    await self?.acceptForegroundStreamHint(
+                        cursor,
+                        configurationIdentifier: connection.configurationIdentifier,
+                        generation: generation
+                    )
+                }
+                guard foregroundIsCurrent(generation) else { return }
+                switch completion {
+                case .unsupported:
+                    foregroundStreamUnavailableForActivation = true
+                    return
+                case .endOfStream:
+                    reconnectDelaySeconds = retrySeconds
+                    retrySeconds = min(retrySeconds * 2, 30)
+                case .liveEndOfStream:
+                    retrySeconds = 1
+                    reconnectDelaySeconds = 1
+                }
+            } catch {
+                guard foregroundIsCurrent(generation) else { return }
+                guard streamFailureIsTransient(error) else {
+                    foregroundStreamUnavailableForActivation = true
+                    return
+                }
+                reconnectDelaySeconds = retrySeconds
+                retrySeconds = min(retrySeconds * 2, 30)
+            }
+            do {
+                try await streamSleep(.seconds(reconnectDelaySeconds))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func acceptForegroundStreamHint(
+        _ cursor: String,
+        configurationIdentifier: String,
+        generation: UInt64
+    ) {
+        guard foregroundIsCurrent(generation),
+              DayWeaveHabitCursorContract.isValidTransportToken(cursor),
+              snapshot?.configurationIdentifier == configurationIdentifier,
+              (try? connectionProvider().configurationIdentifier) == configurationIdentifier else {
+            return
+        }
+        if cursor == snapshot?.deltaCursor { return }
+        foregroundStreamObservationGeneration &+= 1
+        foregroundStreamLatestHintCursor = cursor
+        enqueueForegroundStreamDrain(generation: generation)
+    }
+
+    private func enqueueForegroundStreamDrain(generation: UInt64) {
+        guard foregroundIsCurrent(generation),
+              foregroundStreamDrainTask == nil,
+              operationID == nil else { return }
+        foregroundStreamDrainTask = Task { @MainActor [weak self] in
+            await self?.drainForegroundStreamObservations(generation: generation)
+        }
+    }
+
+    private func drainForegroundStreamObservations(generation: UInt64) async {
+        var drainAttempts = 0
+        defer {
+            if generation == foregroundStreamGeneration {
+                foregroundStreamDrainTask = nil
+            }
+        }
+        while foregroundIsCurrent(generation) {
+            let targetGeneration = foregroundStreamObservationGeneration
+            guard targetGeneration > foregroundStreamReconciledGeneration else { return }
+            if foregroundStreamLatestHintCursor == snapshot?.deltaCursor {
+                foregroundStreamReconciledGeneration = foregroundStreamObservationGeneration
+                foregroundStreamLatestHintCursor = nil
+                continue
+            }
+            guard operationID == nil,
+                  drainAttempts < Self.maximumImmediateStreamDrains,
+                  foregroundStreamImmediateAttempts < Self.maximumImmediateStreamDrains else {
+                return
+            }
+            drainAttempts += 1
+            foregroundStreamImmediateAttempts += 1
+            let outcome = await sync()
+            guard foregroundIsCurrent(generation),
+                  outcome == .success || outcome == .conflict else { return }
+            if foregroundStreamLatestHintCursor == snapshot?.deltaCursor {
+                // Exact equality is the only relationship inferred between
+                // opaque tokens. It also covers hints received in flight.
+                foregroundStreamReconciledGeneration = foregroundStreamObservationGeneration
+                foregroundStreamLatestHintCursor = nil
+            } else {
+                // A fully drained authoritative delta covers the observation
+                // captured before this request. A newer in-flight observation
+                // receives one separately bounded immediate drain.
+                foregroundStreamReconciledGeneration = targetGeneration
+            }
+        }
+    }
+
+    private func foregroundIsCurrent(_ generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && foregroundPollingTask != nil
+            && generation == foregroundStreamGeneration
+    }
+
+    private func connectionIsCurrent(_ connection: DayWeaveHabitConnection) -> Bool {
+        (try? connectionProvider().configurationIdentifier) == connection.configurationIdentifier
+            && snapshot?.configurationIdentifier == connection.configurationIdentifier
+    }
+
+    private func streamFailureIsTransient(_ error: any Error) -> Bool {
+        switch error {
+        case let DayWeaveAPIError.transport(code):
+            return code != .cancelled
+        case let DayWeaveAPIError.server(statusCode, _, _, _):
+            return statusCode == 408 || statusCode == 429 || statusCode >= 500
+        case let DayWeaveAPIError.durableAuthentication(error):
+            switch error {
+            case .transport, .retryableServer: return true
+            default: return false
+            }
+        default:
+            return false
+        }
+    }
+
+    private func releaseOperation(_ operation: UUID) {
+        if operationID == operation { operationID = nil }
+        guard foregroundStreamObservationGeneration > foregroundStreamReconciledGeneration else {
+            return
+        }
+        enqueueForegroundStreamDrain(generation: foregroundStreamGeneration)
     }
 
     private func enqueueAndExecute(
@@ -509,7 +737,7 @@ final class HabitSyncStore: ObservableObject {
         let operation = pending.id
         operationID = operation
         status = .init(phase: .syncing, message: "Saving this habit update securely…")
-        defer { if operationID == operation { operationID = nil } }
+        defer { releaseOperation(operation) }
         do {
             let connection = try connectionProvider()
             guard candidate.configurationIdentifier == connection.configurationIdentifier else {

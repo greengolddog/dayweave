@@ -191,10 +191,7 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
     }
 
     private static func isValidCursor(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 256 && value.utf8.allSatisfy { byte in
-            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
-                || byte == 45 || byte == 95
-        }
+        DayWeaveHabitCursorContract.isValidTransportToken(value)
     }
 }
 
