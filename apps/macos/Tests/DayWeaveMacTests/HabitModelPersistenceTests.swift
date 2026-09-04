@@ -403,6 +403,52 @@ struct HabitModelPersistenceTests {
         ).hasValidShape)
     }
 
+    @Test("shared occurrence evidence fixture stays aligned with the habit protocol")
+    func sharedOccurrenceEvidenceFixture() throws {
+        let fixture = try Self.habitOccurrenceEvidenceFixture()
+        #expect(fixture.schema == "dayweave.habit-occurrence-evidence-fixtures/1")
+
+        let caseNames = (fixture.validCases + fixture.invalidCases).map(\.name)
+        #expect(Set(caseNames).count == caseNames.count, "Fixture case names must be unique")
+
+        for fixtureCase in fixture.validCases {
+            let merged = Self.mergedEvidence(
+                base: fixture.baseEvidence,
+                patch: fixtureCase.patch
+            )
+            let mergedData = try Self.encoder().encode(merged)
+            let evidence = try Self.decoder().decode(
+                DayWeaveHabitOccurrenceEvidence.self,
+                from: mergedData
+            )
+            #expect(evidence.hasValidShape, "Expected valid fixture: \(fixtureCase.name)")
+
+            let reencodedData = try Self.encoder().encode(evidence)
+            let reencoded = try JSONDecoder().decode(JSONValue.self, from: reencodedData)
+            #expect(
+                Self.normalizedEvidenceWire(reencoded)
+                    == Self.normalizedEvidenceWire(merged),
+                "Re-encoded fixture changed protocol fields: \(fixtureCase.name)"
+            )
+        }
+
+        for fixtureCase in fixture.invalidCases {
+            let merged = Self.mergedEvidence(
+                base: fixture.baseEvidence,
+                patch: fixtureCase.patch
+            )
+            let mergedData = try Self.encoder().encode(merged)
+            let accepted = try? Self.decoder().decode(
+                DayWeaveHabitOccurrenceEvidence.self,
+                from: mergedData
+            )
+            #expect(
+                accepted?.hasValidShape != true,
+                "Expected invalid fixture to fail closed: \(fixtureCase.name)"
+            )
+        }
+    }
+
     @Test("strict outcome decoding rejects unknown and omitted nullable keys")
     func strictOutcomeDecoding() {
         let unknown = Data("""
@@ -864,6 +910,64 @@ struct HabitModelPersistenceTests {
         )
     }
 
+    private struct HabitOccurrenceEvidenceFixture: Decodable {
+        let schema: String
+        let baseEvidence: [String: JSONValue]
+        let validCases: [HabitOccurrenceEvidenceFixtureCase]
+        let invalidCases: [HabitOccurrenceEvidenceFixtureCase]
+
+        private enum CodingKeys: String, CodingKey {
+            case schema
+            case baseEvidence = "base_evidence"
+            case validCases = "valid_cases"
+            case invalidCases = "invalid_cases"
+        }
+    }
+
+    private struct HabitOccurrenceEvidenceFixtureCase: Decodable {
+        let name: String
+        let patch: [String: JSONValue]
+    }
+
+    private static func habitOccurrenceEvidenceFixture() throws
+        -> HabitOccurrenceEvidenceFixture {
+        var repository = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { repository.deleteLastPathComponent() }
+        let data = try Data(contentsOf: repository.appendingPathComponent(
+            "fixtures/habit-protocol/occurrence-evidence-v1.json"
+        ))
+        return try JSONDecoder().decode(HabitOccurrenceEvidenceFixture.self, from: data)
+    }
+
+    private static func mergedEvidence(
+        base: [String: JSONValue],
+        patch: [String: JSONValue]
+    ) -> JSONValue {
+        var merged = base
+        for (key, value) in patch { merged[key] = value }
+        return .object(merged)
+    }
+
+    /// Foundation's Codable representations uppercase UUIDs and the persistence encoder writes
+    /// whole-second dates with `.000Z`. Normalize only those spellings before comparing the
+    /// re-encoded model with the server-wire fixture; nested recurrence identity JSON remains exact.
+    private static func normalizedEvidenceWire(_ value: JSONValue) -> JSONValue {
+        guard case var .object(fields) = value else { return value }
+        for key in [
+            "id", "habit_id", "planner_occurrence_id", "source_schedule_revision_id",
+        ] {
+            guard case let .string(raw)? = fields[key] else { continue }
+            fields[key] = .string(raw.lowercased())
+        }
+        for key in ["nominal_start", "nominal_end", "window_start", "window_end"] {
+            guard case let .string(raw)? = fields[key],
+                  let date = CanonicalRFC3339Instant(raw)?.exactlyRepresentableDate,
+                  let canonical = CanonicalRFC3339Instant(date: date) else { continue }
+            fields[key] = .string(canonical.canonicalUTCString)
+        }
+        return .object(fields)
+    }
+
     private static func pause(
         id: UUID,
         habitID: UUID,
@@ -897,7 +1001,9 @@ struct HabitModelPersistenceTests {
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
             let text = try container.decode(String.self)
-            guard let date = CanonicalRFC3339Instant(text)?.exactlyRepresentableDate else {
+            guard let instant = CanonicalRFC3339Instant(text),
+                  instant.hasPostgresPrecision,
+                  let date = instant.exactlyRepresentableDate else {
                 throw DecodingError.dataCorruptedError(in: container, debugDescription: "date")
             }
             return date

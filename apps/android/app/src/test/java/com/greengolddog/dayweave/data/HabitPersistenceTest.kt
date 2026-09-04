@@ -10,18 +10,69 @@ import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
+import java.io.File
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HabitPersistenceTest {
+    @Test
+    fun sharedOccurrenceEvidenceFixturesDefineTheAndroidContract() {
+        val document = fixtureJson.parseToJsonElement(
+            habitOccurrenceEvidenceFixture().readText(),
+        ).jsonObject
+        assertEquals(
+            "dayweave.habit-occurrence-evidence-fixtures/1",
+            document.getValue("schema").jsonPrimitive.content,
+        )
+        val base = document.getValue("base_evidence").jsonObject
+        val validCases = document.getValue("valid_cases").jsonArray
+        val invalidCases = document.getValue("invalid_cases").jsonArray
+        assertTrue(validCases.isNotEmpty())
+        assertTrue(invalidCases.isNotEmpty())
+        val names = mutableSetOf<String>()
+
+        validCases.forEach { element ->
+            val case = element.jsonObject
+            val name = case.getValue("name").jsonPrimitive.content
+            assertTrue("duplicate fixture case $name", names.add(name))
+            val merged = JsonObject(base + case.getValue("patch").jsonObject)
+            val wire = fixtureJson.decodeFromJsonElement<SharedHabitEvidenceWire>(merged)
+            wire.snapshot().requireValid()
+            assertEquals(
+                "$name did not retain its exact wire value",
+                merged,
+                fixtureJson.encodeToJsonElement(wire),
+            )
+        }
+
+        invalidCases.forEach { element ->
+            val case = element.jsonObject
+            val name = case.getValue("name").jsonPrimitive.content
+            assertTrue("duplicate fixture case $name", names.add(name))
+            val merged = JsonObject(base + case.getValue("patch").jsonObject)
+            val accepted = runCatching {
+                fixtureJson.decodeFromJsonElement<SharedHabitEvidenceWire>(merged)
+                    .snapshot()
+                    .requireValid()
+            }.isSuccess
+            assertTrue("invalid fixture was accepted: $name", !accepted)
+        }
+    }
+
     @Test
     fun authoritativeCacheAndExactOutboxRoundTripInCurrentEncryptedPayload() = runBlocking {
         val ledger = ledger()
@@ -316,6 +367,55 @@ class HabitPersistenceTest {
         ).also(HabitLedgerSnapshot::requireValid)
     }
 
+    private fun habitOccurrenceEvidenceFixture(): File {
+        val relative = "fixtures/habit-protocol/occurrence-evidence-v1.json"
+        return generateSequence(File(requireNotNull(System.getProperty("user.dir")))) {
+            it.parentFile
+        }
+            .map { File(it, relative) }
+            .firstOrNull(File::isFile)
+            ?: error("Unable to locate $relative")
+    }
+
+    @Serializable
+    private data class SharedHabitEvidenceWire(
+        val id: String,
+        @SerialName("habit_id") val habitId: String,
+        @SerialName("planner_occurrence_id") val plannerOccurrenceId: String,
+        @SerialName("source_schedule_revision_id") val sourceScheduleRevisionId: String,
+        @SerialName("source_item_revision") val sourceItemRevision: Long,
+        @SerialName("policy_fingerprint") val policyFingerprint: String,
+        val identity: JsonObject,
+        @SerialName("nominal_start") val nominalStart: String,
+        @SerialName("nominal_end") val nominalEnd: String,
+        @SerialName("window_start") val windowStart: String,
+        @SerialName("window_end") val windowEnd: String,
+        @SerialName("local_date") val localDate: String,
+        @SerialName("timezone_name") val timezoneName: String,
+        @SerialName("expected_duration_seconds") val expectedDurationSeconds: Long?,
+        @SerialName("expected_quantity") val expectedQuantity: Long?,
+        @SerialName("expected_unit") val expectedUnit: String?,
+    ) {
+        fun snapshot() = HabitOccurrenceEvidenceSnapshot(
+            id = id,
+            habitId = habitId,
+            plannerOccurrenceId = plannerOccurrenceId,
+            sourceScheduleRevisionId = sourceScheduleRevisionId,
+            sourceItemRevision = sourceItemRevision,
+            policyFingerprint = policyFingerprint,
+            identity = identity,
+            nominalStart = nominalStart,
+            nominalEnd = nominalEnd,
+            windowStart = windowStart,
+            windowEnd = windowEnd,
+            localDate = localDate,
+            timezoneName = timezoneName,
+            expectedDurationSeconds = expectedDurationSeconds,
+            expectedQuantity = expectedQuantity,
+            expectedUnit = expectedUnit,
+        )
+    }
+
     private class FakeDao(
         var snapshot: PlannerSnapshotEntity? = null,
     ) : PlannerSnapshotDao {
@@ -327,6 +427,10 @@ class HabitPersistenceTest {
     }
 
     private companion object {
+        val fixtureJson = Json {
+            ignoreUnknownKeys = false
+            encodeDefaults = true
+        }
         const val ORIGIN = "https://api.example.test/tenant/"
         const val CONFIGURATION_ID = "habit-binding"
         const val HABIT_ID = "11111111-1111-4111-8111-111111111111"

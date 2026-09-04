@@ -735,6 +735,41 @@ pub enum HabitDomainError {
 mod tests {
     use super::*;
 
+    #[derive(serde::Deserialize)]
+    struct EvidenceFixtureFile {
+        schema: String,
+        base_evidence: Value,
+        valid_cases: Vec<EvidenceFixtureCase>,
+        invalid_cases: Vec<EvidenceFixtureCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct EvidenceFixtureCase {
+        name: String,
+        patch: Value,
+    }
+
+    fn evidence_fixture() -> EvidenceFixtureFile {
+        serde_json::from_str(include_str!(
+            "../../../../fixtures/habit-protocol/occurrence-evidence-v1.json"
+        ))
+        .expect("shared habit occurrence evidence fixture must be strict JSON")
+    }
+
+    fn patched_evidence(base: &Value, patch: &Value) -> Value {
+        let mut result = base
+            .as_object()
+            .expect("base habit evidence must be an object")
+            .clone();
+        for (key, value) in patch
+            .as_object()
+            .expect("habit evidence patch must be an object")
+        {
+            result.insert(key.clone(), value.clone());
+        }
+        Value::Object(result)
+    }
+
     fn occurrence(date: NaiveDate, status: Option<HabitOutcomeStatus>) -> HabitOccurrence {
         let start = date.and_hms_opt(8, 0, 0).unwrap().and_utc();
         let habit_id = Uuid::from_u128(1);
@@ -779,6 +814,42 @@ mod tests {
                 occurred_at: start,
                 updated_at: start,
             }),
+        }
+    }
+
+    #[test]
+    fn shared_occurrence_evidence_fixtures_define_the_server_contract() {
+        let fixture = evidence_fixture();
+        assert_eq!(
+            fixture.schema,
+            "dayweave.habit-occurrence-evidence-fixtures/1"
+        );
+        assert!(!fixture.valid_cases.is_empty());
+        assert!(!fixture.invalid_cases.is_empty());
+        let mut names = BTreeSet::new();
+
+        for case in &fixture.valid_cases {
+            assert!(names.insert(case.name.as_str()), "duplicate {}", case.name);
+            let raw = patched_evidence(&fixture.base_evidence, &case.patch);
+            let evidence: HabitOccurrenceEvidence = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|error| panic!("{} did not decode: {error}", case.name));
+            evidence
+                .validate()
+                .unwrap_or_else(|error| panic!("{} did not validate: {error}", case.name));
+            assert_eq!(
+                serde_json::to_value(evidence).expect("valid evidence must encode"),
+                raw,
+                "{} did not retain its exact wire value",
+                case.name
+            );
+        }
+
+        for case in &fixture.invalid_cases {
+            assert!(names.insert(case.name.as_str()), "duplicate {}", case.name);
+            let raw = patched_evidence(&fixture.base_evidence, &case.patch);
+            let accepted = serde_json::from_value::<HabitOccurrenceEvidence>(raw)
+                .is_ok_and(|evidence| evidence.validate().is_ok());
+            assert!(!accepted, "{} unexpectedly passed", case.name);
         }
     }
 

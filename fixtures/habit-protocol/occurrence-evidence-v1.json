@@ -1,0 +1,371 @@
+{
+  "schema": "dayweave.habit-occurrence-evidence-fixtures/1",
+  "base_evidence": {
+    "id": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+    "habit_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+    "planner_occurrence_id": "cccccccc-3333-5333-8333-cccccccccccc",
+    "source_schedule_revision_id": "dddddddd-4444-4444-8444-dddddddddddd",
+    "source_item_revision": 3,
+    "policy_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "identity": {
+      "type": "calendar_day",
+      "date": "2026-09-04",
+      "bucket_ordinal": 0
+    },
+    "nominal_start": "2026-09-04T10:00:00Z",
+    "nominal_end": "2026-09-04T11:00:00Z",
+    "window_start": "2026-09-04T09:00:00Z",
+    "window_end": "2026-09-04T12:00:00Z",
+    "local_date": "2026-09-04",
+    "timezone_name": "Europe/Paris",
+    "expected_duration_seconds": 3600,
+    "expected_quantity": 20,
+    "expected_unit": "pages"
+  },
+  "valid_cases": [
+    {
+      "name": "calendar_day",
+      "patch": {}
+    },
+    {
+      "name": "calendar_week",
+      "patch": {
+        "identity": {
+          "type": "calendar_week",
+          "week_key": 2461288,
+          "bucket_ordinal": 65534
+        }
+      }
+    },
+    {
+      "name": "calendar_month",
+      "patch": {
+        "identity": {
+          "type": "calendar_month",
+          "year": 2026,
+          "month": 9,
+          "bucket_ordinal": 65534
+        }
+      }
+    },
+    {
+      "name": "rolling_minutes",
+      "patch": {
+        "identity": {
+          "type": "rolling_minutes",
+          "index": 4294967295,
+          "anchor": "0001-01-01T00:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "after_completion",
+      "patch": {
+        "identity": {
+          "type": "after_completion",
+          "anchor": "9999-12-31T23:59:59.999999Z"
+        }
+      }
+    },
+    {
+      "name": "rolling_month",
+      "patch": {
+        "identity": {
+          "type": "rolling_month",
+          "cycle": 2147483647,
+          "index": 65534,
+          "anchor": "2026-09-01T08:00:00+18:00"
+        }
+      }
+    },
+    {
+      "name": "custom_rule",
+      "patch": {
+        "identity": {
+          "type": "custom_rule",
+          "rule_id": "123e4567-e89b-52d3-a456-426614174000",
+          "sequence": 9999,
+          "date": "2026-09-04"
+        }
+      }
+    },
+    {
+      "name": "spring_dst_calendar_day",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "2026-03-29",
+          "bucket_ordinal": 0
+        },
+        "nominal_start": "2026-03-28T23:00:00Z",
+        "nominal_end": "2026-03-29T22:00:00Z",
+        "window_start": "2026-03-28T22:00:00Z",
+        "window_end": "2026-03-29T23:00:00Z",
+        "local_date": "2026-03-29"
+      }
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "nil_ledger_id",
+      "patch": {
+        "id": "00000000-0000-0000-0000-000000000000"
+      }
+    },
+    {
+      "name": "ledger_id_equals_planner_id",
+      "patch": {
+        "id": "cccccccc-3333-5333-8333-cccccccccccc"
+      }
+    },
+    {
+      "name": "planner_id_wrong_uuid_version",
+      "patch": {
+        "planner_occurrence_id": "cccccccc-3333-4333-8333-cccccccccccc"
+      }
+    },
+    {
+      "name": "planner_id_wrong_uuid_variant",
+      "patch": {
+        "planner_occurrence_id": "cccccccc-3333-5333-0333-cccccccccccc"
+      }
+    },
+    {
+      "name": "nil_schedule_revision_id",
+      "patch": {
+        "source_schedule_revision_id": "00000000-0000-0000-0000-000000000000"
+      }
+    },
+    {
+      "name": "zero_item_revision",
+      "patch": {
+        "source_item_revision": 0
+      }
+    },
+    {
+      "name": "uppercase_policy_fingerprint",
+      "patch": {
+        "policy_fingerprint": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    },
+    {
+      "name": "reversed_nominal_interval",
+      "patch": {
+        "nominal_start": "2026-09-04T11:00:00Z",
+        "nominal_end": "2026-09-04T10:00:00Z"
+      }
+    },
+    {
+      "name": "nominal_interval_outside_window",
+      "patch": {
+        "nominal_start": "2026-09-04T08:59:59.999999Z"
+      }
+    },
+    {
+      "name": "local_date_below_supported_horizon",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "1899-09-04",
+          "bucket_ordinal": 0
+        },
+        "local_date": "1899-09-04"
+      }
+    },
+    {
+      "name": "local_date_above_supported_horizon",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "2201-09-04",
+          "bucket_ordinal": 0
+        },
+        "local_date": "2201-09-04"
+      }
+    },
+    {
+      "name": "evidence_instant_above_rfc3339_year_range",
+      "patch": {
+        "window_end": "+10000-01-01T00:00:00Z"
+      }
+    },
+    {
+      "name": "evidence_instant_exceeds_postgres_precision",
+      "patch": {
+        "nominal_start": "2026-09-04T10:00:00.000000001Z"
+      }
+    },
+    {
+      "name": "timezone_offset_is_not_iana_name",
+      "patch": {
+        "timezone_name": "+02:00"
+      }
+    },
+    {
+      "name": "duration_exceeds_ledger_limit",
+      "patch": {
+        "expected_duration_seconds": 31622401
+      }
+    },
+    {
+      "name": "quantity_without_unit",
+      "patch": {
+        "expected_unit": null
+      }
+    },
+    {
+      "name": "empty_quantity_unit",
+      "patch": {
+        "expected_unit": ""
+      }
+    },
+    {
+      "name": "legacy_custom_identity",
+      "patch": {
+        "identity": {
+          "type": "custom"
+        }
+      }
+    },
+    {
+      "name": "evidence_with_unknown_field",
+      "patch": {
+        "future": true
+      }
+    },
+    {
+      "name": "identity_with_unknown_field",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "2026-09-04",
+          "bucket_ordinal": 0,
+          "future": true
+        }
+      }
+    },
+    {
+      "name": "calendar_identity_date_mismatch",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "2026-09-03",
+          "bucket_ordinal": 0
+        }
+      }
+    },
+    {
+      "name": "calendar_interval_crosses_local_midnight",
+      "patch": {
+        "nominal_start": "2026-09-04T21:30:00Z",
+        "nominal_end": "2026-09-04T22:30:00Z",
+        "window_start": "2026-09-04T20:30:00Z",
+        "window_end": "2026-09-04T23:30:00Z"
+      }
+    },
+    {
+      "name": "calendar_bucket_ordinal_out_of_range",
+      "patch": {
+        "identity": {
+          "type": "calendar_day",
+          "date": "2026-09-04",
+          "bucket_ordinal": 65535
+        }
+      }
+    },
+    {
+      "name": "rolling_index_out_of_range",
+      "patch": {
+        "identity": {
+          "type": "rolling_minutes",
+          "index": 4294967296,
+          "anchor": "2026-09-01T08:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "rolling_anchor_noncanonical_fraction",
+      "patch": {
+        "identity": {
+          "type": "after_completion",
+          "anchor": "2026-09-01T08:00:00.120Z"
+        }
+      }
+    },
+    {
+      "name": "rolling_anchor_offset_above_eighteen_hours",
+      "patch": {
+        "identity": {
+          "type": "after_completion",
+          "anchor": "2026-09-01T08:00:00+18:01"
+        }
+      }
+    },
+    {
+      "name": "rolling_month_cycle_out_of_range",
+      "patch": {
+        "identity": {
+          "type": "rolling_month",
+          "cycle": 2147483648,
+          "index": 0,
+          "anchor": "2026-09-01T08:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "rolling_month_index_out_of_range",
+      "patch": {
+        "identity": {
+          "type": "rolling_month",
+          "cycle": 0,
+          "index": 65535,
+          "anchor": "2026-09-01T08:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "custom_rule_wrong_uuid_version",
+      "patch": {
+        "identity": {
+          "type": "custom_rule",
+          "rule_id": "123e4567-e89b-42d3-a456-426614174000",
+          "sequence": 0,
+          "date": "2026-09-04"
+        }
+      }
+    },
+    {
+      "name": "custom_rule_wrong_uuid_variant",
+      "patch": {
+        "identity": {
+          "type": "custom_rule",
+          "rule_id": "123e4567-e89b-52d3-2456-426614174000",
+          "sequence": 0,
+          "date": "2026-09-04"
+        }
+      }
+    },
+    {
+      "name": "custom_rule_sequence_out_of_range",
+      "patch": {
+        "identity": {
+          "type": "custom_rule",
+          "rule_id": "123e4567-e89b-52d3-a456-426614174000",
+          "sequence": 10000,
+          "date": "2026-09-04"
+        }
+      }
+    },
+    {
+      "name": "custom_rule_date_mismatch",
+      "patch": {
+        "identity": {
+          "type": "custom_rule",
+          "rule_id": "123e4567-e89b-52d3-a456-426614174000",
+          "sequence": 0,
+          "date": "2026-09-03"
+        }
+      }
+    }
+  ]
+}

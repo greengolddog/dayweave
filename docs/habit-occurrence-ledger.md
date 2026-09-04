@@ -162,6 +162,12 @@ denominators without discarding recorded time or quantity.
 
 ## Verification
 
+`fixtures/habit-protocol/occurrence-evidence-v1.json` freezes the shared evidence envelope,
+identity variants, portable bounds, and invalid-case matrix consumed by Rust, macOS, and Android.
+Each case applies a shallow top-level replacement patch to `base_evidence`; nested values are
+replaced as complete values rather than recursively merged. Case names are unique across the valid
+and invalid sets, and invalid acceptance means either decoding or semantic validation must fail.
+
 `tests/habits_api.rs` freezes REST identity, replay, correction, privacy, cursor/SSE, pause, range,
 and analytics behavior against the in-memory adapter. `tests/habits_postgres.rs` exercises atomic
 publication admission, durable replay, concurrent compare-and-swap, preview invalidation,
