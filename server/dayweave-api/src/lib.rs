@@ -13,6 +13,7 @@ pub mod error;
 pub mod execution;
 pub mod google_oauth;
 pub mod google_sync;
+pub mod habits;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
@@ -37,13 +38,14 @@ use google_oauth::{
     ProductionGoogleOAuthTransport, SecretCipher,
 };
 use google_sync::{GoogleSyncRepository, GoogleSyncService, ProductionGoogleSyncProvider};
+use habits::{HabitRepository, HabitService, InMemoryHabitRepository};
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
 use mcp_oauth::McpOAuthVerifier;
 use persistence::{
     Database, PersistenceError, PostgresCredentialRepository, PostgresExecutionRepository,
-    PostgresGoogleOAuthRepository, PostgresGoogleSyncRepository, PostgresItemRepository,
-    PostgresProposalApplicationRepository, PostgresProposalRepository,
+    PostgresGoogleOAuthRepository, PostgresGoogleSyncRepository, PostgresHabitRepository,
+    PostgresItemRepository, PostgresProposalApplicationRepository, PostgresProposalRepository,
 };
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
@@ -59,6 +61,7 @@ use uuid::Uuid;
 type Repositories = (
     Arc<dyn ProposalRepository>,
     Arc<dyn ItemRepository>,
+    Arc<dyn HabitRepository>,
     Arc<dyn ExecutionRepository>,
     Option<Arc<PostgresExecutionRepository>>,
     Option<Arc<Mutex<()>>>,
@@ -107,6 +110,10 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             )),
+            Arc::new(PostgresHabitRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            )),
             postgres_execution.clone(),
             Some(postgres_execution),
             None,
@@ -146,6 +153,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
     Ok((
         Arc::new(InMemoryProposalRepository::default()),
         item_repository,
+        Arc::new(InMemoryHabitRepository::default()),
         execution_repository,
         None,
         Some(execution_item_gate),
@@ -167,6 +175,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
 pub struct AppState {
     pub proposals: Arc<ProposalService>,
     pub items: Arc<ItemService>,
+    pub habits: Arc<HabitService>,
     pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
     pub credential_repository: Option<Arc<dyn CredentialRepository>>,
@@ -198,6 +207,7 @@ impl AppState {
         let (
             repository,
             item_repository,
+            habit_repository,
             execution_repository,
             postgres_execution,
             execution_item_gate,
@@ -215,6 +225,11 @@ impl AppState {
             config.proposal_ttl,
         ));
         let items = Arc::new(ItemService::new(item_repository, clock.clone()));
+        let habits = Arc::new(HabitService::new(
+            habit_repository,
+            items.clone(),
+            clock.clone(),
+        ));
         let mut execution_service =
             ExecutionService::new(execution_repository.clone(), items.clone(), clock.clone());
         if let Some(gate) = execution_item_gate.as_ref() {
@@ -358,6 +373,7 @@ impl AppState {
         Ok(Self {
             proposals,
             items,
+            habits,
             execution,
             authenticator,
             credential_repository,
@@ -397,6 +413,11 @@ impl AppState {
             )),
             clock.clone(),
         ));
+        let habits = Arc::new(HabitService::new(
+            Arc::new(InMemoryHabitRepository::default()),
+            items.clone(),
+            clock.clone(),
+        ));
         let execution = Arc::new(
             ExecutionService::new(execution_repository.clone(), items.clone(), clock.clone())
                 .with_start_operation_gate(execution_item_gate.clone()),
@@ -404,6 +425,7 @@ impl AppState {
         Self {
             proposals,
             items,
+            habits,
             execution,
             authenticator,
             credential_repository: None,
@@ -427,6 +449,17 @@ impl AppState {
         // memory lease with PostgreSQL item state), so execution deliberately retains its
         // original paired ItemService and fails closed for items that exist only in `items`.
         self.items = items;
+        self
+    }
+
+    /// Installs a habit repository while preserving this state's canonical item service.
+    #[must_use]
+    pub fn with_habit_repository(mut self, repository: Arc<dyn HabitRepository>) -> Self {
+        self.habits = Arc::new(HabitService::new(
+            repository,
+            self.items.clone(),
+            self.clock.clone(),
+        ));
         self
     }
 

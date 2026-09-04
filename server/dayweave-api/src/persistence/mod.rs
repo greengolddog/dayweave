@@ -3,6 +3,7 @@ mod database;
 mod execution_repository;
 mod google_oauth_repository;
 mod google_sync_repository;
+mod habit_repository;
 mod idempotency;
 mod item_repository;
 mod outbox;
@@ -15,6 +16,11 @@ pub(crate) use database::{lock_canonical_item_space, lock_execution_and_canonica
 pub use execution_repository::PostgresExecutionRepository;
 pub use google_oauth_repository::PostgresGoogleOAuthRepository;
 pub(crate) use google_sync_repository::PostgresGoogleSyncRepository;
+pub use habit_repository::PostgresHabitRepository;
+pub(crate) use habit_repository::{
+    AuthoritativeHabitRecurrence, PublishedHabitEvidenceError, authoritative_habit_recurrence_tx,
+    record_published_habit_occurrences_tx,
+};
 pub use idempotency::{IdempotencyDecision, IdempotencyError, PostgresIdempotencyRepository};
 pub use item_repository::PostgresItemRepository;
 pub(crate) use item_repository::{

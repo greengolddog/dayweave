@@ -32,7 +32,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            25, 26
         ]
     );
 
@@ -62,6 +62,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0023_google_task_provider_metadata.sql"),
         include_str!("../migrations/0024_structural_item_fields.sql"),
         include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
+        include_str!("../migrations/0026_habit_occurrence_ledger.sql"),
     ]
     .join("\n");
     for table in [
@@ -121,6 +122,13 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "proposal_application_effects",
         "proposal_application_fences",
         "proposal_application_requests",
+        "habit_occurrence_evidence",
+        "habit_occurrence_outcomes",
+        "habit_occurrence_versions",
+        "habit_pauses",
+        "habit_pause_versions",
+        "habit_changes",
+        "habit_operation_receipts",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }

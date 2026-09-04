@@ -70,6 +70,13 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::replace_item,
         crate::items::http::delete_item,
         crate::items::http::restore_item,
+        crate::habits::http::list_occurrences,
+        crate::habits::http::put_outcome,
+        crate::habits::http::habit_delta,
+        crate::habits::http::habit_stream,
+        crate::habits::http::start_pause,
+        crate::habits::http::resume_pause,
+        crate::habits::http::habit_analytics,
         crate::scheduling::http::preview_schedule,
         crate::scheduling::http::publish_schedule,
         crate::scheduling::http::get_current_schedule,
@@ -172,6 +179,27 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::ItemEnvelope,
         crate::items::http::ItemListEnvelope,
         crate::items::http::ItemDeltaEnvelope,
+        crate::habits::HabitOutcomeStatus,
+        crate::habits::HabitOutcomeInput,
+        crate::habits::HabitOutcomeCommand,
+        crate::habits::HabitOutcome,
+        crate::habits::HabitOccurrenceEvidence,
+        crate::habits::HabitOccurrence,
+        crate::habits::HabitPause,
+        crate::habits::HabitPauseStartCommand,
+        crate::habits::HabitPauseResumeCommand,
+        crate::habits::HabitDeltaChange,
+        crate::habits::HabitAnalyticsBucket,
+        crate::habits::HabitSupportiveFactCode,
+        crate::habits::HabitQuantityTotal,
+        crate::habits::HabitAnalyticsTotals,
+        crate::habits::HabitTrendBucket,
+        crate::habits::HabitAnalytics,
+        crate::habits::http::HabitOccurrenceEnvelope,
+        crate::habits::http::HabitOccurrenceListEnvelope,
+        crate::habits::http::HabitPauseEnvelope,
+        crate::habits::http::HabitDeltaEnvelope,
+        crate::habits::http::HabitAnalyticsEnvelope,
         crate::scheduling::ComposeScheduleRequest,
         crate::scheduling::ComposeScheduleResult,
         crate::scheduling::http::PublishScheduleRequest,
@@ -335,6 +363,7 @@ pub fn router(state: AppState) -> Router {
         )
         .merge(crate::assistant::http::routes())
         .merge(crate::items::http::routes())
+        .merge(crate::habits::http::routes())
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())
         .merge(crate::google_oauth::http::protected_routes())
@@ -996,6 +1025,36 @@ fn map_service_error(error: ProposalServiceError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openapi_includes_the_habit_ledger_and_analytics_contract() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI document");
+        for (path, method) in [
+            ("/v1/habits/{habit_id}/occurrences", "get"),
+            ("/v1/habits/{habit_id}/occurrences/{occurrence_id}", "put"),
+            ("/v1/habits/occurrences/delta", "get"),
+            ("/v1/habits/stream", "get"),
+            ("/v1/habits/{habit_id}/pauses", "post"),
+            ("/v1/habits/{habit_id}/pauses/{pause_id}/resume", "post"),
+            ("/v1/habits/{habit_id}/analytics", "get"),
+        ] {
+            let operation = &document["paths"][path][method];
+            assert!(operation.is_object(), "missing {method} {path}");
+            assert_eq!(operation["security"][0]["bearer_token"], json!([]));
+        }
+        for schema in [
+            "HabitOccurrenceEvidence",
+            "HabitOutcomeCommand",
+            "HabitDeltaChange",
+            "HabitPause",
+            "HabitAnalytics",
+        ] {
+            assert!(
+                document["components"]["schemas"][schema].is_object(),
+                "missing {schema} schema"
+            );
+        }
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)] // Keeps the four-route OpenAPI contract in one consistency assertion.

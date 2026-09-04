@@ -15,7 +15,8 @@ use dayweave_compose::{
 };
 use dayweave_core::{
     ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId, PlanRequest,
-    ScheduleBlockKind, ScheduleError, SchedulePlan, Scheduler,
+    RecurrenceExceptionAction, RecurrenceExceptionSelector, ScheduleBlockKind, ScheduleError,
+    SchedulePlan, Scheduler, expand_occurrences,
 };
 use dayweave_scheduler_helper::{PlanPreflightError, preflight_plan_request};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ use crate::items::{
     BlockedReasonKind, DeadlineKind, DeadlineStrength, DurationKind, DurationSource, Item,
     ItemKind, ItemQuery, ItemService, ItemServiceError, ItemStatus, SplitPolicy,
 };
+use crate::persistence::AuthoritativeHabitRecurrence;
 
 use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp,
@@ -71,6 +73,11 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) planning_evidence: AuthoritativePlanningEvidence,
+    /// Monotonic durable habit ledger head observed while hydrating the
+    /// server-owned recurrence outcome and pause context.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) habit_change_head: u64,
     /// Exact manual proposal inputs retained only for durable publication
     /// evidence and per-block audit binding.
     #[serde(skip)]
@@ -422,18 +429,31 @@ pub(crate) async fn compose_canonical_schedule_unfenced(
 /// Composes against a stable canonical-item and Calendar-generation snapshot.
 /// Generation evidence is read on both sides of the item list so a committed
 /// projection/configuration change cannot produce a mixed preview.
+#[allow(clippy::too_many_lines)] // All cross-store preview fences must surround the same canonical item read.
 async fn compose_canonical_schedule_inner(
     service: &ItemService,
     projection: Option<&PostgresSchedulingRepository>,
     mut request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     validate_schedule_request(&request).map_err(map_prepare_error)?;
+    let moved_occurrence_ids = contained_moved_occurrence_ids(&request);
     let planning_before = match projection {
         Some(projection) => projection
             .authoritative_planning_evidence()
             .await
             .map_err(map_execution_evidence_error)?,
         None => AuthoritativePlanningEvidence::default(),
+    };
+    let habit_before = match projection {
+        Some(projection) => projection
+            .authoritative_habit_recurrence(
+                request.horizon_start,
+                request.horizon_end,
+                &moved_occurrence_ids,
+            )
+            .await
+            .map_err(map_execution_evidence_error)?,
+        None => AuthoritativeHabitRecurrence::default(),
     };
     let projection_before = match projection {
         Some(projection) => projection
@@ -472,6 +492,23 @@ async fn compose_canonical_schedule_inner(
     if planning_before != planning_after {
         return Err(ComposeScheduleError::ExecutionEvidenceChanged);
     }
+    let habit_after = match projection {
+        Some(projection) => projection
+            .authoritative_habit_recurrence(
+                request.horizon_start,
+                request.horizon_end,
+                &moved_occurrence_ids,
+            )
+            .await
+            .map_err(map_execution_evidence_error)?,
+        None => AuthoritativeHabitRecurrence::default(),
+    };
+    if habit_before != habit_after {
+        return Err(ComposeScheduleError::ExecutionEvidenceChanged);
+    }
+    if projection.is_some() {
+        merge_authoritative_habit_recurrence(&mut request, &items, &habit_after)?;
+    }
     normalize_manual_placements_for_execution(&mut request, &planning_before.execution)?;
     validate_manual_placement_item_revisions(&request, &items)?;
     validate_manual_placement_sources(&request, &planning_before)?;
@@ -498,6 +535,7 @@ async fn compose_canonical_schedule_inner(
         super::SCHEDULER_PUBLICATION_SCHEMA,
         projection_before,
         planning_before,
+        habit_after.change_head,
         untrusted_assignments,
     )
     .map_err(|error| {
@@ -515,6 +553,144 @@ async fn compose_canonical_schedule_inner(
             error
         }
     })
+}
+
+/// Explicit occurrence moves can restore a nominal occurrence from outside
+/// the rolling horizon. Hydration admits only destinations wholly contained
+/// by this request, matching core's one-horizon ownership rule and keeping the
+/// authoritative lookup bounded by the validated exception collection.
+fn contained_moved_occurrence_ids(request: &ComposeScheduleRequest) -> Vec<Uuid> {
+    let horizon_start = i128::from(request.horizon_start.timestamp_micros()) * 1_000;
+    let horizon_end = i128::from(request.horizon_end.timestamp_micros()) * 1_000;
+    request
+        .recurrence_context
+        .exceptions
+        .iter()
+        .filter_map(|exception| {
+            let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
+                return None;
+            };
+            let RecurrenceExceptionAction::Move { start, end, .. } = exception.action else {
+                return None;
+            };
+            (horizon_start <= start.unix_timestamp_nanos()
+                && end.unix_timestamp_nanos() <= horizon_end)
+                .then_some(id.0)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Replaces caller-controlled recurrence lifecycle state for persisted habits
+/// with the ledger projection read from `PostgreSQL`. Move exceptions remain
+/// caller inputs because they represent an explicit scheduling request; skip,
+/// completion, anchor and pause evidence are server-owned facts.
+fn merge_authoritative_habit_recurrence(
+    request: &mut ComposeScheduleRequest,
+    items: &[Item],
+    authoritative: &AuthoritativeHabitRecurrence,
+) -> Result<(), ComposeScheduleError> {
+    let habit_ids = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Habit && item.recurrence.is_some())
+        .map(|item| ItemId(item.id))
+        .collect::<BTreeSet<_>>();
+    if habit_ids.is_empty() {
+        return Ok(());
+    }
+
+    request
+        .recurrence_context
+        .completion_anchors
+        .retain(|item_id, _| !habit_ids.contains(item_id));
+    request
+        .recurrence_context
+        .completion_anchors
+        .extend(authoritative.context.completion_anchors.clone());
+
+    request
+        .recurrence_context
+        .pauses
+        .retain(|pause| !habit_ids.contains(&pause.item_id));
+    request
+        .recurrence_context
+        .pauses
+        .extend(authoritative.context.pauses.clone());
+
+    request.recurrence_context.exceptions.retain(|exception| {
+        !habit_ids.contains(&exception.item_id)
+            || matches!(exception.action, RecurrenceExceptionAction::Move { .. })
+    });
+
+    // Completion and partial-progress keys do not encode their owning item.
+    // Materialize a lifecycle-free copy of the current canonical graph to
+    // prove ownership instead of treating every caller occurrence as a habit
+    // occurrence (which would erase valid recurring-task completions), or
+    // trusting caller-computable habit UUIDv5 values. Current materialization
+    // also excludes evidence made obsolete by a recurrence edit while keeping
+    // the same stable identity across harmless item revision bumps.
+    let mut ownership_request = request.clone();
+    ownership_request
+        .recurrence_context
+        .completed_occurrence_ids
+        .clear();
+    ownership_request
+        .recurrence_context
+        .partial_progress
+        .clear();
+    let canonical_items = items.iter().cloned().map(into_canonical_item).collect();
+    let prepared = prepare_canonical_schedule(canonical_items, ownership_request)
+        .map_err(map_prepare_error)?;
+    let habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
+        .map_err(|error| ComposeScheduleError::InvalidRequest(error.to_string()))?
+        .into_iter()
+        .filter_map(|occurrence| {
+            habit_ids
+                .contains(&occurrence.series_item_id)
+                .then_some(occurrence.id)
+        })
+        .collect::<BTreeSet<_>>();
+
+    request.recurrence_context.exceptions.extend(
+        authoritative
+            .context
+            .exceptions
+            .iter()
+            .filter_map(|exception| {
+                let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
+                    return None;
+                };
+                (habit_ids.contains(&exception.item_id) && habit_occurrence_ids.contains(&id))
+                    .then_some(exception.clone())
+            }),
+    );
+
+    request
+        .recurrence_context
+        .completed_occurrence_ids
+        .retain(|occurrence_id| !habit_occurrence_ids.contains(occurrence_id));
+    request.recurrence_context.completed_occurrence_ids.extend(
+        authoritative
+            .context
+            .completed_occurrence_ids
+            .iter()
+            .filter(|occurrence_id| habit_occurrence_ids.contains(occurrence_id))
+            .copied(),
+    );
+    request
+        .recurrence_context
+        .partial_progress
+        .retain(|occurrence_id, _| !habit_occurrence_ids.contains(occurrence_id));
+    request.recurrence_context.partial_progress.extend(
+        authoritative
+            .context
+            .partial_progress
+            .iter()
+            .filter(|(occurrence_id, _)| habit_occurrence_ids.contains(occurrence_id))
+            .map(|(occurrence_id, progress)| (*occurrence_id, *progress)),
+    );
+    Ok(())
 }
 
 fn manual_placement_staleness_flags(
@@ -1126,6 +1302,7 @@ fn compose_items_for_schema(
         scheduler_publication_schema,
         Vec::new(),
         planning_evidence,
+        0,
         ignored,
     )
 }
@@ -1136,6 +1313,7 @@ fn compose_items_with_projection_for_schema(
     scheduler_publication_schema: &str,
     calendar_projection_stamps: Vec<CalendarProjectionStamp>,
     planning_evidence: AuthoritativePlanningEvidence,
+    habit_change_head: u64,
     untrusted_assignments: Vec<IgnoredPreviousAssignment>,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     if !calendar_projection_stamps.is_empty()
@@ -1156,6 +1334,7 @@ fn compose_items_with_projection_for_schema(
         scheduler_publication_schema,
         calendar_projection_stamps,
         planning_evidence,
+        habit_change_head,
         untrusted_assignments,
     )
 }
@@ -1165,6 +1344,7 @@ fn compose_prepared_for_schema(
     scheduler_publication_schema: &str,
     calendar_projection_stamps: Vec<CalendarProjectionStamp>,
     planning_evidence: AuthoritativePlanningEvidence,
+    habit_change_head: u64,
     untrusted_assignments: Vec<IgnoredPreviousAssignment>,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     let PreparedSchedule {
@@ -1187,6 +1367,7 @@ fn compose_prepared_for_schema(
         &source_item_revisions,
         &calendar_projection_stamps,
         &planning_evidence.execution,
+        habit_change_head,
         &plan_request,
     )?;
     let plan = Scheduler.plan_with_execution(&plan_request, &planning_evidence.execution)?;
@@ -1203,6 +1384,7 @@ fn compose_prepared_for_schema(
         source_item_sensitivity: effective_sensitivity,
         calendar_projection_stamps,
         planning_evidence,
+        habit_change_head,
         manual_placements,
         manual_placement_releases,
         planning_request: plan_request.clone(),
@@ -1572,6 +1754,7 @@ pub(super) fn request_digest(
     source_item_revisions: &BTreeMap<Uuid, u64>,
     calendar_projection_stamps: &[CalendarProjectionStamp],
     execution: &ExecutionPlanningContext,
+    habit_change_head: u64,
     request: &PlanRequest,
 ) -> Result<String, ComposeScheduleError> {
     #[derive(Serialize)]
@@ -1581,6 +1764,8 @@ pub(super) fn request_digest(
         source_item_revisions: &'a BTreeMap<Uuid, u64>,
         calendar_projection_stamps: &'a [CalendarProjectionStamp],
         execution: &'a ExecutionPlanningContext,
+        #[serde(skip_serializing_if = "is_zero")]
+        habit_change_head: u64,
         request: &'a PlanRequest,
     }
 
@@ -1590,6 +1775,7 @@ pub(super) fn request_digest(
         source_item_revisions,
         calendar_projection_stamps,
         execution,
+        habit_change_head,
         request,
     })
     .map_err(|_| ComposeScheduleError::Encoding)?;
@@ -1600,6 +1786,11 @@ pub(super) fn request_digest(
         write!(&mut encoded, "{byte:02x}").map_err(|_| ComposeScheduleError::Encoding)?;
     }
     Ok(encoded)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip callback receives a reference.
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -1613,7 +1804,10 @@ mod tests {
         ManualPlacementReleaseInput, PreviousAssignmentInput, PreviousBlockInput,
         SchedulerConfigInput,
     };
-    use dayweave_core::{ItemKind as PlanningItemKind, RecurrenceContext, WorkItem};
+    use dayweave_core::{
+        ItemKind as PlanningItemKind, Minutes, RecurrenceContext, RecurrencePartialProgress,
+        WorkItem,
+    };
     use serde_json::json;
 
     fn canonical_item(id: Uuid) -> Item {
@@ -1708,6 +1902,115 @@ mod tests {
         }
     }
 
+    fn daily_occurrence_id(item_id: Uuid, date: &str) -> OccurrenceId {
+        OccurrenceId(Uuid::new_v5(&item_id, format!("daily:{date}:0").as_bytes()))
+    }
+
+    #[test]
+    fn persisted_habit_partial_progress_replaces_caller_owned_occurrence_state() {
+        let habit_id = Uuid::from_u128(30);
+        let occurrence_id = daily_occurrence_id(habit_id, "2026-09-01");
+        let mut habit = canonical_item(habit_id);
+        habit.kind = ItemKind::Habit;
+        habit.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        let mut request = preview_request();
+        request.recurrence_context.partial_progress.insert(
+            occurrence_id,
+            RecurrencePartialProgress {
+                progress_basis_points: 9_999,
+                expected_duration_minutes: Minutes(60),
+                remaining_duration_minutes: Some(Minutes(1)),
+            },
+        );
+        let trusted = RecurrencePartialProgress {
+            progress_basis_points: 2_500,
+            expected_duration_minutes: Minutes(30),
+            remaining_duration_minutes: None,
+        };
+        let mut authoritative = AuthoritativeHabitRecurrence::default();
+        authoritative
+            .context
+            .partial_progress
+            .insert(occurrence_id, trusted);
+
+        merge_authoritative_habit_recurrence(&mut request, &[habit], &authoritative)
+            .expect("merge authoritative habit evidence");
+
+        assert_eq!(
+            request.recurrence_context.partial_progress,
+            BTreeMap::from([(occurrence_id, trusted)])
+        );
+    }
+
+    #[test]
+    fn zero_habits_preserve_caller_recurring_task_completions() {
+        let task_id = Uuid::from_u128(33);
+        let task_occurrence = daily_occurrence_id(task_id, "2026-09-01");
+        let mut task = canonical_item(task_id);
+        task.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        let mut request = preview_request();
+        request
+            .recurrence_context
+            .completed_occurrence_ids
+            .insert(task_occurrence);
+
+        merge_authoritative_habit_recurrence(
+            &mut request,
+            &[task],
+            &AuthoritativeHabitRecurrence::default(),
+        )
+        .expect("merge without habits");
+
+        assert_eq!(
+            request.recurrence_context.completed_occurrence_ids,
+            BTreeSet::from([task_occurrence])
+        );
+    }
+
+    #[test]
+    fn mixed_recurrences_replace_only_current_habit_occurrence_completions() {
+        let habit_id = Uuid::from_u128(34);
+        let task_id = Uuid::from_u128(35);
+        let habit_occurrence = daily_occurrence_id(habit_id, "2026-09-01");
+        let task_occurrence = daily_occurrence_id(task_id, "2026-09-01");
+        let stale_habit_occurrence = OccurrenceId(Uuid::new_v5(
+            &habit_id,
+            b"frequency-calendar-day:2026-09-01:0",
+        ));
+        let mut habit = canonical_item(habit_id);
+        habit.kind = ItemKind::Habit;
+        habit.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        // A revision bump does not alter the stable recurrence identity.
+        habit.revision = 99;
+        let mut task = canonical_item(task_id);
+        task.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        let mut request = preview_request();
+        request
+            .recurrence_context
+            .completed_occurrence_ids
+            .extend([habit_occurrence, task_occurrence]);
+        let mut authoritative = AuthoritativeHabitRecurrence::default();
+        authoritative
+            .context
+            .completed_occurrence_ids
+            .extend([habit_occurrence, stale_habit_occurrence]);
+
+        merge_authoritative_habit_recurrence(&mut request, &[habit, task], &authoritative)
+            .expect("merge mixed recurrence ownership");
+
+        assert_eq!(
+            request.recurrence_context.completed_occurrence_ids,
+            BTreeSet::from([habit_occurrence, task_occurrence])
+        );
+        assert!(
+            !request
+                .recurrence_context
+                .completed_occurrence_ids
+                .contains(&stale_habit_occurrence),
+            "an occurrence identity no longer generated by the current recurrence must not be admitted"
+        );
+    }
+
     fn map_plannable(item: &Item) -> WorkItem {
         let prepared =
             prepare_canonical_schedule(vec![into_canonical_item(item.clone())], preview_request())
@@ -1739,6 +2042,7 @@ mod tests {
                 super::super::SCHEDULER_PUBLICATION_SCHEMA,
                 Vec::new(),
                 AuthoritativePlanningEvidence::default(),
+                0,
                 Vec::new(),
             )
         });
@@ -1899,6 +2203,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .unwrap();
@@ -1914,6 +2219,7 @@ mod tests {
                 retained_manual_placements: vec![retained],
                 ..AuthoritativePlanningEvidence::default()
             },
+            0,
             Vec::new(),
         )
         .unwrap();
@@ -2024,6 +2330,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("released pin recomposes normally");
@@ -2115,6 +2422,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("atomic release and replacement");
@@ -2225,6 +2533,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("remaining published session can be moved");
@@ -2285,6 +2594,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             over_credit_evidence,
+            0,
             Vec::new(),
         )
         .expect("over-credit remaining session composes");
@@ -2423,6 +2733,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("partial published capacity may be moved while fresh capacity is added");
@@ -2536,6 +2847,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("terminal item no longer bricks composition");
@@ -2634,6 +2946,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             Vec::new(),
             evidence,
+            0,
             Vec::new(),
         )
         .expect("Inbox subtree does not retain stale pinned demand");
@@ -3053,6 +3366,7 @@ mod tests {
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             vec![stamp.clone()],
             AuthoritativePlanningEvidence::default(),
+            0,
             Vec::new(),
         )
         .unwrap();
@@ -3080,6 +3394,7 @@ mod tests {
                 super::super::SCHEDULER_PUBLICATION_SCHEMA,
                 vec![stamp],
                 AuthoritativePlanningEvidence::default(),
+                0,
                 Vec::new(),
             ),
             Err(ComposeScheduleError::InvalidRequest(_))

@@ -23,8 +23,10 @@ use zeroize::Zeroize;
 
 use crate::{
     persistence::{
-        DatabaseScope, fetch_item_batch_tx, insert_proposal_tx, lock_canonical_item_space,
-        lock_execution_and_canonical_item_space, proposal_from_row,
+        AuthoritativeHabitRecurrence, DatabaseScope, PublishedHabitEvidenceError,
+        authoritative_habit_recurrence_tx, fetch_item_batch_tx, insert_proposal_tx,
+        lock_canonical_item_space, lock_execution_and_canonical_item_space, proposal_from_row,
+        record_published_habit_occurrences_tx,
     },
     proposals::{PROPOSAL_CHANGE_SET_SCHEMA_V1, ProposalCommand},
 };
@@ -458,6 +460,44 @@ impl PostgresSchedulingRepository {
         Ok(evidence)
     }
 
+    /// Reads the server-owned habit completion, skip, and pause context plus
+    /// its durable change head from one repeatable snapshot.
+    pub(crate) async fn authoritative_habit_recurrence(
+        &self,
+        horizon_start: DateTime<Utc>,
+        horizon_end: DateTime<Utc>,
+        moved_occurrence_ids: &[Uuid],
+    ) -> Result<AuthoritativeHabitRecurrence, ExecutionPlanningEvidenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        let evidence = authoritative_habit_recurrence_tx(
+            &mut transaction,
+            self.scope.workspace_id,
+            horizon_start,
+            horizon_end,
+            moved_occurrence_ids,
+        )
+        .await
+        .map_err(|error| match error {
+            PublishedHabitEvidenceError::Invalid | PublishedHabitEvidenceError::Conflict => {
+                ExecutionPlanningEvidenceError::Inconsistent
+            }
+            PublishedHabitEvidenceError::Unavailable => ExecutionPlanningEvidenceError::Unavailable,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        Ok(evidence)
+    }
+
     /// Returns the exact content-free grouping needed to recover, release, or
     /// replace a retained user placement from another trusted device.
     pub(crate) async fn retained_manual_placement_catalog(
@@ -762,6 +802,24 @@ impl PostgresSchedulingRepository {
             return Ok(replayed);
         }
 
+        let current_habit_recurrence = authoritative_habit_recurrence_tx(
+            &mut transaction,
+            self.scope.workspace_id,
+            horizon_start,
+            horizon_end,
+            &[],
+        )
+        .await
+        .map_err(|error| match error {
+            PublishedHabitEvidenceError::Conflict | PublishedHabitEvidenceError::Invalid => {
+                SchedulePublicationError::StaleComposition
+            }
+            PublishedHabitEvidenceError::Unavailable => SchedulePublicationError::Unavailable,
+        })?;
+        if current_habit_recurrence.change_head != spec.result.habit_change_head {
+            return Err(SchedulePublicationError::StaleComposition);
+        }
+
         let current_planning_evidence =
             authoritative_planning_evidence_tx(&mut transaction, self.scope.workspace_id)
                 .await
@@ -843,6 +901,26 @@ impl PostgresSchedulingRepository {
                 )
                 .await?
             {
+                // A content-identical publication may be the first one after
+                // the habit-ledger migration. Admit/backfill occurrence
+                // evidence before returning the existing schedule revision.
+                record_published_habit_occurrences_tx(
+                    &mut transaction,
+                    self.scope,
+                    parent_id.ok_or(SchedulePublicationError::Unavailable)?,
+                    &spec.result,
+                    published_at,
+                )
+                .await
+                .map_err(|error| match error {
+                    PublishedHabitEvidenceError::Conflict
+                    | PublishedHabitEvidenceError::Invalid => {
+                        SchedulePublicationError::InvalidPayload
+                    }
+                    PublishedHabitEvidenceError::Unavailable => {
+                        SchedulePublicationError::Unavailable
+                    }
+                })?;
                 bind_publication_key_tx(
                     &mut transaction,
                     self.scope,
@@ -949,6 +1027,21 @@ impl PostgresSchedulingRepository {
             published_at,
         )
         .await?;
+
+        record_published_habit_occurrences_tx(
+            &mut transaction,
+            self.scope,
+            revision_id,
+            &spec.result,
+            published_at,
+        )
+        .await
+        .map_err(|error| match error {
+            PublishedHabitEvidenceError::Conflict | PublishedHabitEvidenceError::Invalid => {
+                SchedulePublicationError::InvalidPayload
+            }
+            PublishedHabitEvidenceError::Unavailable => SchedulePublicationError::Unavailable,
+        })?;
 
         sqlx::query(
             "INSERT INTO schedule_revision_details (workspace_id, user_id, \
@@ -2519,6 +2612,7 @@ fn durable_snapshot(
         "evidence": {
             "source_item_sensitivity": result.source_item_sensitivity,
             "calendar_projection_stamps": result.calendar_projection_stamps,
+            "habit_change_head": result.habit_change_head,
         },
         "conflicts": conflicts,
         "manual_placement_approvals": manual_placement_approvals,
@@ -3149,6 +3243,7 @@ pub(super) fn validate_composed_result_for_schema(
         &result.source_item_revisions,
         &result.calendar_projection_stamps,
         &result.planning_evidence.execution,
+        result.habit_change_head,
         &result.planning_request,
     )
     .map_err(|_| SchedulePublicationError::InvalidPayload)?;

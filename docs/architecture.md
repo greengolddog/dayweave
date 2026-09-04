@@ -78,6 +78,10 @@ Folders may be introduced incrementally, but ownership boundaries in this map ar
 - **Execution session:** single active lease, timer segments, pauses, actual duration, and correction history.
 - **Proposal:** immutable external/AI draft plus review state and resulting change set.
 
+The implemented habit occurrence authority, correction, pause, offline delta, privacy, analytics,
+and schedule-publication fence are specified in
+[habit-occurrence-ledger.md](habit-occurrence-ledger.md).
+
 Cross-aggregate mutations run as explicit commands and produce domain events/audit records. Core command handlers enforce cycle prevention, only-leaf scheduling, single-active-item, hard dependency behavior, and privacy propagation.
 
 ### 4.3 Hierarchy projection
