@@ -88,6 +88,146 @@ class OkHttpHabitTransportTest {
     }
 
     @Test
+    fun missedReconciliationSendsOnlyExactOperationAuthorityAndValidatesProjection() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                """{"resolutions":[${missedResolutionJson()}],"has_more":false,"replayed":false}""",
+                replayed = false,
+            ),
+        )
+        val body = """{"operation_id":"$OPERATION_ID"}"""
+
+        val page = transport.reconcileMissed(
+            configuration(),
+            OPERATION_ID,
+            body,
+            limit = 25,
+        )
+
+        assertFalse(page.hasMore)
+        assertEquals(
+            RemoteHabitMissedResolutionAction.DecisionRequired,
+            page.resolutions.single().action,
+        )
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/tenant/v1/habits/missed/reconcile", request.url.encodedPath)
+        assertEquals("25", request.url.queryParameter("limit"))
+        assertEquals(OPERATION_ID, request.headers["Idempotency-Key"])
+        assertEquals(body, requireNotNull(request.body).utf8())
+    }
+
+    @Test
+    fun explicitMissedDecisionAcceptsMatchingCancelledRaceAndKeepsExactBody() = runBlocking {
+        val cancelled = missedResolutionJson(
+            revision = 2,
+            action = """{"type":"cancelled","reason":"source_completed","resume_action":"carry"}""",
+            updatedAt = "2026-09-01T10:00:00Z",
+        )
+        server.enqueue(
+            jsonResponse(
+                """{"resolution":$cancelled,"replayed":true}""",
+                replayed = true,
+            ),
+        )
+        val body = """{"operation_id":"$OPERATION_ID","expected_revision":1,"action":"carry"}"""
+
+        val mutation = transport.putMissedResolution(
+            configuration(),
+            HABIT_ID,
+            OCCURRENCE_ID,
+            OPERATION_ID,
+            body,
+        )
+
+        val action = mutation.value.action as RemoteHabitMissedResolutionAction.Cancelled
+        assertEquals(RemoteHabitMissedResumeAction.CARRY, action.resumeAction)
+        assertTrue(mutation.replayed)
+        val request = server.takeRequest()
+        assertEquals("PUT", request.method)
+        assertEquals(
+            "/tenant/v1/habits/$HABIT_ID/occurrences/$OCCURRENCE_ID/missed-resolution",
+            request.url.encodedPath,
+        )
+        assertEquals(body, requireNotNull(request.body).utf8())
+    }
+
+    @Test
+    fun occurrenceCoordinatesAllowTransientOutcomeAndResolutionTransitions() = runBlocking {
+        val terminalOutcome = outcomeJson()
+            .replace("\"status\":\"partial\"", "\"status\":\"completed\"")
+            .replace("\"progress_basis_points\":3500", "\"progress_basis_points\":10000")
+        val active = occurrenceJson(missedResolution = missedResolutionJson())
+            .replace(outcomeJson(), terminalOutcome)
+            .replace("\"outcome\":null", "\"outcome\":$terminalOutcome")
+        val cancelled = occurrenceJson(
+            missedResolution = missedResolutionJson(
+                revision = 2,
+                action = """{"type":"cancelled","reason":"source_completed","resume_action":"decision_required"}""",
+                updatedAt = "2026-09-01T10:00:00Z",
+            ),
+        )
+        server.enqueue(
+            jsonResponse("""{"occurrences":[$active],"next_cursor":null,"has_more":false}"""),
+        )
+        server.enqueue(
+            jsonResponse("""{"occurrences":[$cancelled],"next_cursor":null,"has_more":false}"""),
+        )
+
+        assertEquals(
+            RemoteHabitMissedResolutionAction.DecisionRequired,
+            transport.listOccurrences(
+                configuration(),
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-07"),
+            ).occurrences.single().missedResolution?.action,
+        )
+        assertTrue(
+            transport.listOccurrences(
+                configuration(),
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-07"),
+            ).occurrences.single().missedResolution?.action is
+                RemoteHabitMissedResolutionAction.Cancelled,
+        )
+    }
+
+    @Test
+    fun malformedMissedResolutionShapesFailClosed() {
+        val invalid = listOf(
+            missedResolutionJson().replace(
+                "{\"type\":\"decision_required\"}",
+                "{\"type\":\"decision_required\",\"future\":true}",
+            ),
+            missedResolutionJson(
+                revision = 2,
+                action = """{"type":"carry","window_start":"2026-09-01T09:59:00Z","window_end":"2026-09-01T11:00:00Z"}""",
+                updatedAt = "2026-09-01T10:00:00Z",
+            ),
+            missedResolutionJson().replace(PLANNER_OCCURRENCE_ID, SECOND_PLANNER_OCCURRENCE_ID),
+        )
+        invalid.forEach { resolution ->
+            server.enqueue(
+                jsonResponse(
+                    """{"occurrences":[${occurrenceJson(missedResolution = resolution)}],"next_cursor":null,"has_more":false}""",
+                ),
+            )
+            assertThrows(HabitApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.listOccurrences(
+                        configuration(),
+                        HABIT_ID,
+                        LocalDate.parse("2026-09-01"),
+                        LocalDate.parse("2026-09-07"),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
     fun deltaDecodesBothInternallyTaggedChangeKinds() = runBlocking {
         server.enqueue(
             jsonResponse(
@@ -111,6 +251,53 @@ class OkHttpHabitTransportTest {
         assertEquals("/tenant/v1/habits/occurrences/delta", request.url.encodedPath)
         assertEquals("39", request.url.queryParameter("cursor"))
         assertEquals("25", request.url.queryParameter("limit"))
+    }
+
+    @Test
+    fun occurrenceResponsesRequireNullableMissedResolutionMember() {
+        val missing = occurrenceJson(includeMissedResolution = false)
+        server.enqueue(
+            jsonResponse(
+                """{"occurrences":[$missing],"next_cursor":null,"has_more":false}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.listOccurrences(
+                    configuration(),
+                    HABIT_ID,
+                    LocalDate.parse("2026-09-01"),
+                    LocalDate.parse("2026-09-07"),
+                )
+            }
+        }
+
+        server.enqueue(
+            jsonResponse(
+                """{"occurrence":$missing,"replayed":false}""",
+                replayed = false,
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.putOutcome(
+                    configuration(),
+                    HABIT_ID,
+                    OCCURRENCE_ID,
+                    OPERATION_ID,
+                    """{"operation_id":"$OPERATION_ID"}""",
+                )
+            }
+        }
+
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[{"type":"occurrence_upsert","occurrence":$missing}],"next_cursor":"42","has_more":false}""",
+            ),
+        )
+        assertThrows(HabitApiException.InvalidResponse::class.java) {
+            runBlocking { transport.delta(configuration()) }
+        }
     }
 
     @Test
@@ -816,7 +1003,11 @@ class OkHttpHabitTransportTest {
             .body("""{"error":{"code":"$code","message":"test error"}}""")
             .build()
 
-    private fun occurrenceJson(withOutcome: Boolean = false): String = """
+    private fun occurrenceJson(
+        withOutcome: Boolean = false,
+        missedResolution: String? = null,
+        includeMissedResolution: Boolean = true,
+    ): String = """
         {
           "evidence":{
             "id":"$OCCURRENCE_ID",
@@ -836,7 +1027,30 @@ class OkHttpHabitTransportTest {
             "expected_quantity":20,
             "expected_unit":"pages"
           },
-          "outcome":${if (withOutcome) outcomeJson() else "null"}
+          "outcome":${if (withOutcome) outcomeJson() else "null"}${
+              if (includeMissedResolution) {
+                  ",\n          \"missed_resolution\":${missedResolution ?: "null"}"
+              } else {
+                  ""
+              }
+          }
+        }
+    """.trimIndent()
+
+    private fun missedResolutionJson(
+        revision: Long = 1,
+        action: String = """{"type":"decision_required"}""",
+        updatedAt: String = "2026-09-01T09:01:00Z",
+    ): String = """
+        {
+          "occurrence_evidence_id":"$OCCURRENCE_ID",
+          "habit_id":"$HABIT_ID",
+          "source_planner_occurrence_id":"$PLANNER_OCCURRENCE_ID",
+          "revision":$revision,
+          "configured_policy":"ask",
+          "action":$action,
+          "created_at":"2026-09-01T09:01:00Z",
+          "updated_at":"$updatedAt"
         }
     """.trimIndent()
 

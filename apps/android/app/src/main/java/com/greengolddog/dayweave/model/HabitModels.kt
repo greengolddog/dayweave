@@ -2,12 +2,18 @@ package com.greengolddog.dayweave.model
 
 import com.greengolddog.dayweave.network.RemoteHabitAnalytics
 import com.greengolddog.dayweave.network.RemoteHabitAnalyticsBucket
+import com.greengolddog.dayweave.network.RemoteHabitMissedCancellationReason
+import com.greengolddog.dayweave.network.RemoteHabitMissedPolicy
+import com.greengolddog.dayweave.network.RemoteHabitMissedResolution
+import com.greengolddog.dayweave.network.RemoteHabitMissedResolutionAction
+import com.greengolddog.dayweave.network.RemoteHabitMissedResumeAction
 import com.greengolddog.dayweave.network.RemoteHabitOccurrence
 import com.greengolddog.dayweave.network.RemoteHabitOutcome
 import com.greengolddog.dayweave.network.RemoteHabitOutcomeStatus
 import com.greengolddog.dayweave.network.RemoteHabitPause
 import com.greengolddog.dayweave.network.RemoteHabitSupportiveFactCode
 import com.greengolddog.dayweave.network.RemoteHabitTrendBucket
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -109,6 +115,41 @@ data class HabitPauseResumeCommandSnapshot(
 }
 
 @Serializable
+enum class HabitMissedExplicitActionSnapshot {
+    @SerialName("skip")
+    SKIP,
+
+    @SerialName("carry")
+    CARRY,
+
+    @SerialName("reduce_frequency")
+    REDUCE_FREQUENCY,
+}
+
+@Serializable
+data class HabitMissedResolveCommandSnapshot(
+    @SerialName("operation_id") val operationId: String,
+    @SerialName("expected_revision") val expectedRevision: Long,
+    val action: HabitMissedExplicitActionSnapshot,
+) {
+    fun encoded(): String {
+        requireHabitUuid(operationId)
+        require(expectedRevision > 0)
+        return HABIT_COMMAND_JSON.encodeToString(this)
+    }
+}
+
+@Serializable
+data class HabitMissedReconcileCommandSnapshot(
+    @SerialName("operation_id") val operationId: String,
+) {
+    fun encoded(): String {
+        requireHabitUuid(operationId)
+        return HABIT_COMMAND_JSON.encodeToString(this)
+    }
+}
+
+@Serializable
 data class HabitOutcomeSnapshot(
     val revision: Long,
     val status: HabitOutcomeStatusSnapshot,
@@ -164,6 +205,234 @@ data class HabitOutcomeSnapshot(
         ).also(HabitOutcomeSnapshot::requireValid)
     }
 }
+
+@Serializable
+enum class HabitMissedPolicySnapshot {
+    @SerialName("skip")
+    SKIP,
+
+    @SerialName("carry")
+    CARRY,
+
+    @SerialName("reduce_frequency")
+    REDUCE_FREQUENCY,
+
+    @SerialName("ask")
+    ASK,
+}
+
+@Serializable
+enum class HabitMissedCancellationReasonSnapshot {
+    @SerialName("source_completed")
+    SOURCE_COMPLETED,
+
+    @SerialName("source_skipped")
+    SOURCE_SKIPPED,
+
+    @SerialName("source_paused")
+    SOURCE_PAUSED,
+
+    @SerialName("source_obsolete")
+    SOURCE_OBSOLETE,
+}
+
+@Serializable
+enum class HabitMissedResumeActionSnapshot {
+    @SerialName("decision_required")
+    DECISION_REQUIRED,
+
+    @SerialName("skip")
+    SKIP,
+
+    @SerialName("carry")
+    CARRY,
+
+    @SerialName("reduce_frequency")
+    REDUCE_FREQUENCY,
+}
+
+@Serializable
+sealed class HabitMissedResolutionActionSnapshot {
+    @Serializable
+    @SerialName("decision_required")
+    data object DecisionRequired : HabitMissedResolutionActionSnapshot()
+
+    @Serializable
+    @SerialName("reduction_pending")
+    data object ReductionPending : HabitMissedResolutionActionSnapshot()
+
+    @Serializable
+    @SerialName("cancelled")
+    data class Cancelled(
+        val reason: HabitMissedCancellationReasonSnapshot,
+        val resumeAction: HabitMissedResumeActionSnapshot,
+    ) : HabitMissedResolutionActionSnapshot()
+
+    @Serializable
+    @SerialName("skip")
+    data object Skip : HabitMissedResolutionActionSnapshot()
+
+    @Serializable
+    @SerialName("carry")
+    data class Carry(
+        val windowStart: String,
+        val windowEnd: String,
+    ) : HabitMissedResolutionActionSnapshot()
+
+    @Serializable
+    @SerialName("reduce_frequency")
+    data class ReduceFrequency(
+        val suppressedPlannerOccurrenceIds: List<String>,
+    ) : HabitMissedResolutionActionSnapshot()
+}
+
+@Serializable
+data class HabitMissedResolutionSnapshot(
+    val occurrenceEvidenceId: String,
+    val habitId: String,
+    val sourcePlannerOccurrenceId: String,
+    val revision: Long,
+    val configuredPolicy: HabitMissedPolicySnapshot,
+    val action: HabitMissedResolutionActionSnapshot,
+    val createdAt: String,
+    val updatedAt: String,
+) {
+    fun requireValid() {
+        requireHabitUuid(occurrenceEvidenceId)
+        requireHabitUuid(habitId)
+        requireHabitUuid(sourcePlannerOccurrenceId)
+        require(UUID.fromString(sourcePlannerOccurrenceId).isRfc4122Version5())
+        require(revision > 0)
+        val created = requireHabitInstant(createdAt)
+        val updated = requireHabitInstant(updatedAt)
+        require(updated >= created)
+        when (val value = action) {
+            HabitMissedResolutionActionSnapshot.DecisionRequired ->
+                require(configuredPolicy == HabitMissedPolicySnapshot.ASK)
+            HabitMissedResolutionActionSnapshot.ReductionPending -> require(
+                configuredPolicy == HabitMissedPolicySnapshot.REDUCE_FREQUENCY ||
+                    (configuredPolicy == HabitMissedPolicySnapshot.ASK && revision >= 2),
+            )
+            HabitMissedResolutionActionSnapshot.Skip -> require(
+                configuredPolicy == HabitMissedPolicySnapshot.SKIP ||
+                    (configuredPolicy == HabitMissedPolicySnapshot.ASK && revision >= 2),
+            )
+            is HabitMissedResolutionActionSnapshot.Carry -> {
+                require(
+                    configuredPolicy == HabitMissedPolicySnapshot.CARRY ||
+                        (configuredPolicy == HabitMissedPolicySnapshot.ASK && revision >= 2),
+                )
+                val start = requireHabitInstant(value.windowStart)
+                val end = requireHabitInstant(value.windowEnd)
+                require(start == updated && end > start)
+                require(Duration.between(start, end) <= MAX_HABIT_MISSED_WINDOW)
+            }
+            is HabitMissedResolutionActionSnapshot.ReduceFrequency -> {
+                require(
+                    configuredPolicy == HabitMissedPolicySnapshot.REDUCE_FREQUENCY ||
+                        (configuredPolicy == HabitMissedPolicySnapshot.ASK && revision >= 2),
+                )
+                require(value.suppressedPlannerOccurrenceIds.size == 1)
+                value.suppressedPlannerOccurrenceIds.forEach { occurrenceId ->
+                    requireHabitUuid(occurrenceId)
+                    require(UUID.fromString(occurrenceId).isRfc4122Version5())
+                }
+                require(sourcePlannerOccurrenceId !in value.suppressedPlannerOccurrenceIds)
+            }
+            is HabitMissedResolutionActionSnapshot.Cancelled -> {
+                require(revision >= 2)
+                if (configuredPolicy != HabitMissedPolicySnapshot.ASK) {
+                    require(
+                        value.resumeAction == when (configuredPolicy) {
+                            HabitMissedPolicySnapshot.SKIP -> HabitMissedResumeActionSnapshot.SKIP
+                            HabitMissedPolicySnapshot.CARRY -> HabitMissedResumeActionSnapshot.CARRY
+                            HabitMissedPolicySnapshot.REDUCE_FREQUENCY ->
+                                HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY
+                            HabitMissedPolicySnapshot.ASK -> error("unreachable")
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    internal fun matchesExplicitAction(requested: HabitMissedExplicitActionSnapshot): Boolean =
+        when (val value = action) {
+            HabitMissedResolutionActionSnapshot.Skip ->
+                requested == HabitMissedExplicitActionSnapshot.SKIP
+            is HabitMissedResolutionActionSnapshot.Carry ->
+                requested == HabitMissedExplicitActionSnapshot.CARRY
+            HabitMissedResolutionActionSnapshot.ReductionPending,
+            is HabitMissedResolutionActionSnapshot.ReduceFrequency,
+            -> requested == HabitMissedExplicitActionSnapshot.REDUCE_FREQUENCY
+            is HabitMissedResolutionActionSnapshot.Cancelled -> value.resumeAction == when (requested) {
+                HabitMissedExplicitActionSnapshot.SKIP -> HabitMissedResumeActionSnapshot.SKIP
+                HabitMissedExplicitActionSnapshot.CARRY -> HabitMissedResumeActionSnapshot.CARRY
+                HabitMissedExplicitActionSnapshot.REDUCE_FREQUENCY ->
+                    HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY
+            }
+            HabitMissedResolutionActionSnapshot.DecisionRequired -> false
+        }
+
+    override fun toString(): String =
+        "HabitMissedResolutionSnapshot(occurrenceEvidenceId=$occurrenceEvidenceId, " +
+            "revision=$revision, action=${action::class.simpleName}, content=<redacted>)"
+
+    companion object {
+        fun fromRemote(remote: RemoteHabitMissedResolution) = HabitMissedResolutionSnapshot(
+            occurrenceEvidenceId = remote.occurrenceEvidenceId,
+            habitId = remote.habitId,
+            sourcePlannerOccurrenceId = remote.sourcePlannerOccurrenceId,
+            revision = remote.revision,
+            configuredPolicy = when (remote.configuredPolicy) {
+                RemoteHabitMissedPolicy.SKIP -> HabitMissedPolicySnapshot.SKIP
+                RemoteHabitMissedPolicy.CARRY -> HabitMissedPolicySnapshot.CARRY
+                RemoteHabitMissedPolicy.REDUCE_FREQUENCY ->
+                    HabitMissedPolicySnapshot.REDUCE_FREQUENCY
+                RemoteHabitMissedPolicy.ASK -> HabitMissedPolicySnapshot.ASK
+            },
+            action = remote.action.toSnapshot(),
+            createdAt = remote.createdAt,
+            updatedAt = remote.updatedAt,
+        ).also(HabitMissedResolutionSnapshot::requireValid)
+    }
+}
+
+private fun RemoteHabitMissedResolutionAction.toSnapshot(): HabitMissedResolutionActionSnapshot =
+    when (this) {
+        RemoteHabitMissedResolutionAction.DecisionRequired ->
+            HabitMissedResolutionActionSnapshot.DecisionRequired
+        RemoteHabitMissedResolutionAction.ReductionPending ->
+            HabitMissedResolutionActionSnapshot.ReductionPending
+        RemoteHabitMissedResolutionAction.Skip -> HabitMissedResolutionActionSnapshot.Skip
+        is RemoteHabitMissedResolutionAction.Carry ->
+            HabitMissedResolutionActionSnapshot.Carry(windowStart, windowEnd)
+        is RemoteHabitMissedResolutionAction.ReduceFrequency ->
+            HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                suppressedPlannerOccurrenceIds,
+            )
+        is RemoteHabitMissedResolutionAction.Cancelled ->
+            HabitMissedResolutionActionSnapshot.Cancelled(
+                reason = when (reason) {
+                    RemoteHabitMissedCancellationReason.SOURCE_COMPLETED ->
+                        HabitMissedCancellationReasonSnapshot.SOURCE_COMPLETED
+                    RemoteHabitMissedCancellationReason.SOURCE_SKIPPED ->
+                        HabitMissedCancellationReasonSnapshot.SOURCE_SKIPPED
+                    RemoteHabitMissedCancellationReason.SOURCE_PAUSED ->
+                        HabitMissedCancellationReasonSnapshot.SOURCE_PAUSED
+                    RemoteHabitMissedCancellationReason.SOURCE_OBSOLETE ->
+                        HabitMissedCancellationReasonSnapshot.SOURCE_OBSOLETE
+                },
+                resumeAction = when (resumeAction) {
+                    RemoteHabitMissedResumeAction.DECISION_REQUIRED ->
+                        HabitMissedResumeActionSnapshot.DECISION_REQUIRED
+                    RemoteHabitMissedResumeAction.SKIP -> HabitMissedResumeActionSnapshot.SKIP
+                    RemoteHabitMissedResumeAction.CARRY -> HabitMissedResumeActionSnapshot.CARRY
+                    RemoteHabitMissedResumeAction.REDUCE_FREQUENCY ->
+                        HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY
+                },
+            )
+    }
 
 @Serializable
 data class HabitOccurrenceEvidenceSnapshot(
@@ -226,6 +495,7 @@ data class HabitOccurrenceEvidenceSnapshot(
 data class HabitOccurrenceSnapshot(
     val evidence: HabitOccurrenceEvidenceSnapshot,
     val outcome: HabitOutcomeSnapshot?,
+    val missedResolution: HabitMissedResolutionSnapshot? = null,
 ) {
     fun requireValid() {
         evidence.requireValid()
@@ -234,6 +504,12 @@ data class HabitOccurrenceSnapshot(
             if (recorded.quantity != null && evidence.expectedUnit != null) {
                 require(recorded.unit == evidence.expectedUnit)
             }
+        }
+        missedResolution?.let { resolution ->
+            resolution.requireValid()
+            require(resolution.occurrenceEvidenceId == evidence.id)
+            require(resolution.habitId == evidence.habitId)
+            require(resolution.sourcePlannerOccurrenceId == evidence.plannerOccurrenceId)
         }
     }
 
@@ -261,6 +537,9 @@ data class HabitOccurrenceSnapshot(
                 expectedUnit = remote.evidence.expectedUnit,
             ),
             outcome = remote.outcome?.let(HabitOutcomeSnapshot::fromRemote),
+            missedResolution = remote.missedResolution?.let(
+                HabitMissedResolutionSnapshot::fromRemote,
+            ),
         ).also(HabitOccurrenceSnapshot::requireValid)
     }
 }
@@ -515,6 +794,9 @@ enum class PendingHabitMutationKind {
 
     @SerialName("resume_pause")
     RESUME_PAUSE,
+
+    @SerialName("missed_resolution")
+    MISSED_RESOLUTION,
 }
 
 @Serializable
@@ -555,6 +837,7 @@ data class PendingHabitMutation(
         requireHabitUuid(idempotencyKey)
         require(expectedRevision in 0 until Long.MAX_VALUE)
         require(kind != PendingHabitMutationKind.START_PAUSE || expectedRevision == 0L)
+        require(kind != PendingHabitMutationKind.MISSED_RESOLUTION || expectedRevision > 0L)
         require(requestJson.length in 2..MAX_HABIT_REQUEST_CHARS)
         requireHabitInstant(createdAt)
         require(syncOrigin.length in 1..MAX_HABIT_ORIGIN_CHARS)
@@ -595,6 +878,15 @@ data class PendingHabitMutation(
                     require(command.expectedRevision > 0)
                     requireHabitInstant(command.endedAt)
                 }
+                PendingHabitMutationKind.MISSED_RESOLUTION -> {
+                    val command =
+                        HABIT_COMMAND_JSON.decodeFromString<HabitMissedResolveCommandSnapshot>(
+                            requestJson,
+                        )
+                    require(command.operationId == idempotencyKey)
+                    require(command.expectedRevision == expectedRevision)
+                    require(command.expectedRevision > 0)
+                }
             }
         } catch (error: SerializationException) {
             throw IllegalArgumentException("Habit request journal is malformed", error)
@@ -619,9 +911,47 @@ data class PendingHabitMutation(
         return HABIT_COMMAND_JSON.decodeFromString(requestJson)
     }
 
+    internal fun decodedMissedResolutionCommand(): HabitMissedResolveCommandSnapshot {
+        require(kind == PendingHabitMutationKind.MISSED_RESOLUTION)
+        requireValid()
+        return HABIT_COMMAND_JSON.decodeFromString(requestJson)
+    }
+
     override fun toString(): String =
         "PendingHabitMutation(kind=$kind, habitId=$habitId, targetId=$targetId, " +
             "expectedRevision=$expectedRevision, request=<redacted>, binding=<redacted>)"
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+    }
+}
+
+/** Exact no-op reconciliation request retained until its server receipt is safely replayable. */
+@Serializable
+data class PendingHabitMissedReconcile(
+    val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    val idempotencyKey: String,
+    val requestJson: String,
+    val limit: Int,
+    val createdAt: String,
+) {
+    fun requireValid() {
+        require(schemaVersion == CURRENT_SCHEMA_VERSION)
+        requireHabitUuid(idempotencyKey)
+        require(requestJson.length in 2..MAX_HABIT_REQUEST_CHARS)
+        require(limit in 1..MAX_HABIT_RECONCILE_LIMIT)
+        requireHabitInstant(createdAt)
+        try {
+            val command = HABIT_COMMAND_JSON
+                .decodeFromString<HabitMissedReconcileCommandSnapshot>(requestJson)
+            require(command.operationId == idempotencyKey)
+        } catch (error: SerializationException) {
+            throw IllegalArgumentException("Habit reconciliation journal is malformed", error)
+        }
+    }
+
+    override fun toString(): String =
+        "PendingHabitMissedReconcile(limit=$limit, request=<redacted>)"
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
@@ -641,6 +971,7 @@ data class HabitLedgerSnapshot(
     val pauses: Map<String, HabitPauseSnapshot> = emptyMap(),
     val analytics: Map<String, HabitAnalyticsSnapshot> = emptyMap(),
     val pendingMutations: List<PendingHabitMutation> = emptyList(),
+    val pendingMissedReconcile: PendingHabitMissedReconcile? = null,
 ) {
     val isBound: Boolean
         get() = syncOrigin != null && configurationId != null
@@ -653,6 +984,7 @@ data class HabitLedgerSnapshot(
             require(!deltaCaughtUp)
             require(occurrences.isEmpty() && pauses.isEmpty() && analytics.isEmpty())
             require(pendingMutations.isEmpty())
+            require(pendingMissedReconcile == null)
             return
         }
         require(syncOrigin?.length in 1..MAX_HABIT_ORIGIN_CHARS)
@@ -712,6 +1044,11 @@ data class HabitLedgerSnapshot(
             require(pending.syncOrigin == syncOrigin)
             require(pending.configurationId == configurationId)
         }
+        pendingMissedReconcile?.let { pending ->
+            pending.requireValid()
+            require(!deltaCaughtUp)
+            require(pendingMutations.none { it.idempotencyKey == pending.idempotencyKey })
+        }
         requireValidPendingMutationRelations()
     }
 
@@ -719,7 +1056,8 @@ data class HabitLedgerSnapshot(
         "HabitLedgerSnapshot(bound=$isBound, deltaCaughtUp=$deltaCaughtUp, " +
             "occurrenceCount=${occurrences.size}, " +
             "pauseCount=${pauses.size}, analyticsCount=${analytics.size}, " +
-            "pendingCount=${pendingMutations.size}, content=<redacted>)"
+            "pendingCount=${pendingMutations.size}, " +
+            "pendingReconcile=${pendingMissedReconcile != null}, content=<redacted>)"
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
@@ -741,7 +1079,10 @@ private fun HabitLedgerSnapshot.requireValidPendingMutationRelations() {
         it.disposition == PendingHabitMutationDisposition.PENDING
     }
     require(pending.map { it.habitId to it.targetId }.distinct().size == pending.size)
-    val pendingPauseMutations = pending.filter { it.kind != PendingHabitMutationKind.OUTCOME }
+    val pendingPauseMutations = pending.filter {
+        it.kind == PendingHabitMutationKind.START_PAUSE ||
+            it.kind == PendingHabitMutationKind.RESUME_PAUSE
+    }
     require(
         pendingPauseMutations.map(PendingHabitMutation::habitId).distinct().size ==
             pendingPauseMutations.size,
@@ -767,6 +1108,14 @@ private fun HabitLedgerSnapshot.requireValidPendingMutationRelations() {
                 val pause = requireNotNull(pauses[mutation.targetId])
                 require(pause.habitId == mutation.habitId)
                 require(pause.endedAt == null && pause.revision == mutation.expectedRevision)
+            }
+            PendingHabitMutationKind.MISSED_RESOLUTION -> {
+                val occurrence = requireNotNull(occurrences[mutation.targetId])
+                require(occurrence.evidence.habitId == mutation.habitId)
+                val resolution = requireNotNull(occurrence.missedResolution)
+                require(resolution.revision == mutation.expectedRevision)
+                require(resolution.configuredPolicy == HabitMissedPolicySnapshot.ASK)
+                require(resolution.action == HabitMissedResolutionActionSnapshot.DecisionRequired)
             }
         }
     }
@@ -828,6 +1177,24 @@ internal fun HabitOccurrenceSnapshot.estimatedHabitCacheBytes(): Long =
                 (value.note?.conservativeJsonStorageBytes() ?: 0L) +
                 value.occurredAt.conservativeJsonStorageBytes() +
                 value.updatedAt.conservativeJsonStorageBytes()
+        } ?: 0L) +
+        (missedResolution?.let { value ->
+            HABIT_CACHE_ENTRY_OVERHEAD_BYTES +
+                value.occurrenceEvidenceId.conservativeJsonStorageBytes() +
+                value.habitId.conservativeJsonStorageBytes() +
+                value.sourcePlannerOccurrenceId.conservativeJsonStorageBytes() +
+                value.createdAt.conservativeJsonStorageBytes() +
+                value.updatedAt.conservativeJsonStorageBytes() +
+                when (val action = value.action) {
+                    is HabitMissedResolutionActionSnapshot.Carry ->
+                        action.windowStart.conservativeJsonStorageBytes() +
+                            action.windowEnd.conservativeJsonStorageBytes()
+                    is HabitMissedResolutionActionSnapshot.ReduceFrequency ->
+                        action.suppressedPlannerOccurrenceIds.sumOf {
+                            it.conservativeJsonStorageBytes()
+                        }
+                    else -> 0L
+                }
         } ?: 0L)
 
 internal fun HabitAnalyticsSnapshot.estimatedHabitCacheBytes(): Long =
@@ -933,6 +1300,7 @@ private const val MIN_HABIT_EVIDENCE_INSTANT_YEAR = 1
 private const val MAX_HABIT_EVIDENCE_INSTANT_YEAR = 9_999
 private const val MAX_HABIT_QUANTITY = 1_000_000_000_000L
 private const val MAX_HABIT_SECONDS = 366L * 24 * 60 * 60
+private val MAX_HABIT_MISSED_WINDOW: Duration = Duration.ofDays(366)
 private const val MAX_HABIT_ANALYTICS_OCCURRENCES = 50_000L
 private const val MAX_HABIT_ANALYTICS_SECONDS = MAX_HABIT_ANALYTICS_OCCURRENCES * MAX_HABIT_SECONDS
 private const val MAX_HABIT_ANALYTICS_QUANTITY =
@@ -955,3 +1323,4 @@ private const val HABIT_CACHE_ENTRY_OVERHEAD_BYTES = 1_024L
 private const val HABIT_CACHE_LIST_ENTRY_OVERHEAD_BYTES = 512L
 private const val MAX_PENDING_HABIT_MUTATIONS = 256
 private const val MAX_PENDING_HABIT_REQUEST_CHARS = 2 * 1024 * 1024
+private const val MAX_HABIT_RECONCILE_LIMIT = 200

@@ -13,6 +13,7 @@ import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.data.PlannerStateRepository
@@ -514,7 +515,7 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
-    fun openEndedPauseResumeAndSkipRemainServerCommands() = runBlocking {
+    fun stalePublishedHeadStillAllowsOpenEndedPauseResumeAndSkipServerCommands() = runBlocking {
         val store = plannerStore()
         var serverSession = activeSession(sessionId = SESSION_ID)
         var globalRevision = 1L
@@ -560,6 +561,17 @@ class ExecutionSyncManagerTest {
         }
         val manager = manager(store, transport)
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        val hintReceipt = requireNotNull(
+            store.recordPublishedScheduleRevisionHint(
+                "https://api.example.test/",
+                DEFAULT_CONFIGURATION_ID,
+                2uL,
+            ),
+        )
+        assertTrue(hintReceipt.awaitDurable())
+        assertFalse(
+            store.state.value.hasPublishedExecutionAuthority(store.state.value.schedule.single()),
+        )
 
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.pause(BLOCK_ID))
         assertTrue(store.state.value.activeSession?.isPaused == true)
@@ -1013,6 +1025,9 @@ class ExecutionSyncManagerTest {
                 publishedScheduleProof = requireNotNull(
                     original.state.value.publishedScheduleProof,
                 ).copy(revision = republishedRevision),
+                publishedScheduleRevisionHint = requireNotNull(
+                    original.state.value.publishedScheduleRevisionHint,
+                ).copy(revisionNumber = republishedRevision.revisionNumber),
                 scheduleInputDigest = republishedRevision.inputDigest,
             ),
             nowEpochMillis = { NOW.toEpochMilli() },
@@ -3062,6 +3077,11 @@ class ExecutionSyncManagerTest {
                     revision = revision,
                     asOf = NOW.toString(),
                     blocks = blocks.map(::publishedBlockProof),
+                ),
+                publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                    syncOrigin = "https://api.example.test/",
+                    configurationId = configurationId,
+                    revisionNumber = revision.revisionNumber,
                 ),
                 scheduleInputDigest = revision.inputDigest,
                 scheduleGeneratedAt = NOW.toString(),

@@ -417,6 +417,11 @@ class OnboardingReadinessProofTest {
             canonicalConfigurationId = CONFIGURATION_ID,
             publishedScheduleRevision = revision,
             publishedScheduleProof = proof,
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = ORIGIN,
+                configurationId = CONFIGURATION_ID,
+                revisionNumber = revision.revisionNumber,
+            ),
             onboardingFirstItemAnchor = OnboardingFirstItemAnchorSnapshot(
                 ITEM_ID,
                 item.revision,

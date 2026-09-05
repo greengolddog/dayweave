@@ -7,6 +7,7 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
@@ -284,6 +285,11 @@ class TodayActionEligibilityTest {
             schedule = schedule,
             publishedScheduleRevision = revision,
             publishedScheduleProof = proof,
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revisionNumber = revision.revisionNumber,
+            ),
             scheduleInputDigest = revision.inputDigest,
             scheduleGeneratedAt = "2026-09-01T07:00:00Z",
             schedulePlanningZoneId = "UTC",

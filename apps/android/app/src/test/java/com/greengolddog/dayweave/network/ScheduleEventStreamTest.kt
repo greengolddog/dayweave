@@ -13,12 +13,12 @@ import org.junit.Test
 
 class ScheduleInvalidationSseParserTest {
     @Test
-    fun acceptsCanonicalUnsignedRevisionsAndHeartbeats() {
+    fun acceptsCanonicalSignedBigintRevisionsAndHeartbeats() = runBlocking {
         val revisions = mutableListOf<ULong>()
         val body = buildString {
             append(": heartbeat\n\n")
             append(event(7uL, "\r\n"))
-            append(event(ULong.MAX_VALUE, "\n"))
+            append(event(Long.MAX_VALUE.toULong(), "\n"))
         }
 
         ScheduleInvalidationSseParser(5uL).parse(
@@ -26,11 +26,11 @@ class ScheduleInvalidationSseParserTest {
             revisions::add,
         )
 
-        assertEquals(listOf(7uL, ULong.MAX_VALUE), revisions)
+        assertEquals(listOf(7uL, Long.MAX_VALUE.toULong()), revisions)
     }
 
     @Test
-    fun rejectsWrongEventDataOrderingAndNonCanonicalUnsignedIds() {
+    fun rejectsWrongEventDataOrderingAndNonCanonicalUnsignedIds() = runBlocking {
         listOf(
             "id: 6\nevent: execution-invalidation\ndata: {\"revision\":6}\n\n",
             "id: 6\nevent: schedule-invalidation\ndata: {\"revision\":7}\n\n",
@@ -38,13 +38,17 @@ class ScheduleInvalidationSseParserTest {
             "id: +6\nevent: schedule-invalidation\ndata: {\"revision\":6}\n\n",
             "id: 18446744073709551616\nevent: schedule-invalidation\n" +
                 "data: {\"revision\":18446744073709551616}\n\n",
+            "id: 9223372036854775808\nevent: schedule-invalidation\n" +
+                "data: {\"revision\":9223372036854775808}\n\n",
             event(5uL, "\n"),
             "id: 6\nevent: schedule-invalidation\ndata: {\"revision\":6}\n",
         ).forEach { body ->
             assertThrows(Exception::class.java) {
-                ScheduleInvalidationSseParser(5uL).parse(
-                    ByteArrayInputStream(body.toByteArray()),
-                ) {}
+                runBlocking {
+                    ScheduleInvalidationSseParser(5uL).parse(
+                        ByteArrayInputStream(body.toByteArray()),
+                    ) {}
+                }
             }
         }
     }

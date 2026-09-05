@@ -64,11 +64,15 @@ object PlannerSnapshotFormats {
     const val JSON_V17 = "json-v17-authoritative-habit-ledger"
     /** Rich authoring duration provenance and habit-wide spacing; rollback must not erase either. */
     const val JSON_V18 = "json-v18-duration-authoring-and-habit-spacing"
+    /** Revisioned missed-occurrence authority and exact ask-decision recovery journal. */
+    const val JSON_V19 = "json-v19-habit-missed-resolution-authority"
+    /** Exact current-publication occurrence membership plus durable later-head invalidation. */
+    const val JSON_V20 = "json-v20-published-occurrence-membership-authority"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 18,
+    version = 20,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -214,6 +218,23 @@ object PlannerDatabaseMigrations {
     val MIGRATION_17_18 = object : Migration(17, 18) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains authoritative missed-occurrence
+     * projections and exact ask-decision replay, so rollback must fail before an older binary can
+     * erase either coordinate.
+     */
+    val MIGRATION_18_19 = object : Migration(18, 19) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains bounded occurrence-membership
+     * authority; this version fence prevents rollback from ignoring a later-head invalidation.
+     */
+    val MIGRATION_19_20 = object : Migration(19, 20) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -271,6 +292,8 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_15_16,
                 PlannerDatabaseMigrations.MIGRATION_16_17,
                 PlannerDatabaseMigrations.MIGRATION_17_18,
+                PlannerDatabaseMigrations.MIGRATION_18_19,
+                PlannerDatabaseMigrations.MIGRATION_19_20,
             )
             .build()
     }

@@ -28,19 +28,35 @@ import kotlinx.coroutines.launch
 internal data class DurableScheduleInvalidationCursor(
     val syncOrigin: String?,
     val configurationId: String?,
+    /** Last schedule head installed by an authoritative current-schedule response. */
     val revision: ULong,
+    /** Newest durably observed authenticated hint, used only as the SSE resume cursor. */
+    val latestObservedRevision: ULong = revision,
 )
 
+/** One-shot authority to replace a rejected SSE cursor with a lower server-epoch head. */
+internal data class ScheduleRevisionEpochResetFence(
+    val syncOrigin: String,
+    val configurationId: String,
+    val rejectedRevision: ULong,
+) {
+    init {
+        require(syncOrigin.isNotBlank() && configurationId.isNotBlank())
+        require(rejectedRevision in 1uL..Long.MAX_VALUE.toULong())
+    }
+}
+
 /**
- * Runs only in the unlocked foreground. Revisions are memory-only hints; every mutation goes
- * through the ordinary authenticated current-schedule GET and durable replica install.
+ * Runs only in the unlocked foreground. Authenticated revision hints are durably fenced before
+ * they can invalidate membership; every schedule mutation still comes from a current-schedule GET.
  */
 internal class ForegroundScheduleInvalidationManager(
     private val credentialStore: ApiCredentialStore,
     private val streamTransport: ScheduleInvalidationStreamTransport?,
     private val durableCursor: () -> DurableScheduleInvalidationCursor,
+    private val recordRevisionHint: suspend (String, String, ULong) -> Boolean = { _, _, _ -> true },
     private val tryLaunchAuthoritativeRefresh: ((suspend () -> Unit) -> Boolean),
-    private val authoritativeRefresh: suspend () -> Boolean,
+    private val authoritativeRefresh: suspend (ScheduleRevisionEpochResetFence?) -> Boolean,
     private val delayMillis: suspend (Long) -> Unit = { delay(it) },
     private val monotonicNanos: () -> Long = System::nanoTime,
 ) {
@@ -60,16 +76,30 @@ internal class ForegroundScheduleInvalidationManager(
         try {
             val binding = captureBinding() ?: return
             val highWater = AtomicReference<ScheduleRevisionHint?>(null)
+            val epochResetFromRevision = AtomicLong(0L)
             val forceRefresh = AtomicLong(0)
             val signals = Channel<Unit>(Channel.CONFLATED)
             coroutineScope {
                 val drainJob = launch {
-                    drainHints(binding, highWater, forceRefresh, signals)
+                    drainHints(
+                        binding,
+                        highWater,
+                        epochResetFromRevision,
+                        forceRefresh,
+                        signals,
+                    )
                 }
                 val streamJob = streamTransport?.let { transport ->
                     launch {
                         try {
-                            collectConnections(binding, transport, highWater, forceRefresh, signals)
+                            collectConnections(
+                                binding,
+                                transport,
+                                highWater,
+                                epochResetFromRevision,
+                                forceRefresh,
+                                signals,
+                            )
                         } catch (error: CancellationException) {
                             throw error
                         } catch (_: Exception) {
@@ -108,16 +138,20 @@ internal class ForegroundScheduleInvalidationManager(
         binding: ActivationBinding,
         transport: ScheduleInvalidationStreamTransport,
         highWater: AtomicReference<ScheduleRevisionHint?>,
+        epochResetFromRevision: AtomicLong,
         forceRefresh: AtomicLong,
         signals: Channel<Unit>,
     ) {
         var reconnectDelay = MIN_RECONNECT_DELAY_MILLIS
         while (currentCoroutineContext().isActive && bindingIsCurrent(binding)) {
             val configuration = configurationFor(binding) ?: return
-            val cursor = durableRevisionFor(binding)
+            val cursor = durableResumeRevisionFor(binding)
             val startedAt = monotonicNanos()
             val streamEnd = try {
                 transport.collect(configuration, cursor) { revision ->
+                    if (!recordRevisionHint(binding.baseUrl, binding.configurationId, revision)) {
+                        throw IOException("Could not durably fence a newer schedule revision")
+                    }
                     offerHighWater(highWater, revision)
                     signals.trySend(Unit)
                 }
@@ -131,6 +165,7 @@ internal class ForegroundScheduleInvalidationManager(
                     // target derived from that epoch is invalid too; retaining it would make a
                     // successful GET that restores a lower head look perpetually behind.
                     highWater.set(null)
+                    if (cursor > 0uL) epochResetFromRevision.set(cursor.toLong())
                     offerForcedRefresh(forceRefresh)
                     signals.trySend(Unit)
                     // Do not hammer the same invalid cursor. Wait under bounded backoff until the
@@ -139,7 +174,7 @@ internal class ForegroundScheduleInvalidationManager(
                     var repairDelay = MIN_RECONNECT_DELAY_MILLIS
                     while (
                         currentCoroutineContext().isActive && bindingIsCurrent(binding) &&
-                        durableRevisionFor(binding) == cursor
+                        durableResumeRevisionFor(binding) == cursor
                     ) {
                         delayMillis(repairDelay)
                         repairDelay = (repairDelay * 2)
@@ -195,6 +230,7 @@ internal class ForegroundScheduleInvalidationManager(
     private suspend fun drainHints(
         binding: ActivationBinding,
         highWater: AtomicReference<ScheduleRevisionHint?>,
+        epochResetFromRevision: AtomicLong,
         forceRefresh: AtomicLong,
         signals: Channel<Unit>,
     ) {
@@ -203,8 +239,12 @@ internal class ForegroundScheduleInvalidationManager(
             while (currentCoroutineContext().isActive) {
                 if (!bindingIsCurrent(binding)) return
                 val target = highWater.get()
+                val epochReset = epochResetFromRevision.get()
+                    .takeIf { it > 0L }
+                    ?.toULong()
                 val forcedGeneration = forceRefresh.get()
                 if (
+                    epochReset == null &&
                     forcedGeneration == 0L &&
                     (target == null || durableRevisionFor(binding) >= target.revision)
                 ) {
@@ -216,7 +256,15 @@ internal class ForegroundScheduleInvalidationManager(
                     tryLaunchAuthoritativeRefresh {
                         var success = false
                         try {
-                            success = authoritativeRefresh()
+                            success = authoritativeRefresh(
+                                epochReset?.let { rejectedRevision ->
+                                    ScheduleRevisionEpochResetFence(
+                                        syncOrigin = binding.baseUrl,
+                                        configurationId = binding.configurationId,
+                                        rejectedRevision = rejectedRevision,
+                                    )
+                                },
+                            )
                         } finally {
                             completed.complete(success)
                         }
@@ -229,6 +277,9 @@ internal class ForegroundScheduleInvalidationManager(
                 val succeeded = completed.await()
                 if (!bindingIsCurrent(binding)) return
                 if (succeeded) {
+                    if (epochReset != null) {
+                        epochResetFromRevision.compareAndSet(epochReset.toLong(), 0L)
+                    }
                     if (forcedGeneration > 0) {
                         forceRefresh.compareAndSet(forcedGeneration, 0)
                     }
@@ -307,6 +358,14 @@ internal class ForegroundScheduleInvalidationManager(
     private fun durableRevisionFor(binding: ActivationBinding): ULong {
         val cursor = durableCursor()
         return cursor.revision.takeIf {
+            cursor.syncOrigin == binding.baseUrl &&
+                cursor.configurationId == binding.configurationId
+        } ?: 0uL
+    }
+
+    private fun durableResumeRevisionFor(binding: ActivationBinding): ULong {
+        val cursor = durableCursor()
+        return cursor.latestObservedRevision.takeIf {
             cursor.syncOrigin == binding.baseUrl &&
                 cursor.configurationId == binding.configurationId
         } ?: 0uL

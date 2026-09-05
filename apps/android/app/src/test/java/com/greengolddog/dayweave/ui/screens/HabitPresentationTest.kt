@@ -1,8 +1,12 @@
 package com.greengolddog.dayweave.ui.screens
 
+import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
 import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitMissedPolicySnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceEvidenceSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeSnapshot
@@ -16,8 +20,14 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipProofSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceStateSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.ScheduleItemPresentationSlice
+import com.greengolddog.dayweave.model.habitPolicyFingerprintOrNull
 import java.time.Instant
 import java.time.LocalDate
 import kotlinx.coroutines.runBlocking
@@ -254,6 +264,198 @@ class HabitPresentationTest {
         assertEquals("Private habit", rows.single().title)
         assertTrue(rows.single().isSensitive)
         assertTrue(rows.single().hasCanonicalEvidence)
+    }
+
+    @Test
+    fun missedReviewOnlyOffersCurrentEffectiveActiveDecision() {
+        val decision = occurrence(
+            localDate = TODAY.toString(),
+            outcome = outcome(),
+            missedResolution = missedResolution(),
+        )
+        val active = canonicalHabit()
+
+        assertEquals(
+            listOf(LEDGER_OCCURRENCE_ID),
+            missedHabitDecisions(listOf(active), ledger(occurrences = listOf(decision)))
+                .map { it.occurrence.evidence.id },
+        )
+        assertTrue(
+            missedHabitDecisions(
+                listOf(active),
+                ledger(
+                    occurrences = listOf(decision),
+                    pauses = listOf(pause(PAUSE_ID, revision = 1, endedAt = null)),
+                ),
+            ).isEmpty(),
+        )
+        assertTrue(
+            missedHabitDecisions(
+                listOf(active),
+                ledger(
+                    occurrences = listOf(
+                        decision.copy(
+                            outcome = outcome().copy(
+                                status = HabitOutcomeStatusSnapshot.COMPLETED,
+                                progressBasisPoints = 10_000,
+                            ),
+                        ),
+                    ),
+                ),
+            ).isEmpty(),
+        )
+        assertEquals(
+            listOf(LEDGER_OCCURRENCE_ID),
+            missedHabitDecisions(
+                listOf(active.copy(revision = 8, title = "Renamed habit", importance = 99)),
+                ledger(occurrences = listOf(decision)),
+            ).map { it.occurrence.evidence.id },
+        )
+        listOf(
+            emptyList(),
+            listOf(active.copy(
+                revision = 8,
+                recurrenceJson = """{"type":"daily","times_per_day":2}""",
+            )),
+            listOf(active.copy(deletedAt = NOW)),
+            listOf(active.copy(kind = "task")),
+            listOf(active.copy(status = "cancelled")),
+            listOf(active.copy(status = "blocked")),
+            listOf(active.copy(status = "future_status")),
+            listOf(active.copy(isExecutable = false)),
+            listOf(active.copy(revision = decision.evidence.sourceItemRevision - 1)),
+        ).forEach { canonical ->
+            assertTrue(
+                missedHabitDecisions(
+                    canonical,
+                    ledger(occurrences = listOf(decision)),
+                ).isEmpty(),
+            )
+        }
+
+        val targetEvidence = decision.evidence.copy(
+            id = SECOND_LEDGER_OCCURRENCE_ID,
+            plannerOccurrenceId = "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa",
+            identity = buildJsonObject {
+                put("type", JsonPrimitive("calendar_day"))
+                put("date", JsonPrimitive("2026-09-04"))
+                put("bucket_ordinal", JsonPrimitive(0))
+            },
+            nominalStart = "2026-09-04T06:00:00Z",
+            nominalEnd = "2026-09-04T06:20:00Z",
+            windowStart = "2026-09-04T05:00:00Z",
+            windowEnd = "2026-09-04T20:00:00Z",
+            localDate = "2026-09-04",
+        )
+        val targetDecision = decision.copy(
+            evidence = targetEvidence,
+            outcome = null,
+            missedResolution = requireNotNull(decision.missedResolution).copy(
+                occurrenceEvidenceId = targetEvidence.id,
+                sourcePlannerOccurrenceId = targetEvidence.plannerOccurrenceId,
+            ),
+        )
+        val sourceReduction = decision.copy(
+            missedResolution = requireNotNull(decision.missedResolution).copy(
+                revision = 2,
+                action = HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                    listOf(targetEvidence.plannerOccurrenceId),
+                ),
+            ),
+        )
+        assertEquals(
+            listOf(targetEvidence.id),
+            missedHabitDecisions(
+                listOf(active),
+                ledger(occurrences = listOf(targetDecision, sourceReduction)),
+            ).map { it.occurrence.evidence.id },
+        )
+        val revision = PublishedScheduleRevisionSnapshot(
+            id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            revisionNumber = 11uL,
+            revision = "11:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            inputDigest = "sha256:${"a".repeat(64)}",
+            horizonStart = "2026-09-03T00:00:00Z",
+            horizonEnd = "2026-09-05T00:00:00Z",
+            timezoneName = "Europe/Paris",
+            publishedAt = "2026-09-03T00:00:00Z",
+        )
+        val matchingHint = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = SYNC_ORIGIN,
+            configurationId = CONFIGURATION_ID,
+            revisionNumber = revision.revisionNumber,
+        )
+        fun decisionsWithMembership(
+            state: PublishedOccurrenceStateSnapshot?,
+            hint: PublishedScheduleRevisionHintSnapshot = matchingHint,
+            configurationId: String = CONFIGURATION_ID,
+        ): List<String> {
+            val proof = PublishedOccurrenceMembershipProofSnapshot(
+                schemaVersion = PublishedOccurrenceMembershipProofSnapshot.CURRENT_SCHEMA_VERSION,
+                syncOrigin = SYNC_ORIGIN,
+                configurationId = CONFIGURATION_ID,
+                revision = revision,
+                occurrences = state?.let {
+                    listOf(
+                        PublishedOccurrenceMembershipSnapshot(
+                            plannerOccurrenceId = targetEvidence.plannerOccurrenceId,
+                            seriesItemId = HABIT_ID,
+                            state = it,
+                        ),
+                    )
+                }.orEmpty(),
+            )
+            return missedHabitDecisions(
+                canonicalItems = listOf(active),
+                ledger = ledger(occurrences = listOf(targetDecision, sourceReduction)),
+                publishedOccurrenceMembershipProof = proof,
+                publishedScheduleRevisionHint = hint,
+                syncOrigin = SYNC_ORIGIN,
+                configurationId = configurationId,
+            ).map { it.occurrence.evidence.id }
+        }
+        listOf(
+            PublishedOccurrenceStateSnapshot.GENERATED,
+            PublishedOccurrenceStateSnapshot.SKIPPED,
+        ).forEach { state ->
+            assertTrue(decisionsWithMembership(state).isEmpty())
+        }
+        listOf(
+            PublishedOccurrenceStateSnapshot.COMPLETED,
+            PublishedOccurrenceStateSnapshot.PAUSED,
+        ).forEach { state ->
+            assertEquals(listOf(targetEvidence.id), decisionsWithMembership(state))
+        }
+        assertEquals(listOf(targetEvidence.id), decisionsWithMembership(null))
+        assertEquals(
+            listOf(targetEvidence.id),
+            decisionsWithMembership(
+                PublishedOccurrenceStateSnapshot.GENERATED,
+                hint = matchingHint.copy(revisionNumber = 12uL),
+            ),
+        )
+        assertEquals(
+            listOf(targetEvidence.id),
+            decisionsWithMembership(
+                PublishedOccurrenceStateSnapshot.GENERATED,
+                configurationId = "replacement-configuration",
+            ),
+        )
+        assertEquals(
+            listOf(targetEvidence.id),
+            missedHabitDecisions(
+                listOf(active),
+                ledger(occurrences = listOf(
+                    targetDecision,
+                    sourceReduction.copy(
+                        outcome = outcome().copy(
+                            status = HabitOutcomeStatusSnapshot.COMPLETED,
+                            progressBasisPoints = 10_000,
+                        ),
+                    ),
+                )),
+            ).map { it.occurrence.evidence.id },
+        )
     }
 
     @Test
@@ -568,6 +770,7 @@ class HabitPresentationTest {
         sourceItemRevision: Long = 7,
         expectedDurationSeconds: Long? = 1_200,
         outcome: HabitOutcomeSnapshot? = null,
+        missedResolution: HabitMissedResolutionSnapshot? = null,
     ) = HabitOccurrenceSnapshot(
         evidence = HabitOccurrenceEvidenceSnapshot(
             id = ledgerOccurrenceId,
@@ -575,7 +778,7 @@ class HabitPresentationTest {
             plannerOccurrenceId = PLANNER_OCCURRENCE_ID,
             sourceScheduleRevisionId = SCHEDULE_REVISION_ID,
             sourceItemRevision = sourceItemRevision,
-            policyFingerprint = "sha256:${"a".repeat(64)}",
+            policyFingerprint = requireNotNull(canonicalHabit().habitPolicyFingerprintOrNull()),
             identity = buildJsonObject {
                 put("type", JsonPrimitive("calendar_day"))
                 put("date", JsonPrimitive(localDate))
@@ -592,6 +795,37 @@ class HabitPresentationTest {
             expectedUnit = null,
         ),
         outcome = outcome,
+        missedResolution = missedResolution,
+    )
+
+    private fun missedResolution() = HabitMissedResolutionSnapshot(
+        occurrenceEvidenceId = LEDGER_OCCURRENCE_ID,
+        habitId = HABIT_ID,
+        sourcePlannerOccurrenceId = PLANNER_OCCURRENCE_ID,
+        revision = 1,
+        configuredPolicy = HabitMissedPolicySnapshot.ASK,
+        action = HabitMissedResolutionActionSnapshot.DecisionRequired,
+        createdAt = "2026-09-03T20:01:00Z",
+        updatedAt = "2026-09-03T20:01:00Z",
+    )
+
+    private fun canonicalHabit() = CanonicalItemSnapshot(
+        id = HABIT_ID,
+        kind = "habit",
+        status = "planned",
+        title = "Morning practice",
+        timezoneName = "Europe/Paris",
+        durationSeconds = 1_200,
+        recurrenceJson = """{"type":"daily","times_per_day":1}""",
+        flexibleConstraintsJson = "{}",
+        splitPolicyJson = "{\"type\":\"indivisible\"}",
+        importance = 5,
+        urgency = 5,
+        siblingOrder = 0,
+        isExecutable = true,
+        revision = 7,
+        createdAt = "2026-09-01T00:00:00Z",
+        updatedAt = "2026-09-01T00:00:00Z",
     )
 
     private fun outcome(actualSeconds: Long? = 600) = HabitOutcomeSnapshot(

@@ -1038,6 +1038,7 @@ private fun DayWeaveRoot(
                         currentZone = plannerClockZone,
                         onRefresh = viewModel::refreshHabits,
                         onRecordOutcome = viewModel::recordHabitOutcome,
+                        onResolveMissed = viewModel::resolveMissedHabit,
                         onStartPause = viewModel::startHabitPause,
                         onResumePause = viewModel::resumeHabitPause,
                         onDiscardReviewedMutation =

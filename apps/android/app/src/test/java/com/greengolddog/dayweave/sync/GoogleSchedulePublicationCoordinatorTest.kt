@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationJournal
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -63,7 +64,7 @@ class GoogleSchedulePublicationCoordinatorTest {
 
     @Test
     fun approvedRecoveryRequiresExplicitReplayEvenAfterLocalExpiry() = runBlocking {
-        val store = PlannerStore(boundState(approvedJournal()))
+        val store = PlannerStore(publishedState(approvedJournal()))
         val transport = FakeSchedulePublicationTransport()
         val coordinator = coordinator(
             store,
@@ -98,6 +99,62 @@ class GoogleSchedulePublicationCoordinatorTest {
         assertNull(recovered.approvalExpiresAt)
         assertEquals(ScheduleGooglePublicationState.PUBLISHED, recovered.status?.state)
         assertEquals(GoogleSchedulePublicationPhase.PUBLISHED, coordinator.state.value.phase)
+    }
+
+    @Test
+    fun newerDurableHeadBlocksApprovedReplayBeforeExternalEnqueue() = runBlocking {
+        val approved = approvedJournal()
+        val store = PlannerStore(publishedState(approved))
+        val receipt = requireNotNull(
+            store.recordPublishedScheduleRevisionHint(
+                API_BASE_URL,
+                CONFIGURATION_ID,
+                12uL,
+            ),
+        )
+        assertTrue(receipt.awaitDurable())
+        val transport = FakeSchedulePublicationTransport()
+        val coordinator = coordinator(store, transport)
+
+        assertEquals(
+            GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED,
+            coordinator.replayApprovedEnqueue(),
+        )
+        assertEquals(0, transport.enqueueCalls)
+        assertEquals(0, transport.statusCalls)
+        assertEquals(approved, store.durableState.value?.pendingGoogleSchedulePublication)
+    }
+
+    @Test
+    fun newerHeadDuringExternalEnqueueStillPersistsAcceptanceAndStatus() = runBlocking {
+        val store = PlannerStore(publishedState(approvedJournal()))
+        val transport = FakeSchedulePublicationTransport().apply {
+            onEnqueue = {
+                val receipt = requireNotNull(
+                    store.recordPublishedScheduleRevisionHint(
+                        API_BASE_URL,
+                        CONFIGURATION_ID,
+                        12uL,
+                    ),
+                )
+                assertTrue(receipt.awaitDurable())
+                RemoteScheduleGooglePublicationAccepted(PUBLICATION_ID, replayed = true)
+            }
+        }
+        val coordinator = coordinator(store, transport)
+
+        assertEquals(
+            GoogleSchedulePublicationOutcome.STATUS_UPDATED,
+            coordinator.replayApprovedEnqueue(),
+        )
+        assertEquals(1, transport.enqueueCalls)
+        assertEquals(1, transport.statusCalls)
+        val accepted = requireNotNull(
+            store.durableState.value?.pendingGoogleSchedulePublication,
+        )
+        assertEquals(GoogleSchedulePublicationStage.ACCEPTED, accepted.stage)
+        assertEquals(ScheduleGooglePublicationState.PUBLISHED, accepted.status?.state)
+        assertEquals(12uL, store.durableState.value?.publishedScheduleRevisionHint?.revisionNumber)
     }
 
     @Test
@@ -159,6 +216,46 @@ class GoogleSchedulePublicationCoordinatorTest {
         )
         assertEquals(GoogleSchedulePublicationStage.ACCEPTED, persisted.stage)
         assertNull(persisted.approvalCapability)
+    }
+
+    @Test
+    fun newerDurableHeadBetweenPreviewAndApprovalResponsePreventsEnqueue() = runBlocking {
+        val previewed = intentJournal().recordingPreview(validPreview())
+        val store = PlannerStore(publishedState(previewed))
+        val transport = FakeSchedulePublicationTransport().apply {
+            onApproval = {
+                val receipt = requireNotNull(
+                    store.recordPublishedScheduleRevisionHint(
+                        API_BASE_URL,
+                        CONFIGURATION_ID,
+                        12uL,
+                    ),
+                )
+                assertTrue(receipt.awaitDurable())
+                RemoteScheduleGooglePublicationApproval(
+                    PREVIEW_ID,
+                    CAPABILITY,
+                    "2026-09-03T12:15:00Z",
+                )
+            }
+        }
+        val coordinator = coordinator(store, transport)
+        assertEquals(
+            GoogleSchedulePublicationOutcome.PREVIEW_READY,
+            coordinator.recoverPending(),
+        )
+
+        assertEquals(
+            GoogleSchedulePublicationOutcome.PENDING,
+            coordinator.approveAndEnqueue(requireNotNull(coordinator.approvalConfirmation())),
+        )
+        assertEquals(1, transport.approvalCalls)
+        assertEquals(0, transport.enqueueCalls)
+        assertEquals(0, transport.statusCalls)
+        assertEquals(
+            GoogleSchedulePublicationStage.APPROVAL_ATTEMPTED,
+            store.durableState.value?.pendingGoogleSchedulePublication?.stage,
+        )
     }
 
     @Test
@@ -401,7 +498,7 @@ class GoogleSchedulePublicationCoordinatorTest {
 
     @Test
     fun cancelledHolderAndNewLifecyclePreventWaitingRecoveryFromStartingRequest() = runBlocking {
-        val store = PlannerStore(boundState(approvedJournal()))
+        val store = PlannerStore(publishedState(approvedJournal()))
         val enqueueEntered = CompletableDeferred<Unit>()
         val neverReturns = CompletableDeferred<RemoteScheduleGooglePublicationAccepted>()
         val transport = FakeSchedulePublicationTransport().apply {
@@ -635,6 +732,11 @@ class GoogleSchedulePublicationCoordinatorTest {
                 revision = revision,
                 asOf = "2026-09-03T12:00:00Z",
                 blocks = emptyList(),
+            ),
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = API_BASE_URL,
+                configurationId = CONFIGURATION_ID,
+                revisionNumber = revision.revisionNumber,
             ),
             scheduleInputDigest = digest,
             scheduleGeneratedAt = "2026-09-03T12:00:00Z",

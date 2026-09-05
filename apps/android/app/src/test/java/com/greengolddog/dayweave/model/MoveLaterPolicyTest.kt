@@ -698,6 +698,11 @@ class MoveLaterPolicyTest {
                 asOf = generatedAt.toString(),
                 blocks = blocks.map(PublishedScheduleBlockProofSnapshot::from),
             ),
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = "https://api.example.test/",
+                configurationId = "connection-1",
+                revisionNumber = revision.revisionNumber,
+            ),
             scheduleInputDigest = revision.inputDigest,
             scheduleGeneratedAt = generatedAt.toString(),
             schedulePlanningZoneId = zone.id,

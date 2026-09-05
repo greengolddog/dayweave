@@ -16,12 +16,16 @@ import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitMissedPolicySnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceEvidenceSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeCommandSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
+import com.greengolddog.dayweave.model.HabitPauseSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
@@ -30,6 +34,11 @@ import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipProofSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceStateSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
@@ -40,6 +49,7 @@ import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.localScheduleCompositionFingerprintComputationCount
+import com.greengolddog.dayweave.model.habitPolicyFingerprintOrNull
 import com.greengolddog.dayweave.model.requireCanonicalReplacementSupport
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import com.greengolddog.dayweave.data.PlannerStateRepository
@@ -112,6 +122,80 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CanonicalSyncManagerTest {
+    @Test
+    fun cursorEpochResetFenceCannotCrossCredentialBinding() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport()
+
+        val outcome = manager(store, transport).refreshCurrentPublishedScheduleAfterCursorReset(
+            ScheduleRevisionEpochResetFence(
+                syncOrigin = "https://api.example.test/",
+                configurationId = "replacement-connection",
+                rejectedRevision = 9uL,
+            ),
+        )
+
+        assertEquals(CanonicalRefreshOutcome.CONFIGURATION_ERROR, outcome)
+        assertTrue(transport.currentScheduleConfigurations.isEmpty())
+        assertTrue(transport.deltaCursors.isEmpty())
+        assertEquals(DayWeaveUiState(), store.state.value)
+    }
+
+    @Test
+    fun currentAndEmptyHeadRefreshFailIfStorageBecomesUnavailableBeforeInstall() = runBlocking {
+        listOf(false, true).forEach { hasCurrentHead ->
+            val initial = DayWeaveUiState(
+                canonicalSyncOrigin = "https://api.example.test/",
+                canonicalConfigurationId = "connection-1",
+                executionDeviceId = DEVICE_ID,
+            )
+            var failSaves = false
+            val repository = object : PlannerStateRepository {
+                override suspend fun load(): DayWeaveUiState = initial
+
+                override suspend fun save(state: DayWeaveUiState) {
+                    if (failSaves) throw IOException("synthetic current-head persistence failure")
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val store = PlannerStore(initial, repository, scope)
+                withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+                val head = currentSchedule(preview()).takeIf { hasCurrentHead }
+                var currentCalls = 0
+                val transport = FakeCanonicalTransport().apply {
+                    pages[null] = RemoteItemDeltaPage(
+                        listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                        "cursor-1",
+                        false,
+                    )
+                    currentScheduleHandler = {
+                        currentCalls += 1
+                        if (!hasCurrentHead || currentCalls == 2) {
+                            failSaves = true
+                            val failed = requireNotNull(store.ensureExecutionDeviceId(DEVICE_ID))
+                            assertFalse(failed.awaitDurable())
+                            assertEquals(
+                                PlannerLoadState.PERSISTENCE_FAILED,
+                                store.loadState.value,
+                            )
+                        }
+                        head
+                    }
+                }
+
+                assertEquals(
+                    CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
+                    manager(store, transport).refreshCurrentPublishedSchedule(),
+                )
+                assertNull(store.state.value.publishedScheduleRevision)
+                assertNull(store.state.value.publishedScheduleRevisionHint)
+            } finally {
+                scope.cancel()
+            }
+        }
+    }
+
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
 
     @Test
@@ -5780,6 +5864,655 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun localHabitCompositionSerializesMissedSkipAndReductionAsDemandExceptions() = runBlocking {
+        val origin = "https://api.example.test/"
+        val configurationId = "connection-1"
+        val habit = localCanonicalItem().copy(
+            kind = "habit",
+            title = "Renamed without changing policy",
+            recurrenceJson = """{"type":"daily","times_per_day":1}""",
+            revision = 8,
+        )
+        val sourceEvidence = HabitOccurrenceEvidenceSnapshot(
+            id = HABIT_LEDGER_OCCURRENCE_ID,
+            habitId = habit.id,
+            plannerOccurrenceId = OCCURRENCE_ID,
+            sourceScheduleRevisionId = HABIT_SOURCE_SCHEDULE_ID,
+            sourceItemRevision = 7,
+            policyFingerprint = requireNotNull(habit.habitPolicyFingerprintOrNull()),
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T05:00:00Z",
+            nominalEnd = "2026-09-01T05:30:00Z",
+            windowStart = "2026-09-01T04:00:00Z",
+            windowEnd = "2026-09-01T06:00:00Z",
+            localDate = "2026-09-01",
+            timezoneName = "Europe/Madrid",
+            expectedDurationSeconds = 1_800,
+            expectedQuantity = null,
+            expectedUnit = null,
+        )
+        val partial = HabitOutcomeSnapshot(
+            revision = 1,
+            status = HabitOutcomeStatusSnapshot.PARTIAL,
+            progressBasisPoints = 5_000,
+            quantity = null,
+            unit = null,
+            actualSeconds = 900,
+            note = null,
+            occurredAt = "2026-09-01T05:30:00Z",
+            updatedAt = "2026-09-01T05:31:00Z",
+        )
+        fun resolution(action: HabitMissedResolutionActionSnapshot) =
+            HabitMissedResolutionSnapshot(
+                occurrenceEvidenceId = sourceEvidence.id,
+                habitId = habit.id,
+                sourcePlannerOccurrenceId = sourceEvidence.plannerOccurrenceId,
+                revision = 2,
+                configuredPolicy = HabitMissedPolicySnapshot.ASK,
+                action = action,
+                createdAt = "2026-09-01T06:01:00Z",
+                updatedAt = "2026-09-01T06:02:00Z",
+            )
+        val targetEvidence = sourceEvidence.copy(
+            id = REDUCED_HABIT_LEDGER_OCCURRENCE_ID,
+            plannerOccurrenceId = REDUCED_HABIT_PLANNER_OCCURRENCE_ID,
+            identity = buildJsonObject {
+                put("type", "calendar_day")
+                put("date", "2026-09-02")
+                put("bucket_ordinal", 0)
+            },
+            nominalStart = "2026-09-02T05:00:00Z",
+            nominalEnd = "2026-09-02T05:30:00Z",
+            windowStart = "2026-09-02T04:00:00Z",
+            windowEnd = "2026-09-02T06:00:00Z",
+            localDate = "2026-09-02",
+        )
+        val targetPartial = partial.copy(
+            occurredAt = "2026-09-02T05:30:00Z",
+            updatedAt = "2026-09-02T05:31:00Z",
+        )
+        val targetCarryResolution = HabitMissedResolutionSnapshot(
+            occurrenceEvidenceId = targetEvidence.id,
+            habitId = habit.id,
+            sourcePlannerOccurrenceId = targetEvidence.plannerOccurrenceId,
+            revision = 2,
+            configuredPolicy = HabitMissedPolicySnapshot.ASK,
+            action = HabitMissedResolutionActionSnapshot.Carry(
+                windowStart = "2026-09-02T07:00:00Z",
+                windowEnd = "2026-09-02T07:30:00Z",
+            ),
+            createdAt = "2026-09-02T06:59:00Z",
+            updatedAt = "2026-09-02T07:00:00Z",
+        )
+        val membershipRevision = PublishedScheduleRevisionSnapshot(
+            id = HABIT_SOURCE_SCHEDULE_ID,
+            revisionNumber = 1uL,
+            revision = "1:$HABIT_SOURCE_SCHEDULE_ID",
+            inputDigest = "sha256:${"a".repeat(64)}",
+            horizonStart = "2026-09-01T00:00:00Z",
+            horizonEnd = "2026-09-08T00:00:00Z",
+            timezoneName = "Europe/Madrid",
+            publishedAt = "2026-09-01T00:00:00Z",
+        )
+
+        fun storedMove(
+            evidence: HabitOccurrenceEvidenceSnapshot,
+            startAt: String,
+            endAt: String,
+            movedAt: String,
+        ) = RecurrenceMoveSnapshot(
+            itemId = habit.id,
+            startAt = startAt,
+            endAt = endAt,
+            movedAt = movedAt,
+            source = RecurrenceOccurrenceSourceSnapshot(
+                itemId = habit.id,
+                itemRevision = habit.revision,
+                identityJson = evidence.identity.toString(),
+                nominalStart = evidence.nominalStart,
+                nominalEnd = evidence.nominalEnd,
+                localDate = evidence.localDate,
+                ordinal = 0,
+            ),
+        )
+
+        suspend fun capturedRequest(
+            occurrences: List<HabitOccurrenceSnapshot>,
+            recurrenceMoves: Map<String, RecurrenceMoveSnapshot> = emptyMap(),
+            recurrenceOutcomes: Map<String, RecurrenceOutcomeSnapshot> = emptyMap(),
+            pauses: Map<String, HabitPauseSnapshot> = emptyMap(),
+            canonicalHabit: CanonicalItemSnapshot = habit,
+        ): SchedulePreviewRequest {
+            val membership = occurrences
+                .distinctBy { it.evidence.plannerOccurrenceId }
+                .map { occurrence ->
+                    PublishedOccurrenceMembershipSnapshot(
+                        plannerOccurrenceId = occurrence.evidence.plannerOccurrenceId,
+                        seriesItemId = occurrence.evidence.habitId,
+                        state = PublishedOccurrenceStateSnapshot.GENERATED,
+                    )
+                }
+                .sortedBy(PublishedOccurrenceMembershipSnapshot::plannerOccurrenceId)
+            val state = localCompositionReadyState().copy(
+                canonicalItems = listOf(canonicalHabit),
+                recurrenceMoves = recurrenceMoves,
+                recurrenceOutcomes = recurrenceOutcomes,
+                habitLedger = HabitLedgerSnapshot(
+                    syncOrigin = origin,
+                    configurationId = configurationId,
+                    deltaCursor = "habit-cursor",
+                    deltaCaughtUp = true,
+                    occurrences = occurrences.associateBy { it.evidence.id },
+                    pauses = pauses,
+                ).also(HabitLedgerSnapshot::requireValid),
+                publishedOccurrenceMembershipProof =
+                    PublishedOccurrenceMembershipProofSnapshot(
+                        schemaVersion =
+                            PublishedOccurrenceMembershipProofSnapshot.CURRENT_SCHEMA_VERSION,
+                        syncOrigin = origin,
+                        configurationId = configurationId,
+                        revision = membershipRevision,
+                        occurrences = membership,
+                    ),
+                publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                    syncOrigin = origin,
+                    configurationId = configurationId,
+                    revisionNumber = membershipRevision.revisionNumber,
+                ),
+            )
+            var captured: SchedulePreviewRequest? = null
+            val outcome = manager(
+                PlannerStore(state),
+                FakeCanonicalTransport(),
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    captured = request
+                    emptyLocalComposition(request).copy(
+                        sourceItemCount = 1,
+                        sourceItemRevisions = mapOf(habit.id to habit.revision),
+                        rejectedItems = listOf(
+                            RemoteRejectedScheduleItem(
+                                itemId = habit.id,
+                                isSensitive = habit.isSensitive,
+                                title = habit.title,
+                                reason = "Synthetic unsupported habit",
+                            ),
+                        ),
+                    )
+                },
+            ).composeLocally()
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
+            return requireNotNull(captured)
+        }
+
+        fun exceptionActions(request: SchedulePreviewRequest): List<Pair<String, String>> =
+            request.recurrenceContext["exceptions"]?.jsonArray.orEmpty().map { exception ->
+                val value = exception.jsonObject
+                value.getValue("selector").jsonObject.getValue("id").jsonPrimitive.content to
+                    value.getValue("action").jsonObject.getValue("type").jsonPrimitive.content
+            }
+
+        val reduction = resolution(
+            HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+            ),
+        )
+        val targetWithOwnCarry = HabitOccurrenceSnapshot(
+            targetEvidence,
+            outcome = null,
+            missedResolution = targetCarryResolution,
+        )
+        val completedSource = partial.copy(
+            status = HabitOutcomeStatusSnapshot.COMPLETED,
+            progressBasisPoints = 10_000,
+        )
+        val sourcePause = HabitPauseSnapshot(
+            id = HABIT_PAUSE_ID,
+            habitId = habit.id,
+            revision = 1,
+            startedAt = "2026-09-01T04:30:00Z",
+            endedAt = "2026-09-01T06:30:00Z",
+            preservesStreak = true,
+            createdAt = "2026-09-01T04:30:00Z",
+            updatedAt = "2026-09-01T06:30:00Z",
+        )
+        val sourceSpecificInvalidations = listOf(
+            capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(sourceEvidence, completedSource, reduction),
+                    targetWithOwnCarry,
+                ),
+            ),
+            capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence,
+                        outcome = null,
+                        missedResolution = reduction,
+                    ),
+                    targetWithOwnCarry,
+                ),
+                pauses = mapOf(sourcePause.id to sourcePause),
+            ),
+            capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence.copy(policyFingerprint = "sha256:${"f".repeat(64)}"),
+                        outcome = null,
+                        missedResolution = reduction,
+                    ),
+                    targetWithOwnCarry,
+                ),
+            ),
+            capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence.copy(sourceItemRevision = habit.revision + 1),
+                        outcome = null,
+                        missedResolution = reduction,
+                    ),
+                    targetWithOwnCarry,
+                ),
+            ),
+        )
+        sourceSpecificInvalidations.forEach { request ->
+            assertEquals(
+                listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to "move"),
+                exceptionActions(request),
+            )
+        }
+        val activeReductionOverridesTargetsOwnCarry = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = reduction,
+                ),
+                targetWithOwnCarry,
+            ),
+        )
+        assertEquals(
+            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to "skip"),
+            exceptionActions(activeReductionOverridesTargetsOwnCarry),
+        )
+        listOf(
+            habit.copy(status = "blocked"),
+            habit.copy(status = "future_status"),
+            habit.copy(isExecutable = false),
+        ).forEach { inactiveHabit ->
+            val inactiveRequest = capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence,
+                        outcome = null,
+                        missedResolution = reduction,
+                    ),
+                    targetWithOwnCarry,
+                ),
+                canonicalHabit = inactiveHabit,
+            )
+            assertTrue(exceptionActions(inactiveRequest).isEmpty())
+        }
+
+        listOf(
+            targetEvidence.copy(policyFingerprint = "sha256:${"e".repeat(64)}"),
+            targetEvidence.copy(sourceItemRevision = habit.revision + 1),
+        ).forEach { invalidTargetEvidence ->
+            val request = capturedRequest(
+                listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence,
+                        outcome = null,
+                        missedResolution = reduction,
+                    ),
+                    HabitOccurrenceSnapshot(
+                        invalidTargetEvidence,
+                        outcome = null,
+                        missedResolution = null,
+                    ),
+                ),
+            )
+            assertTrue(exceptionActions(request).isEmpty())
+        }
+
+        val skipRequest = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    partial,
+                    resolution(HabitMissedResolutionActionSnapshot.Skip),
+                ),
+            ),
+        )
+        assertEquals(
+            setOf(OCCURRENCE_ID),
+            requireNotNull(skipRequest.recurrenceContext["exceptions"]).jsonArray
+                .mapTo(mutableSetOf()) {
+                    it.jsonObject.getValue("selector").jsonObject.getValue("id")
+                        .jsonPrimitive.content
+                },
+        )
+        assertNull(skipRequest.recurrenceContext["partial_progress"])
+
+        fun carryResolution(windowEnd: String) = HabitMissedResolutionSnapshot(
+            occurrenceEvidenceId = sourceEvidence.id,
+            habitId = habit.id,
+            sourcePlannerOccurrenceId = sourceEvidence.plannerOccurrenceId,
+            revision = 2,
+            configuredPolicy = HabitMissedPolicySnapshot.ASK,
+            action = HabitMissedResolutionActionSnapshot.Carry(
+                windowStart = clock.toString(),
+                windowEnd = windowEnd,
+            ),
+            createdAt = "2026-09-01T06:01:00Z",
+            updatedAt = clock.toString(),
+        )
+        val containedCarry = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    partial,
+                    carryResolution("2026-09-01T07:30:00Z"),
+                ),
+            ),
+        )
+        assertEquals(
+            "move",
+            requireNotNull(containedCarry.recurrenceContext["exceptions"]).jsonArray.single()
+                .jsonObject.getValue("action").jsonObject.getValue("type").jsonPrimitive.content,
+        )
+        val containedMoveSource = requireNotNull(
+            containedCarry.recurrenceContext["exceptions"],
+        ).jsonArray.single().jsonObject.getValue("action").jsonObject
+            .getValue("source").jsonObject
+        assertEquals(
+            habit.revision.toString(),
+            containedMoveSource.getValue("item_revision").jsonPrimitive.content,
+        )
+        assertNotNull(containedCarry.recurrenceContext["partial_progress"])
+
+        val outsideCarry = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    partial,
+                    carryResolution("2026-09-08T00:00:00Z"),
+                ),
+            ),
+        )
+        val outsideException = requireNotNull(
+            outsideCarry.recurrenceContext["exceptions"],
+        ).jsonArray.single().jsonObject
+        assertEquals(
+            OCCURRENCE_ID,
+            outsideException.getValue("selector").jsonObject.getValue("id")
+                .jsonPrimitive.content,
+        )
+        assertEquals(
+            "skip",
+            outsideException.getValue("action").jsonObject.getValue("type")
+                .jsonPrimitive.content,
+        )
+        assertNull(outsideCarry.recurrenceContext["partial_progress"])
+
+        val reductionRequest = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+                HabitOccurrenceSnapshot(targetEvidence, outcome = null),
+            ),
+        )
+        assertEquals(
+            setOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+            requireNotNull(reductionRequest.recurrenceContext["exceptions"]).jsonArray
+                .mapTo(mutableSetOf()) {
+                    it.jsonObject.getValue("selector").jsonObject.getValue("id")
+                        .jsonPrimitive.content
+                },
+        )
+        assertNull(reductionRequest.recurrenceContext["partial_progress"])
+
+        val chainTargetEvidence = targetEvidence.copy(
+            id = "12121212-1212-4212-8212-121212121212",
+            plannerOccurrenceId = "13131313-1313-5313-8313-131313131313",
+            identity = buildJsonObject {
+                put("type", "calendar_day")
+                put("date", "2026-09-03")
+                put("bucket_ordinal", 0)
+            },
+            nominalStart = "2026-09-03T05:00:00Z",
+            nominalEnd = "2026-09-03T05:30:00Z",
+            windowStart = "2026-09-03T04:00:00Z",
+            windowEnd = "2026-09-03T06:00:00Z",
+            localDate = "2026-09-03",
+        )
+        fun reductionFor(
+            evidence: HabitOccurrenceEvidenceSnapshot,
+            targetPlannerId: String,
+        ) = HabitMissedResolutionSnapshot(
+            occurrenceEvidenceId = evidence.id,
+            habitId = evidence.habitId,
+            sourcePlannerOccurrenceId = evidence.plannerOccurrenceId,
+            revision = 2,
+            configuredPolicy = HabitMissedPolicySnapshot.ASK,
+            action = HabitMissedResolutionActionSnapshot.ReduceFrequency(listOf(targetPlannerId)),
+            createdAt = evidence.windowEnd,
+            updatedAt = evidence.windowEnd,
+        )
+        val chainSource = HabitOccurrenceSnapshot(
+            sourceEvidence,
+            outcome = null,
+            missedResolution = reductionFor(
+                sourceEvidence,
+                targetEvidence.plannerOccurrenceId,
+            ),
+        )
+        val chainMiddle = HabitOccurrenceSnapshot(
+            targetEvidence,
+            outcome = null,
+            missedResolution = reductionFor(
+                targetEvidence,
+                chainTargetEvidence.plannerOccurrenceId,
+            ),
+        )
+        val chainTarget = HabitOccurrenceSnapshot(chainTargetEvidence, outcome = null)
+        assertEquals(
+            listOf(targetEvidence.plannerOccurrenceId to "skip"),
+            exceptionActions(capturedRequest(listOf(chainTarget, chainMiddle, chainSource))),
+        )
+        assertEquals(
+            listOf(chainTargetEvidence.plannerOccurrenceId to "skip"),
+            exceptionActions(capturedRequest(listOf(
+                chainTarget,
+                chainMiddle,
+                chainSource.copy(outcome = completedSource),
+            ))),
+        )
+
+        val missingTargetRequest = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        assertTrue(
+            missingTargetRequest.recurrenceContext["exceptions"] == null ||
+                requireNotNull(missingTargetRequest.recurrenceContext["exceptions"])
+                    .jsonArray.isEmpty(),
+        )
+
+        val targetPrecedenceRequest = capturedRequest(
+            listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+                HabitOccurrenceSnapshot(targetEvidence, targetPartial),
+            ),
+        )
+        assertTrue(
+            targetPrecedenceRequest.recurrenceContext["exceptions"] == null ||
+                requireNotNull(targetPrecedenceRequest.recurrenceContext["exceptions"])
+                    .jsonArray.isEmpty(),
+        )
+        assertEquals(
+            REDUCED_HABIT_PLANNER_OCCURRENCE_ID,
+            requireNotNull(targetPrecedenceRequest.recurrenceContext["partial_progress"])
+                .jsonObject.keys.single(),
+        )
+
+        listOf(
+            "2026-09-01T06:00:00Z",
+            "2026-09-01T06:03:00Z",
+        ).forEach { movedAt ->
+            val collision = capturedRequest(
+                occurrences = listOf(
+                    HabitOccurrenceSnapshot(
+                        sourceEvidence,
+                        partial,
+                        resolution(HabitMissedResolutionActionSnapshot.Skip),
+                    ),
+                ),
+                recurrenceMoves = mapOf(
+                    OCCURRENCE_ID to storedMove(
+                        sourceEvidence,
+                        startAt = "2026-09-01T07:30:00Z",
+                        endAt = "2026-09-01T08:00:00Z",
+                        movedAt = movedAt,
+                    ),
+                ),
+            )
+            assertEquals(listOf(OCCURRENCE_ID to "skip"), exceptionActions(collision))
+            assertNull(collision.recurrenceContext["partial_progress"])
+        }
+
+        val targetMove = storedMove(
+            targetEvidence,
+            startAt = "2026-09-02T07:00:00Z",
+            endAt = "2026-09-02T07:30:00Z",
+            movedAt = "2026-09-01T06:03:00Z",
+        )
+        val reductionCollision = capturedRequest(
+            occurrences = listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+                HabitOccurrenceSnapshot(targetEvidence, outcome = null),
+            ),
+            recurrenceMoves = mapOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to targetMove),
+        )
+        assertEquals(
+            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to "skip"),
+            exceptionActions(reductionCollision),
+        )
+
+        val partialTargetKeepsMove = capturedRequest(
+            occurrences = listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+                HabitOccurrenceSnapshot(targetEvidence, targetPartial),
+            ),
+            recurrenceMoves = mapOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to targetMove),
+        )
+        assertEquals(
+            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to "move"),
+            exceptionActions(partialTargetKeepsMove),
+        )
+        assertEquals(
+            REDUCED_HABIT_PLANNER_OCCURRENCE_ID,
+            requireNotNull(partialTargetKeepsMove.recurrenceContext["partial_progress"])
+                .jsonObject.keys.single(),
+        )
+
+        val targetPause = HabitPauseSnapshot(
+            id = HABIT_PAUSE_ID,
+            habitId = habit.id,
+            revision = 1,
+            startedAt = "2026-09-02T04:00:00Z",
+            endedAt = "2026-09-02T08:00:00Z",
+            preservesStreak = true,
+            createdAt = "2026-09-02T04:00:00Z",
+            updatedAt = "2026-09-02T08:00:00Z",
+        )
+        val pausedTargetKeepsPauseAuthority = capturedRequest(
+            occurrences = listOf(
+                HabitOccurrenceSnapshot(
+                    sourceEvidence,
+                    outcome = null,
+                    missedResolution = resolution(
+                        HabitMissedResolutionActionSnapshot.ReduceFrequency(
+                            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID),
+                        ),
+                    ),
+                ),
+                HabitOccurrenceSnapshot(targetEvidence, outcome = null),
+            ),
+            recurrenceMoves = mapOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to targetMove),
+            pauses = mapOf(HABIT_PAUSE_ID to targetPause),
+        )
+        assertEquals(
+            listOf(REDUCED_HABIT_PLANNER_OCCURRENCE_ID to "move"),
+            exceptionActions(pausedTargetKeepsPauseAuthority),
+        )
+        assertEquals(
+            habit.id,
+            requireNotNull(pausedTargetKeepsPauseAuthority.recurrenceContext["pauses"])
+                .jsonArray.single().jsonObject.getValue("item_id").jsonPrimitive.content,
+        )
+
+        val ordinaryOutcomeCollision = capturedRequest(
+            occurrences = emptyList(),
+            recurrenceMoves = mapOf(
+                OCCURRENCE_ID to storedMove(
+                    sourceEvidence,
+                    startAt = "2026-09-01T07:30:00Z",
+                    endAt = "2026-09-01T08:00:00Z",
+                    movedAt = "2026-09-01T06:59:00Z",
+                ),
+            ),
+            recurrenceOutcomes = mapOf(
+                OCCURRENCE_ID to RecurrenceOutcomeSnapshot(
+                    itemId = habit.id,
+                    status = ItemStatus.SKIPPED,
+                    resolvedAt = clock.toString(),
+                ),
+            ),
+        )
+        assertEquals(listOf(OCCURRENCE_ID to "skip"), exceptionActions(ordinaryOutcomeCollision))
+    }
+
+    @Test
     fun localHabitCompositionRequiresACompleteDurableHabitCheckpoint() = runBlocking {
         val origin = "https://api.example.test/"
         val configurationId = "connection-1"
@@ -6684,7 +7417,12 @@ class CanonicalSyncManagerTest {
         const val THIRD_BLOCK_ID = "99999999-9999-4999-8999-999999999999"
         const val OCCURRENCE_ID = "44444444-4444-5444-8444-444444444444"
         const val HABIT_LEDGER_OCCURRENCE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        const val REDUCED_HABIT_LEDGER_OCCURRENCE_ID =
+            "abababab-abab-4bab-8bab-abababababab"
+        const val REDUCED_HABIT_PLANNER_OCCURRENCE_ID =
+            "fafafafa-fafa-5afa-8afa-fafafafafafa"
         const val HABIT_SOURCE_SCHEDULE_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        const val HABIT_PAUSE_ID = "12121212-1212-4212-8212-121212121212"
         const val HABIT_OPERATION_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         const val EXECUTION_ID = "55555555-5555-4555-8555-555555555555"
         const val DEVICE_ID = "66666666-6666-4666-8666-666666666666"
@@ -6775,6 +7513,7 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
     var deltaError: Throwable? = null
     var currentScheduleResult: RemoteCurrentPublishedSchedule? = null
     var currentScheduleError: Throwable? = null
+    var currentScheduleHandler: (suspend () -> RemoteCurrentPublishedSchedule?)? = null
     val currentScheduleConfigurations = mutableListOf<String?>()
     var replacementResult: RemoteCanonicalItem? = null
     var replacementRequest: ReplaceCanonicalItemRequest? = null
@@ -6831,7 +7570,7 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
     ): RemoteCurrentPublishedSchedule? {
         currentScheduleConfigurations += configuration.configurationId
         currentScheduleError?.let { throw it }
-        return currentScheduleResult
+        return currentScheduleHandler?.invoke() ?: currentScheduleResult
     }
 
     override suspend fun preview(

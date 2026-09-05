@@ -64,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
+import com.greengolddog.dayweave.model.HabitMissedExplicitActionSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.PendingHabitMutation
@@ -82,6 +83,8 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+private const val MAX_PRESENTED_MISSED_DECISIONS = 12
 
 private data class HabitOutcomeEditorTarget(
     val row: HabitTodayRow,
@@ -102,6 +105,12 @@ fun TodayHabitsSection(
     currentZone: ZoneId,
     onRefresh: () -> Boolean,
     onRecordOutcome: (String, String, Long, HabitOutcomeInputSnapshot) -> Deferred<Boolean>,
+    onResolveMissed: (
+        String,
+        String,
+        Long,
+        HabitMissedExplicitActionSnapshot,
+    ) -> Deferred<Boolean>,
     onStartPause: (String) -> Boolean,
     onResumePause: (String, String) -> Boolean,
     onDiscardReviewedMutation: (String) -> Boolean,
@@ -121,9 +130,27 @@ fun TodayHabitsSection(
     val reviewed = remember(state.habitLedger.pendingMutations) {
         reviewedHabitMutations(state.habitLedger)
     }
+    val missedDecisions = remember(
+        state.canonicalItems,
+        state.habitLedger,
+        state.publishedOccurrenceMembershipProof,
+        state.publishedScheduleRevisionHint,
+        state.canonicalSyncOrigin,
+        state.canonicalConfigurationId,
+    ) {
+        missedHabitDecisions(
+            state.canonicalItems,
+            state.habitLedger,
+            state.publishedOccurrenceMembershipProof,
+            state.publishedScheduleRevisionHint,
+            state.canonicalSyncOrigin,
+            state.canonicalConfigurationId,
+        )
+    }
     val coroutineScope = rememberCoroutineScope()
     var editorTarget by remember { mutableStateOf<HabitOutcomeEditorTarget?>(null) }
     var quickOutcomeSaveInFlight by remember { mutableStateOf(false) }
+    var missedDecisionSaveInFlightId by remember { mutableStateOf<String?>(null) }
     var discardTarget by remember { mutableStateOf<PendingHabitMutation?>(null) }
     var discardAdmissionError by remember { mutableStateOf<String?>(null) }
     var actionAdmissionMessage by remember { mutableStateOf<String?>(null) }
@@ -306,7 +333,11 @@ fun TodayHabitsSection(
                 val openPause = row.habitId?.let { activePauseForHabit(state.habitLedger, it) }
                 val pauseMutation = row.habitId?.let { habitId ->
                     state.habitLedger.pendingMutations
-                        .filter { it.habitId == habitId && it.kind != PendingHabitMutationKind.OUTCOME }
+                        .filter {
+                            it.habitId == habitId &&
+                                (it.kind == PendingHabitMutationKind.START_PAUSE ||
+                                    it.kind == PendingHabitMutationKind.RESUME_PAUSE)
+                        }
                         .maxByOrNull(PendingHabitMutation::createdAt)
                 }
                 HabitTodayCard(
@@ -393,6 +424,36 @@ fun TodayHabitsSection(
             }
         }
 
+        if (missedDecisions.isNotEmpty()) {
+            MissedHabitReviewQueue(
+                decisions = missedDecisions,
+                ledger = state.habitLedger,
+                savingOccurrenceId = missedDecisionSaveInFlightId,
+                actionsEnabled = !syncState.isBusy && missedDecisionSaveInFlightId == null,
+                onResolve = { row, action ->
+                    val resolution = requireNotNull(row.occurrence.missedResolution)
+                    missedDecisionSaveInFlightId = row.occurrence.evidence.id
+                    actionAdmissionMessage = null
+                    coroutineScope.launch {
+                        try {
+                            actionAdmissionMessage = habitActionAdmissionMessage(
+                                onResolveMissed(
+                                    row.occurrence.evidence.habitId,
+                                    row.occurrence.evidence.id,
+                                    resolution.revision,
+                                    action,
+                                ).await(),
+                            )
+                        } finally {
+                            if (missedDecisionSaveInFlightId == row.occurrence.evidence.id) {
+                                missedDecisionSaveInFlightId = null
+                            }
+                        }
+                    }
+                },
+            )
+        }
+
         if (reviewed.isNotEmpty()) {
             HabitReviewQueue(
                 mutations = reviewed,
@@ -402,6 +463,140 @@ fun TodayHabitsSection(
                 },
                 actionsEnabled = !syncState.isBusy,
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun MissedHabitReviewQueue(
+    decisions: List<HabitMissedDecisionRow>,
+    ledger: com.greengolddog.dayweave.model.HabitLedgerSnapshot,
+    savingOccurrenceId: String?,
+    actionsEnabled: Boolean,
+    onResolve: (HabitMissedDecisionRow, HabitMissedExplicitActionSnapshot) -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.56f),
+        ),
+        modifier = Modifier.fillMaxWidth().testTag("habit_missed_review_queue"),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                "A gentle check-in",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.semantics { heading() },
+            )
+            Text(
+                "These habit windows passed without a final outcome. Choose what feels right; " +
+                    "your earlier history stays unchanged.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            decisions.take(MAX_PRESENTED_MISSED_DECISIONS).forEach { row ->
+                val occurrenceId = row.occurrence.evidence.id
+                val pending = ledger.pendingMutations.firstOrNull {
+                    it.targetId == occurrenceId &&
+                        it.kind == PendingHabitMutationKind.MISSED_RESOLUTION
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    row.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (row.isSensitive) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(
+                                        Icons.Outlined.Lock,
+                                        contentDescription = "Private habit",
+                                    )
+                                }
+                            }
+                            Text(
+                                "Window ended ${row.occurrence.evidence.localDate}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (savingOccurrenceId == occurrenceId) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.width(20.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
+                    }
+                    if (pending != null) {
+                        Text(
+                            habitMutationLabel(pending),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (
+                                pending.disposition == PendingHabitMutationDisposition.PENDING
+                            ) {
+                                MaterialTheme.colorScheme.tertiary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                        )
+                    }
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                onResolve(row, HabitMissedExplicitActionSnapshot.SKIP)
+                            },
+                            enabled = actionsEnabled && pending == null,
+                            modifier = Modifier.testTag("habit_missed_skip"),
+                        ) { Text("Skip") }
+                        Button(
+                            onClick = {
+                                onResolve(row, HabitMissedExplicitActionSnapshot.CARRY)
+                            },
+                            enabled = actionsEnabled && pending == null,
+                            modifier = Modifier.testTag("habit_missed_carry"),
+                        ) { Text("Will do later") }
+                        OutlinedButton(
+                            onClick = {
+                                onResolve(
+                                    row,
+                                    HabitMissedExplicitActionSnapshot.REDUCE_FREQUENCY,
+                                )
+                            },
+                            enabled = actionsEnabled && pending == null,
+                            modifier = Modifier.testTag("habit_missed_reduce_frequency"),
+                        ) { Text("Reduce frequency") }
+                    }
+                    Text(
+                        "DayWeave asks the server to choose any new time or occurrence safely.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.18f),
+                )
+            }
+            if (decisions.size > MAX_PRESENTED_MISSED_DECISIONS) {
+                Text(
+                    "+${decisions.size - MAX_PRESENTED_MISSED_DECISIONS} more check-ins are " +
+                        "kept securely",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
     }
 }
@@ -884,6 +1079,8 @@ private fun HabitReviewQueue(
                             PendingHabitMutationKind.OUTCOME -> "Occurrence outcome"
                             PendingHabitMutationKind.START_PAUSE -> "Pause request"
                             PendingHabitMutationKind.RESUME_PAUSE -> "Resume request"
+                            PendingHabitMutationKind.MISSED_RESOLUTION ->
+                                "Missed habit choice"
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -1123,7 +1320,9 @@ fun HabitStatisticsSection(
                     val openPause = activePauseForHabit(state.habitLedger, choice.id)
                     val pauseMutation = state.habitLedger.pendingMutations
                         .filter {
-                            it.habitId == choice.id && it.kind != PendingHabitMutationKind.OUTCOME
+                            it.habitId == choice.id &&
+                                (it.kind == PendingHabitMutationKind.START_PAUSE ||
+                                    it.kind == PendingHabitMutationKind.RESUME_PAUSE)
                         }
                         .maxByOrNull(PendingHabitMutation::createdAt)
                     HabitPauseControl(

@@ -7,6 +7,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.time.DateTimeException
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -85,6 +86,101 @@ data class RemoteHabitOccurrenceEvidence(
 data class RemoteHabitOccurrence(
     val evidence: RemoteHabitOccurrenceEvidence,
     val outcome: RemoteHabitOutcome?,
+    @SerialName("missed_resolution")
+    val missedResolution: RemoteHabitMissedResolution?,
+)
+
+@Serializable
+enum class RemoteHabitMissedPolicy {
+    @SerialName("skip")
+    SKIP,
+
+    @SerialName("carry")
+    CARRY,
+
+    @SerialName("reduce_frequency")
+    REDUCE_FREQUENCY,
+
+    @SerialName("ask")
+    ASK,
+}
+
+@Serializable
+enum class RemoteHabitMissedCancellationReason {
+    @SerialName("source_completed")
+    SOURCE_COMPLETED,
+
+    @SerialName("source_skipped")
+    SOURCE_SKIPPED,
+
+    @SerialName("source_paused")
+    SOURCE_PAUSED,
+
+    @SerialName("source_obsolete")
+    SOURCE_OBSOLETE,
+}
+
+@Serializable
+enum class RemoteHabitMissedResumeAction {
+    @SerialName("decision_required")
+    DECISION_REQUIRED,
+
+    @SerialName("skip")
+    SKIP,
+
+    @SerialName("carry")
+    CARRY,
+
+    @SerialName("reduce_frequency")
+    REDUCE_FREQUENCY,
+}
+
+@Serializable
+sealed class RemoteHabitMissedResolutionAction {
+    @Serializable
+    @SerialName("decision_required")
+    data object DecisionRequired : RemoteHabitMissedResolutionAction()
+
+    @Serializable
+    @SerialName("reduction_pending")
+    data object ReductionPending : RemoteHabitMissedResolutionAction()
+
+    @Serializable
+    @SerialName("cancelled")
+    data class Cancelled(
+        val reason: RemoteHabitMissedCancellationReason,
+        @SerialName("resume_action") val resumeAction: RemoteHabitMissedResumeAction,
+    ) : RemoteHabitMissedResolutionAction()
+
+    @Serializable
+    @SerialName("skip")
+    data object Skip : RemoteHabitMissedResolutionAction()
+
+    @Serializable
+    @SerialName("carry")
+    data class Carry(
+        @SerialName("window_start") val windowStart: String,
+        @SerialName("window_end") val windowEnd: String,
+    ) : RemoteHabitMissedResolutionAction()
+
+    @Serializable
+    @SerialName("reduce_frequency")
+    data class ReduceFrequency(
+        @SerialName("suppressed_planner_occurrence_ids")
+        val suppressedPlannerOccurrenceIds: List<String>,
+    ) : RemoteHabitMissedResolutionAction()
+}
+
+@Serializable
+data class RemoteHabitMissedResolution(
+    @SerialName("occurrence_evidence_id") val occurrenceEvidenceId: String,
+    @SerialName("habit_id") val habitId: String,
+    @SerialName("source_planner_occurrence_id") val sourcePlannerOccurrenceId: String,
+    val revision: Long,
+    @SerialName("configured_policy") val configuredPolicy: RemoteHabitMissedPolicy,
+    val action: RemoteHabitMissedResolutionAction,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("updated_at") val updatedAt: String,
 )
 
 @Serializable
@@ -205,6 +301,12 @@ data class RemoteHabitMutation<T>(
     val replayed: Boolean,
 )
 
+data class RemoteHabitMissedReconcilePage(
+    val resolutions: List<RemoteHabitMissedResolution>,
+    val hasMore: Boolean,
+    val replayed: Boolean,
+)
+
 @Serializable
 private data class HabitOccurrenceEnvelope(
     val occurrence: RemoteHabitOccurrence,
@@ -234,6 +336,19 @@ private data class HabitDeltaEnvelope(
 @Serializable
 private data class HabitAnalyticsEnvelope(
     val analytics: RemoteHabitAnalytics,
+)
+
+@Serializable
+private data class HabitMissedReconcileEnvelope(
+    val resolutions: List<RemoteHabitMissedResolution>,
+    @SerialName("has_more") val hasMore: Boolean,
+    val replayed: Boolean,
+)
+
+@Serializable
+private data class HabitMissedResolutionEnvelope(
+    val resolution: RemoteHabitMissedResolution,
+    val replayed: Boolean,
 )
 
 @Serializable
@@ -288,6 +403,23 @@ interface HabitTransport {
         idempotencyKey: String,
         requestJson: String,
     ): RemoteHabitMutation<RemoteHabitOccurrence>
+
+    /** Server-clock reconciliation accepts only an operation ID; windows and targets are outputs. */
+    suspend fun reconcileMissed(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        requestJson: String,
+        limit: Int = MAX_HABIT_RESPONSE_PAGE_LIMIT,
+    ): RemoteHabitMissedReconcilePage
+
+    /** [requestJson] is exact encrypted decision authority and must not be re-encoded on retry. */
+    suspend fun putMissedResolution(
+        configuration: AuthenticatedApiConfiguration,
+        habitId: String,
+        occurrenceId: String,
+        idempotencyKey: String,
+        requestJson: String,
+    ): RemoteHabitMutation<RemoteHabitMissedResolution>
 
     suspend fun delta(
         configuration: AuthenticatedApiConfiguration,
@@ -405,6 +537,60 @@ class OkHttpHabitTransport(
             envelope.occurrence.requireValid(canonicalHabitId)
             require(envelope.occurrence.evidence.id == canonicalOccurrenceId)
             RemoteHabitMutation(envelope.occurrence, envelope.replayed)
+        }
+    }
+
+    override suspend fun reconcileMissed(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        requestJson: String,
+        limit: Int,
+    ): RemoteHabitMissedReconcilePage {
+        require(limit in 1..MAX_HABIT_RESPONSE_PAGE_LIMIT)
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/habits/missed/reconcile")
+            .addQueryParameter("limit", limit.toString())
+            .build()
+        val envelope = execute<HabitMissedReconcileEnvelope>(
+            mutationRequest(configuration, url.toString(), "POST", idempotencyKey, requestJson),
+        )
+        return validatedHabitResponse {
+            require(envelope.resolutions.size <= limit)
+            require(envelope.resolutions.map { it.occurrenceEvidenceId }.distinct().size ==
+                envelope.resolutions.size)
+            envelope.resolutions.forEach(RemoteHabitMissedResolution::requireValid)
+            RemoteHabitMissedReconcilePage(
+                resolutions = envelope.resolutions,
+                hasMore = envelope.hasMore,
+                replayed = envelope.replayed,
+            )
+        }
+    }
+
+    override suspend fun putMissedResolution(
+        configuration: AuthenticatedApiConfiguration,
+        habitId: String,
+        occurrenceId: String,
+        idempotencyKey: String,
+        requestJson: String,
+    ): RemoteHabitMutation<RemoteHabitMissedResolution> {
+        val canonicalHabitId = habitId.requireCanonicalUuid()
+        val canonicalOccurrenceId = occurrenceId.requireCanonicalUuid()
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/habits")
+            .addPathSegment(canonicalHabitId)
+            .addPathSegment("occurrences")
+            .addPathSegment(canonicalOccurrenceId)
+            .addPathSegment("missed-resolution")
+            .build()
+        val envelope = execute<HabitMissedResolutionEnvelope>(
+            mutationRequest(configuration, url.toString(), "PUT", idempotencyKey, requestJson),
+        )
+        return validatedHabitResponse {
+            envelope.resolution.requireValid()
+            require(envelope.resolution.habitId == canonicalHabitId)
+            require(envelope.resolution.occurrenceEvidenceId == canonicalOccurrenceId)
+            RemoteHabitMutation(envelope.resolution, envelope.replayed)
         }
     }
 
@@ -678,6 +864,8 @@ class OkHttpHabitTransport(
         val replayed = when (decoded) {
             is HabitOccurrenceEnvelope -> decoded.replayed
             is HabitPauseEnvelope -> decoded.replayed
+            is HabitMissedReconcileEnvelope -> decoded.replayed
+            is HabitMissedResolutionEnvelope -> decoded.replayed
             else -> throw HabitApiException.InvalidResponse()
         }
         val header = replayValues.singleOrNull()?.lowercase(Locale.ROOT)
@@ -728,6 +916,71 @@ private fun RemoteHabitOccurrence.requireValid(expectedHabitId: String) {
         recorded.requireValid()
         if (recorded.quantity != null && evidence.expectedUnit != null) {
             require(recorded.unit == evidence.expectedUnit)
+        }
+    }
+    missedResolution?.let { resolution ->
+        resolution.requireValid()
+        require(resolution.occurrenceEvidenceId == evidence.id)
+        require(resolution.habitId == evidence.habitId)
+        require(resolution.sourcePlannerOccurrenceId == evidence.plannerOccurrenceId)
+    }
+}
+
+private fun RemoteHabitMissedResolution.requireValid() {
+    occurrenceEvidenceId.requireCanonicalUuid()
+    habitId.requireCanonicalUuid()
+    sourcePlannerOccurrenceId.requireCanonicalUuid()
+    require(UUID.fromString(sourcePlannerOccurrenceId).isRfc4122Version5())
+    require(revision > 0)
+    val created = requireInstant(createdAt)
+    val updated = requireInstant(updatedAt)
+    require(updated >= created)
+    when (val value = action) {
+        RemoteHabitMissedResolutionAction.DecisionRequired ->
+            require(configuredPolicy == RemoteHabitMissedPolicy.ASK)
+        RemoteHabitMissedResolutionAction.ReductionPending -> require(
+            configuredPolicy == RemoteHabitMissedPolicy.REDUCE_FREQUENCY ||
+                (configuredPolicy == RemoteHabitMissedPolicy.ASK && revision >= 2),
+        )
+        RemoteHabitMissedResolutionAction.Skip -> require(
+            configuredPolicy == RemoteHabitMissedPolicy.SKIP ||
+                (configuredPolicy == RemoteHabitMissedPolicy.ASK && revision >= 2),
+        )
+        is RemoteHabitMissedResolutionAction.Carry -> {
+            require(
+                configuredPolicy == RemoteHabitMissedPolicy.CARRY ||
+                    (configuredPolicy == RemoteHabitMissedPolicy.ASK && revision >= 2),
+            )
+            val start = requireInstant(value.windowStart)
+            val end = requireInstant(value.windowEnd)
+            require(start == updated && end > start)
+            require(Duration.between(start, end) <= MAX_MISSED_CARRY_WINDOW)
+        }
+        is RemoteHabitMissedResolutionAction.ReduceFrequency -> {
+            require(
+                configuredPolicy == RemoteHabitMissedPolicy.REDUCE_FREQUENCY ||
+                    (configuredPolicy == RemoteHabitMissedPolicy.ASK && revision >= 2),
+            )
+            require(value.suppressedPlannerOccurrenceIds.size == 1)
+            value.suppressedPlannerOccurrenceIds.forEach { occurrenceId ->
+                occurrenceId.requireCanonicalUuid()
+                require(UUID.fromString(occurrenceId).isRfc4122Version5())
+            }
+            require(sourcePlannerOccurrenceId !in value.suppressedPlannerOccurrenceIds)
+        }
+        is RemoteHabitMissedResolutionAction.Cancelled -> {
+            require(revision >= 2)
+            if (configuredPolicy != RemoteHabitMissedPolicy.ASK) {
+                require(
+                    value.resumeAction == when (configuredPolicy) {
+                        RemoteHabitMissedPolicy.SKIP -> RemoteHabitMissedResumeAction.SKIP
+                        RemoteHabitMissedPolicy.CARRY -> RemoteHabitMissedResumeAction.CARRY
+                        RemoteHabitMissedPolicy.REDUCE_FREQUENCY ->
+                            RemoteHabitMissedResumeAction.REDUCE_FREQUENCY
+                        RemoteHabitMissedPolicy.ASK -> error("unreachable")
+                    },
+                )
+            }
         }
     }
 }
@@ -962,6 +1215,7 @@ private const val MAX_HABIT_CURSOR_CHARS = 256
 private const val MAX_ERROR_MESSAGE_CHARS = 16_384
 private const val MAX_QUANTITY = 1_000_000_000_000L
 private const val MAX_EXPECTED_SECONDS = 366L * 24 * 60 * 60
+private val MAX_MISSED_CARRY_WINDOW: Duration = Duration.ofDays(366)
 private const val MAX_ANALYTICS_OCCURRENCES = 50_000L
 private const val MAX_ANALYTICS_SECONDS = MAX_ANALYTICS_OCCURRENCES * MAX_EXPECTED_SECONDS
 private const val MAX_ANALYTICS_QUANTITY = MAX_ANALYTICS_OCCURRENCES * MAX_QUANTITY

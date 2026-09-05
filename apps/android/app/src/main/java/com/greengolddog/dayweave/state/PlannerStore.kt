@@ -24,6 +24,10 @@ import com.greengolddog.dayweave.model.GoogleSchedulePublicationJournal
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
 import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitMissedPolicySnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResumeActionSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.HabitPauseSnapshot
@@ -40,6 +44,7 @@ import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
+import com.greengolddog.dayweave.model.PendingHabitMissedReconcile
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
@@ -51,6 +56,9 @@ import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipProofSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
@@ -60,6 +68,7 @@ import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.effectiveHabitMissedProjection
 import com.greengolddog.dayweave.model.estimatedHabitCacheBytes
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringShape
@@ -72,10 +81,12 @@ import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.hasValidRecurrenceSourceFor
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
 import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
+import com.greengolddog.dayweave.model.habitPolicyFingerprintOrNull
 import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.allowsMissedHabitScheduling
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isCoveredBy
@@ -116,6 +127,235 @@ enum class PlannerLoadState {
     LOADING,
     READY,
     PERSISTENCE_FAILED,
+}
+
+private sealed interface HabitMissedMergeState {
+    data object DecisionRequired : HabitMissedMergeState
+    data object ReductionPending : HabitMissedMergeState
+    data class Cancelled(val resumeAction: HabitMissedResumeActionSnapshot) :
+        HabitMissedMergeState
+    data object Skip : HabitMissedMergeState
+    data object Carry : HabitMissedMergeState
+    data object ReduceFrequency : HabitMissedMergeState
+}
+
+private fun HabitMissedResolutionActionSnapshot.mergeState(): HabitMissedMergeState = when (this) {
+    HabitMissedResolutionActionSnapshot.DecisionRequired ->
+        HabitMissedMergeState.DecisionRequired
+    HabitMissedResolutionActionSnapshot.ReductionPending ->
+        HabitMissedMergeState.ReductionPending
+    is HabitMissedResolutionActionSnapshot.Cancelled ->
+        HabitMissedMergeState.Cancelled(resumeAction)
+    HabitMissedResolutionActionSnapshot.Skip -> HabitMissedMergeState.Skip
+    is HabitMissedResolutionActionSnapshot.Carry -> HabitMissedMergeState.Carry
+    is HabitMissedResolutionActionSnapshot.ReduceFrequency ->
+        HabitMissedMergeState.ReduceFrequency
+}
+
+private fun nextHabitMissedMergeStates(
+    state: HabitMissedMergeState,
+    policy: HabitMissedPolicySnapshot,
+): Set<HabitMissedMergeState> = when (state) {
+    HabitMissedMergeState.DecisionRequired -> if (policy == HabitMissedPolicySnapshot.ASK) {
+        setOf(
+            HabitMissedMergeState.Skip,
+            HabitMissedMergeState.Carry,
+            HabitMissedMergeState.ReductionPending,
+            HabitMissedMergeState.ReduceFrequency,
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.DECISION_REQUIRED,
+            ),
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.SKIP,
+            ),
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.CARRY,
+            ),
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY,
+            ),
+        )
+    } else {
+        emptySet()
+    }
+    HabitMissedMergeState.ReductionPending,
+    HabitMissedMergeState.ReduceFrequency,
+    -> setOf(
+        HabitMissedMergeState.ReductionPending,
+        HabitMissedMergeState.ReduceFrequency,
+        HabitMissedMergeState.Cancelled(
+            HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY,
+        ),
+    )
+    HabitMissedMergeState.Skip -> setOf(
+        HabitMissedMergeState.Cancelled(
+            HabitMissedResumeActionSnapshot.SKIP,
+        ),
+    )
+    HabitMissedMergeState.Carry -> when (policy) {
+        HabitMissedPolicySnapshot.ASK -> setOf(
+            HabitMissedMergeState.DecisionRequired,
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.CARRY,
+            ),
+        )
+        HabitMissedPolicySnapshot.CARRY -> setOf(
+            HabitMissedMergeState.Carry,
+            HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.CARRY,
+            ),
+        )
+        HabitMissedPolicySnapshot.SKIP,
+        HabitMissedPolicySnapshot.REDUCE_FREQUENCY,
+        -> emptySet()
+    }
+    is HabitMissedMergeState.Cancelled -> when (state.resumeAction) {
+        HabitMissedResumeActionSnapshot.DECISION_REQUIRED ->
+            setOf(HabitMissedMergeState.DecisionRequired)
+        HabitMissedResumeActionSnapshot.SKIP ->
+            setOf(HabitMissedMergeState.Skip)
+        HabitMissedResumeActionSnapshot.CARRY ->
+            setOf(HabitMissedMergeState.Carry)
+        HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY ->
+            setOf(HabitMissedMergeState.ReductionPending, HabitMissedMergeState.ReduceFrequency)
+    }
+}
+
+private fun HabitMissedResolutionSnapshot.canDirectlyTransitionTo(
+    incoming: HabitMissedResolutionSnapshot,
+): Boolean {
+    val next = incoming.action.mergeState()
+    return when (val current = action.mergeState()) {
+        HabitMissedMergeState.DecisionRequired ->
+            configuredPolicy == HabitMissedPolicySnapshot.ASK &&
+                next in nextHabitMissedMergeStates(current, configuredPolicy)
+        HabitMissedMergeState.ReductionPending -> next == HabitMissedMergeState.ReduceFrequency ||
+            next == HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY,
+            )
+        HabitMissedMergeState.ReduceFrequency -> next == HabitMissedMergeState.ReductionPending ||
+            next == HabitMissedMergeState.Cancelled(
+                HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY,
+            )
+        HabitMissedMergeState.Skip -> next == HabitMissedMergeState.Cancelled(
+            HabitMissedResumeActionSnapshot.SKIP,
+        )
+        HabitMissedMergeState.Carry -> when (configuredPolicy) {
+            HabitMissedPolicySnapshot.ASK -> next == HabitMissedMergeState.DecisionRequired ||
+                next == HabitMissedMergeState.Cancelled(HabitMissedResumeActionSnapshot.CARRY)
+            HabitMissedPolicySnapshot.CARRY -> next == HabitMissedMergeState.Carry ||
+                next == HabitMissedMergeState.Cancelled(HabitMissedResumeActionSnapshot.CARRY)
+            HabitMissedPolicySnapshot.SKIP,
+            HabitMissedPolicySnapshot.REDUCE_FREQUENCY,
+            -> false
+        }
+        is HabitMissedMergeState.Cancelled -> when (current.resumeAction) {
+            HabitMissedResumeActionSnapshot.DECISION_REQUIRED ->
+                next == HabitMissedMergeState.DecisionRequired
+            HabitMissedResumeActionSnapshot.SKIP -> next == HabitMissedMergeState.Skip
+            HabitMissedResumeActionSnapshot.CARRY -> next == HabitMissedMergeState.Carry
+            HabitMissedResumeActionSnapshot.REDUCE_FREQUENCY ->
+                next == HabitMissedMergeState.ReductionPending ||
+                    next == HabitMissedMergeState.ReduceFrequency
+        }
+    }
+}
+
+private fun HabitMissedResolutionSnapshot.canReachCompacted(
+    incoming: HabitMissedResolutionSnapshot,
+): Boolean {
+    if (revision == Long.MAX_VALUE || incoming.revision <= revision) return false
+    if (incoming.revision == revision + 1) return canDirectlyTransitionTo(incoming)
+    val revisionDistance = incoming.revision - revision
+    val target = incoming.action.mergeState()
+    var frontier = setOf(action.mergeState())
+    var step = 0L
+    val seen = mutableMapOf<Set<HabitMissedMergeState>, Long>()
+    while (step < revisionDistance) {
+        val cycleStart = seen[frontier]
+        if (cycleStart != null) {
+            val cycleLength = step - cycleStart
+            val completeCycles = (revisionDistance - step) / cycleLength
+            if (completeCycles > 0) {
+                step += completeCycles * cycleLength
+                continue
+            }
+        } else {
+            seen[frontier] = step
+        }
+        frontier = frontier.flatMapTo(mutableSetOf()) { state ->
+            nextHabitMissedMergeStates(state, configuredPolicy)
+        }
+        step += 1
+        if (frontier.isEmpty()) return false
+    }
+    return target in frontier
+}
+
+/**
+ * Outcome and missed-resolution revisions advance independently. Merge each coordinate on its own
+ * revision axis so a stale outcome page can still deliver a newer missed decision (and vice versa).
+ * Equal coordinates must carry byte-equivalent decoded content.
+ */
+private fun mergeAuthoritativeHabitOccurrence(
+    existing: HabitOccurrenceSnapshot,
+    incoming: HabitOccurrenceSnapshot,
+): HabitOccurrenceSnapshot {
+    existing.requireValid()
+    incoming.requireValid()
+    require(existing.evidence == incoming.evidence) {
+        "Authoritative habit evidence changed under a stable ledger identity"
+    }
+    val existingOutcomeRevision = existing.outcome?.revision ?: 0L
+    val incomingOutcomeRevision = incoming.outcome?.revision ?: 0L
+    val existingMissedRevision = existing.missedResolution?.revision ?: 0L
+    val incomingMissedRevision = incoming.missedResolution?.revision ?: 0L
+    if (existing.missedResolution != null && incoming.missedResolution != null) {
+        val previous = existing.missedResolution
+        val candidate = incoming.missedResolution
+        require(
+            previous.occurrenceEvidenceId == candidate.occurrenceEvidenceId &&
+                previous.habitId == candidate.habitId &&
+                previous.sourcePlannerOccurrenceId == candidate.sourcePlannerOccurrenceId &&
+                previous.configuredPolicy == candidate.configuredPolicy &&
+                previous.createdAt == candidate.createdAt,
+        ) { "Missed-resolution identity changed under a stable occurrence" }
+        when {
+            candidate.revision > previous.revision -> require(
+                Instant.parse(candidate.updatedAt) >= Instant.parse(previous.updatedAt),
+            ) { "Missed-resolution update time moved backward" }
+            candidate.revision < previous.revision -> require(
+                Instant.parse(candidate.updatedAt) <= Instant.parse(previous.updatedAt),
+            ) { "Stale missed-resolution update time moved forward" }
+        }
+        if (candidate.revision > previous.revision) {
+            require(previous.canReachCompacted(candidate)) {
+                "Missed-resolution action is unreachable across compacted revisions"
+            }
+        }
+    }
+    if (existingOutcomeRevision == incomingOutcomeRevision) {
+        require(existing.outcome == incoming.outcome) {
+            "Equal habit outcome revisions carried different content"
+        }
+    }
+    if (existingMissedRevision == incomingMissedRevision) {
+        require(existing.missedResolution == incoming.missedResolution) {
+            "Equal missed-resolution revisions carried different content"
+        }
+    }
+    return existing.copy(
+        outcome = if (incomingOutcomeRevision > existingOutcomeRevision) {
+            incoming.outcome
+        } else {
+            existing.outcome
+        },
+        missedResolution = if (incomingMissedRevision > existingMissedRevision) {
+            incoming.missedResolution
+        } else {
+            existing.missedResolution
+        },
+    ).also(HabitOccurrenceSnapshot::requireValid)
 }
 
 /**
@@ -684,14 +924,41 @@ class PlannerStore(
         expectedState: DayWeaveUiState,
         update: CanonicalPlanUpdate,
         revision: PublishedScheduleRevisionSnapshot,
+        epochResetFromRevision: ULong? = null,
     ): PlannerPersistenceReceipt? {
         validateCanonicalPlanUpdate(update)
         val proof = currentPublishedScheduleProof(update, revision)
+        val occurrenceMembershipProof = requireNotNull(
+            publishedOccurrenceMembershipProof(update, revision),
+        ) { "The current published schedule omitted exact occurrence membership" }
+        val revisionHint = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = update.syncOrigin,
+            configurationId = requireNotNull(update.configurationId),
+            revisionNumber = revision.revisionNumber,
+        ).also { require(it.hasValidShape()) }
         return mutateDurablyWithSnapshot { current ->
             require(current == expectedState && mutableDurableState.value == expectedState) {
                 "Planner state changed while the published schedule was in flight"
             }
             requireCurrentScheduleReplicaPreflight(current, update)
+            val currentHint = current.publishedScheduleRevisionHint
+            currentHint?.let {
+                require(
+                    it.syncOrigin == revisionHint.syncOrigin &&
+                        it.configurationId == revisionHint.configurationId,
+                ) { "Published schedule hint does not match the current binding" }
+            }
+            val durableResumeRevision = maxOf(
+                currentHint?.revisionNumber ?: 0uL,
+                current.publishedOccurrenceMembershipProof?.revision?.revisionNumber ?: 0uL,
+                current.publishedScheduleRevision?.revisionNumber ?: 0uL,
+            )
+            val exactEpochReset = epochResetFromRevision?.let { rejectedRevision ->
+                rejectedRevision == durableResumeRevision && rejectedRevision > 0uL
+            } == true
+            require(
+                revision.revisionNumber >= durableResumeRevision || exactEpochReset,
+            ) { "Published schedule response is older than the durable head hint" }
             val accepted = canonicalPlanState(current, update)
             require(accepted.scheduleInputDigest == revision.inputDigest)
             accepted.copy(
@@ -699,10 +966,19 @@ class PlannerStore(
                 pendingSchedulePublicationInvalidated = false,
                 publishedScheduleRevision = revision,
                 publishedScheduleProof = proof,
+                publishedOccurrenceMembershipProof = occurrenceMembershipProof,
+                publishedScheduleRevisionHint = revisionHint,
                 scheduleMessage = update.message,
             ).also { installed ->
                 require(proof.matchesStateBinding(installed))
                 require(proof.matchesPublishedPlan(installed.schedule))
+                require(
+                    occurrenceMembershipProof.currentAuthority(
+                        revisionHint = installed.publishedScheduleRevisionHint,
+                        syncOrigin = installed.canonicalSyncOrigin,
+                        configurationId = installed.canonicalConfigurationId,
+                    ) != null,
+                )
             }
         }?.receipt
     }
@@ -712,6 +988,7 @@ class PlannerStore(
         expectedState: DayWeaveUiState,
         syncOrigin: String,
         configurationId: String,
+        epochResetFromRevision: ULong? = null,
     ): PlannerPersistenceReceipt? = mutateDurablyWithSnapshot { current ->
         require(current == expectedState && mutableDurableState.value == expectedState) {
             "Planner state changed while the empty schedule head was in flight"
@@ -722,6 +999,17 @@ class PlannerStore(
                 current.canonicalConfigurationId == configurationId,
         )
         requireNoReplicaBlockingMutation(current)
+        val durableResumeRevision = maxOf(
+            current.publishedScheduleRevisionHint?.revisionNumber ?: 0uL,
+            current.publishedOccurrenceMembershipProof?.revision?.revisionNumber ?: 0uL,
+            current.publishedScheduleRevision?.revisionNumber ?: 0uL,
+        )
+        val exactEpochReset = epochResetFromRevision?.let { rejectedRevision ->
+            rejectedRevision == durableResumeRevision && rejectedRevision > 0uL
+        } == true
+        require(
+            durableResumeRevision == 0uL && epochResetFromRevision == null || exactEpochReset,
+        ) { "An empty schedule response cannot roll back the durable head without its reset fence" }
         val retainedLeaseIds = current.canonicalExecutionSession
             ?.takeIf { it.status in OPEN_EXECUTION_STATUSES }
             ?.let { lease ->
@@ -741,6 +1029,8 @@ class PlannerStore(
             pendingSchedulePublicationInvalidated = false,
             publishedScheduleRevision = null,
             publishedScheduleProof = null,
+            publishedOccurrenceMembershipProof = null,
+            publishedScheduleRevisionHint = null,
             scheduleInputDigest = null,
             localScheduleCompositionProvenance = null,
             scheduleGeneratedAt = null,
@@ -822,6 +1112,51 @@ class PlannerStore(
         ).also { proof ->
             require(proof.hasValidShape())
             require(proof.matchesPublishedPlan(update.schedule))
+        }
+    }
+
+    /** Persist an authenticated stream high-water before it can leave stale membership active. */
+    fun recordPublishedScheduleRevisionHint(
+        syncOrigin: String,
+        configurationId: String,
+        revisionNumber: ULong,
+    ): PlannerPersistenceReceipt? {
+        val incoming = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = syncOrigin,
+            configurationId = configurationId,
+            revisionNumber = revisionNumber,
+        )
+        require(incoming.hasValidShape())
+        val visible = state.value
+        require(
+            visible.canonicalSyncOrigin == syncOrigin &&
+                visible.canonicalConfigurationId == configurationId,
+        ) { "Schedule revision hint does not match the active canonical binding" }
+        val durableHint = durableState.value?.publishedScheduleRevisionHint
+        if (
+            durableHint?.syncOrigin == syncOrigin &&
+            durableHint.configurationId == configurationId &&
+            durableHint.revisionNumber >= revisionNumber
+        ) return null
+        return mutateDurably { current ->
+            require(
+                current.canonicalSyncOrigin == syncOrigin &&
+                    current.canonicalConfigurationId == configurationId,
+            ) { "Schedule revision hint raced a canonical binding replacement" }
+            val currentHint = current.publishedScheduleRevisionHint
+            require(
+                currentHint == null ||
+                    currentHint.syncOrigin == syncOrigin &&
+                    currentHint.configurationId == configurationId,
+            ) { "Durable schedule revision hint belongs to another binding" }
+            if (currentHint != null && currentHint.revisionNumber >= revisionNumber) {
+                current
+            } else {
+                current.copy(
+                    publishedScheduleRevisionHint = incoming,
+                    localScheduleCompositionProvenance = null,
+                ).withHabitRecurrenceProjectionRebuilt()
+            }
         }
     }
 
@@ -994,6 +1329,37 @@ class PlannerStore(
             update.occurrenceSeriesItemIds[occurrenceId] == source.itemId &&
                 source.hasValidRecurrenceSourceFor(item)
         }) { "Canonical occurrence source envelopes are invalid" }
+        if (update.hasExactPlanOccurrenceMembership) {
+            require(
+                update.planOccurrenceMembership.size <=
+                    PublishedOccurrenceMembershipProofSnapshot.MAX_OCCURRENCES,
+            ) { "Published occurrence membership exceeds its cache bound" }
+            require(
+                update.planOccurrenceMembership.all(
+                    PublishedOccurrenceMembershipSnapshot::hasValidShape,
+                ),
+            ) { "Published occurrence membership is malformed" }
+            require(
+                update.planOccurrenceMembership.map { it.plannerOccurrenceId }.distinct().size ==
+                    update.planOccurrenceMembership.size,
+            ) { "Published occurrence membership ids must be unique" }
+            require(
+                update.planOccurrenceMembership == update.planOccurrenceMembership.sortedWith(
+                    compareBy<PublishedOccurrenceMembershipSnapshot> {
+                        it.plannerOccurrenceId
+                    }.thenBy { it.seriesItemId },
+                ),
+            ) { "Published occurrence membership must be sorted" }
+            require(
+                update.planOccurrenceMembership.associate {
+                    it.plannerOccurrenceId to it.seriesItemId
+                } == update.occurrenceSeriesItemIds,
+            ) { "Published occurrence membership does not match occurrence ownership" }
+        } else {
+            require(update.planOccurrenceMembership.isEmpty()) {
+                "Legacy plan updates cannot carry occurrence membership"
+            }
+        }
         require(update.items.all { it.id.isNotBlank() && it.revision > 0 && it.deletedAt == null }) {
             "Canonical items must be active, identified, positive revisions"
         }
@@ -1193,6 +1559,10 @@ class PlannerStore(
                 publishedScheduleProof = current.publishedScheduleProof.takeUnless {
                     authoringProofInvalidated
                 },
+                publishedOccurrenceMembershipProof =
+                    current.publishedOccurrenceMembershipProof.takeIf { sameBinding },
+                publishedScheduleRevisionHint =
+                    current.publishedScheduleRevisionHint.takeIf { sameBinding },
                 scheduleInputDigest = update.inputDigest.takeUnless { authoringProofInvalidated },
                 localScheduleCompositionProvenance = null,
                 scheduleGeneratedAt = update.generatedAt,
@@ -1309,6 +1679,14 @@ class PlannerStore(
         validatePublishedScheduleRevision(expected, revision)
         require(!replayed) { "A replayed publication cannot grant execution authority" }
         val proof = publishedScheduleProof(expected, revision)
+        val occurrenceMembershipProof = requireNotNull(
+            publishedOccurrenceMembershipProof(expected.candidate, revision),
+        ) { "The published schedule omitted exact occurrence membership" }
+        val responseHint = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = expected.syncOrigin,
+            configurationId = requireNotNull(expected.configurationId),
+            revisionNumber = revision.revisionNumber,
+        ).also { require(it.hasValidShape()) }
         return mutateDurably { current ->
             require(current.pendingSchedulePublication == expected) {
                 "Schedule publication changed before its response was committed"
@@ -1317,12 +1695,28 @@ class PlannerStore(
             require(accepted.scheduleInputDigest == revision.inputDigest) {
                 "Published schedule no longer matches the local canonical authoring overlay"
             }
-            val publicationWasInvalidated = current.pendingSchedulePublicationInvalidated
+            val currentHint = current.publishedScheduleRevisionHint
+            require(
+                currentHint == null ||
+                    currentHint.syncOrigin == responseHint.syncOrigin &&
+                    currentHint.configurationId == responseHint.configurationId,
+            ) { "Schedule publication response raced a binding replacement" }
+            val nextHint = responseHint.copy(
+                revisionNumber = maxOf(
+                    responseHint.revisionNumber,
+                    currentHint?.revisionNumber ?: 0uL,
+                ),
+            )
+            val publicationWasInvalidated = current.pendingSchedulePublicationInvalidated ||
+                nextHint.revisionNumber != revision.revisionNumber
             accepted.copy(
                 pendingSchedulePublication = null,
                 pendingSchedulePublicationInvalidated = false,
                 publishedScheduleRevision = revision.takeUnless { publicationWasInvalidated },
                 publishedScheduleProof = proof.takeUnless { publicationWasInvalidated },
+                publishedOccurrenceMembershipProof = occurrenceMembershipProof
+                    .takeUnless { publicationWasInvalidated },
+                publishedScheduleRevisionHint = nextHint,
                 scheduleInputDigest = accepted.scheduleInputDigest
                     .takeUnless { publicationWasInvalidated },
                 localScheduleCompositionProvenance = null,
@@ -1346,15 +1740,33 @@ class PlannerStore(
     ): PlannerPersistenceReceipt? {
         validateSchedulePublicationJournal(expected)
         validatePublishedScheduleRevision(expected, revision)
+        val responseHint = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = expected.syncOrigin,
+            configurationId = requireNotNull(expected.configurationId),
+            revisionNumber = revision.revisionNumber,
+        ).also { require(it.hasValidShape()) }
         return mutateDurably { current ->
             require(current.pendingSchedulePublication == expected) {
                 "Schedule publication changed before its replay was resolved"
             }
+            val currentHint = current.publishedScheduleRevisionHint
+            require(
+                currentHint == null ||
+                    currentHint.syncOrigin == responseHint.syncOrigin &&
+                    currentHint.configurationId == responseHint.configurationId,
+            ) { "Schedule publication replay raced a binding replacement" }
             current.copy(
                 pendingSchedulePublication = null,
                 pendingSchedulePublicationInvalidated = false,
                 publishedScheduleRevision = null,
                 publishedScheduleProof = null,
+                publishedOccurrenceMembershipProof = null,
+                publishedScheduleRevisionHint = responseHint.copy(
+                    revisionNumber = maxOf(
+                        responseHint.revisionNumber,
+                        currentHint?.revisionNumber ?: 0uL,
+                    ),
+                ),
                 scheduleInputDigest = null,
                 scheduleMessage =
                     "An exact publication replay may be superseded · recomposing before use",
@@ -1376,6 +1788,7 @@ class PlannerStore(
                 pendingSchedulePublicationInvalidated = false,
                 publishedScheduleRevision = null,
                 publishedScheduleProof = null,
+                publishedOccurrenceMembershipProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage =
                     "The validated preview became stale · recomposing before schedule use",
@@ -1750,6 +2163,36 @@ class PlannerStore(
         require(proof.matchesPublishedPlan(publication.candidate.schedule)) {
             "Published schedule proof does not match the accepted candidate"
         }
+        return proof
+    }
+
+    private fun publishedOccurrenceMembershipProof(
+        update: CanonicalPlanUpdate,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PublishedOccurrenceMembershipProofSnapshot? {
+        if (!update.hasExactPlanOccurrenceMembership) return null
+        val proof = PublishedOccurrenceMembershipProofSnapshot(
+            schemaVersion = PublishedOccurrenceMembershipProofSnapshot.CURRENT_SCHEMA_VERSION,
+            syncOrigin = update.syncOrigin,
+            configurationId = requireNotNull(update.configurationId) {
+                "Published occurrence membership needs an opaque credential binding"
+            },
+            revision = revision,
+            occurrences = update.planOccurrenceMembership,
+        )
+        require(proof.hasValidShape()) { "Published occurrence membership proof is invalid" }
+        val revisionHint = PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = update.syncOrigin,
+            configurationId = requireNotNull(update.configurationId),
+            revisionNumber = revision.revisionNumber,
+        )
+        require(
+            proof.currentAuthority(
+                revisionHint = revisionHint,
+                syncOrigin = update.syncOrigin,
+                configurationId = update.configurationId,
+            ) != null,
+        ) { "Published occurrence membership proof is not current for its binding" }
         return proof
     }
 
@@ -3081,6 +3524,82 @@ class PlannerStore(
         }
     }
 
+    /**
+     * Durably revokes local composition authority before a workspace-wide missed reconciliation
+     * can commit on the server. Only a later terminal delta page may restore the checkpoint.
+     */
+    fun markHabitDeltaIncompleteForReconciliation(
+        syncOrigin: String,
+        configurationId: String,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
+        require(ledger.syncOrigin == syncOrigin && ledger.configurationId == configurationId)
+        current.copy(
+            habitLedger = ledger.copy(deltaCaughtUp = false)
+                .also(HabitLedgerSnapshot::requireValid),
+            scheduleMessage = "Checking missed habits against server time",
+        )
+    }
+
+    /** Persists the exact bounded scan request before it can reach the server. */
+    fun stageHabitMissedReconcile(
+        pending: PendingHabitMissedReconcile,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        pending.requireValid()
+        val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
+        require(ledger.isBound)
+        require(ledger.pendingMissedReconcile == null) {
+            "A missed-habit reconciliation request is already unresolved"
+        }
+        require(ledger.pendingMutations.none { it.idempotencyKey == pending.idempotencyKey })
+        current.copy(
+            habitLedger = ledger.copy(
+                deltaCaughtUp = false,
+                pendingMissedReconcile = pending,
+            ).also(HabitLedgerSnapshot::requireValid),
+            scheduleMessage = "Checking missed habits against server time",
+        )
+    }
+
+    /** Clears one exact server-confirmed scan while keeping delta composition authority revoked. */
+    fun acknowledgeHabitMissedReconcile(
+        idempotencyKey: String,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
+        val pending = requireNotNull(ledger.pendingMissedReconcile) {
+            "Missed-habit reconciliation request is not journaled"
+        }
+        require(pending.idempotencyKey == idempotencyKey)
+        current.copy(
+            habitLedger = ledger.copy(
+                deltaCaughtUp = false,
+                pendingMissedReconcile = null,
+            ).also(HabitLedgerSnapshot::requireValid),
+        )
+    }
+
+    /**
+     * Abandons a retry only after its client lease expires. The server receipt outlives this lease,
+     * and delta authority stays revoked until a fresh reconciliation and terminal pull complete.
+     */
+    fun rotateExpiredHabitMissedReconcile(
+        cutoff: Instant,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
+        val pending = ledger.pendingMissedReconcile
+        if (pending == null || Instant.parse(pending.createdAt).isAfter(cutoff)) {
+            current
+        } else {
+            current.copy(
+                habitLedger = ledger.copy(
+                    deltaCaughtUp = false,
+                    pendingMissedReconcile = null,
+                ).also(HabitLedgerSnapshot::requireValid),
+                scheduleMessage = "Expired missed-habit retry was rotated safely",
+            )
+        }
+    }
+
     /** Persists exact idempotent mutation authority before any habit write leaves the device. */
     fun stageHabitMutation(
         mutation: PendingHabitMutation,
@@ -3097,10 +3616,13 @@ class PlannerStore(
         require(ledger.pendingMutations.none { pending ->
             pending.habitId == mutation.habitId && pending.targetId == mutation.targetId
         }) { "This habit occurrence already has an unresolved change" }
-        if (mutation.kind != PendingHabitMutationKind.OUTCOME) {
+        if (mutation.kind == PendingHabitMutationKind.START_PAUSE ||
+            mutation.kind == PendingHabitMutationKind.RESUME_PAUSE
+        ) {
             require(ledger.pendingMutations.none { pending ->
                 pending.habitId == mutation.habitId &&
-                    pending.kind != PendingHabitMutationKind.OUTCOME
+                    (pending.kind == PendingHabitMutationKind.START_PAUSE ||
+                        pending.kind == PendingHabitMutationKind.RESUME_PAUSE)
             }) { "This habit already has an unresolved pause change" }
         }
         when (mutation.kind) {
@@ -3128,9 +3650,21 @@ class PlannerStore(
                 require(pause.habitId == mutation.habitId)
                 require(pause.endedAt == null && pause.revision == mutation.expectedRevision)
             }
+            PendingHabitMutationKind.MISSED_RESOLUTION -> {
+                val occurrence = ledger.occurrences[mutation.targetId]
+                    ?: throw IllegalArgumentException("Habit occurrence is not cached")
+                require(occurrence.evidence.habitId == mutation.habitId)
+                val resolution = requireNotNull(occurrence.missedResolution) {
+                    "Missed habit decision is not cached"
+                }
+                require(resolution.revision == mutation.expectedRevision)
+                require(resolution.configuredPolicy == HabitMissedPolicySnapshot.ASK)
+                require(resolution.action == HabitMissedResolutionActionSnapshot.DecisionRequired)
+            }
         }
         val updated = ledger.copy(
             analytics = ledger.analytics.filterValues { it.habitId != mutation.habitId },
+            deltaCaughtUp = false,
             pendingMutations = ledger.pendingMutations + mutation,
         ).also(HabitLedgerSnapshot::requireValid)
         current.copy(
@@ -3222,14 +3756,13 @@ class PlannerStore(
                 received.note == command.outcome.note &&
                 received.occurredAt == command.outcome.occurredAt,
         ) { "Habit response does not match the exact journaled outcome" }
-        ledger.occurrences[occurrence.evidence.id]?.let { previous ->
-            require(previous.evidence == occurrence.evidence) {
-                "Authoritative habit evidence changed under a stable ledger identity"
-            }
-        }
+        val previous = requireNotNull(ledger.occurrences[occurrence.evidence.id])
+        val mergedOccurrence = mergeAuthoritativeHabitOccurrence(previous, occurrence)
         val updated = current.retainedHabitLedger(
             ledger.copy(
-                occurrences = ledger.occurrences + (occurrence.evidence.id to occurrence),
+                deltaCaughtUp = false,
+                occurrences = ledger.occurrences +
+                    (occurrence.evidence.id to mergedOccurrence),
                 analytics = ledger.analytics.filterValues {
                     it.habitId != occurrence.evidence.habitId
                 },
@@ -3244,6 +3777,54 @@ class PlannerStore(
         )
     }
 
+    /** Commits the server-derived result for one exact, durable ask-policy decision. */
+    fun reconcileHabitMissedResolution(
+        idempotencyKey: String,
+        resolution: HabitMissedResolutionSnapshot,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        resolution.requireValid()
+        val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
+        val pending = ledger.pendingMutations.firstOrNull {
+            it.idempotencyKey == idempotencyKey
+        } ?: throw IllegalArgumentException("Habit mutation fence changed during reconciliation")
+        require(pending.disposition == PendingHabitMutationDisposition.PENDING)
+        require(pending.kind == PendingHabitMutationKind.MISSED_RESOLUTION)
+        require(pending.habitId == resolution.habitId)
+        require(pending.targetId == resolution.occurrenceEvidenceId)
+        val command = pending.decodedMissedResolutionCommand()
+        val previousOccurrence = requireNotNull(ledger.occurrences[pending.targetId])
+        val previous = requireNotNull(previousOccurrence.missedResolution)
+        require(previous.configuredPolicy == HabitMissedPolicySnapshot.ASK)
+        require(previous.action == HabitMissedResolutionActionSnapshot.DecisionRequired)
+        require(previous.revision == pending.expectedRevision)
+        require(resolution.revision == pending.expectedRevision + 1)
+        require(resolution.occurrenceEvidenceId == previous.occurrenceEvidenceId)
+        require(resolution.habitId == previous.habitId)
+        require(resolution.sourcePlannerOccurrenceId == previous.sourcePlannerOccurrenceId)
+        require(resolution.configuredPolicy == previous.configuredPolicy)
+        require(resolution.createdAt == previous.createdAt)
+        require(resolution.matchesExplicitAction(command.action)) {
+            "Missed habit response does not match the exact saved decision"
+        }
+        val incoming = previousOccurrence.copy(missedResolution = resolution)
+            .also(HabitOccurrenceSnapshot::requireValid)
+        val merged = mergeAuthoritativeHabitOccurrence(previousOccurrence, incoming)
+        val updated = current.retainedHabitLedger(
+            ledger.copy(
+                deltaCaughtUp = false,
+                occurrences = ledger.occurrences + (pending.targetId to merged),
+                analytics = ledger.analytics.filterValues { it.habitId != pending.habitId },
+                pendingMutations = ledger.pendingMutations.filterNot {
+                    it.idempotencyKey == idempotencyKey
+                },
+            ),
+        )
+        current.withHabitLedgerProjection(
+            updated,
+            "Missed habit choice synchronized across devices",
+        )
+    }
+
     /** Commits a pause response only when it resolves the exact durable pause command. */
     fun reconcileHabitPause(
         idempotencyKey: String,
@@ -3255,7 +3836,10 @@ class PlannerStore(
             it.idempotencyKey == idempotencyKey
         } ?: throw IllegalArgumentException("Habit mutation fence changed during reconciliation")
         require(pending.disposition == PendingHabitMutationDisposition.PENDING)
-        require(pending.kind != PendingHabitMutationKind.OUTCOME)
+        require(
+            pending.kind == PendingHabitMutationKind.START_PAUSE ||
+                pending.kind == PendingHabitMutationKind.RESUME_PAUSE,
+        )
         require(pending.habitId == pause.habitId && pending.targetId == pause.id)
         require(pause.revision == pending.expectedRevision + 1)
         when (pending.kind) {
@@ -3269,6 +3853,7 @@ class PlannerStore(
                 require(pause.endedAt == command.endedAt)
             }
             PendingHabitMutationKind.OUTCOME -> error("unreachable")
+            PendingHabitMutationKind.MISSED_RESOLUTION -> error("unreachable")
         }
         ledger.pauses[pause.id]?.let { previous ->
             require(previous.habitId == pause.habitId)
@@ -3279,6 +3864,7 @@ class PlannerStore(
         }
         val updated = current.retainedHabitLedger(
             ledger.copy(
+                deltaCaughtUp = false,
                 pauses = ledger.pauses + (pause.id to pause),
                 analytics = ledger.analytics.filterValues { it.habitId != pause.habitId },
                 pendingMutations = ledger.pendingMutations.filterNot {
@@ -3311,19 +3897,15 @@ class PlannerStore(
             incoming.requireValid()
             val existing = occurrenceMap[incoming.evidence.id]
             require(existing == null || existing.evidence == incoming.evidence)
-            val existingRevision = existing?.outcome?.revision ?: 0
-            val incomingRevision = incoming.outcome?.revision ?: 0
-            when {
-                existing == null -> {
-                    occurrenceMap = occurrenceMap + (incoming.evidence.id to incoming)
+            if (existing == null) {
+                occurrenceMap = occurrenceMap + (incoming.evidence.id to incoming)
+                analyticsInvalidatedHabitIds += incoming.evidence.habitId
+            } else {
+                val merged = mergeAuthoritativeHabitOccurrence(existing, incoming)
+                if (merged != existing) {
+                    occurrenceMap = occurrenceMap + (incoming.evidence.id to merged)
                     analyticsInvalidatedHabitIds += incoming.evidence.habitId
                 }
-                incomingRevision > existingRevision -> {
-                    occurrenceMap = occurrenceMap + (incoming.evidence.id to incoming)
-                    analyticsInvalidatedHabitIds += incoming.evidence.habitId
-                }
-                incomingRevision == existingRevision -> require(existing == incoming)
-                else -> Unit
             }
         }
         var pauseMap = ledger.pauses
@@ -3392,15 +3974,18 @@ class PlannerStore(
             incoming.requireValid()
             val existing = merged[incoming.evidence.id]
             require(existing == null || existing.evidence == incoming.evidence)
-            val existingRevision = existing?.outcome?.revision ?: 0
-            val incomingRevision = incoming.outcome?.revision ?: 0
             when {
-                existing == null || incomingRevision > existingRevision -> {
+                existing == null -> {
                     merged = merged + (incoming.evidence.id to incoming)
                     analyticsChanged = true
                 }
-                incomingRevision == existingRevision -> require(existing == incoming)
-                else -> Unit
+                else -> {
+                    val authoritative = mergeAuthoritativeHabitOccurrence(existing, incoming)
+                    if (authoritative != existing) {
+                        merged = merged + (incoming.evidence.id to authoritative)
+                        analyticsChanged = true
+                    }
+                }
             }
         }
         val updated = current.retainedHabitLedger(
@@ -3448,30 +4033,239 @@ class PlannerStore(
     /**
      * Keeps the encrypted replica bounded without turning an old-to-new genesis replay into a
      * permanent failure at the cache ceiling. Exact offline mutation targets win every eviction;
-     * then current schedule evidence, latest completion anchors, open pauses, and newest history.
+     * then current schedule evidence, every correction-safe completion anchor, open pauses, and
+     * newest history.
      */
     private fun DayWeaveUiState.retainedHabitLedger(
         candidate: HabitLedgerSnapshot,
         protectedAnalyticsKeys: Set<String> = emptySet(),
     ): HabitLedgerSnapshot {
+        require(
+            candidate.occurrences.values.map { it.evidence.plannerOccurrenceId }
+                .distinct().size == candidate.occurrences.size,
+        ) { "A planner occurrence maps to multiple habit evidence rows" }
+        candidate.pauses.values.groupBy(HabitPauseSnapshot::habitId).values.forEach { pauses ->
+            val ordered = pauses.sortedWith(
+                compareBy<HabitPauseSnapshot> { Instant.parse(it.startedAt) }.thenBy { it.id },
+            )
+            require(ordered.count { it.endedAt == null } <= 1)
+            ordered.zipWithNext().forEach { (previous, next) ->
+                val previousEnd = previous.endedAt?.let(Instant::parse)
+                require(previousEnd != null && previousEnd <= Instant.parse(next.startedAt))
+            }
+        }
         val pendingOccurrenceIds = candidate.pendingMutations.asSequence()
-            .filter { it.kind == PendingHabitMutationKind.OUTCOME }
+            .filter {
+                it.kind == PendingHabitMutationKind.OUTCOME ||
+                    it.kind == PendingHabitMutationKind.MISSED_RESOLUTION
+            }
             .mapTo(mutableSetOf(), PendingHabitMutation::targetId)
         val pendingPauseIds = candidate.pendingMutations.asSequence()
-            .filter { it.kind != PendingHabitMutationKind.OUTCOME }
+            .filter {
+                it.kind == PendingHabitMutationKind.START_PAUSE ||
+                    it.kind == PendingHabitMutationKind.RESUME_PAUSE
+            }
             .mapTo(mutableSetOf(), PendingHabitMutation::targetId)
+        val openPauseIds = candidate.pauses.values.asSequence()
+            .filter { it.endedAt == null }
+            .mapTo(mutableSetOf(), HabitPauseSnapshot::id)
         val schedulingPlannerIds = recurrenceOccurrenceSources.keys.toMutableSet().apply {
             addAll(occurrenceSeriesItemIds.keys)
             addAll(recurrenceMoves.keys)
             schedule.mapNotNullTo(this) { it.occurrenceId }
         }
+        val schedulingEvidenceIds = candidate.occurrences.values.asSequence()
+            .filter { it.evidence.plannerOccurrenceId in schedulingPlannerIds }
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val now = Instant.ofEpochMilli(nowEpochMillis())
+        val recentBoundary = now.minus(Duration.ofDays(1))
+        val planningBoundary = now.plus(
+            Duration.ofDays(scheduleCompositionProfile.firmHorizonDays.toLong() + 1L),
+        )
+        val unresolvedMissed = candidate.occurrences.values.filter { occurrence ->
+            occurrence.missedResolution != null && occurrence.outcome?.status !in setOf(
+                HabitOutcomeStatusSnapshot.COMPLETED,
+                HabitOutcomeStatusSnapshot.SKIPPED,
+            ) && occurrence.missedResolution.action !is
+                HabitMissedResolutionActionSnapshot.Cancelled
+        }
+        // Decision/pending rows remain live review authority. Preserve every one up to the global
+        // cache budget and fail closed if that honest authority itself exceeds the budget; old
+        // terminal Skip/Cancelled history must not receive the same treatment.
+        val reviewSourceIds = unresolvedMissed.asSequence()
+            .filter {
+                it.missedResolution?.action in setOf(
+                    HabitMissedResolutionActionSnapshot.DecisionRequired,
+                    HabitMissedResolutionActionSnapshot.ReductionPending,
+                )
+            }
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val occurrencesByPlannerId = candidate.occurrences.values.groupBy {
+            it.evidence.plannerOccurrenceId
+        }
+        val planningMissedSources = unresolvedMissed.filter { occurrence ->
+            when (val action = requireNotNull(occurrence.missedResolution).action) {
+                HabitMissedResolutionActionSnapshot.Skip ->
+                    Instant.parse(occurrence.evidence.windowStart) < planningBoundary &&
+                        Instant.parse(occurrence.evidence.windowEnd) >= recentBoundary
+                is HabitMissedResolutionActionSnapshot.Carry ->
+                    Instant.parse(action.windowStart) < planningBoundary &&
+                        Instant.parse(action.windowEnd) >= recentBoundary
+                is HabitMissedResolutionActionSnapshot.ReduceFrequency -> {
+                    val targets = action.suppressedPlannerOccurrenceIds.flatMap { targetId ->
+                        occurrencesByPlannerId[targetId].orEmpty()
+                            .filter { it.evidence.habitId == occurrence.evidence.habitId }
+                    }
+                    if (targets.isEmpty()) {
+                        // Delta pages may deliver the source before its target evidence. Preserve
+                        // that bridge only for the server's bounded missed-window lifetime.
+                        Instant.parse(requireNotNull(occurrence.missedResolution).updatedAt) >=
+                            now.minus(Duration.ofDays(MAX_RETAINED_MISSED_ACTION_DAYS))
+                    } else {
+                        targets.any { Instant.parse(it.evidence.windowEnd) >= recentBoundary }
+                    }
+                }
+                HabitMissedResolutionActionSnapshot.DecisionRequired,
+                HabitMissedResolutionActionSnapshot.ReductionPending,
+                is HabitMissedResolutionActionSnapshot.Cancelled,
+                -> false
+            }
+        }
+        val planningMissedSourceIds = planningMissedSources
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val reductionTargetKeys = planningMissedSources.asSequence()
+            .flatMap { source ->
+                val action = source.missedResolution?.action
+                    as? HabitMissedResolutionActionSnapshot.ReduceFrequency
+                    ?: return@flatMap emptySequence()
+                action.suppressedPlannerOccurrenceIds.asSequence().map { targetId ->
+                    source.evidence.habitId to targetId
+                }
+            }
+            .toSet()
+        val reductionTargetEvidenceIds = candidate.occurrences.values.asSequence()
+            .filter {
+                (it.evidence.habitId to it.evidence.plannerOccurrenceId) in reductionTargetKeys
+            }
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val physicalReductionSources = candidate.occurrences.values.filter {
+            it.missedResolution?.action is HabitMissedResolutionActionSnapshot.ReduceFrequency
+        }
+        val physicalReductionTargetKeys = physicalReductionSources.asSequence()
+            .flatMap { source ->
+                val action = source.missedResolution?.action
+                    as? HabitMissedResolutionActionSnapshot.ReduceFrequency
+                    ?: return@flatMap emptySequence()
+                action.suppressedPlannerOccurrenceIds.asSequence().map { targetId ->
+                    source.evidence.habitId to targetId
+                }
+            }
+            .toSet()
+        val physicalReductionTargetEvidenceIds = candidate.occurrences.values.asSequence()
+            .filter {
+                (it.evidence.habitId to it.evidence.plannerOccurrenceId) in
+                    physicalReductionTargetKeys
+            }
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val completedOccurrenceIds = candidate.occurrences.values.asSequence()
+            .filter { it.outcome?.status == HabitOutcomeStatusSnapshot.COMPLETED }
+            .mapTo(mutableSetOf()) { it.evidence.id }
+        val mandatoryOccurrenceIds = mutableSetOf<String>().apply {
+            addAll(pendingOccurrenceIds)
+            addAll(schedulingEvidenceIds)
+            addAll(reviewSourceIds)
+            addAll(planningMissedSourceIds)
+            addAll(reductionTargetEvidenceIds)
+            addAll(physicalReductionSources.map { it.evidence.id })
+            addAll(physicalReductionTargetEvidenceIds)
+            addAll(completedOccurrenceIds)
+        }
+        val reductionSourcesByTarget = mutableMapOf<
+            Pair<String, String>,
+            MutableList<HabitOccurrenceSnapshot>,
+        >()
+        physicalReductionSources.forEach { source ->
+            val action = source.missedResolution?.action
+                as? HabitMissedResolutionActionSnapshot.ReduceFrequency
+                ?: return@forEach
+            action.suppressedPlannerOccurrenceIds.forEach { targetId ->
+                reductionSourcesByTarget.getOrPut(
+                    source.evidence.habitId to targetId,
+                    ::mutableListOf,
+                ).add(source)
+            }
+        }
+        // Retention must preserve the same alternating reduction graph across
+        // process death. If A -> B and required B -> C survives while A is
+        // evicted, B becomes spuriously effective and suppresses C.
+        val plannerKeysToVisit = mandatoryOccurrenceIds.mapNotNull { evidenceId ->
+            candidate.occurrences[evidenceId]?.evidence?.let {
+                it.habitId to it.plannerOccurrenceId
+            }
+        }.toMutableList()
+        val visitedPlannerKeys = mutableSetOf<Pair<String, String>>()
+        var plannerKeyIndex = 0
+        while (plannerKeyIndex < plannerKeysToVisit.size) {
+            val targetKey = plannerKeysToVisit[plannerKeyIndex++]
+            if (!visitedPlannerKeys.add(targetKey)) continue
+            reductionSourcesByTarget[targetKey].orEmpty().forEach { source ->
+                if (mandatoryOccurrenceIds.add(source.evidence.id)) {
+                    plannerKeysToVisit += source.evidence.habitId to
+                        source.evidence.plannerOccurrenceId
+                }
+            }
+        }
+        val retainedOccurrences = retainHabitOccurrences(
+            candidate.occurrences,
+            mandatoryOccurrenceIds,
+            schedulingPlannerIds,
+        )
+        val retainedByPlannerId = retainedOccurrences.values.associateBy {
+            it.evidence.plannerOccurrenceId
+        }
+        val protectedPauseWindows = mutableListOf<Triple<String, Instant, Instant>>()
+        retainedOccurrences.values.forEach { occurrence ->
+            protectedPauseWindows += Triple(
+                occurrence.evidence.habitId,
+                Instant.parse(occurrence.evidence.windowStart),
+                Instant.parse(occurrence.evidence.windowEnd),
+            )
+            val action = occurrence.missedResolution?.action ?: return@forEach
+            if (action is HabitMissedResolutionActionSnapshot.Carry) {
+                protectedPauseWindows += Triple(
+                    occurrence.evidence.habitId,
+                    Instant.parse(action.windowStart),
+                    Instant.parse(action.windowEnd),
+                )
+            }
+            if (action is HabitMissedResolutionActionSnapshot.ReduceFrequency) {
+                action.suppressedPlannerOccurrenceIds.forEach { targetId ->
+                    retainedByPlannerId[targetId]?.takeIf {
+                        it.evidence.habitId == occurrence.evidence.habitId
+                    }?.let { target ->
+                        protectedPauseWindows += Triple(
+                            target.evidence.habitId,
+                            Instant.parse(target.evidence.windowStart),
+                            Instant.parse(target.evidence.windowEnd),
+                        )
+                    }
+                }
+            }
+        }
+        val lifecyclePauseIds = candidate.pauses.values.asSequence()
+            .filter { pause ->
+                protectedPauseWindows.any { (habitId, start, end) ->
+                    pause.habitId == habitId && Instant.parse(pause.startedAt) < end &&
+                        (pause.endedAt == null || Instant.parse(pause.endedAt) > start)
+                }
+            }
+            .mapTo(mutableSetOf(), HabitPauseSnapshot::id)
         return candidate.copy(
-            occurrences = retainHabitOccurrences(
-                candidate.occurrences,
-                pendingOccurrenceIds,
-                schedulingPlannerIds,
+            occurrences = retainedOccurrences,
+            pauses = retainHabitPauses(
+                candidate.pauses,
+                pendingPauseIds + openPauseIds + lifecyclePauseIds,
             ),
-            pauses = retainHabitPauses(candidate.pauses, pendingPauseIds),
             analytics = retainHabitAnalytics(candidate.analytics, protectedAnalyticsKeys),
         ).also(HabitLedgerSnapshot::requireValid)
     }
@@ -3489,7 +4283,11 @@ class PlannerStore(
             return candidates
         }
         val retentionOrder = compareByDescending<HabitOccurrenceSnapshot> {
-            Instant.parse(it.outcome?.updatedAt ?: it.evidence.nominalStart)
+            listOfNotNull(
+                it.outcome?.updatedAt,
+                it.missedResolution?.updatedAt,
+                it.evidence.nominalStart,
+            ).maxOf(Instant::parse)
         }.thenByDescending { Instant.parse(it.evidence.nominalStart) }
             .thenBy { it.evidence.id }
         val retained = linkedMapOf<String, HabitOccurrenceSnapshot>()
@@ -3505,25 +4303,22 @@ class PlannerStore(
                 retainedBytes += bytes
             }
         }
-        mandatoryIds.mapNotNull(candidates::get).sortedWith(retentionOrder).forEach(::offer)
-        require(mandatoryIds.all { it !in candidates || it in retained }) {
-            "Exact pending habit occurrence authority exceeds the encrypted cache budget"
+        // Every completed occurrence remains authoritative fallback evidence. A newer completion
+        // may later be corrected to partial/skipped, at which point an older completion becomes
+        // the recurrence anchor again. Until the wire contract supplies a compact correction-safe
+        // anchor, completed rows cannot be silently evicted.
+        val correctionSafeRequiredIds = mandatoryIds + candidates.values.asSequence()
+            .filter { it.outcome?.status == HabitOutcomeStatusSnapshot.COMPLETED }
+            .map { it.evidence.id }
+            .toSet()
+        correctionSafeRequiredIds.mapNotNull(candidates::get)
+            .sortedWith(retentionOrder)
+            .forEach(::offer)
+        require(correctionSafeRequiredIds.all { it !in candidates || it in retained }) {
+            "Required habit occurrence and completion authority exceeds the encrypted cache budget"
         }
         candidates.values.asSequence()
             .filter { it.evidence.plannerOccurrenceId in schedulingPlannerIds }
-            .sortedWith(retentionOrder)
-            .forEach(::offer)
-        candidates.values.asSequence()
-            .filter { it.outcome?.status == HabitOutcomeStatusSnapshot.COMPLETED }
-            .groupBy { it.evidence.habitId }
-            .values
-            .mapNotNull { values ->
-                values.maxWithOrNull(
-                    compareBy<HabitOccurrenceSnapshot> {
-                        Instant.parse(requireNotNull(it.outcome).occurredAt)
-                    }.thenBy { it.evidence.id },
-                )
-            }
             .sortedWith(retentionOrder)
             .forEach(::offer)
         candidates.values.sortedWith(retentionOrder).forEach(::offer)
@@ -3631,40 +4426,94 @@ class PlannerStore(
     ): Pair<Map<String, RecurrenceOutcomeSnapshot>, Map<String, String>> {
         val priorPlannerIds = habitLedger.occurrences.values
             .mapTo(mutableSetOf()) { it.evidence.plannerOccurrenceId }
+            .apply {
+                habitLedger.occurrences.values.forEach { occurrence ->
+                    val action = occurrence.missedResolution?.action
+                    if (action is HabitMissedResolutionActionSnapshot.ReduceFrequency) {
+                        addAll(action.suppressedPlannerOccurrenceIds)
+                    }
+                }
+            }
         val projectedPlannerIds = updated.occurrences.values
             .mapTo(priorPlannerIds) { it.evidence.plannerOccurrenceId }
+            .apply {
+                updated.occurrences.values.forEach { occurrence ->
+                    val action = occurrence.missedResolution?.action
+                    if (action is HabitMissedResolutionActionSnapshot.ReduceFrequency) {
+                        addAll(action.suppressedPlannerOccurrenceIds)
+                    }
+                }
+            }
         var outcomes = recurrenceOutcomes - projectedPlannerIds
-        val activeHabitIds = if (
+        val authoritativeItemsById = if (
             updated.isBound &&
             updated.syncOrigin == canonicalSyncOrigin &&
             updated.configurationId == canonicalConfigurationId
         ) {
-            canonicalItems.asSequence()
-                .filter { it.kind == "habit" }
-                .mapTo(mutableSetOf(), CanonicalItemSnapshot::id)
+            canonicalItems.associateBy(CanonicalItemSnapshot::id)
         } else {
-            emptySet()
+            emptyMap()
         }
+        val activeParentIds = authoritativeItemsById.values.asSequence()
+            .filter { it.deletedAt == null }
+            .mapNotNullTo(hashSetOf(), CanonicalItemSnapshot::parentId)
         val projectableOccurrences = updated.occurrences.values.filter { occurrence ->
-            occurrence.evidence.habitId in activeHabitIds
+            authoritativeItemsById[occurrence.evidence.habitId]?.let { item ->
+                item.kind == "habit" && item.isExecutable && item.deletedAt == null &&
+                    item.id !in activeParentIds && item.allowsMissedHabitScheduling() &&
+                    occurrence.evidence.sourceItemRevision <= item.revision
+            } == true
         }
+        val effectiveMissed = effectiveHabitMissedProjection(
+            authoritativeItemsById,
+            updated.occurrences.values,
+            updated.pauses.values,
+            publishedOccurrenceMembershipProof,
+            publishedScheduleRevisionHint,
+            canonicalSyncOrigin,
+            canonicalConfigurationId,
+        )
         projectableOccurrences.forEach { occurrence ->
-            val outcome = occurrence.outcome ?: return@forEach
-            val status = when (outcome.status) {
+            val outcome = occurrence.outcome
+            val activeMissedAction = effectiveMissed.actionsByEvidenceId[occurrence.evidence.id]
+            val status = when (outcome?.status) {
                 HabitOutcomeStatusSnapshot.COMPLETED -> ItemStatus.COMPLETED
                 HabitOutcomeStatusSnapshot.SKIPPED -> ItemStatus.SKIPPED
+                null,
                 HabitOutcomeStatusSnapshot.UNRESOLVED,
                 HabitOutcomeStatusSnapshot.PARTIAL,
-                -> null
+                -> if (activeMissedAction == HabitMissedResolutionActionSnapshot.Skip) {
+                    ItemStatus.SKIPPED
+                } else {
+                    null
+                }
             }
             if (status != null) {
+                val resolvedAt = when {
+                    outcome?.status == HabitOutcomeStatusSnapshot.COMPLETED ||
+                        outcome?.status == HabitOutcomeStatusSnapshot.SKIPPED -> outcome.occurredAt
+                    else -> requireNotNull(occurrence.missedResolution).updatedAt
+                }
                 outcomes = outcomes + (
                     occurrence.evidence.plannerOccurrenceId to RecurrenceOutcomeSnapshot(
                         itemId = occurrence.evidence.habitId,
                         status = status,
-                        resolvedAt = outcome.occurredAt,
+                        resolvedAt = resolvedAt,
                     )
                 )
+            }
+            if (activeMissedAction is HabitMissedResolutionActionSnapshot.ReduceFrequency) {
+                activeMissedAction.suppressedPlannerOccurrenceIds
+                    .filter { it in effectiveMissed.suppressedPlannerOccurrenceIds }
+                    .forEach { suppressedId ->
+                    outcomes = outcomes + (
+                        suppressedId to RecurrenceOutcomeSnapshot(
+                            itemId = occurrence.evidence.habitId,
+                            status = ItemStatus.SKIPPED,
+                            resolvedAt = requireNotNull(occurrence.missedResolution).updatedAt,
+                        )
+                    )
+                }
             }
         }
         val affectedHabitIds = (habitLedger.occurrences.values.asSequence() +
@@ -4491,15 +5340,18 @@ class PlannerStore(
                     require(expected.canTransitionTo(replacement)) {
                         "Google schedule publication recovery transition is invalid"
                     }
+                    val recordsStartedExternalEffect =
+                        expected.stage == GoogleSchedulePublicationStage.APPROVED &&
+                            replacement.stage == GoogleSchedulePublicationStage.ACCEPTED
                     if (
-                        replacement.stage == GoogleSchedulePublicationStage.PREVIEWED ||
-                        replacement.stage == GoogleSchedulePublicationStage.APPROVAL_ATTEMPTED
+                        expected.stage != GoogleSchedulePublicationStage.ACCEPTED &&
+                        !recordsStartedExternalEffect
                     ) {
                         require(
                             current.hasExactPublishedSchedule(
                                 replacement.expectedScheduleRevisionId,
                             ),
-                        ) { "The published schedule changed before approval" }
+                        ) { "The published schedule changed before publication completed" }
                     }
                 }
                 current.copy(pendingGoogleSchedulePublication = replacement)
@@ -5056,6 +5908,8 @@ class PlannerStore(
             proposalApplications = emptyMap(),
             publishedScheduleRevision = null,
             publishedScheduleProof = null,
+            publishedOccurrenceMembershipProof = null,
+            publishedScheduleRevisionHint = null,
             schedule = current.schedule.filter { it.canonicalItemId == null },
             activeSession = current.activeSession?.takeUnless { it.itemId in canonicalBlockIds },
             scheduleInputDigest = null,
@@ -6922,6 +7776,7 @@ class PlannerStore(
         const val MAX_ASSISTANT_REPLY_BYTES = 32 * 1024
         const val MAX_ASSISTANT_MESSAGE_ID_CHARS = 128
         const val MAX_ASSISTANT_MESSAGES = 200
+        const val MAX_RETAINED_MISSED_ACTION_DAYS = 366L
         const val MAX_ASSISTANT_TRANSCRIPT_BYTES = 512 * 1024
         val EXECUTION_DEFER_VIOLATION_CODES = setOf(
             "outside_availability",

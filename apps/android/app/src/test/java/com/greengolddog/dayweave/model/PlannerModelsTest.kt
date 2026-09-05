@@ -207,6 +207,7 @@ class PlannerModelsTest {
                 asOf = "2026-09-01T07:00:00Z",
                 blocks = emptyList(),
             ),
+            publishedScheduleRevisionHint = matchingHint(revision),
         )
 
         assertTrue(
@@ -225,6 +226,27 @@ class PlannerModelsTest {
             state.isPublishedScheduleDisplayCurrent(
                 Instant.parse("2026-09-01T12:00:00Z"),
                 ZoneId.of("America/Los_Angeles"),
+            ),
+        )
+        val newerHead = state.copy(
+            publishedScheduleRevisionHint = matchingHint(revision).copy(revisionNumber = 2uL),
+        )
+        assertTrue(
+            newerHead.isPublishedScheduleDisplayCurrent(
+                Instant.parse("2026-09-01T12:00:00Z"),
+                ZoneId.of("Europe/Madrid"),
+            ),
+        )
+        assertTrue(
+            newerHead.isScheduleDisplayCurrent(
+                Instant.parse("2026-09-01T12:00:00Z"),
+                ZoneId.of("Europe/Madrid"),
+            ),
+        )
+        assertFalse(
+            newerHead.isCanonicalPlanCurrent(
+                Instant.parse("2026-09-01T12:00:00Z"),
+                ZoneId.of("Europe/Madrid"),
             ),
         )
         assertTrue(
@@ -262,6 +284,7 @@ class PlannerModelsTest {
                 asOf = revision.publishedAt,
                 blocks = emptyList(),
             ),
+            publishedScheduleRevisionHint = matchingHint(revision),
         )
 
         assertTrue(
@@ -345,6 +368,7 @@ class PlannerModelsTest {
                 asOf = horizonStart.toString(),
                 blocks = emptyList(),
             ),
+            publishedScheduleRevisionHint = matchingHint(revision),
         )
 
         assertFalse(
@@ -401,6 +425,7 @@ class PlannerModelsTest {
             schedulePlanningZoneId = zone.id,
             publishedScheduleRevision = revision,
             publishedScheduleProof = proof,
+            publishedScheduleRevisionHint = matchingHint(revision),
         )
 
         assertTrue(proof.hasValidShape())
@@ -497,6 +522,7 @@ class PlannerModelsTest {
             canonicalConfigurationId = proof.configurationId,
             publishedScheduleRevision = revision,
             publishedScheduleProof = proof,
+            publishedScheduleRevisionHint = matchingHint(revision),
             scheduleInputDigest = revision.inputDigest,
             scheduleGeneratedAt = proof.asOf,
             schedulePlanningZoneId = revision.timezoneName,
@@ -565,6 +591,13 @@ class PlannerModelsTest {
             ),
         )
     }
+
+    private fun matchingHint(revision: PublishedScheduleRevisionSnapshot) =
+        PublishedScheduleRevisionHintSnapshot(
+            syncOrigin = "https://api.example.test/",
+            configurationId = "connection-1",
+            revisionNumber = revision.revisionNumber,
+        )
 
     private fun item(id: String, start: String, end: String) = ScheduleItem(
         id = id,

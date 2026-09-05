@@ -17,6 +17,7 @@ import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationTarget
 import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
+import com.greengolddog.dayweave.model.HabitMissedExplicitActionSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
@@ -920,6 +921,32 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                         occurrenceId = occurrenceId,
                         observedOutcomeRevision = observedOutcomeRevision,
                         outcome = outcome,
+                    ) == HabitSyncOutcome.SUCCESS
+                },
+                scheduleSync = {
+                    dayWeaveApplication.launchCanonicalAction { habitSyncManager.refresh() }
+                },
+            )
+        } catch (error: RuntimeException) {
+            if (error is CancellationException) throw error
+            false
+        }
+    }
+
+    fun resolveMissedHabit(
+        habitId: String,
+        occurrenceId: String,
+        observedMissedRevision: Long,
+        action: HabitMissedExplicitActionSnapshot,
+    ): Deferred<Boolean> = dayWeaveApplication.launchDurableHabitAction {
+        try {
+            persistHabitOutcomeThenScheduleSync(
+                persist = {
+                    habitSyncManager.stageMissedResolution(
+                        habitId = habitId,
+                        occurrenceId = occurrenceId,
+                        observedMissedRevision = observedMissedRevision,
+                        action = action,
                     ) == HabitSyncOutcome.SUCCESS
                 },
                 scheduleSync = {

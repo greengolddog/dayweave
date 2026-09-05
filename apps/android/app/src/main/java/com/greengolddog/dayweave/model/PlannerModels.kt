@@ -22,9 +22,14 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.longOrNull
 
 @Serializable
 enum class AppDestination(val label: String) {
@@ -366,6 +371,215 @@ data class CanonicalItemSnapshot(
     /** Prevents pre-structural full replacements from erasing richer server state. */
     val hasExplicitStructuralMetadata: Boolean = false,
 )
+
+private val MISSED_HABIT_ACTIVE_STATUSES = setOf(
+    "inbox",
+    "planned",
+    "scheduled",
+    "in_progress",
+    "paused",
+)
+
+/** Unknown future statuses fail closed until this client understands their scheduling semantics. */
+internal fun CanonicalItemSnapshot.allowsMissedHabitScheduling(): Boolean =
+    status in MISSED_HABIT_ACTIVE_STATUSES
+
+internal data class EffectiveHabitMissedProjection(
+    val actionsByEvidenceId: Map<String, HabitMissedResolutionActionSnapshot>,
+    val suppressedPlannerOccurrenceIds: Set<String>,
+)
+
+/**
+ * Resolves the server's forward reduction graph for an authoritative local replica. If A reduces
+ * B, B's own missed action is inert; therefore B cannot cascade a reduction to C. A terminal or
+ * otherwise inactive B makes A's edge ineligible, allowing B's own lifecycle to win instead.
+ */
+internal fun effectiveHabitMissedProjection(
+    itemsById: Map<String, CanonicalItemSnapshot>,
+    occurrences: Collection<HabitOccurrenceSnapshot>,
+    pauses: Collection<HabitPauseSnapshot>,
+    publishedOccurrenceMembershipProof: PublishedOccurrenceMembershipProofSnapshot?,
+    publishedScheduleRevisionHint: PublishedScheduleRevisionHintSnapshot?,
+    syncOrigin: String?,
+    configurationId: String?,
+): EffectiveHabitMissedProjection {
+    val occurrenceOrder = compareBy<HabitOccurrenceSnapshot> {
+        Instant.parse(it.evidence.nominalStart)
+    }.thenBy {
+        requireNotNull(recurrenceIdentityOrdinal(it.evidence.identity))
+    }.thenBy { it.evidence.plannerOccurrenceId }
+    val byPlannerId = occurrences.associateBy { it.evidence.plannerOccurrenceId }
+    require(byPlannerId.size == occurrences.size) {
+        "A planner occurrence maps to multiple habit evidence rows"
+    }
+    val activeParentIds = itemsById.values.asSequence()
+        .filter { it.deletedAt == null }
+        .mapNotNullTo(hashSetOf(), CanonicalItemSnapshot::parentId)
+    val publicationAuthority = publishedOccurrenceMembershipProof.currentAuthority(
+        revisionHint = publishedScheduleRevisionHint,
+        syncOrigin = syncOrigin,
+        configurationId = configurationId,
+    )
+    fun isPaused(occurrence: HabitOccurrenceSnapshot, actionWindow: Boolean): Boolean {
+        val resolution = occurrence.missedResolution
+        val action = resolution?.action
+        val (start, end) = if (
+            actionWindow && action is HabitMissedResolutionActionSnapshot.Carry
+        ) {
+            Instant.parse(action.windowStart) to Instant.parse(action.windowEnd)
+        } else {
+            Instant.parse(occurrence.evidence.windowStart) to
+                Instant.parse(occurrence.evidence.windowEnd)
+        }
+        return pauses.any { pause ->
+            pause.habitId == occurrence.evidence.habitId &&
+                Instant.parse(pause.startedAt) < end &&
+                (pause.endedAt == null || Instant.parse(pause.endedAt) > start)
+        }
+    }
+    val candidates = occurrences.mapNotNull { occurrence ->
+        val action = occurrence.missedResolution?.action ?: return@mapNotNull null
+        val evidence = occurrence.evidence
+        val item = itemsById[evidence.habitId] ?: return@mapNotNull null
+        if (
+            item.kind != "habit" || !item.isExecutable || item.deletedAt != null ||
+            item.id in activeParentIds ||
+            !item.allowsMissedHabitScheduling() || evidence.sourceItemRevision > item.revision ||
+            item.habitPolicyFingerprintOrNull() != evidence.policyFingerprint ||
+            occurrence.outcome?.status in setOf(
+                HabitOutcomeStatusSnapshot.COMPLETED,
+                HabitOutcomeStatusSnapshot.SKIPPED,
+            ) || action is HabitMissedResolutionActionSnapshot.Cancelled ||
+            isPaused(occurrence, actionWindow = true)
+        ) {
+            return@mapNotNull null
+        }
+        occurrence to action
+    }.sortedWith { left, right -> occurrenceOrder.compare(left.first, right.first) }
+
+    fun reductionTargetIsEligible(
+        source: HabitOccurrenceSnapshot,
+        targetId: String,
+    ): Boolean {
+        val target = byPlannerId[targetId] ?: return false
+        if (target.evidence.habitId != source.evidence.habitId) return false
+        val item = itemsById[source.evidence.habitId] ?: return false
+        return item.kind == "habit" && item.isExecutable && item.deletedAt == null &&
+            item.id !in activeParentIds && item.allowsMissedHabitScheduling() &&
+            occurrenceOrder.compare(target, source) > 0 &&
+            target.evidence.sourceItemRevision <= item.revision &&
+            target.evidence.policyFingerprint == item.habitPolicyFingerprintOrNull() &&
+            target.outcome?.status in setOf(null, HabitOutcomeStatusSnapshot.UNRESOLVED) &&
+            !isPaused(target, actionWindow = false) &&
+            publicationAuthority?.authorizesReductionTarget(target) == true
+    }
+
+    val actions = linkedMapOf<String, HabitMissedResolutionActionSnapshot>()
+    val suppressed = linkedSetOf<String>()
+    candidates.forEach { (source, action) ->
+        if (source.evidence.plannerOccurrenceId in suppressed) return@forEach
+        actions[source.evidence.id] = action
+        if (action is HabitMissedResolutionActionSnapshot.ReduceFrequency) {
+            action.suppressedPlannerOccurrenceIds
+                .filter { reductionTargetIsEligible(source, it) }
+                .forEach(suppressed::add)
+        }
+    }
+    return EffectiveHabitMissedProjection(actions, suppressed)
+}
+
+/**
+ * Reproduces the server's `habit_policy_fingerprint` bytes without trusting the item revision.
+ *
+ * serde_json's default object map is key-sorted, including nested recurrence and constraints.
+ * Sorting every object recursively is therefore part of the wire contract; retaining a raw JSON
+ * string (or insertion order) would incorrectly cancel a decision after a harmless item edit.
+ * Unknown structural enum/split shapes fail closed because Android cannot prove byte parity.
+ */
+internal fun CanonicalItemSnapshot.habitPolicyFingerprintOrNull(): String? = runCatching {
+    require(kind == "habit")
+    requireCanonicalUuid(id, "habit policy")
+    require(durationKind.isSupported && durationSource?.isSupported != false)
+    requireValidStructuralMetadata()
+    val recurrence = requireNotNull(recurrenceJson)
+        .let(HABIT_POLICY_FINGERPRINT_JSON::parseToJsonElement) as? JsonObject
+        ?: error("Habit recurrence is not an object")
+    val constraints = HABIT_POLICY_FINGERPRINT_JSON
+        .parseToJsonElement(flexibleConstraintsJson) as? JsonObject
+        ?: error("Habit constraints are not an object")
+    val rawSplit = HABIT_POLICY_FINGERPRINT_JSON.parseToJsonElement(splitPolicyJson) as? JsonObject
+        ?: error("Habit split policy is not an object")
+    val splitType = rawSplit["type"] as? JsonPrimitive
+        ?: error("Habit split policy has no type")
+    require(splitType.isString)
+    val (splitAllowed, minimumChunk, maximumChunk) = when (splitType.content) {
+        "indivisible" -> {
+            require(rawSplit.keys == setOf("type"))
+            Triple(false, null, null)
+        }
+        "splittable" -> {
+            require(
+                rawSplit.keys == setOf(
+                    "type",
+                    "minimum_chunk_seconds",
+                    "maximum_chunk_seconds",
+                ),
+            )
+            val minimum = (rawSplit["minimum_chunk_seconds"] as? JsonPrimitive)
+                ?.takeUnless { it.isString }?.longOrNull
+                ?: error("Habit split minimum is not an integer")
+            val maximum = (rawSplit["maximum_chunk_seconds"] as? JsonPrimitive)
+                ?.takeUnless { it.isString }?.longOrNull
+                ?: error("Habit split maximum is not an integer")
+            require(minimum > 0 && maximum >= minimum)
+            Triple(true, minimum, maximum)
+        }
+        else -> error("Unsupported habit split policy")
+    }
+    val policy = buildJsonObject {
+        put("schema", JsonPrimitive("dayweave-habit-policy/1"))
+        put("habit_id", JsonPrimitive(id))
+        put("timezone_name", JsonPrimitive(timezoneName))
+        put("recurrence", recurrence)
+        put("constraints", constraints)
+        put(
+            "duration",
+            buildJsonObject {
+                put("kind", JsonPrimitive(durationKind.wireValue))
+                put("seconds", durationSeconds?.let(::JsonPrimitive) ?: JsonNull)
+                put("minimum_seconds", durationMinSeconds?.let(::JsonPrimitive) ?: JsonNull)
+                put("maximum_seconds", durationMaxSeconds?.let(::JsonPrimitive) ?: JsonNull)
+                put("source", durationSource?.wireValue?.let(::JsonPrimitive) ?: JsonNull)
+            },
+        )
+        put(
+            "split",
+            buildJsonObject {
+                put("allowed", JsonPrimitive(splitAllowed))
+                put("minimum_seconds", minimumChunk?.let(::JsonPrimitive) ?: JsonNull)
+                put("maximum_seconds", maximumChunk?.let(::JsonPrimitive) ?: JsonNull)
+            },
+        )
+    }.sortedForSerdeJson()
+    val bytes = HABIT_POLICY_FINGERPRINT_JSON.encodeToString(JsonElement.serializer(), policy)
+        .toByteArray(Charsets.UTF_8)
+    "sha256:" + MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
+    }
+}.getOrNull()
+
+private fun JsonElement.sortedForSerdeJson(): JsonElement = when (this) {
+    is JsonObject -> JsonObject(entries.sortedBy { it.key }.associate {
+        it.key to it.value.sortedForSerdeJson()
+    })
+    is JsonArray -> JsonArray(map(JsonElement::sortedForSerdeJson))
+    else -> this
+}
+
+private val HABIT_POLICY_FINGERPRINT_JSON = Json {
+    ignoreUnknownKeys = false
+    explicitNulls = true
+}
 
 internal fun CanonicalItemSnapshot.requireValidStructuralMetadata() {
     val structuralEnums = listOf(
@@ -898,6 +1112,9 @@ data class CanonicalPlanUpdate(
     val unscheduledWork: List<UnscheduledWorkSnapshot>,
     val occurrenceSeriesItemIds: Map<String, String>,
     val occurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot> = emptyMap(),
+    /** Exact preview occurrence table. Legacy journals deliberately retain this as unavailable. */
+    val planOccurrenceMembership: List<PublishedOccurrenceMembershipSnapshot> = emptyList(),
+    val hasExactPlanOccurrenceMembership: Boolean = false,
     val message: String,
 )
 
@@ -1195,6 +1412,8 @@ private data class LocalScheduleMutableInputSnapshot(
     val hasPendingCanonicalMutation: Boolean,
     val hasPendingCanonicalAuthoringMutation: Boolean,
     val hasPendingProposalApplicationMutation: Boolean,
+    val publishedOccurrenceMembershipProof: PublishedOccurrenceMembershipProofSnapshot?,
+    val publishedScheduleRevisionHint: PublishedScheduleRevisionHintSnapshot?,
 )
 
 /** Content-free deterministic fence for every mutable input currently used by previewRequest. */
@@ -1231,6 +1450,8 @@ fun DayWeaveUiState.localScheduleCompositionStateFingerprint(): String {
         hasPendingCanonicalMutation = pendingCanonicalMutation != null,
         hasPendingCanonicalAuthoringMutation = pendingCanonicalAuthoringMutations.isNotEmpty(),
         hasPendingProposalApplicationMutation = pendingProposalApplicationMutation != null,
+        publishedOccurrenceMembershipProof = publishedOccurrenceMembershipProof,
+        publishedScheduleRevisionHint = publishedScheduleRevisionHint,
     )
     val bytes = LOCAL_COMPOSITION_FINGERPRINT_JSON.encodeToString(snapshot)
         .toByteArray(Charsets.UTF_8)
@@ -1508,13 +1729,32 @@ data class PublishedScheduleProofSnapshot(
         return blocks.all { proof -> scheduleById[proof.id]?.let(proof::matches) == true }
     }
 
-    /** One full immutable-proof validation per state identity, regardless of UI clock ticks. */
+    /** Action authority additionally requires that no newer durable head has been observed. */
     internal fun matchesCurrentStateAndPlan(state: DayWeaveUiState): Boolean {
+        val revisionHint = state.publishedScheduleRevisionHint
+        if (
+            revisionHint?.hasValidShape() != true ||
+            revisionHint.syncOrigin != syncOrigin ||
+            revisionHint.configurationId != configurationId ||
+            revisionHint.revisionNumber != revision.revisionNumber
+        ) {
+            return false
+        }
+        return matchesCurrentStateAndPlanForDisplay(state)
+    }
+
+    /** One full immutable-proof display validation per state identity, regardless of UI ticks. */
+    internal fun matchesCurrentStateAndPlanForDisplay(state: DayWeaveUiState): Boolean {
         if (state.hasMemoizedPublishedScheduleValidation(this)) return true
         PUBLISHED_SCHEDULE_VALIDATION_COMPUTATIONS.incrementAndGet()
+        val revisionHint = state.publishedScheduleRevisionHint
         if (
             schemaVersion != CURRENT_SCHEMA_VERSION || !hasValidShape() ||
             !matchesStateBindingAfterValidation(state) ||
+            revisionHint?.hasValidShape() != true ||
+            revisionHint.syncOrigin != syncOrigin ||
+            revisionHint.configurationId != configurationId ||
+            revisionHint.revisionNumber < revision.revisionNumber ||
             !matchesPublishedPlanAfterValidation(state.schedule)
         ) {
             return false
@@ -1537,6 +1777,181 @@ data class PublishedScheduleProofSnapshot(
         private val NIL_PUBLICATION_UUID = UUID(0L, 0L)
     }
 }
+
+@Serializable
+enum class PublishedOccurrenceStateSnapshot {
+    @SerialName("generated")
+    GENERATED,
+
+    @SerialName("completed")
+    COMPLETED,
+
+    @SerialName("paused")
+    PAUSED,
+
+    @SerialName("skipped")
+    SKIPPED,
+    ;
+
+    companion object {
+        fun fromWire(value: String): PublishedOccurrenceStateSnapshot = when (value) {
+            "generated" -> GENERATED
+            "completed" -> COMPLETED
+            "paused" -> PAUSED
+            "skipped" -> SKIPPED
+            else -> throw IllegalArgumentException("Unsupported published occurrence state")
+        }
+    }
+}
+
+/** Exact state of one occurrence in a particular published schedule revision. */
+@Serializable
+data class PublishedOccurrenceMembershipSnapshot(
+    val plannerOccurrenceId: String,
+    val seriesItemId: String,
+    val state: PublishedOccurrenceStateSnapshot,
+) {
+    fun hasValidShape(): Boolean = runCatching {
+        val occurrenceId = UUID.fromString(plannerOccurrenceId)
+        require(
+            occurrenceId != NIL_PUBLISHED_OCCURRENCE_UUID && occurrenceId.version() == 5 &&
+                occurrenceId.toString() == plannerOccurrenceId,
+        )
+        val itemId = UUID.fromString(seriesItemId)
+        require(itemId != NIL_PUBLISHED_OCCURRENCE_UUID && itemId.toString() == seriesItemId)
+    }.isSuccess
+
+    private companion object {
+        val NIL_PUBLISHED_OCCURRENCE_UUID = UUID(0L, 0L)
+    }
+}
+
+/** Durable, content-free high-water learned from a current response, publish receipt, or SSE. */
+@Serializable
+data class PublishedScheduleRevisionHintSnapshot(
+    val syncOrigin: String,
+    val configurationId: String,
+    val revisionNumber: ULong,
+) {
+    fun hasValidShape(): Boolean =
+        syncOrigin.isNotBlank() && syncOrigin.length <= 4_096 &&
+            syncOrigin.none(Char::isISOControl) && configurationId.isNotBlank() &&
+            configurationId.length <= 4_096 && configurationId.none(Char::isISOControl) &&
+            revisionNumber in 1uL..Long.MAX_VALUE.toULong()
+}
+
+/**
+ * Encrypted authority for occurrence membership in the newest schedule head observed by this
+ * binding. Unlike [PublishedScheduleProofSnapshot], it is independent of the rendered block list
+ * and therefore survives an on-device composition without granting block execution authority.
+ */
+@Serializable
+data class PublishedOccurrenceMembershipProofSnapshot(
+    val schemaVersion: Int,
+    val syncOrigin: String,
+    val configurationId: String,
+    val revision: PublishedScheduleRevisionSnapshot,
+    val occurrences: List<PublishedOccurrenceMembershipSnapshot>,
+) {
+    fun hasValidShape(): Boolean = runCatching {
+        require(schemaVersion == CURRENT_SCHEMA_VERSION)
+        require(
+            syncOrigin.isNotBlank() && syncOrigin.length <= MAX_BINDING_CHARS &&
+                syncOrigin.none(Char::isISOControl),
+        )
+        require(
+            configurationId.isNotBlank() && configurationId.length <= MAX_BINDING_CHARS &&
+                configurationId.none(Char::isISOControl),
+        )
+        val revisionId = UUID.fromString(revision.id)
+        require(revisionId != NIL_UUID && revisionId.toString() == revision.id)
+        require(revision.revisionNumber > 0uL)
+        require(revision.revision == "${revision.revisionNumber}:${revision.id}")
+        require(
+            revision.inputDigest.length == 71 && revision.inputDigest.startsWith("sha256:") &&
+                revision.inputDigest.drop(7).all { it in '0'..'9' || it in 'a'..'f' },
+        )
+        val horizonStart = Instant.parse(revision.horizonStart)
+        val horizonEnd = Instant.parse(revision.horizonEnd)
+        require(horizonStart < horizonEnd)
+        require(Duration.between(horizonStart, horizonEnd) <= MAX_HORIZON_DURATION)
+        require(
+            revision.timezoneName.isNotBlank() && revision.timezoneName.length <= 255 &&
+                revision.timezoneName.none(Char::isISOControl) &&
+                revision.timezoneName in SERVER_NAMED_TIMEZONE_IDS,
+        )
+        requireNotNull(runCatching { ZoneId.of(revision.timezoneName) }.getOrNull())
+        requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
+        require(occurrences.size <= MAX_OCCURRENCES)
+        require(occurrences.all(PublishedOccurrenceMembershipSnapshot::hasValidShape))
+        require(occurrences.map { it.plannerOccurrenceId }.distinct().size == occurrences.size)
+        require(occurrences == occurrences.sortedWith(OCCURRENCE_ORDER))
+    }.isSuccess
+
+    internal fun currentAuthority(
+        revisionHint: PublishedScheduleRevisionHintSnapshot?,
+        syncOrigin: String?,
+        configurationId: String?,
+    ): CurrentPublishedOccurrenceMembershipAuthority? {
+        if (
+            !hasValidShape() || revisionHint?.hasValidShape() != true ||
+            revisionHint.syncOrigin != this.syncOrigin ||
+            revisionHint.configurationId != this.configurationId ||
+            revisionHint.revisionNumber != revision.revisionNumber ||
+            this.syncOrigin != syncOrigin || this.configurationId != configurationId
+        ) {
+            return null
+        }
+        return CurrentPublishedOccurrenceMembershipAuthority(
+            horizonStart = Instant.parse(revision.horizonStart),
+            horizonEnd = Instant.parse(revision.horizonEnd),
+            occurrencesByPlannerId = occurrences.associateBy {
+                it.plannerOccurrenceId
+            },
+        )
+    }
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+        const val MAX_OCCURRENCES = 200_000
+        private const val MAX_BINDING_CHARS = 4_096
+        private val MAX_HORIZON_DURATION: Duration = Duration.ofDays(90)
+        private val NIL_UUID = UUID(0L, 0L)
+        private val OCCURRENCE_ORDER = compareBy<PublishedOccurrenceMembershipSnapshot>(
+            PublishedOccurrenceMembershipSnapshot::plannerOccurrenceId,
+        ).thenBy(PublishedOccurrenceMembershipSnapshot::seriesItemId)
+    }
+}
+
+internal data class CurrentPublishedOccurrenceMembershipAuthority(
+    val horizonStart: Instant,
+    val horizonEnd: Instant,
+    val occurrencesByPlannerId: Map<String, PublishedOccurrenceMembershipSnapshot>,
+) {
+    fun authorizesReductionTarget(target: HabitOccurrenceSnapshot): Boolean {
+        val targetStart = runCatching { Instant.parse(target.evidence.windowStart) }.getOrNull()
+            ?: return false
+        val targetEnd = runCatching { Instant.parse(target.evidence.windowEnd) }.getOrNull()
+            ?: return false
+        if (horizonStart > targetStart || horizonEnd < targetEnd) return true
+        val member = occurrencesByPlannerId[target.evidence.plannerOccurrenceId] ?: return false
+        return member.seriesItemId == target.evidence.habitId &&
+            member.state in setOf(
+                PublishedOccurrenceStateSnapshot.GENERATED,
+                PublishedOccurrenceStateSnapshot.SKIPPED,
+            )
+    }
+}
+
+private fun PublishedOccurrenceMembershipProofSnapshot?.currentAuthority(
+    revisionHint: PublishedScheduleRevisionHintSnapshot?,
+    syncOrigin: String?,
+    configurationId: String?,
+): CurrentPublishedOccurrenceMembershipAuthority? = this?.currentAuthority(
+    revisionHint = revisionHint,
+    syncOrigin = syncOrigin,
+    configurationId = configurationId,
+)
 
 internal fun publishedScheduleValidationComputationCount(): Long =
     PUBLISHED_SCHEDULE_VALIDATION_COMPUTATIONS.get()
@@ -1750,6 +2165,10 @@ data class DayWeaveUiState(
     val publishedScheduleRevision: PublishedScheduleRevisionSnapshot? = null,
     /** Exact, encrypted publication authority. Legacy revision receipts are not actionable. */
     val publishedScheduleProof: PublishedScheduleProofSnapshot? = null,
+    /** Exact current-head occurrence membership; never grants rendered-block authority. */
+    val publishedOccurrenceMembershipProof: PublishedOccurrenceMembershipProofSnapshot? = null,
+    /** Binding-scoped schedule head high-water, retained even without membership authority. */
+    val publishedScheduleRevisionHint: PublishedScheduleRevisionHintSnapshot? = null,
     /** Content-free identity of the exact item reviewed during onboarding. */
     val onboardingFirstItemAnchor: OnboardingFirstItemAnchorSnapshot? = null,
     val scheduleInputDigest: String? = null,
@@ -1845,6 +2264,7 @@ data class DayWeaveUiState(
             canonicalSyncOrigin == previous.canonicalSyncOrigin &&
             canonicalConfigurationId == previous.canonicalConfigurationId &&
             publishedScheduleRevision === previous.publishedScheduleRevision &&
+            publishedScheduleRevisionHint === previous.publishedScheduleRevisionHint &&
             scheduleInputDigest == previous.scheduleInputDigest &&
             scheduleGeneratedAt == previous.scheduleGeneratedAt &&
             schedulePlanningZoneId == previous.schedulePlanningZoneId
@@ -1901,6 +2321,9 @@ data class DayWeaveUiState(
             previous.pendingSchedulePublicationInvalidated &&
             publishedScheduleRevision === previous.publishedScheduleRevision &&
             publishedScheduleProof === previous.publishedScheduleProof &&
+            publishedOccurrenceMembershipProof ===
+            previous.publishedOccurrenceMembershipProof &&
+            publishedScheduleRevisionHint === previous.publishedScheduleRevisionHint &&
             scheduleInputDigest == previous.scheduleInputDigest &&
             localScheduleCompositionProvenance ===
             previous.localScheduleCompositionProvenance
@@ -2182,7 +2605,8 @@ data class DayWeaveUiState(
         if (canonicalSyncOrigin == null) return true
         val effectiveZone = scheduleCompositionProfile.effectivePlanningZone(currentZone)
             ?: return false
-        return isPublishedScheduleDisplayCurrent(reference, effectiveZone, requireSameZone = true)
+        return publishedScheduleProof?.matchesCurrentStateAndPlan(this) == true &&
+            isPublishedScheduleDisplayCurrent(reference, effectiveZone, requireSameZone = true)
     }
 
     /**
@@ -2201,7 +2625,7 @@ data class DayWeaveUiState(
     ): Boolean {
         if (pendingSchedulePublication != null || canonicalSyncOrigin == null) return false
         val proof = publishedScheduleProof ?: return false
-        if (!proof.matchesCurrentStateAndPlan(this)) {
+        if (!proof.matchesCurrentStateAndPlanForDisplay(this)) {
             return false
         }
         val zone = schedulePlanningZoneId?.let { raw ->

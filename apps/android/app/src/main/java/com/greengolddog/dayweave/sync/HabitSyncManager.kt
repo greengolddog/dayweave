@@ -2,12 +2,19 @@ package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
+import com.greengolddog.dayweave.model.HabitMissedExplicitActionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedPolicySnapshot
+import com.greengolddog.dayweave.model.HabitMissedReconcileCommandSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolveCommandSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeCommandSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitPauseResumeCommandSnapshot
 import com.greengolddog.dayweave.model.HabitPauseSnapshot
 import com.greengolddog.dayweave.model.HabitPauseStartCommandSnapshot
+import com.greengolddog.dayweave.model.PendingHabitMissedReconcile
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
@@ -68,6 +75,7 @@ class HabitSyncManager(
     private val transport: HabitTransport,
     private val now: () -> Instant = Instant::now,
     private val newUuid: () -> UUID = UUID::randomUUID,
+    private val newReconciliationUuid: () -> UUID = UUID::randomUUID,
 ) {
     private val operationMutex = Mutex()
     private val mutableState = MutableStateFlow(initialState())
@@ -86,6 +94,7 @@ class HabitSyncManager(
                 configuration.withBindingOperation {
                     ensureBound(configuration)
                     replayPending(configuration)
+                    reconcileMissed(configuration)
                     pullDelta(configuration)
                 }
                 completeSuccessfulSync("Habit history is synchronized across devices")
@@ -108,6 +117,12 @@ class HabitSyncManager(
                 configuration.withBindingOperation {
                     ensureBound(configuration)
                     replayPending(configuration)
+                    reconcileMissed(configuration)
+                    // Reconciliation is workspace-wide while the range request below is scoped to
+                    // one habit. Drain the authoritative delta before returning so resolutions for
+                    // every habit survive even though reconciliation response projections are
+                    // intentionally not trusted as cache authority.
+                    pullDelta(configuration)
                     var cursor: String? = null
                     var pages = 0
                     val seenCursors = mutableSetOf<String>()
@@ -165,6 +180,8 @@ class HabitSyncManager(
                 configuration.withBindingOperation {
                     ensureBound(configuration)
                     replayPending(configuration)
+                    reconcileMissed(configuration)
+                    pullDelta(configuration)
                     val requestedBucket = when (bucket) {
                         HabitAnalyticsBucketSnapshot.DAY -> RemoteHabitAnalyticsBucket.DAY
                         HabitAnalyticsBucketSnapshot.WEEK -> RemoteHabitAnalyticsBucket.WEEK
@@ -233,6 +250,42 @@ class HabitSyncManager(
                 mutableState.value = HabitSyncState(
                     CanonicalSyncPhase.READY,
                     "Habit change saved securely · synchronizing when possible",
+                )
+                HabitSyncOutcome.SUCCESS
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
+    /**
+     * Durably records an explicit ask-policy decision before any request can leave the device.
+     * Carry windows and reduction targets are intentionally absent from the command.
+     */
+    suspend fun stageMissedResolution(
+        habitId: String,
+        occurrenceId: String,
+        observedMissedRevision: Long,
+        action: HabitMissedExplicitActionSnapshot,
+    ): HabitSyncOutcome = withReadyStore {
+        operationMutex.withLock {
+            val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
+            updateBusy("Saving missed habit choice securely…")
+            try {
+                configuration.withBindingOperation {
+                    ensureBound(configuration)
+                    val pending = createMissedResolutionMutation(
+                        configuration = configuration,
+                        habitId = habitId,
+                        occurrenceId = occurrenceId,
+                        observedMissedRevision = observedMissedRevision,
+                        action = action,
+                    )
+                    awaitDurable(plannerStore.stageHabitMutation(pending))
+                }
+                mutableState.value = HabitSyncState(
+                    CanonicalSyncPhase.READY,
+                    "Missed habit choice saved securely · synchronizing when possible",
                 )
                 HabitSyncOutcome.SUCCESS
             } catch (error: Throwable) {
@@ -386,6 +439,49 @@ class HabitSyncManager(
         )
     }
 
+    private fun createMissedResolutionMutation(
+        configuration: AuthenticatedApiConfiguration,
+        habitId: String,
+        occurrenceId: String,
+        observedMissedRevision: Long,
+        action: HabitMissedExplicitActionSnapshot,
+    ): PendingHabitMutation {
+        val occurrence = plannerStore.state.value.habitLedger.occurrences[occurrenceId]
+            ?: throw InvalidLocalHabitStateException("The habit occurrence is not cached")
+        if (occurrence.evidence.habitId != habitId) {
+            throw InvalidLocalHabitStateException("The occurrence belongs to another habit")
+        }
+        val resolution = occurrence.missedResolution
+            ?: throw InvalidLocalHabitStateException("The missed habit decision is not cached")
+        if (
+            resolution.revision != observedMissedRevision ||
+            resolution.configuredPolicy != HabitMissedPolicySnapshot.ASK ||
+            resolution.action != HabitMissedResolutionActionSnapshot.DecisionRequired
+        ) {
+            throw InvalidLocalHabitStateException(
+                "Missed habit choice changed since it was opened · review it and try again",
+            )
+        }
+        val operationId = canonicalNewUuid()
+        val command = HabitMissedResolveCommandSnapshot(
+            operationId = operationId,
+            expectedRevision = observedMissedRevision,
+            action = action,
+        )
+        return PendingHabitMutation(
+            schemaVersion = PendingHabitMutation.CURRENT_SCHEMA_VERSION,
+            kind = PendingHabitMutationKind.MISSED_RESOLUTION,
+            habitId = habitId,
+            targetId = occurrenceId,
+            expectedRevision = observedMissedRevision,
+            idempotencyKey = operationId,
+            requestJson = command.encoded(),
+            createdAt = canonicalNow(),
+            syncOrigin = configuration.baseUrl.toString(),
+            configurationId = requireConfigurationId(configuration),
+        )
+    }
+
     private suspend fun ensureBound(configuration: AuthenticatedApiConfiguration) {
         val origin = configuration.baseUrl.toString()
         val configurationId = requireConfigurationId(configuration)
@@ -400,6 +496,7 @@ class HabitSyncManager(
     }
 
     private suspend fun replayPending(configuration: AuthenticatedApiConfiguration) {
+        rotateExpiredMissedReconcileJournal()
         val pending = plannerStore.state.value.habitLedger.pendingMutations.toList()
         pending.filter { it.disposition == PendingHabitMutationDisposition.PENDING }
             .forEach { replayOne(configuration, it) }
@@ -456,6 +553,22 @@ class HabitSyncManager(
                         plannerStore.reconcileHabitPause(
                             pending.idempotencyKey,
                             HabitPauseSnapshot.fromRemote(mutation.value),
+                        ),
+                    )
+                }
+                PendingHabitMutationKind.MISSED_RESOLUTION -> {
+                    val mutation = transport.putMissedResolution(
+                        configuration,
+                        pending.habitId,
+                        pending.targetId,
+                        pending.idempotencyKey,
+                        pending.requestJson,
+                    )
+                    ensureConfigurationCurrent(configuration)
+                    awaitDurable(
+                        plannerStore.reconcileHabitMissedResolution(
+                            pending.idempotencyKey,
+                            HabitMissedResolutionSnapshot.fromRemote(mutation.value),
                         ),
                     )
                 }
@@ -554,6 +667,77 @@ class HabitSyncManager(
         }
     }
 
+    /**
+     * Advances overdue policy projections using only the server clock. Each page command contains
+     * an operation ID and nothing that could let this client invent a carry window or target.
+     */
+    private suspend fun reconcileMissed(configuration: AuthenticatedApiConfiguration) {
+        // The response projection is intentionally not trusted as cache authority. Revoke the
+        // prior terminal checkpoint durably before the first server write so response loss or
+        // coroutine cancellation cannot leave stale composition data marked complete.
+        awaitDurable(
+            plannerStore.markHabitDeltaIncompleteForReconciliation(
+                configuration.baseUrl.toString(),
+                requireConfigurationId(configuration),
+            ),
+        )
+        var pages = 0
+        var recoveredRequestNeedsFreshScan =
+            plannerStore.state.value.habitLedger.pendingMissedReconcile != null
+        while (true) {
+            val isRecoveredRequest = recoveredRequestNeedsFreshScan
+            if (!isRecoveredRequest && ++pages > MAX_MISSED_RECONCILE_PAGE_CHAIN) {
+                throw InvalidHabitProtocolException()
+            }
+            val pending = plannerStore.state.value.habitLedger.pendingMissedReconcile ?: run {
+                val operationId = canonicalUuid(newReconciliationUuid())
+                val command = HabitMissedReconcileCommandSnapshot(operationId)
+                PendingHabitMissedReconcile(
+                    idempotencyKey = operationId,
+                    requestJson = command.encoded(),
+                    limit = MAX_HABIT_RESPONSE_PAGE_LIMIT,
+                    createdAt = canonicalNow(),
+                ).also { journal ->
+                    awaitDurable(plannerStore.stageHabitMissedReconcile(journal))
+                }
+            }
+            pending.requireValid()
+            val page = transport.reconcileMissed(
+                configuration = configuration,
+                idempotencyKey = pending.idempotencyKey,
+                requestJson = pending.requestJson,
+                limit = pending.limit,
+            )
+            if (
+                page.resolutions.size > pending.limit ||
+                page.hasMore && page.resolutions.isEmpty()
+            ) {
+                throw InvalidHabitProtocolException()
+            }
+            ensureConfigurationCurrent(configuration)
+            awaitDurable(
+                plannerStore.acknowledgeHabitMissedReconcile(pending.idempotencyKey),
+            )
+            if (isRecoveredRequest) {
+                // Exact replay closes the ambiguous request; it is not a current server-clock scan.
+                recoveredRequestNeedsFreshScan = false
+                continue
+            }
+            if (!page.hasMore) return
+        }
+    }
+
+    /**
+     * The server retains empty-scan receipts for 24 hours. Rotate locally after 12 so a stale retry
+     * never approaches that boundary; the atomic store transition keeps delta authority revoked.
+     */
+    private suspend fun rotateExpiredMissedReconcileJournal() {
+        val pending = plannerStore.state.value.habitLedger.pendingMissedReconcile ?: return
+        val cutoff = now().minus(MISSED_RECONCILE_JOURNAL_LEASE)
+        if (Instant.parse(pending.createdAt).isAfter(cutoff)) return
+        awaitDurable(plannerStore.rotateExpiredHabitMissedReconcile(cutoff))
+    }
+
     private suspend fun awaitDurable(receipt: PlannerPersistenceReceipt?) {
         if (receipt == null || !receipt.awaitDurable()) throw LocalHabitStorageException()
     }
@@ -647,7 +831,10 @@ class HabitSyncManager(
     }
 
     private fun canonicalNewUuid(): String {
-        val value = newUuid()
+        return canonicalUuid(newUuid())
+    }
+
+    private fun canonicalUuid(value: UUID): String {
         if (value == UUID(0L, 0L)) throw InvalidLocalHabitStateException("UUID source returned nil")
         return value.toString()
     }
@@ -786,12 +973,15 @@ class HabitSyncManager(
             MAX_HABIT_RECORDS_PER_OPERATION / MAX_HABIT_RESPONSE_PAGE_LIMIT
         const val MAX_DELTA_PAGE_CHAIN =
             MAX_HABIT_RECORDS_PER_OPERATION / MAX_HABIT_RESPONSE_PAGE_LIMIT
+        const val MAX_MISSED_RECONCILE_PAGE_CHAIN =
+            MAX_HABIT_RECORDS_PER_OPERATION / MAX_HABIT_RESPONSE_PAGE_LIMIT
         const val INVALID_DELTA_CURSOR_STATUS = 400
         const val MIN_HABIT_DATE_YEAR = 1900
         const val MAX_HABIT_DATE_YEAR = 2200
         const val MAX_HABIT_RANGE_DAYS = 366
         val MUTATION_PAST_LIMIT: Duration = Duration.ofDays(366L * 20)
         val MUTATION_FUTURE_LIMIT: Duration = Duration.ofMinutes(5)
+        val MISSED_RECONCILE_JOURNAL_LEASE: Duration = Duration.ofHours(12)
 
         fun initialState() = HabitSyncState(
             CanonicalSyncPhase.NOT_CONFIGURED,

@@ -545,6 +545,17 @@ class GoogleSchedulePublicationCoordinator(
             ),
         )
         requireCurrent(lifecycle, binding)
+        if (
+            plannerStore.durableState.value?.pendingGoogleSchedulePublication != journal ||
+            !sourceAndTargetRemainCurrent(journal)
+        ) {
+            return failure(
+                lifecycle,
+                GoogleSchedulePublicationPhase.RECOVERY_REQUIRED,
+                "The published schedule or destination changed. Nothing was sent.",
+                GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED,
+            )
+        }
         val accepted = transport.enqueueSchedulePublication(
             binding.configuration,
             journal.accountId,

@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.model.OnboardingFirstItemAnchorSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.network.DeviceAuthPhase
@@ -414,6 +415,11 @@ class OnboardingReadinessProjectionTest {
             onboardingFirstItemAnchor = OnboardingFirstItemAnchorSnapshot(ITEM_ID, 1),
             publishedScheduleRevision = revision,
             publishedScheduleProof = proof,
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = proof.syncOrigin,
+                configurationId = proof.configurationId,
+                revisionNumber = revision.revisionNumber,
+            ),
             scheduleInputDigest = PLAN_DIGEST,
             scheduleGeneratedAt = proof.asOf,
             schedulePlanningZoneId = "UTC",

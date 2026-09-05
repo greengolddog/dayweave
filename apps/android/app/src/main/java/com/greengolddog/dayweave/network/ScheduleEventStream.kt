@@ -28,7 +28,7 @@ fun interface ScheduleInvalidationStreamTransport {
     suspend fun collect(
         configuration: AuthenticatedApiConfiguration,
         lastDurableRevision: ULong,
-        onInvalidation: (ULong) -> Unit,
+        onInvalidation: suspend (ULong) -> Unit,
     ): ScheduleInvalidationStreamEnd
 }
 
@@ -57,7 +57,7 @@ class OkHttpScheduleInvalidationStreamTransport(
     override suspend fun collect(
         configuration: AuthenticatedApiConfiguration,
         lastDurableRevision: ULong,
-        onInvalidation: (ULong) -> Unit,
+        onInvalidation: suspend (ULong) -> Unit,
     ): ScheduleInvalidationStreamEnd {
         val activeCall = AtomicReference<Call?>()
         val url = configuration.baseUrl.newBuilder()
@@ -113,7 +113,7 @@ class OkHttpScheduleInvalidationStreamTransport(
     private suspend fun collectSuccessfulResponse(
         response: Response,
         lastDurableRevision: ULong,
-        onInvalidation: (ULong) -> Unit,
+        onInvalidation: suspend (ULong) -> Unit,
     ): ScheduleInvalidationStreamEnd {
         if (
             !response.hasStrictEventStreamMediaType() ||
@@ -190,7 +190,7 @@ internal class ScheduleInvalidationSseParser(initialRevision: ULong) {
     private var eventCount = 0
     private var frameCount = 0
 
-    fun parse(input: InputStream, onInvalidation: (ULong) -> Unit) {
+    suspend fun parse(input: InputStream, onInvalidation: suspend (ULong) -> Unit) {
         var frame = Frame()
         var frameBytes = 0
         var lineCount = 0
@@ -307,7 +307,9 @@ private fun String.parseCanonicalScheduleRevision(): ULong {
         scheduleProtocolFailure()
     }
     if (any { it !in '0'..'9' }) scheduleProtocolFailure()
-    return toULongOrNull()?.takeIf { it.toString() == this } ?: scheduleProtocolFailure()
+    return toULongOrNull()?.takeIf {
+        it <= Long.MAX_VALUE.toULong() && it.toString() == this
+    } ?: scheduleProtocolFailure()
 }
 
 private fun checkedScheduleAdd(left: Int, right: Int): Int = try {

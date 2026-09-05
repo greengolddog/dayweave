@@ -432,19 +432,62 @@ class DayWeaveApplication : Application() {
             streamTransport = OkHttpScheduleInvalidationStreamTransport(),
             durableCursor = {
                 val durable = plannerStore.durableState.value
-                val proof = durable?.publishedScheduleProof?.takeIf { candidate ->
-                    candidate.matchesCurrentStateAndPlan(durable)
+                val syncOrigin = durable?.canonicalSyncOrigin
+                val configurationId = durable?.canonicalConfigurationId
+                val hint = durable?.publishedScheduleRevisionHint?.takeIf { candidate ->
+                    candidate.hasValidShape() && candidate.syncOrigin == syncOrigin &&
+                        candidate.configurationId == configurationId
                 }
+                val proof = durable?.let { snapshot ->
+                    snapshot.publishedOccurrenceMembershipProof?.takeIf { candidate ->
+                        candidate.hasValidShape() &&
+                            candidate.syncOrigin == syncOrigin &&
+                            candidate.configurationId == configurationId &&
+                            hint?.revisionNumber?.let { it >= candidate.revision.revisionNumber } ==
+                            true
+                    }
+                }
+                val installedRevision = maxOf(
+                    proof?.revision?.revisionNumber ?: 0uL,
+                    durable?.publishedScheduleRevision?.revisionNumber ?: 0uL,
+                )
                 DurableScheduleInvalidationCursor(
-                    syncOrigin = proof?.syncOrigin,
-                    configurationId = proof?.configurationId,
-                    revision = proof?.revision?.revisionNumber ?: 0uL,
+                    syncOrigin = syncOrigin,
+                    configurationId = configurationId,
+                    revision = installedRevision,
+                    latestObservedRevision = maxOf(
+                        installedRevision,
+                        hint?.revisionNumber ?: 0uL,
+                    ),
                 )
             },
+            recordRevisionHint = { syncOrigin, configurationId, revision ->
+                val durableHint = plannerStore.durableState.value
+                    ?.publishedScheduleRevisionHint
+                if (
+                    durableHint?.syncOrigin == syncOrigin &&
+                    durableHint.configurationId == configurationId &&
+                    durableHint.revisionNumber >= revision
+                ) {
+                    true
+                } else {
+                    plannerStore.recordPublishedScheduleRevisionHint(
+                        syncOrigin = syncOrigin,
+                        configurationId = configurationId,
+                        revisionNumber = revision,
+                    )?.awaitDurable() == true
+                }
+            },
             tryLaunchAuthoritativeRefresh = ::launchCanonicalAction,
-            authoritativeRefresh = {
-                canonicalSyncManager.refreshCurrentPublishedSchedule() ==
-                    CanonicalRefreshOutcome.SUCCESS
+            authoritativeRefresh = { epochResetFence ->
+                val outcome = if (epochResetFence == null) {
+                    canonicalSyncManager.refreshCurrentPublishedSchedule()
+                } else {
+                    canonicalSyncManager.refreshCurrentPublishedScheduleAfterCursorReset(
+                        epochResetFence,
+                    )
+                }
+                outcome == CanonicalRefreshOutcome.SUCCESS
             },
         )
     }

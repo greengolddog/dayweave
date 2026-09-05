@@ -4,6 +4,7 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsBucketSnapshot
 import com.greengolddog.dayweave.model.HabitAnalyticsSnapshot
 import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeSnapshot
@@ -13,8 +14,11 @@ import com.greengolddog.dayweave.model.HabitSupportiveFactCodeSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.ScheduleItemPresentationSlice
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.effectiveHabitMissedProjection
 import com.greengolddog.dayweave.model.hasAtMostUnicodeScalars
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -63,6 +67,15 @@ internal data class HabitChoice(
     val isSensitive: Boolean,
 ) {
     override fun toString(): String = "HabitChoice(id=$id, content=<redacted>)"
+}
+
+internal data class HabitMissedDecisionRow(
+    val occurrence: HabitOccurrenceSnapshot,
+    val title: String,
+    val isSensitive: Boolean,
+) {
+    override fun toString(): String =
+        "HabitMissedDecisionRow(occurrenceId=${occurrence.evidence.id}, content=<redacted>)"
 }
 
 internal enum class HabitStatisticsRange(val days: Long, val label: String) {
@@ -319,6 +332,46 @@ internal fun reviewedHabitMutations(ledger: HabitLedgerSnapshot): List<PendingHa
     ledger.pendingMutations
         .filter { it.disposition != PendingHabitMutationDisposition.PENDING }
         .sortedByDescending(PendingHabitMutation::createdAt)
+
+internal fun missedHabitDecisions(
+    canonicalItems: List<CanonicalItemSnapshot>,
+    ledger: HabitLedgerSnapshot,
+    publishedOccurrenceMembershipProof: PublishedOccurrenceMembershipProofSnapshot? = null,
+    publishedScheduleRevisionHint: PublishedScheduleRevisionHintSnapshot? = null,
+    syncOrigin: String? = null,
+    configurationId: String? = null,
+): List<HabitMissedDecisionRow> {
+    val items = canonicalItems.associateBy(CanonicalItemSnapshot::id)
+    val effectiveMissed = effectiveHabitMissedProjection(
+        items,
+        ledger.occurrences.values,
+        ledger.pauses.values,
+        publishedOccurrenceMembershipProof,
+        publishedScheduleRevisionHint,
+        syncOrigin,
+        configurationId,
+    )
+    return ledger.occurrences.values.asSequence()
+        .filter { occurrence ->
+            effectiveMissed.actionsByEvidenceId[occurrence.evidence.id] ==
+                HabitMissedResolutionActionSnapshot.DecisionRequired
+        }
+        .sortedWith(
+            compareBy<HabitOccurrenceSnapshot> { Instant.parse(it.evidence.windowEnd) }
+                .thenBy { it.evidence.id },
+        )
+        .map { occurrence ->
+            val item = items[occurrence.evidence.habitId]
+            HabitMissedDecisionRow(
+                occurrence = occurrence,
+                title = item?.title?.ifBlank { "Habit" } ?: "Private habit",
+                isSensitive = item?.let {
+                    effectiveCanonicalSensitivity(canonicalItems, it.id)
+                } ?: true,
+            )
+        }
+        .toList()
+}
 
 internal fun HabitOutcomeDraft.validate(occurredAt: String): HabitOutcomeDraftValidation {
     if (status == HabitOutcomeStatusSnapshot.UNRESOLVED) {

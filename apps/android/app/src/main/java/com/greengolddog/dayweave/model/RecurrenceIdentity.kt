@@ -33,6 +33,10 @@ internal fun recurrenceIdentityObject(raw: String?): JsonObject? {
 internal fun recurrenceIdentityType(raw: String?): String? =
     recurrenceIdentityObject(raw)?.exactString("type")
 
+/** Stable scheduler ordinal for already-validated server occurrence evidence. */
+internal fun recurrenceIdentityOrdinal(identity: JsonObject): Long? =
+    identity.takeIf(JsonObject::hasValidRecurrenceIdentityShape)?.let(::stableOrdinal)
+
 internal fun UUID.isRfc4122Version5(): Boolean = version() == 5 && variant() == 2
 
 /** Validates the complete persisted source envelope against its current canonical series. */

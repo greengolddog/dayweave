@@ -6,6 +6,8 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
+import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
+import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
@@ -15,18 +17,24 @@ import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipSnapshot
+import com.greengolddog.dayweave.model.PublishedOccurrenceStateSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
+import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.exactFirmHorizonDayCount
+import com.greengolddog.dayweave.model.effectiveHabitMissedProjection
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
 import com.greengolddog.dayweave.model.hasLegacyEquivalentStructuralMetadata
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.recurrenceIdentityObject
+import com.greengolddog.dayweave.model.recurrenceIdentityOrdinal
 import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.model.toApprovalEnvelope
@@ -376,9 +384,19 @@ class CanonicalSyncManager(
 
     /**
      * Recovers the server's exact immutable schedule head without previewing or publishing.
-     * SSE callers use this same path; a revision hint itself never mutates planner state.
+     * SSE callers use this same path. A cursor-ahead reset may authorize one exact lower epoch head
+     * only when the durable rejected cursor is still unchanged at the final install boundary.
      */
-    suspend fun refreshCurrentPublishedSchedule(): CanonicalRefreshOutcome {
+    suspend fun refreshCurrentPublishedSchedule(): CanonicalRefreshOutcome =
+        refreshCurrentPublishedScheduleInternal(epochResetFence = null)
+
+    internal suspend fun refreshCurrentPublishedScheduleAfterCursorReset(
+        epochResetFence: ScheduleRevisionEpochResetFence,
+    ): CanonicalRefreshOutcome = refreshCurrentPublishedScheduleInternal(epochResetFence)
+
+    private suspend fun refreshCurrentPublishedScheduleInternal(
+        epochResetFence: ScheduleRevisionEpochResetFence?,
+    ): CanonicalRefreshOutcome {
         val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
         if (loadState != PlannerLoadState.READY) {
             updateError("Encrypted planner storage is unavailable; the cached plan was kept.")
@@ -388,6 +406,14 @@ class CanonicalSyncManager(
             val resolution = authenticatedConfiguration()
             if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
             val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            if (
+                epochResetFence != null &&
+                (epochResetFence.syncOrigin != configuration.baseUrl.toString() ||
+                    epochResetFence.configurationId != configuration.configurationId)
+            ) {
+                updateError("API connection changed; the rejected schedule cursor was discarded.")
+                return@withLock CanonicalRefreshOutcome.CONFIGURATION_ERROR
+            }
             mutableState.value = CanonicalSyncState(
                 phase = CanonicalSyncPhase.SYNCING,
                 message = "Checking the current published schedule…",
@@ -412,8 +438,9 @@ class CanonicalSyncManager(
                             expectedState = expected,
                             syncOrigin = configuration.baseUrl.toString(),
                             configurationId = requireNotNull(configuration.configurationId),
+                            epochResetFromRevision = epochResetFence?.rejectedRevision,
                         )
-                        if (receipt != null && !receipt.awaitDurable()) {
+                        if (receipt == null || !receipt.awaitDurable()) {
                             throw LocalPlannerStorageException()
                         }
                         ensureConfigurationCurrent(configuration)
@@ -432,8 +459,9 @@ class CanonicalSyncManager(
                             expectedState = expected,
                             syncOrigin = configuration.baseUrl.toString(),
                             configurationId = requireNotNull(configuration.configurationId),
+                            epochResetFromRevision = epochResetFence?.rejectedRevision,
                         )
-                        if (receipt != null && !receipt.awaitDurable()) {
+                        if (receipt == null || !receipt.awaitDurable()) {
                             throw LocalPlannerStorageException()
                         }
                         ensureConfigurationCurrent(configuration)
@@ -476,8 +504,9 @@ class CanonicalSyncManager(
                         expectedState = expected,
                         update = update,
                         revision = revision,
+                        epochResetFromRevision = epochResetFence?.rejectedRevision,
                     )
-                    if (receipt != null && !receipt.awaitDurable()) {
+                    if (receipt == null || !receipt.awaitDurable()) {
                         throw LocalPlannerStorageException()
                     }
                     ensureConfigurationCurrent(configuration)
@@ -2999,10 +3028,76 @@ class CanonicalSyncManager(
                         it.pendingMutations.isEmpty()
                 )
         }
+        val effectiveMissed = effectiveHabitMissedProjection(
+            itemsById,
+            habitLedger?.occurrences?.values.orEmpty(),
+            habitLedger?.pauses?.values.orEmpty(),
+            cached.publishedOccurrenceMembershipProof,
+            cached.publishedScheduleRevisionHint,
+            cached.canonicalSyncOrigin,
+            cached.canonicalConfigurationId,
+        )
+        val effectiveMissedActions = habitLedger?.occurrences?.values.orEmpty().mapNotNull {
+            occurrence ->
+            effectiveMissed.actionsByEvidenceId[occurrence.evidence.id]?.let { action ->
+                occurrence to action
+            }
+        }
+        val missedSkippedEntries = effectiveMissedActions.asSequence()
+            .flatMap { (occurrence, action) ->
+                val occurrenceIds = when (action) {
+                    HabitMissedResolutionActionSnapshot.Skip -> listOf(
+                        occurrence.evidence.plannerOccurrenceId,
+                    )
+                    is HabitMissedResolutionActionSnapshot.ReduceFrequency ->
+                        action.suppressedPlannerOccurrenceIds.filter { targetId ->
+                            targetId in effectiveMissed.suppressedPlannerOccurrenceIds &&
+                                recurrenceOutcomes.firstOrNull { it.key == targetId }
+                                    ?.value?.status !in setOf(
+                                        ItemStatus.COMPLETED,
+                                        ItemStatus.SKIPPED,
+                                    )
+                        }
+                    is HabitMissedResolutionActionSnapshot.Carry -> {
+                        val start = parseTimestamp(action.windowStart).toInstant()
+                        val end = parseTimestamp(action.windowEnd).toInstant()
+                        if (
+                            start < horizonStart.toInstant() ||
+                            end > horizonEnd.toInstant()
+                        ) {
+                            listOf(occurrence.evidence.plannerOccurrenceId)
+                        } else {
+                            emptyList()
+                        }
+                    }
+                    HabitMissedResolutionActionSnapshot.DecisionRequired,
+                    HabitMissedResolutionActionSnapshot.ReductionPending,
+                    is HabitMissedResolutionActionSnapshot.Cancelled,
+                    -> emptyList<String>()
+                }
+                occurrenceIds.asSequence().map { occurrenceId ->
+                    occurrenceId to RecurrenceOutcomeSnapshot(
+                        itemId = occurrence.evidence.habitId,
+                        status = ItemStatus.SKIPPED,
+                        resolvedAt = requireNotNull(occurrence.missedResolution).updatedAt,
+                    )
+                }
+            }
+            .toList()
+        if (missedSkippedEntries.map { it.first }.distinct().size != missedSkippedEntries.size) {
+            throw RemotePlannerMappingException()
+        }
+        val missedSkippedOccurrences = missedSkippedEntries.toMap()
+        val effectiveSkippedOccurrenceIds = recurrenceOutcomes.asSequence()
+            .filter { (_, outcome) -> outcome.status == ItemStatus.SKIPPED }
+            .mapTo(missedSkippedOccurrences.keys.toMutableSet()) { it.key }
         val partialProgress = habitLedger?.occurrences?.values.orEmpty()
             .asSequence()
             .mapNotNull { occurrence ->
                 val evidence = occurrence.evidence
+                if (evidence.plannerOccurrenceId in effectiveSkippedOccurrenceIds) {
+                    return@mapNotNull null
+                }
                 val outcome = occurrence.outcome?.takeIf {
                     it.status == HabitOutcomeStatusSnapshot.PARTIAL
                 } ?: return@mapNotNull null
@@ -3055,7 +3150,7 @@ class CanonicalSyncManager(
             }
             .sortedWith(compareBy({ it.first }, { it.second }, { it.third }))
             .toList()
-        val recurrenceMoves = (if (sameOrigin) cached.recurrenceMoves else emptyMap()).entries
+        val storedRecurrenceMoves = (if (sameOrigin) cached.recurrenceMoves else emptyMap()).entries
             .sortedBy { it.key }
             .filter { (occurrenceId, _) ->
                 runCatching { UUID.fromString(occurrenceId).version() == 5 }
@@ -3074,6 +3169,62 @@ class CanonicalSyncManager(
                 // preview, then expire immediately after its destination day.
                 movedAt < relevantOutcomeEnd && moveEnd >= horizonStart.toInstant()
             }
+        val missedCarryMoves = effectiveMissedActions.asSequence()
+            .mapNotNull { (occurrence, rawAction) ->
+                val action = rawAction as? HabitMissedResolutionActionSnapshot.Carry
+                    ?: return@mapNotNull null
+                val evidence = occurrence.evidence
+                val item = requireNotNull(itemsById[evidence.habitId])
+                val start = parseTimestamp(action.windowStart).toInstant()
+                val end = parseTimestamp(action.windowEnd).toInstant()
+                // Never send a Move that the bundled scheduler would reject as crossing its
+                // exact composition horizon. The next horizon can safely reconsider it.
+                if (
+                    start < horizonStart.toInstant() || end > horizonEnd.toInstant() ||
+                    start >= end
+                ) {
+                    return@mapNotNull null
+                }
+                val identityJson = validatedRecurrenceIdentityJson(evidence.identity)
+                    ?: throw RemotePlannerMappingException()
+                val ordinal = recurrenceIdentityOrdinal(evidence.identity)
+                    ?: throw RemotePlannerMappingException()
+                val identityType = recurrenceIdentityType(identityJson)
+                evidence.plannerOccurrenceId to RecurrenceMoveSnapshot(
+                    itemId = item.id,
+                    startAt = action.windowStart,
+                    endAt = action.windowEnd,
+                    movedAt = requireNotNull(occurrence.missedResolution).updatedAt,
+                    source = RecurrenceOccurrenceSourceSnapshot(
+                        itemId = item.id,
+                        itemRevision = item.revision,
+                        identityJson = identityJson,
+                        nominalStart = evidence.nominalStart,
+                        nominalEnd = evidence.nominalEnd,
+                        localDate = evidence.localDate.takeIf {
+                            identityType in setOf(
+                                "calendar_day",
+                                "calendar_week",
+                                "calendar_month",
+                                "custom_rule",
+                            )
+                        },
+                        ordinal = ordinal,
+                    ),
+                )
+            }
+            .toList()
+        val missedCarryIds = missedCarryMoves.mapTo(mutableSetOf()) { it.first }
+        // Recurrence exceptions are applied sequentially by the scheduler. Never serialize an
+        // older (or even later-created) caller Move after authoritative habit/outcome suppression,
+        // because that would regenerate an occurrence the authoritative coordinate removed.
+        // A contained missed Carry owns its selector too, replacing any stored caller Move.
+        val authoritativeMoveOwnerIds = effectiveSkippedOccurrenceIds + missedCarryIds
+        val recurrenceMoves = (storedRecurrenceMoves.filterNot {
+            it.key in authoritativeMoveOwnerIds
+        }
+            .map { it.key to it.value } + missedCarryMoves)
+            .sortedBy { it.first }
             .onEach { (occurrenceId, move) ->
                 validateUuid(occurrenceId)
                 validateUuid(move.itemId)
@@ -3096,7 +3247,8 @@ class CanonicalSyncManager(
                 }
             }
         if (
-            recurrenceOutcomes.size + completionAnchors.size + partialProgress.size +
+            (recurrenceOutcomes.map { it.key } + missedSkippedOccurrences.keys).distinct().size +
+            completionAnchors.size + partialProgress.size +
             recurrencePauses.size + recurrenceMoves.size >
             MAX_RECURRENCE_CONTEXT_IDS
         ) {
@@ -3107,6 +3259,19 @@ class CanonicalSyncManager(
             .map { (occurrenceId, _) -> occurrenceId }
         val skippedOccurrences = recurrenceOutcomes
             .filter { (_, outcome) -> outcome.status == ItemStatus.SKIPPED }
+            .associate { it.key to it.value }
+            .toMutableMap()
+            .apply {
+                missedSkippedOccurrences.forEach { (occurrenceId, outcome) ->
+                    get(occurrenceId)?.let { existing ->
+                        if (existing.itemId != outcome.itemId) {
+                            throw RemotePlannerMappingException()
+                        }
+                    }
+                    put(occurrenceId, outcome)
+                }
+            }
+            .toSortedMap()
         val previousSchedule = if (
             sameOrigin &&
             cached.schedulePlanningZoneId == planningZone.id
@@ -3327,7 +3492,7 @@ class CanonicalSyncManager(
             preview.ignoredPreviousAssignments.size > MAX_SCHEDULE_BLOCKS ||
             preview.plan.decisions.size > MAX_SCHEDULE_BLOCKS ||
             preview.plan.violations.size > MAX_SCHEDULE_BLOCKS ||
-            preview.plan.occurrences.size > MAX_SCHEDULE_BLOCKS ||
+            preview.plan.occurrences.size > MAX_PLAN_OCCURRENCES ||
             preview.manualPlacementAssessments.size > MAX_MANUAL_PLACEMENTS
         ) {
             throw RemotePlannerMappingException()
@@ -3637,6 +3802,18 @@ class CanonicalSyncManager(
                     ordinal = occurrence.ordinal,
                 )
             },
+            planOccurrenceMembership = preview.plan.occurrences.map { occurrence ->
+                PublishedOccurrenceMembershipSnapshot(
+                    plannerOccurrenceId = occurrence.id,
+                    seriesItemId = occurrence.seriesItemId,
+                    state = PublishedOccurrenceStateSnapshot.fromWire(occurrence.state),
+                )
+            }.sortedWith(
+                compareBy<PublishedOccurrenceMembershipSnapshot> {
+                    it.plannerOccurrenceId
+                }.thenBy { it.seriesItemId },
+            ),
+            hasExactPlanOccurrenceMembership = true,
             message = message,
         )
     }
@@ -4206,7 +4383,9 @@ class CanonicalSyncManager(
             current.pendingCanonicalAuthoringMutations.isNotEmpty() ||
             current.pendingCanonicalMutation != null ||
             current.publishedScheduleRevision != null ||
-            current.publishedScheduleProof != null
+            current.publishedScheduleProof != null ||
+            current.publishedOccurrenceMembershipProof != null ||
+            current.publishedScheduleRevisionHint != null
         val pendingPublicationMismatch = current.pendingSchedulePublication?.let { pending ->
             pending.syncOrigin != origin || pending.configurationId != configurationId
         } ?: false
@@ -4532,6 +4711,7 @@ class CanonicalSyncManager(
         private const val MAX_DELTA_PAGE_SIZE = 50
         private const val MAX_DELTA_CHANGES = MAX_DELTA_PAGES * MAX_DELTA_PAGE_SIZE
         private const val MAX_SCHEDULE_BLOCKS = 10_000
+        private const val MAX_PLAN_OCCURRENCES = 200_000
         private const val MAX_SCHEDULE_CACHE_ESTIMATED_BYTES = 8L * 1024L * 1024L
         private const val SCHEDULE_ITEM_OBJECT_OVERHEAD_BYTES = 512L
         private const val MAX_PENDING_MUTATION_JSON_CHARS = 2 * 1024 * 1024

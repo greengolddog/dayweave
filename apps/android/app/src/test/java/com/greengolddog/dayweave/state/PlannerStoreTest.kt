@@ -34,6 +34,7 @@ import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
@@ -54,6 +55,7 @@ import com.greengolddog.dayweave.network.prepareProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.prepareProposalUndoHttpRequest
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -657,6 +659,7 @@ class PlannerStoreTest {
                     expectedState = installed,
                     syncOrigin = CANONICAL_ORIGIN,
                     configurationId = "connection-1",
+                    epochResetFromRevision = 1uL,
                 ),
             )
             assertTrue(clear.awaitDurable())
@@ -665,6 +668,141 @@ class PlannerStoreTest {
             assertNull(store.state.value.scheduleInputDigest)
             assertTrue(store.state.value.schedule.isEmpty())
         }
+
+    @Test
+    fun durableHeadHintFencesOlderCurrentUnlessExactCursorEpochResetIsStillCurrent() = runBlocking {
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(canonicalItem("planned", 7)),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            ),
+        )
+        val hintReceipt = requireNotNull(
+            store.recordPublishedScheduleRevisionHint(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revisionNumber = 2uL,
+            ),
+        )
+        assertTrue(hintReceipt.awaitDurable())
+        assertNull(store.state.value.publishedOccurrenceMembershipProof)
+        assertEquals(
+            PublishedScheduleRevisionHintSnapshot(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                2uL,
+            ),
+            store.state.value.publishedScheduleRevisionHint,
+        )
+        val expected = store.state.value
+        val update = canonicalUpdate(
+            item = canonicalItem("planned", 8),
+            block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+            cursor = "cursor-1",
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            store.installCurrentPublishedSchedule(expected, update, publishedRevision())
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.installCurrentPublishedSchedule(
+                expectedState = expected,
+                update = update,
+                revision = publishedRevision(),
+                epochResetFromRevision = 3uL,
+            )
+        }
+        assertNull(store.state.value.publishedOccurrenceMembershipProof)
+        assertEquals(2uL, store.state.value.publishedScheduleRevisionHint?.revisionNumber)
+
+        val resetReceipt = requireNotNull(
+            store.installCurrentPublishedSchedule(
+                expectedState = expected,
+                update = update,
+                revision = publishedRevision(),
+                epochResetFromRevision = 2uL,
+            ),
+        )
+        assertTrue(resetReceipt.awaitDurable())
+        assertEquals(1uL, store.state.value.publishedScheduleRevisionHint?.revisionNumber)
+        assertEquals(
+            1uL,
+            store.state.value.publishedOccurrenceMembershipProof?.revision?.revisionNumber,
+        )
+    }
+
+    @Test
+    fun durableHeadHintFencesEmptyCurrentUnlessExactCursorEpochResetIsStillCurrent() = runBlocking {
+        val store = PlannerStore(publishedCanonicalState())
+        val hintReceipt = requireNotNull(
+            store.recordPublishedScheduleRevisionHint(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revisionNumber = 2uL,
+            ),
+        )
+        assertTrue(hintReceipt.awaitDurable())
+        val expected = store.state.value
+
+        assertThrows(IllegalArgumentException::class.java) {
+            store.installNoCurrentPublishedSchedule(
+                expected,
+                CANONICAL_ORIGIN,
+                "connection-1",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.installNoCurrentPublishedSchedule(
+                expected,
+                CANONICAL_ORIGIN,
+                "connection-1",
+                epochResetFromRevision = 3uL,
+            )
+        }
+        assertEquals(2uL, store.state.value.publishedScheduleRevisionHint?.revisionNumber)
+
+        val clearReceipt = requireNotNull(
+            store.installNoCurrentPublishedSchedule(
+                expected,
+                CANONICAL_ORIGIN,
+                "connection-1",
+                epochResetFromRevision = 2uL,
+            ),
+        )
+        assertTrue(clearReceipt.awaitDurable())
+        assertNull(store.state.value.publishedScheduleRevisionHint)
+        assertNull(store.state.value.publishedScheduleProof)
+
+        val raced = PlannerStore(publishedCanonicalState())
+        val secondHint = requireNotNull(
+            raced.recordPublishedScheduleRevisionHint(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                2uL,
+            ),
+        )
+        assertTrue(secondHint.awaitDurable())
+        val staleExpected = raced.state.value
+        val thirdHint = requireNotNull(
+            raced.recordPublishedScheduleRevisionHint(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                3uL,
+            ),
+        )
+        assertTrue(thirdHint.awaitDurable())
+        assertThrows(IllegalArgumentException::class.java) {
+            raced.installNoCurrentPublishedSchedule(
+                staleExpected,
+                CANONICAL_ORIGIN,
+                "connection-1",
+                epochResetFromRevision = 2uL,
+            )
+        }
+        assertEquals(3uL, raced.state.value.publishedScheduleRevisionHint?.revisionNumber)
+    }
 
     @Test
     fun typedMissingCurrentScheduleClearsDisplayOnlyLocalComposition() = runBlocking {
@@ -860,6 +998,19 @@ class PlannerStoreTest {
             canonicalExecutionHistoryVerified = true,
         )
         assertFalse(PlannerStore(actionable).isCanonicalExecutionStartBlocked(block.id))
+
+        val newerHeadObserved = actionable.copy(
+            publishedScheduleRevisionHint = requireNotNull(
+                actionable.publishedScheduleRevisionHint,
+            ).copy(revisionNumber = 2uL),
+        )
+        assertTrue(PlannerStore(newerHeadObserved).isCanonicalExecutionStartBlocked(block.id))
+        assertTrue(
+            newerHeadObserved.isPublishedScheduleDisplayCurrent(
+                Instant.parse("1970-01-01T01:00:00Z"),
+                ZoneId.of("UTC"),
+            ),
+        )
 
         val shifted = actionable.copy(
             schedule = listOf(
@@ -3097,6 +3248,8 @@ class PlannerStoreTest {
         errorViolationCount = 0,
         unscheduledWork = emptyList(),
         occurrenceSeriesItemIds = emptyMap(),
+        planOccurrenceMembership = emptyList(),
+        hasExactPlanOccurrenceMembership = true,
         message = "Updated",
     )
 
@@ -3187,6 +3340,11 @@ class PlannerStoreTest {
             schedule = listOf(block),
             publishedScheduleRevision = revision,
             publishedScheduleProof = publishedProof(block, revision),
+            publishedScheduleRevisionHint = PublishedScheduleRevisionHintSnapshot(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revisionNumber = revision.revisionNumber,
+            ),
             scheduleInputDigest = revision.inputDigest,
             scheduleGeneratedAt = "1970-01-01T00:00:00Z",
             schedulePlanningZoneId = "UTC",

@@ -2,6 +2,7 @@ package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
+import com.greengolddog.dayweave.model.HabitMissedExplicitActionSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
@@ -11,6 +12,12 @@ import com.greengolddog.dayweave.network.HabitTransport
 import com.greengolddog.dayweave.network.RemoteHabitAnalytics
 import com.greengolddog.dayweave.network.RemoteHabitAnalyticsBucket
 import com.greengolddog.dayweave.network.RemoteHabitDeltaPage
+import com.greengolddog.dayweave.network.RemoteHabitMissedReconcilePage
+import com.greengolddog.dayweave.network.RemoteHabitMissedCancellationReason
+import com.greengolddog.dayweave.network.RemoteHabitMissedPolicy
+import com.greengolddog.dayweave.network.RemoteHabitMissedResolution
+import com.greengolddog.dayweave.network.RemoteHabitMissedResolutionAction
+import com.greengolddog.dayweave.network.RemoteHabitMissedResumeAction
 import com.greengolddog.dayweave.network.RemoteHabitMutation
 import com.greengolddog.dayweave.network.RemoteHabitOccurrence
 import com.greengolddog.dayweave.network.RemoteHabitOccurrenceEvidence
@@ -21,15 +28,18 @@ import com.greengolddog.dayweave.network.RemoteHabitPause
 import com.greengolddog.dayweave.network.RemoteHabitSupportiveFactCode
 import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -116,6 +126,42 @@ class HabitSyncManagerTest {
     }
 
     @Test
+    fun outcomeAcknowledgementPreservesAConcurrentMissedResolutionAdvance() = runBlocking {
+        val store = boundStore(missedResolution = remoteMissedResolution())
+        val advancedMissed = remoteMissedResolution(
+            revision = 2,
+            action = RemoteHabitMissedResolutionAction.Skip,
+            updatedAt = "2026-09-01T09:02:00Z",
+        )
+        val transport = FakeHabitTransport().apply {
+            outcomeHandler = { _, _, _, _ ->
+                RemoteHabitMutation(
+                    remoteOccurrence(
+                        outcome = completedOutcome(),
+                        missedResolution = advancedMissed,
+                    ),
+                    replayed = false,
+                )
+            }
+        }
+        val manager = manager(store, transport, listOf(OPERATION_ID))
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager.recordOutcome(HABIT_ID, OCCURRENCE_ID, 0, completedInput()),
+        )
+
+        val occurrence = store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID)
+        assertEquals(1L, occurrence.outcome?.revision)
+        assertEquals(2L, occurrence.missedResolution?.revision)
+        assertEquals(
+            com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
+            occurrence.missedResolution?.action,
+        )
+        assertTrue(store.state.value.habitLedger.pendingMutations.isEmpty())
+    }
+
+    @Test
     fun deterministicConflictRemainsEncryptedForReviewAndIsNotReplayed() = runBlocking {
         val store = boundStore()
         val transport = FakeHabitTransport().apply {
@@ -136,6 +182,335 @@ class HabitSyncManagerTest {
 
         assertEquals(HabitSyncOutcome.SUCCESS, manager.discardReviewedMutation(OPERATION_ID))
         assertTrue(store.state.value.habitLedger.pendingMutations.isEmpty())
+    }
+
+    @Test
+    fun missedDecisionReplaysExactJournalAndAcceptsMatchingCancelledRace() = runBlocking {
+        val store = boundStore(missedResolution = remoteMissedResolution())
+        var attempts = 0
+        val transport = FakeHabitTransport().apply {
+            missedResolutionHandler = { _, _, key, body ->
+                attempts += 1
+                assertEquals(OPERATION_ID, key)
+                assertEquals(
+                    """{"operation_id":"$OPERATION_ID","expected_revision":1,"action":"carry"}""",
+                    body,
+                )
+                if (attempts == 1) throw IOException("synthetic response loss")
+                RemoteHabitMutation(
+                    remoteMissedResolution(
+                        revision = 2,
+                        action = RemoteHabitMissedResolutionAction.Cancelled(
+                            RemoteHabitMissedCancellationReason.SOURCE_COMPLETED,
+                            RemoteHabitMissedResumeAction.CARRY,
+                        ),
+                        updatedAt = "2026-09-01T09:02:00Z",
+                    ),
+                    replayed = true,
+                )
+            }
+        }
+        val manager = manager(store, transport, listOf(OPERATION_ID))
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager.stageMissedResolution(
+                HABIT_ID,
+                OCCURRENCE_ID,
+                observedMissedRevision = 1,
+                action = HabitMissedExplicitActionSnapshot.CARRY,
+            ),
+        )
+        val pending = store.durableState.value?.habitLedger?.pendingMutations?.single()
+        assertEquals(OPERATION_ID, pending?.idempotencyKey)
+        assertTrue(transport.missedResolutionBodies.isEmpty())
+        assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, manager.refresh())
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager(store, transport, emptyList()).refresh(),
+        )
+        assertEquals(listOf(OPERATION_ID, OPERATION_ID), transport.missedResolutionKeys)
+        assertEquals(listOf(pending?.requestJson, pending?.requestJson), transport.missedResolutionBodies)
+        assertTrue(store.state.value.habitLedger.pendingMutations.isEmpty())
+        val action = store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID)
+            .missedResolution?.action
+        assertTrue(
+            action is com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Cancelled,
+        )
+    }
+
+    @Test
+    fun confirmedMissedDecisionStaysDeltaIncompleteWhenFollowingPullFails() = runBlocking {
+        val store = boundStore(missedResolution = remoteMissedResolution())
+        val resolved = remoteMissedResolution(
+            revision = 2,
+            action = RemoteHabitMissedResolutionAction.Skip,
+            updatedAt = "2026-09-01T09:02:00Z",
+        )
+        var deltaAttempts = 0
+        val transport = FakeHabitTransport().apply {
+            missedResolutionHandler = { _, _, _, _ ->
+                RemoteHabitMutation(resolved, replayed = false)
+            }
+            deltaHandler = { cursor ->
+                deltaAttempts += 1
+                if (deltaAttempts == 1) throw IOException("synthetic post-confirmation loss")
+                RemoteHabitDeltaPage(emptyList(), cursor ?: "cursor-0", hasMore = false)
+            }
+        }
+        val manager = manager(store, transport, listOf(OPERATION_ID))
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager.stageMissedResolution(
+                HABIT_ID,
+                OCCURRENCE_ID,
+                observedMissedRevision = 1,
+                action = HabitMissedExplicitActionSnapshot.SKIP,
+            ),
+        )
+        assertFalse(store.state.value.habitLedger.deltaCaughtUp)
+        assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, manager.refresh())
+        assertTrue(store.state.value.habitLedger.pendingMutations.isEmpty())
+        assertFalse(store.state.value.habitLedger.deltaCaughtUp)
+        assertEquals(
+            com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
+            store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID)
+                .missedResolution?.action,
+        )
+
+        assertEquals(HabitSyncOutcome.SUCCESS, manager.refresh())
+        assertTrue(store.state.value.habitLedger.deltaCaughtUp)
+    }
+
+    @Test
+    fun missedReconcileResponseIsNonAuthoritativeUntilFollowingDeltaPull() = runBlocking {
+        val store = boundStore()
+        val skipped = remoteMissedResolution(
+            configuredPolicy = RemoteHabitMissedPolicy.SKIP,
+            action = RemoteHabitMissedResolutionAction.Skip,
+        )
+        var reconcileAttempt = 0
+        var deltaAttempt = 0
+        val transport = FakeHabitTransport().apply {
+            missedReconcileHandler = { _, _, _ ->
+                reconcileAttempt += 1
+                if (reconcileAttempt == 1) {
+                    RemoteHabitMissedReconcilePage(listOf(skipped), false, replayed = false)
+                } else {
+                    RemoteHabitMissedReconcilePage(emptyList(), false, replayed = false)
+                }
+            }
+            deltaHandler = { cursor ->
+                deltaAttempt += 1
+                if (deltaAttempt == 1) throw IOException("delta unavailable")
+                RemoteHabitDeltaPage(
+                    changes = listOf(
+                        com.greengolddog.dayweave.network.RemoteHabitDeltaChange.OccurrenceUpsert(
+                            remoteOccurrence(missedResolution = skipped),
+                        ),
+                    ),
+                    nextCursor = cursor ?: "cursor-0",
+                    hasMore = false,
+                )
+            }
+        }
+        val manager = manager(
+            store,
+            transport,
+            emptyList(),
+            reconciliationUuids = listOf(RECONCILE_ID, SECOND_RECONCILE_ID),
+        )
+
+        assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, manager.refresh())
+        assertNull(
+            store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID).missedResolution,
+        )
+        assertFalse(requireNotNull(store.durableState.value).habitLedger.deltaCaughtUp)
+        assertEquals(HabitSyncOutcome.SUCCESS, manager.refresh())
+        assertEquals(
+            com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
+            store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID)
+                .missedResolution?.action,
+        )
+        assertEquals(
+            listOf(
+                """{"operation_id":"$RECONCILE_ID"}""",
+                """{"operation_id":"$SECOND_RECONCILE_ID"}""",
+            ),
+            transport.missedReconcileBodies,
+        )
+        assertEquals(listOf(RECONCILE_ID, SECOND_RECONCILE_ID), transport.missedReconcileKeys)
+        assertTrue(transport.missedReconcileLimits.all { it == 25 })
+    }
+
+    @Test
+    fun missedReconcileResponseLossKeepsCheckpointIncompleteUntilNextDeltaConverges() =
+        runBlocking {
+            val store = boundStore()
+            val skipped = remoteMissedResolution(
+                configuredPolicy = RemoteHabitMissedPolicy.SKIP,
+                action = RemoteHabitMissedResolutionAction.Skip,
+            )
+            var reconciliationAttempt = 0
+            val transport = FakeHabitTransport().apply {
+                missedReconcileHandler = { _, _, _ ->
+                    reconciliationAttempt += 1
+                    if (reconciliationAttempt == 1) {
+                        throw IOException("synthetic committed response loss")
+                    }
+                    RemoteHabitMissedReconcilePage(emptyList(), false, replayed = true)
+                }
+                deltaHandler = { cursor ->
+                    RemoteHabitDeltaPage(
+                        changes = listOf(
+                            com.greengolddog.dayweave.network.RemoteHabitDeltaChange
+                                .OccurrenceUpsert(
+                                    remoteOccurrence(missedResolution = skipped),
+                                ),
+                        ),
+                        nextCursor = cursor ?: "cursor-0",
+                        hasMore = false,
+                    )
+                }
+            }
+            val first = manager(
+                store,
+                transport,
+                emptyList(),
+                reconciliationUuids = listOf(RECONCILE_ID),
+            )
+
+            assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, first.refresh())
+            assertFalse(store.state.value.habitLedger.deltaCaughtUp)
+            assertFalse(requireNotNull(store.durableState.value).habitLedger.deltaCaughtUp)
+            assertEquals(
+                RECONCILE_ID,
+                requireNotNull(store.durableState.value).habitLedger
+                    .pendingMissedReconcile?.idempotencyKey,
+            )
+
+            val relaunched = manager(
+                store,
+                transport,
+                emptyList(),
+                reconciliationUuids = listOf(SECOND_RECONCILE_ID),
+            )
+            assertEquals(HabitSyncOutcome.SUCCESS, relaunched.refresh())
+            assertTrue(store.state.value.habitLedger.deltaCaughtUp)
+            assertNull(store.state.value.habitLedger.pendingMissedReconcile)
+            assertEquals(
+                listOf(RECONCILE_ID, RECONCILE_ID, SECOND_RECONCILE_ID),
+                transport.missedReconcileKeys,
+            )
+            assertEquals(
+                listOf(
+                    """{"operation_id":"$RECONCILE_ID"}""",
+                    """{"operation_id":"$RECONCILE_ID"}""",
+                    """{"operation_id":"$SECOND_RECONCILE_ID"}""",
+                ),
+                transport.missedReconcileBodies,
+            )
+            assertEquals(
+                com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
+                store.state.value.habitLedger.occurrences.getValue(OCCURRENCE_ID)
+                    .missedResolution?.action,
+            )
+        }
+
+    @Test
+    fun expiredAmbiguousMissedReconcileRotatesDurablyThenReplaysTheFreshRequest() = runBlocking {
+        val store = boundStore()
+        var attempt = 0
+        val transport = FakeHabitTransport().apply {
+            missedReconcileHandler = { _, _, _ ->
+                attempt += 1
+                if (attempt <= 2) throw IOException("synthetic committed response loss")
+                RemoteHabitMissedReconcilePage(emptyList(), false, replayed = true)
+            }
+        }
+        val first = manager(
+            store,
+            transport,
+            emptyList(),
+            times = listOf(NOW),
+            reconciliationUuids = listOf(RECONCILE_ID),
+        )
+
+        assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, first.refresh())
+        assertEquals(
+            RECONCILE_ID,
+            store.state.value.habitLedger.pendingMissedReconcile?.idempotencyKey,
+        )
+
+        val leaseBoundary = NOW.plus(Duration.ofHours(12))
+        val rotated = manager(
+            store,
+            transport,
+            emptyList(),
+            times = listOf(leaseBoundary),
+            reconciliationUuids = listOf(SECOND_RECONCILE_ID),
+        )
+        assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, rotated.refresh())
+        val freshJournal = requireNotNull(store.durableState.value).habitLedger
+            .pendingMissedReconcile
+        assertEquals(SECOND_RECONCILE_ID, freshJournal?.idempotencyKey)
+        assertEquals(leaseBoundary.toString(), freshJournal?.createdAt)
+        assertFalse(store.state.value.habitLedger.deltaCaughtUp)
+        assertFalse(requireNotNull(store.durableState.value).habitLedger.deltaCaughtUp)
+
+        val relaunched = manager(
+            store,
+            transport,
+            emptyList(),
+            times = listOf(leaseBoundary.plus(Duration.ofHours(1))),
+            reconciliationUuids = listOf(THIRD_RECONCILE_ID),
+        )
+        assertEquals(HabitSyncOutcome.SUCCESS, relaunched.refresh())
+        assertEquals(
+            listOf(
+                RECONCILE_ID,
+                SECOND_RECONCILE_ID,
+                SECOND_RECONCILE_ID,
+                THIRD_RECONCILE_ID,
+            ),
+            transport.missedReconcileKeys,
+        )
+        assertNull(store.state.value.habitLedger.pendingMissedReconcile)
+        assertTrue(store.state.value.habitLedger.deltaCaughtUp)
+    }
+
+    @Test
+    fun cancellationDuringMissedReconcileCannotRestoreStaleCheckpointAuthority() = runBlocking {
+        val store = boundStore()
+        val transport = FakeHabitTransport().apply {
+            missedReconcileHandler = { _, _, _ ->
+                throw CancellationException("synthetic cancellation after request admission")
+            }
+        }
+        val manager = manager(
+            store,
+            transport,
+            emptyList(),
+            reconciliationUuids = listOf(RECONCILE_ID),
+        )
+        var cancelled = false
+
+        try {
+            manager.refresh()
+        } catch (_: CancellationException) {
+            cancelled = true
+        }
+
+        assertTrue(cancelled)
+        assertFalse(store.state.value.habitLedger.deltaCaughtUp)
+        assertFalse(requireNotNull(store.durableState.value).habitLedger.deltaCaughtUp)
+        assertEquals(
+            RECONCILE_ID,
+            requireNotNull(store.durableState.value).habitLedger
+                .pendingMissedReconcile?.idempotencyKey,
+        )
     }
 
     @Test
@@ -203,6 +578,64 @@ class HabitSyncManagerTest {
         assertEquals("cursor-0", store.state.value.habitLedger.deltaCursor)
         assertEquals(listOf(null, "page-2"), transport.occurrenceCursors)
         assertEquals(listOf(25, 25), transport.occurrenceLimits)
+    }
+
+    @Test
+    fun scopedHabitLoadDrainsWorkspaceDeltaAfterMissedReconciliation() = runBlocking {
+        val base = remoteOccurrence(id = SECOND_OCCURRENCE_ID)
+        val crossHabitResolution = remoteMissedResolution(
+            configuredPolicy = RemoteHabitMissedPolicy.SKIP,
+            action = RemoteHabitMissedResolutionAction.Skip,
+        ).copy(
+            occurrenceEvidenceId = base.evidence.id,
+            habitId = OTHER_HABIT_ID,
+            sourcePlannerOccurrenceId = base.evidence.plannerOccurrenceId,
+        )
+        val crossHabit = base.copy(
+            evidence = base.evidence.copy(habitId = OTHER_HABIT_ID),
+            missedResolution = crossHabitResolution,
+        )
+        val transport = FakeHabitTransport().apply {
+            missedReconcileHandler = { _, _, _ ->
+                RemoteHabitMissedReconcilePage(
+                    resolutions = listOf(crossHabitResolution),
+                    hasMore = false,
+                    replayed = false,
+                )
+            }
+            deltaHandler = { _ ->
+                RemoteHabitDeltaPage(
+                    changes = listOf(
+                        com.greengolddog.dayweave.network.RemoteHabitDeltaChange.OccurrenceUpsert(
+                            crossHabit,
+                        ),
+                    ),
+                    nextCursor = "cursor-workspace",
+                    hasMore = false,
+                )
+            }
+            occurrencePages += RemoteHabitOccurrencePage(
+                occurrences = listOf(remoteOccurrence()),
+                nextCursor = null,
+                hasMore = false,
+            )
+        }
+        val store = boundStore()
+
+        assertEquals(
+            HabitSyncOutcome.SUCCESS,
+            manager(store, transport, emptyList()).loadHabit(
+                HABIT_ID,
+                LocalDate.parse("2026-09-01"),
+                LocalDate.parse("2026-09-02"),
+            ),
+        )
+        assertEquals(listOf("cursor-0"), transport.deltaCursors)
+        assertEquals(
+            com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
+            store.state.value.habitLedger.occurrences.getValue(SECOND_OCCURRENCE_ID)
+                .missedResolution?.action,
+        )
     }
 
     @Test
@@ -370,6 +803,47 @@ class HabitSyncManagerTest {
     }
 
     @Test
+    fun staleMissedDeltaStillValidatesIdentityAndTimestampOrdering() {
+        val current = remoteMissedResolution(
+            revision = 2,
+            action = RemoteHabitMissedResolutionAction.Skip,
+            updatedAt = "2026-09-01T09:02:00Z",
+        )
+        val invalidStaleCoordinates = listOf(
+            remoteMissedResolution(
+                revision = 1,
+                configuredPolicy = RemoteHabitMissedPolicy.SKIP,
+                action = RemoteHabitMissedResolutionAction.Skip,
+            ),
+            remoteMissedResolution(
+                revision = 1,
+                updatedAt = "2026-09-01T09:03:00Z",
+            ),
+        )
+
+        invalidStaleCoordinates.forEachIndexed { index, invalid ->
+            val store = boundStore(missedResolution = current)
+            val before = store.state.value
+
+            assertThrows(IllegalArgumentException::class.java) {
+                store.applyHabitDeltaPage(
+                    ORIGIN,
+                    CONFIGURATION_ID,
+                    occurrences = listOf(
+                        HabitOccurrenceSnapshot.fromRemote(
+                            remoteOccurrence(missedResolution = invalid),
+                        ),
+                    ),
+                    pauses = emptyList(),
+                    nextCursor = "invalid-stale-$index",
+                    hasMore = false,
+                )
+            }
+            assertEquals(before, store.state.value)
+        }
+    }
+
+    @Test
     fun occurrencePaginationRejectsOpaqueCursorCyclesBeforeRepeatingARequest() = runBlocking {
         val transport = FakeHabitTransport().apply {
             occurrencePages += RemoteHabitOccurrencePage(
@@ -516,12 +990,17 @@ class HabitSyncManagerTest {
 
     private fun boundStore(
         outcome: RemoteHabitOutcome? = null,
+        missedResolution: RemoteHabitMissedResolution? = null,
     ) = PlannerStore(DayWeaveUiState()).also { store ->
         store.bindHabitLedger(ORIGIN, CONFIGURATION_ID)
         store.applyHabitDeltaPage(
             ORIGIN,
             CONFIGURATION_ID,
-            listOf(HabitOccurrenceSnapshot.fromRemote(remoteOccurrence(outcome = outcome))),
+            listOf(
+                HabitOccurrenceSnapshot.fromRemote(
+                    remoteOccurrence(outcome = outcome, missedResolution = missedResolution),
+                ),
+            ),
             emptyList(),
             "cursor-0",
             hasMore = false,
@@ -533,9 +1012,11 @@ class HabitSyncManagerTest {
         transport: FakeHabitTransport,
         uuids: List<String>,
         times: List<Instant> = listOf(NOW),
+        reconciliationUuids: List<String> = emptyList(),
     ): HabitSyncManager {
         val uuidIterator = uuids.iterator()
         val timeIterator = times.iterator()
+        val reconciliationIterator = reconciliationUuids.iterator()
         var lastTime = times.last()
         return HabitSyncManager(
             plannerStore = store,
@@ -548,6 +1029,15 @@ class HabitSyncManagerTest {
                 lastTime
             },
             newUuid = { UUID.fromString(uuidIterator.next()) },
+            newReconciliationUuid = {
+                UUID.fromString(
+                    if (reconciliationIterator.hasNext()) {
+                        reconciliationIterator.next()
+                    } else {
+                        UUID.randomUUID().toString()
+                    },
+                )
+            },
         )
     }
 
@@ -578,6 +1068,7 @@ class HabitSyncManagerTest {
         const val ORIGIN = "https://api.example.test/"
         const val CONFIGURATION_ID = "configuration-a"
         const val HABIT_ID = "11111111-1111-4111-8111-111111111111"
+        const val OTHER_HABIT_ID = "12121212-1212-4212-8212-121212121212"
         const val OCCURRENCE_ID = "22222222-2222-4222-8222-222222222222"
         const val SECOND_OCCURRENCE_ID = "88888888-8888-4888-8888-888888888888"
         const val PLANNER_OCCURRENCE_ID = "33333333-3333-5333-8333-333333333333"
@@ -585,6 +1076,9 @@ class HabitSyncManagerTest {
         const val PAUSE_ID = "55555555-5555-4555-8555-555555555555"
         const val OPERATION_ID = "66666666-6666-4666-8666-666666666666"
         const val SECOND_OPERATION_ID = "77777777-7777-4777-8777-777777777777"
+        const val RECONCILE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        const val SECOND_RECONCILE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        const val THIRD_RECONCILE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         const val OCCURRED_AT = "2026-09-01T07:30:00Z"
         const val UPDATED_AT = "2026-09-01T07:31:00Z"
         const val PAUSED_AT = "2026-09-02T08:00:00Z"
@@ -600,6 +1094,11 @@ private class FakeHabitTransport : HabitTransport {
     val outcomeBodies = mutableListOf<String>()
     val startPauseBodies = mutableListOf<String>()
     val resumePauseBodies = mutableListOf<String>()
+    val missedReconcileBodies = mutableListOf<String>()
+    val missedReconcileKeys = mutableListOf<String>()
+    val missedReconcileLimits = mutableListOf<Int>()
+    val missedResolutionBodies = mutableListOf<String>()
+    val missedResolutionKeys = mutableListOf<String>()
     val deltaCursors = mutableListOf<String?>()
     val deltaLimits = mutableListOf<Int>()
 
@@ -609,6 +1108,13 @@ private class FakeHabitTransport : HabitTransport {
         RemoteHabitMutation<RemoteHabitPause> = { _, _, _ -> error("not configured") }
     var resumePauseHandler: suspend (String, String, String, String) ->
         RemoteHabitMutation<RemoteHabitPause> = { _, _, _, _ -> error("not configured") }
+    var missedResolutionHandler: suspend (String, String, String, String) ->
+        RemoteHabitMutation<RemoteHabitMissedResolution> =
+        { _, _, _, _ -> error("not configured") }
+    var missedReconcileHandler: suspend (String, String, Int) ->
+        RemoteHabitMissedReconcilePage = { _, _, _ ->
+            RemoteHabitMissedReconcilePage(emptyList(), hasMore = false, replayed = false)
+        }
     var deltaHandler: suspend (String?) -> RemoteHabitDeltaPage = { cursor ->
         RemoteHabitDeltaPage(emptyList(), cursor ?: "cursor-0", hasMore = false)
     }
@@ -652,6 +1158,30 @@ private class FakeHabitTransport : HabitTransport {
         deltaCursors += cursor
         deltaLimits += limit
         return deltaHandler(cursor)
+    }
+
+    override suspend fun reconcileMissed(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        requestJson: String,
+        limit: Int,
+    ): RemoteHabitMissedReconcilePage {
+        missedReconcileBodies += requestJson
+        missedReconcileKeys += idempotencyKey
+        missedReconcileLimits += limit
+        return missedReconcileHandler(idempotencyKey, requestJson, limit)
+    }
+
+    override suspend fun putMissedResolution(
+        configuration: AuthenticatedApiConfiguration,
+        habitId: String,
+        occurrenceId: String,
+        idempotencyKey: String,
+        requestJson: String,
+    ): RemoteHabitMutation<RemoteHabitMissedResolution> {
+        missedResolutionBodies += requestJson
+        missedResolutionKeys += idempotencyKey
+        return missedResolutionHandler(habitId, occurrenceId, idempotencyKey, requestJson)
     }
 
     override suspend fun startPause(
@@ -714,6 +1244,7 @@ private fun remoteAnalytics(
 private fun remoteOccurrence(
     id: String = "22222222-2222-4222-8222-222222222222",
     outcome: RemoteHabitOutcome? = null,
+    missedResolution: RemoteHabitMissedResolution? = null,
 ) = RemoteHabitOccurrence(
     evidence = RemoteHabitOccurrenceEvidence(
         id = id,
@@ -744,6 +1275,24 @@ private fun remoteOccurrence(
         expectedUnit = "pages",
     ),
     outcome = outcome,
+    missedResolution = missedResolution,
+)
+
+private fun remoteMissedResolution(
+    revision: Long = 1,
+    configuredPolicy: RemoteHabitMissedPolicy = RemoteHabitMissedPolicy.ASK,
+    action: RemoteHabitMissedResolutionAction =
+        RemoteHabitMissedResolutionAction.DecisionRequired,
+    updatedAt: String = "2026-09-01T09:01:00Z",
+) = RemoteHabitMissedResolution(
+    occurrenceEvidenceId = "22222222-2222-4222-8222-222222222222",
+    habitId = "11111111-1111-4111-8111-111111111111",
+    sourcePlannerOccurrenceId = "33333333-3333-5333-8333-333333333333",
+    revision = revision,
+    configuredPolicy = configuredPolicy,
+    action = action,
+    createdAt = "2026-09-01T09:01:00Z",
+    updatedAt = updatedAt,
 )
 
 private fun remotePause(

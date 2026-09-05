@@ -31,6 +31,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -62,8 +63,27 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V18 -> decodeCurrentSnapshot(
+            PlannerSnapshotFormats.JSON_V20 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+                requireCanonicalStructuralFields = true,
+                requireHabitLedgerField = true,
+                requireCanonicalDraftDurationFields = true,
+                requireHabitMissedResolutionFields = true,
+                requirePublishedOccurrenceMembershipField = true,
+            )
+            PlannerSnapshotFormats.JSON_V19 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+                requireCanonicalStructuralFields = true,
+                requireHabitLedgerField = true,
+                requireCanonicalDraftDurationFields = true,
+                requireHabitMissedResolutionFields = true,
+            )
+            PlannerSnapshotFormats.JSON_V18 -> decodeCurrentSnapshot(
+                payload = migrateLegacyHabitMissedSnapshot(snapshot.payload),
                 requireGoogleSchedulePublicationField = true,
                 requireOnboardingFirstItemAnchorField = true,
                 requireCanonicalStructuralFields = true,
@@ -71,7 +91,9 @@ class RoomPlannerStateRepository(
                 requireCanonicalDraftDurationFields = true,
             )
             PlannerSnapshotFormats.JSON_V17 -> decodeCurrentSnapshot(
-                payload = migrateLegacyDurationAuthoringSnapshot(snapshot.payload),
+                payload = migrateLegacyDurationAuthoringSnapshot(
+                    migrateLegacyHabitMissedSnapshot(snapshot.payload),
+                ),
                 requireGoogleSchedulePublicationField = true,
                 requireOnboardingFirstItemAnchorField = true,
                 requireCanonicalStructuralFields = true,
@@ -212,6 +234,8 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
@@ -227,6 +251,8 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V17 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V16 ||
@@ -248,7 +274,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V18 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V20 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -279,7 +305,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V18,
+                payloadFormat = PlannerSnapshotFormats.JSON_V20,
             ),
         )
     }
@@ -342,6 +368,49 @@ class RoomPlannerStateRepository(
         )
     }
 
+    /**
+     * V18 had no missed-resolution coordinate or decision journal. Strip both before defaults are
+     * applied so relabelled/injected predecessor data cannot mint scheduling or replay authority.
+     */
+    private fun migrateLegacyHabitMissedSnapshot(payload: String): String {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val ledger = root["habitLedger"] as? JsonObject ?: return payload
+        val occurrences = ledger["occurrences"] as? JsonObject
+        val safeOccurrences = occurrences?.let { values ->
+            JsonObject(
+                values.mapValues { (_, element) ->
+                    if (element is JsonObject) {
+                        JsonObject(element - "missedResolution")
+                    } else {
+                        element
+                    }
+                },
+            )
+        }
+        val pending = ledger["pendingMutations"] as? JsonArray
+        val safePending = pending?.let { values ->
+            JsonArray(
+                values.filterNot { element ->
+                    ((element as? JsonObject)?.get("kind") as? JsonPrimitive)?.contentOrNull ==
+                        "missed_resolution"
+                },
+            )
+        }
+        val safeLedger = JsonObject(
+            (ledger - "pendingMissedReconcile") + listOfNotNull(
+                safeOccurrences?.let { "occurrences" to it },
+                safePending?.let { "pendingMutations" to it },
+            ) + mapOf(
+                "deltaCaughtUp" to JsonPrimitive(false),
+                "pendingMissedReconcile" to JsonNull,
+            ),
+        )
+        return SNAPSHOT_JSON.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(root + ("habitLedger" to safeLedger)),
+        )
+    }
+
     private fun decodeCurrentSnapshot(
         payload: String,
         requireProposalApplicationFields: Boolean = true,
@@ -357,8 +426,15 @@ class RoomPlannerStateRepository(
         requireCanonicalStructuralFields: Boolean = false,
         requireHabitLedgerField: Boolean = false,
         requireCanonicalDraftDurationFields: Boolean = false,
+        requireHabitMissedResolutionFields: Boolean = false,
+        requirePublishedOccurrenceMembershipField: Boolean = false,
     ): DayWeaveUiState {
-        val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val decodedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val parsedRoot = if (requirePublishedOccurrenceMembershipField) {
+            decodedRoot
+        } else {
+            withoutPublishedOccurrenceMembershipFields(decodedRoot)
+        }
         val publicationSafeRoot = if (requirePublicationProofField) {
             parsedRoot
         } else {
@@ -500,6 +576,35 @@ class RoomPlannerStateRepository(
         if (requireCanonicalDraftDurationFields) {
             requireCanonicalDraftDurationFields(root)
         }
+        if (requireHabitMissedResolutionFields) {
+            requireHabitMissedResolutionFields(root)
+        }
+        if (
+            requirePublishedOccurrenceMembershipField &&
+            (!root.containsKey("publishedOccurrenceMembershipProof") ||
+                !root.containsKey("publishedScheduleRevisionHint"))
+        ) {
+            throw SerializationException(
+                "Current published occurrence membership and revision hint are required",
+            )
+        }
+        if (requirePublishedOccurrenceMembershipField) {
+            val pending = root["pendingSchedulePublication"]
+            if (pending != null && pending !is JsonNull) {
+                val candidate = ((pending as? JsonObject)?.get("candidate") as? JsonObject)
+                    ?: throw SerializationException(
+                        "Current schedule publication candidate is required",
+                    )
+                if (
+                    !candidate.containsKey("planOccurrenceMembership") ||
+                    !candidate.containsKey("hasExactPlanOccurrenceMembership")
+                ) {
+                    throw SerializationException(
+                        "Current schedule publication occurrence membership is required",
+                    )
+                }
+            }
+        }
         if (requireHabitLedgerField && !root.containsKey("habitLedger")) {
             throw SerializationException("Current habit ledger recovery state is required")
         }
@@ -559,6 +664,28 @@ class RoomPlannerStateRepository(
                     throw SerializationException("Habit ledger recovery state is invalid", error)
                 }
             }
+    }
+
+    /** A predecessor label cannot mint authority through an injected root or journal field. */
+    private fun withoutPublishedOccurrenceMembershipFields(root: JsonObject): JsonObject {
+        val withoutProof = JsonObject(
+            root - setOf(
+                "publishedOccurrenceMembershipProof",
+                "publishedScheduleRevisionHint",
+            ),
+        )
+        val pending = withoutProof["pendingSchedulePublication"] as? JsonObject
+            ?: return withoutProof
+        val candidate = pending["candidate"] as? JsonObject ?: return withoutProof
+        val safeCandidate = JsonObject(
+            candidate - setOf("planOccurrenceMembership", "hasExactPlanOccurrenceMembership"),
+        )
+        return JsonObject(
+            withoutProof + (
+                "pendingSchedulePublication" to
+                    JsonObject(pending + ("candidate" to safeCandidate))
+                ),
+        )
     }
 
     private fun withoutCanonicalStructuralFields(root: JsonObject): JsonObject {
@@ -663,6 +790,27 @@ class RoomPlannerStateRepository(
         }
     }
 
+    private fun requireHabitMissedResolutionFields(root: JsonObject) {
+        val ledger = root["habitLedger"] as? JsonObject
+            ?: throw SerializationException("Current habit ledger is required")
+        if (!ledger.containsKey("pendingMissedReconcile")) {
+            throw SerializationException(
+                "Current missed-reconciliation recovery journal is required",
+            )
+        }
+        val occurrences = ledger["occurrences"] as? JsonObject
+            ?: throw SerializationException("Current habit occurrences are required")
+        occurrences.forEach { (id, element) ->
+            val occurrence = element as? JsonObject
+                ?: throw SerializationException("Habit occurrence $id must be an object")
+            if (!occurrence.containsKey("missedResolution")) {
+                throw SerializationException(
+                    "Habit occurrence $id is missing missed-resolution authority",
+                )
+            }
+        }
+    }
+
     private fun validateCanonicalStructuralState(state: DayWeaveUiState) {
         val items = buildList {
             addAll(state.canonicalItems)
@@ -690,14 +838,14 @@ class RoomPlannerStateRepository(
 
     /** V4 already required explicit sensitivity and an exact pending replacement target. */
     private fun decodeVersionFourSnapshot(payload: String): DayWeaveUiState {
-        val root = JsonObject(
-            SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject - setOf(
+        val root = withoutPublishedOccurrenceMembershipFields(
+            JsonObject(SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject - setOf(
                 "publishedScheduleProof",
                 "localScheduleCompositionProvenance",
                 "scheduleCompositionProfile",
                 "onboardingFirstItemAnchor",
                 "habitLedger",
-            ),
+            )),
         )
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
@@ -740,8 +888,8 @@ class RoomPlannerStateRepository(
         requireExistingSensitivity: Boolean = false,
         allowPreSensitivityJournal: Boolean = false,
     ): DayWeaveUiState {
-        val legacyRoot = JsonObject(
-            LEGACY_SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject -
+        val legacyRoot = withoutPublishedOccurrenceMembershipFields(
+            JsonObject(LEGACY_SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject -
                 setOf(
                     "publishedScheduleProof",
                     "localScheduleCompositionProvenance",
@@ -749,6 +897,7 @@ class RoomPlannerStateRepository(
                     "onboardingFirstItemAnchor",
                     "habitLedger",
                 ),
+            ),
         )
         if (requireExistingSensitivity) {
             requireExplicitSensitivity(legacyRoot, "schedule")
@@ -1002,6 +1151,47 @@ class RoomPlannerStateRepository(
                 !proof.matchesPublishedPlan(state.schedule)
             ) {
                 throw SerializationException("Exact published schedule proof does not match cache")
+            }
+        }
+        state.publishedScheduleRevisionHint?.let { hint ->
+            if (
+                !hint.hasValidShape() || state.canonicalSyncOrigin != hint.syncOrigin ||
+                state.canonicalConfigurationId != hint.configurationId
+            ) {
+                throw SerializationException(
+                    "Published schedule revision hint does not match its cache binding",
+                )
+            }
+        }
+        state.publishedOccurrenceMembershipProof?.let { proof ->
+            val hint = state.publishedScheduleRevisionHint
+                ?: throw SerializationException(
+                    "Published occurrence membership has no durable revision hint",
+                )
+            if (
+                !proof.hasValidShape() || state.canonicalSyncOrigin != proof.syncOrigin ||
+                state.canonicalConfigurationId != proof.configurationId ||
+                hint.syncOrigin != proof.syncOrigin ||
+                hint.configurationId != proof.configurationId ||
+                hint.revisionNumber < proof.revision.revisionNumber
+            ) {
+                throw SerializationException(
+                    "Published occurrence membership does not match its durable head hint",
+                )
+            }
+            state.publishedScheduleRevision?.let { revision ->
+                if (proof.revision != revision) {
+                    throw SerializationException(
+                        "Published occurrence membership and block proof revisions disagree",
+                    )
+                }
+            }
+            state.publishedScheduleProof?.let { blockProof ->
+                if (proof.revision != blockProof.revision) {
+                    throw SerializationException(
+                        "Published occurrence membership and block authority disagree",
+                    )
+                }
             }
         }
     }

@@ -2,11 +2,13 @@ package com.greengolddog.dayweave.data
 
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.HabitMissedReconcileCommandSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceEvidenceSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeCommandSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
+import com.greengolddog.dayweave.model.PendingHabitMissedReconcile
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
@@ -16,6 +18,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -24,6 +27,8 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -83,12 +88,47 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(ledger, restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V18, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V20, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("Good start"))
         assertTrue(restored.habitLedger.toString().contains("content=<redacted>"))
         assertTrue(
             restored.habitLedger.pendingMutations.single().toString().contains("request=<redacted>"),
         )
+    }
+
+    @Test
+    fun exactMissedReconcileJournalRoundTripsAndCurrentPayloadRequiresRecoveryField() = runBlocking {
+        val pending = pendingMissedReconcile(DIFFERENT_OPERATION_ID)
+        val journaled = ledger().copy(
+            deltaCaughtUp = false,
+            pendingMissedReconcile = pending,
+        ).also(HabitLedgerSnapshot::requireValid)
+        assertThrows(IllegalArgumentException::class.java) {
+            journaled.copy(deltaCaughtUp = true).requireValid()
+        }
+        val dao = FakeDao()
+        val repository = RoomPlannerStateRepository(dao) { 1_100 }
+
+        repository.save(DayWeaveUiState(habitLedger = journaled))
+        assertEquals(journaled, requireNotNull(repository.load()).habitLedger)
+        assertTrue(pending.toString().contains("request=<redacted>"))
+
+        repository.save(DayWeaveUiState(habitLedger = ledger()))
+        val root = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
+        val encodedLedger = root.getValue("habitLedger").jsonObject
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(
+                    root + ("habitLedger" to JsonObject(encodedLedger - "pendingMissedReconcile")),
+                ),
+            ),
+        )
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        Unit
     }
 
     @Test
@@ -103,7 +143,58 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(HabitLedgerSnapshot(), restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V18, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V20, dao.snapshot?.payloadFormat)
+    }
+
+    @Test
+    fun v18LabelCannotInjectMissedProjectionOrDecisionReplayAuthority() = runBlocking {
+        val expected = ledger()
+        val dao = FakeDao()
+        val repository = RoomPlannerStateRepository(dao) { 2_100 }
+        repository.save(DayWeaveUiState(habitLedger = expected))
+        val root = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
+        val encodedLedger = root.getValue("habitLedger").jsonObject
+        val occurrences = encodedLedger.getValue("occurrences").jsonObject
+        val occurrence = occurrences.getValue(OCCURRENCE_ID).jsonObject
+        val forgedResolution = Json.parseToJsonElement(
+            """{"occurrenceEvidenceId":"$OCCURRENCE_ID","habitId":"$HABIT_ID","sourcePlannerOccurrenceId":"$PLANNER_OCCURRENCE_ID","revision":99,"configuredPolicy":"ask","action":{"type":"skip"},"createdAt":"2026-09-01T09:01:00Z","updatedAt":"2026-09-01T09:01:00Z"}""",
+        )
+        val forgedPending = Json.parseToJsonElement(
+            """{"schemaVersion":1,"kind":"missed_resolution","habitId":"$HABIT_ID","targetId":"$OCCURRENCE_ID","expectedRevision":99,"idempotencyKey":"$DIFFERENT_OPERATION_ID","requestJson":"{}","createdAt":"2026-09-01T09:01:00Z","syncOrigin":"$ORIGIN","configurationId":"$CONFIGURATION_ID","disposition":"pending"}""",
+        )
+        val forgedReconcile = fixtureJson.encodeToJsonElement(
+            pendingMissedReconcile(DIFFERENT_OPERATION_ID),
+        )
+        val forgedOccurrences = JsonObject(
+            occurrences + (OCCURRENCE_ID to JsonObject(occurrence +
+                ("missedResolution" to forgedResolution))),
+        )
+        val pending = encodedLedger.getValue("pendingMutations").jsonArray
+        val forgedLedger = JsonObject(
+            encodedLedger + mapOf(
+                "occurrences" to forgedOccurrences,
+                "pendingMutations" to JsonArray(pending + forgedPending),
+                "pendingMissedReconcile" to forgedReconcile,
+            ),
+        )
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payloadFormat = PlannerSnapshotFormats.JSON_V18,
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(root + ("habitLedger" to forgedLedger)),
+            ),
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(expected.copy(deltaCaughtUp = false), restored.habitLedger)
+        assertEquals(expected.deltaCursor, restored.habitLedger.deltaCursor)
+        assertFalse(restored.habitLedger.deltaCaughtUp)
+        assertEquals(PlannerSnapshotFormats.JSON_V20, dao.snapshot?.payloadFormat)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"missedResolution\":null"))
+        assertTrue(!requireNotNull(dao.snapshot).payload.contains("missed_resolution"))
+        assertNull(restored.habitLedger.pendingMissedReconcile)
+        assertTrue(!requireNotNull(dao.snapshot).payload.contains(DIFFERENT_OPERATION_ID))
     }
 
     @Test
@@ -366,6 +457,13 @@ class HabitPersistenceTest {
             pendingMutations = listOf(pending),
         ).also(HabitLedgerSnapshot::requireValid)
     }
+
+    private fun pendingMissedReconcile(operationId: String) = PendingHabitMissedReconcile(
+        idempotencyKey = operationId,
+        requestJson = HabitMissedReconcileCommandSnapshot(operationId).encoded(),
+        limit = 25,
+        createdAt = "2026-09-01T07:31:00Z",
+    ).also(PendingHabitMissedReconcile::requireValid)
 
     private fun habitOccurrenceEvidenceFixture(): File {
         val relative = "fixtures/habit-protocol/occurrence-evidence-v1.json"
