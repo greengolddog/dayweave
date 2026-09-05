@@ -1479,6 +1479,188 @@ struct DurableAuthCoordinatorTests {
         #expect(await transport.records().map(\.method) == ["GET", "DELETE", "POST"])
     }
 
+    @Test("fallback approval resolves a committed DELETE whose response is lost")
+    func fallbackCurrentSessionRevokeCommittedTransportLoss() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 15, refreshMarker: 16)
+        let state = TestDurableAuthStateStore(
+            initial: envelope(active: active, revision: 10)
+        )
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .failure(.transport(.timedOut)),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [17, 18]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let approval = try await coordinator.prepareCurrentSessionRevocationApproval(
+            boundTo: baseURL
+        )
+
+        try await coordinator.revokeAndForget(
+            boundTo: baseURL,
+            approvedBy: approval
+        )
+
+        #expect(state.loadEnvelope() == nil)
+        #expect(await transport.records().map(\.method) == ["DELETE", "GET", "POST"])
+    }
+
+    @Test("fallback approval retains credentials when timeout is noncommitted or unverified")
+    func fallbackCurrentSessionRevokeNoncommittedTransportLoss() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 19, refreshMarker: 20)
+        let initial = envelope(active: active, revision: 11)
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .failure(.transport(.timedOut)),
+                .inventory([active.session]),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let approval = try await coordinator.prepareCurrentSessionRevocationApproval(
+            boundTo: baseURL
+        )
+
+        do {
+            try await coordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedBy: approval
+            )
+            Issue.record("A still-active session was cleared after an ambiguous DELETE")
+        } catch {
+            #expect(error as? DurableAuthError == .transport(.timedOut))
+        }
+        #expect(state.loadEnvelope() == initial)
+        #expect(await transport.records().map(\.method) == ["DELETE", "GET"])
+
+        let unverifiedState = TestDurableAuthStateStore(initial: initial)
+        let unverifiedTransport = TestDurableAuthTransport(
+            stateStore: unverifiedState,
+            plans: [
+                .failure(.transport(.timedOut)),
+                .failure(.transport(.notConnectedToInternet)),
+            ]
+        )
+        let unverifiedCoordinator = makeCoordinator(
+            state: unverifiedState,
+            transport: unverifiedTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let unverifiedApproval = try await unverifiedCoordinator
+            .prepareCurrentSessionRevocationApproval(boundTo: baseURL)
+        do {
+            try await unverifiedCoordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedBy: unverifiedApproval
+            )
+            Issue.record("An unverified ambiguous DELETE cleared local credentials")
+        } catch {
+            #expect(
+                error as? DurableDeviceSessionManagementError
+                    == .remoteRevocationVerificationRequired
+            )
+        }
+        #expect(unverifiedState.loadEnvelope() == initial)
+        #expect(await unverifiedTransport.records().map(\.method) == ["DELETE", "GET"])
+    }
+
+    @Test("fallback approval reconciles malformed 204 and 404 responses before clearing")
+    func fallbackCurrentSessionRevokeMalformedResponses() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 21, refreshMarker: 22)
+        let initial = envelope(active: active, revision: 12)
+
+        for statusCode in [204, 404] {
+            let state = TestDurableAuthStateStore(initial: initial)
+            let transport = TestDurableAuthTransport(
+                stateStore: state,
+                plans: [
+                    .response(statusCode: statusCode, headers: [:], body: Data()),
+                    .inventory([active.session]),
+                ]
+            )
+            let coordinator = makeCoordinator(
+                state: state,
+                transport: transport,
+                generator: TestDurableCredentialGenerator(),
+                now: { instant.addingTimeInterval(60) }
+            )
+            let approval = try await coordinator
+                .prepareCurrentSessionRevocationApproval(boundTo: baseURL)
+
+            do {
+                try await coordinator.revokeAndForget(
+                    boundTo: baseURL,
+                    approvedBy: approval
+                )
+                Issue.record("Malformed HTTP \(statusCode) cleared a still-active session")
+            } catch {
+                #expect(error as? DurableAuthError == .invalidResponse)
+            }
+            #expect(state.loadEnvelope() == initial)
+            #expect(await transport.records().map(\.method) == ["DELETE", "GET"])
+        }
+    }
+
+    @Test("fallback approval cannot cross replacement during protected-work preparation")
+    func fallbackCurrentSessionApprovalIsExactlyFenced() async throws {
+        let first = makeActive(issuedAt: instant, accessMarker: 23, refreshMarker: 24)
+        let initial = envelope(active: first, revision: 13)
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(stateStore: state, plans: [])
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let approval = try await coordinator.prepareCurrentSessionRevocationApproval(
+            boundTo: baseURL
+        )
+        let replacement = makeActive(
+            issuedAt: instant.addingTimeInterval(30),
+            accessMarker: 25,
+            refreshMarker: 26,
+            sessionID: UUID(uuidString: "56565656-5656-4656-8656-565656565656")!,
+            clientInstanceID: first.session.clientInstanceID
+        )
+        let replacementEnvelope = envelope(active: replacement, revision: 14)
+        state.forceReplace(replacementEnvelope)
+
+        do {
+            try await coordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedBy: approval
+            )
+            Issue.record("A fallback confirmation crossed a session replacement")
+        } catch {
+            #expect(error as? DurableAuthError == .concurrentStateChange)
+        }
+        #expect(await transport.records().isEmpty)
+        #expect(state.loadEnvelope() == replacementEnvelope)
+    }
+
     @Test("failed remote revoke retains state; stale success cannot delete newer CAS state")
     func revokeFailureAndStaleCASRetention() async throws {
         let active = makeActive(issuedAt: instant, accessMarker: 83, refreshMarker: 84)
@@ -1486,7 +1668,10 @@ struct DurableAuthCoordinatorTests {
         let state = TestDurableAuthStateStore(initial: initial)
         let transport = TestDurableAuthTransport(
             stateStore: state,
-            plans: [.failure(.transport(.notConnectedToInternet))]
+            plans: [
+                .failure(.transport(.notConnectedToInternet)),
+                .inventory([active.session]),
+            ]
         )
         let coordinator = makeCoordinator(
             state: state,
@@ -1504,7 +1689,10 @@ struct DurableAuthCoordinatorTests {
 
         let rejectedTransport = TestDurableAuthTransport(
             stateStore: state,
-            plans: [.raw(statusCode: 403, body: Data())]
+            plans: [
+                .raw(statusCode: 403, body: Data()),
+                .inventory([active.session]),
+            ]
         )
         let rejectedCoordinator = makeCoordinator(
             state: state,
@@ -1545,7 +1733,7 @@ struct DurableAuthCoordinatorTests {
         #expect(state.loadEnvelope() == newer)
     }
 
-    @Test("revoke retry retires only an exactly and definitively rejected refreshed lease")
+    @Test("revoke retry accepts only an exactly and definitively rejected refreshed lease")
     func revokeSecondUnauthorizedIsStrictAndExact() async throws {
         let active = makeActive(issuedAt: instant, accessMarker: 230, refreshMarker: 231)
         let initial = envelope(active: active, revision: 160)
@@ -1576,16 +1764,8 @@ struct DurableAuthCoordinatorTests {
             generator: TestDurableCredentialGenerator(markers: [232, 233]),
             now: { instant.addingTimeInterval(60) }
         )
-        do {
-            try await strictCoordinator.revokeAndForget(boundTo: baseURL)
-            Issue.record("A twice-rejected revoke must require reauthentication")
-        } catch {
-            #expect(error as? DurableAuthError == .reauthenticationRequired)
-        }
-        guard case .reauthenticationRequired? = strictState.loadEnvelope()?.state else {
-            Issue.record("The exact refreshed revoke lease was not retired")
-            return
-        }
+        try await strictCoordinator.revokeAndForget(boundTo: baseURL)
+        #expect(strictState.loadEnvelope() == nil)
 
         let arbitraryState = TestDurableAuthStateStore(initial: initial)
         let arbitraryTransport = TestDurableAuthTransport(
@@ -3746,6 +3926,10 @@ struct DurableAuthCoordinatorTests {
         #expect(model.deviceSessionInventoryIsStale)
         #expect(model.shouldOfferCurrentSessionRevokeFallback)
         #expect(model.deviceSessionErrorMessage?.contains("offline") == true)
+        #expect(
+            await model.prepareCurrentSessionRevocationApproval(baseURL: baseURL)
+                != nil
+        )
         let staleApproval = try #require(model.deviceSessionInventory)
         #expect(!(await model.revokeRemoteDeviceSession(
             remote.id,

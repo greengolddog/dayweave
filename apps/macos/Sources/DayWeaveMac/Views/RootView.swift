@@ -6708,13 +6708,19 @@ struct SettingsView: View {
     @State private var dayWeaveBearerToken = ""
     @State private var dayWeaveEnrollmentCode = ""
     @State private var isCanonicalResetConfirmationPresented = false
-    @State private var isCurrentSessionRevokeConfirmationPresented = false
+    @State private var pendingCurrentSessionRevocationApproval:
+        DurableCurrentSessionRevocationApproval?
     @State private var isLocalOnlyForgetConfirmationPresented = false
     @State private var apiSettingsError: String?
     @State private var scheduleProfileBaseline: ScheduleProfile?
     @State private var scheduleProfileDraft: ScheduleProfileDraft?
     @State private var scheduleProfileError: String?
     @State private var scheduleProfileStatus: String?
+
+    private enum ApprovedCurrentSessionRevocation {
+        case inventory(DurableDeviceSessionInventorySnapshot)
+        case fallback(DurableCurrentSessionRevocationApproval)
+    }
 
     var body: some View {
         Form {
@@ -6920,7 +6926,7 @@ struct SettingsView: View {
                         if durableAuth.presentation.canRevokeRemotely,
                            durableAuth.shouldOfferCurrentSessionRevokeFallback {
                             Button("Revoke this Mac & sign out…", role: .destructive) {
-                                isCurrentSessionRevokeConfirmationPresented = true
+                                prepareCurrentSessionRevocationConfirmation()
                             }
                             .disabled(
                                 suggestionSync.isRefreshing
@@ -7074,7 +7080,9 @@ struct SettingsView: View {
                         || executionSync.credentialReplacementIsBlocked
                         || googleCredentialTransitionIsBlocked,
                 onRevokeCurrentSession: { inventory in
-                    revokeAndRemoveAuthentication(approvedFrom: inventory)
+                    revokeAndRemoveAuthentication(
+                        approvedBy: .inventory(inventory)
+                    )
                 }
             )
             Section("Local data") {
@@ -7119,11 +7127,19 @@ struct SettingsView: View {
         }
         .confirmationDialog(
             "Revoke this Mac and sign out?",
-            isPresented: $isCurrentSessionRevokeConfirmationPresented,
+            isPresented: currentSessionRevocationConfirmationIsPresented,
             titleVisibility: .visible
         ) {
-            Button("Revoke & Sign Out", role: .destructive) {
-                revokeAndRemoveAuthentication()
+            if let approval = pendingCurrentSessionRevocationApproval {
+                Button("Revoke & Sign Out", role: .destructive) {
+                    pendingCurrentSessionRevocationApproval = nil
+                    revokeAndRemoveAuthentication(
+                        approvedBy: .fallback(approval)
+                    )
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingCurrentSessionRevocationApproval = nil
             }
         } message: {
             Text("DayWeave will revoke this Mac on the server, then remove its local Keychain credentials. Pending protected work must be reconciled first.")
@@ -7151,6 +7167,37 @@ struct SettingsView: View {
         }
         .onChange(of: store.scheduleProfile) { _, profile in
             persistedScheduleProfileDidChange(profile)
+        }
+        .onDisappear {
+            pendingCurrentSessionRevocationApproval = nil
+        }
+    }
+
+    private var currentSessionRevocationConfirmationIsPresented: Binding<Bool> {
+        Binding(
+            get: { pendingCurrentSessionRevocationApproval != nil },
+            set: {
+                if !$0 { pendingCurrentSessionRevocationApproval = nil }
+            }
+        )
+    }
+
+    private func prepareCurrentSessionRevocationConfirmation() {
+        apiSettingsError = nil
+        let baseURL: DayWeaveAPIBaseURL
+        do {
+            baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+        } catch {
+            apiSettingsError = error.localizedDescription
+            return
+        }
+        Task { @MainActor in
+            guard let approval = await durableAuth
+                .prepareCurrentSessionRevocationApproval(baseURL: baseURL) else {
+                apiSettingsError = durableAuth.errorMessage
+                return
+            }
+            pendingCurrentSessionRevocationApproval = approval
         }
     }
 
@@ -7441,7 +7488,7 @@ struct SettingsView: View {
     }
 
     private func revokeAndRemoveAuthentication(
-        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot? = nil
+        approvedBy approval: ApprovedCurrentSessionRevocation
     ) {
         apiSettingsError = nil
         guard allowGoogleCredentialTransition() else { return }
@@ -7457,10 +7504,19 @@ struct SettingsView: View {
             defer { googleIntegration.endCredentialTransition() }
             do {
                 try await executionSync.prepareForCredentialReplacement()
-                guard await durableAuth.revokeAndForget(
-                    baseURL: baseURL,
-                    approvedFrom: expectedInventory
-                ) else {
+                let revoked = switch approval {
+                case let .inventory(inventory):
+                    await durableAuth.revokeAndForget(
+                        baseURL: baseURL,
+                        approvedFrom: inventory
+                    )
+                case let .fallback(approval):
+                    await durableAuth.revokeAndForget(
+                        baseURL: baseURL,
+                        approvedBy: approval
+                    )
+                }
+                guard revoked else {
                     apiSettingsError = durableAuth.errorMessage
                     return
                 }
