@@ -14,9 +14,9 @@ use dayweave_api::{
     account_deletion::{
         AccountDeletionFenceConfirmation, AccountDeletionFenceSafetyEvidence,
         AccountDeletionPreparation, AccountDeletionPreparationSafetyEvidence,
-        AccountDeletionRepository, AccountDeletionRepositoryError, AccountDeletionSafetyGate,
-        AccountDeletionSafetyGateError, AccountDeletionScope, AccountDeletionStatus,
-        AccountDeletionTransition, account_deletion_approval_digest,
+        AccountDeletionPrincipalKey, AccountDeletionPrincipalPseudonym, AccountDeletionRepository,
+        AccountDeletionRepositoryError, AccountDeletionSafetyGate, AccountDeletionSafetyGateError,
+        AccountDeletionStatus, AccountDeletionTransition, account_deletion_approval_digest,
     },
     credential_auth::{
         AccountRecoveryCodeSpec, CredentialKind, CredentialRepository,
@@ -44,7 +44,7 @@ struct VerifiedTestSafetyGate {
 impl AccountDeletionSafetyGate for VerifiedTestSafetyGate {
     async fn authorize_preparation(
         &self,
-        _scope: AccountDeletionScope,
+        _principal: AccountDeletionPrincipalPseudonym,
         _deletion_id: Uuid,
     ) -> Result<AccountDeletionPreparationSafetyEvidence, AccountDeletionSafetyGateError> {
         self.reservations.fetch_add(1, Ordering::SeqCst);
@@ -55,7 +55,7 @@ impl AccountDeletionSafetyGate for VerifiedTestSafetyGate {
 
     async fn commit_tombstone(
         &self,
-        _scope: AccountDeletionScope,
+        _principal: AccountDeletionPrincipalPseudonym,
         _deletion_id: Uuid,
     ) -> Result<AccountDeletionFenceSafetyEvidence, AccountDeletionSafetyGateError> {
         self.promotions.fetch_add(1, Ordering::SeqCst);
@@ -339,9 +339,31 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         0
     );
 
+    let mismatched_gate = Arc::new(VerifiedTestSafetyGate::default());
+    let mismatched_repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
+        .with_safety_gate(
+            mismatched_gate.clone(),
+            AccountDeletionPrincipalKey::new(1, [0x51; 32])
+                .unwrap()
+                .bind("a-different-owner")
+                .unwrap(),
+        );
+    assert_eq!(
+        mismatched_repository
+            .prepare(preparation.clone(), &recovery_code)
+            .await,
+        Err(AccountDeletionRepositoryError::InvalidAuthority),
+        "an external pseudonym cannot be paired with a different local owner"
+    );
+    assert_eq!(mismatched_gate.reservations.load(Ordering::SeqCst), 0);
+
     let safety_gate = Arc::new(VerifiedTestSafetyGate::default());
+    let external_principal = AccountDeletionPrincipalKey::new(1, [0x51; 32])
+        .unwrap()
+        .bind("account-deletion-owner")
+        .unwrap();
     let repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
-        .with_safety_gate(safety_gate.clone());
+        .with_safety_gate(safety_gate.clone(), external_principal);
     let mut unauthorized_preparation = preparation.clone();
     unauthorized_preparation.id = Uuid::new_v4();
     unauthorized_preparation.request_hash = [0x7f; 32];
@@ -435,6 +457,31 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     assert_eq!(prepared.status, AccountDeletionStatus::Prepared);
     assert_eq!(prepared.revision, 1);
     assert!(!prepared.replayed);
+    let persisted_external_principal = sqlx::query_as::<_, (i32, Vec<u8>)>(
+        "SELECT external_principal_key_version, external_principal_pseudonym \
+         FROM account_deletion_lifecycles WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .fetch_one(pool)
+    .await
+    .expect("persisted external principal binding");
+    assert_eq!(persisted_external_principal.0, 1);
+    assert_eq!(
+        persisted_external_principal.1,
+        external_principal.pseudonym().digest()
+    );
+    let principal_mutation_error = sqlx::query(
+        "UPDATE account_deletion_lifecycles SET external_principal_key_version = 2 \
+         WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect_err("external principal binding is immutable");
+    assert_eq!(
+        postgres_code(&principal_mutation_error).as_deref(),
+        Some("DWCON")
+    );
     assert_eq!(safety_gate.reservations.load(Ordering::SeqCst), 2);
     let replayed_preparation = repository
         .prepare(preparation.clone(), &recovery_code)
@@ -442,6 +489,23 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .expect("lost preparation response replays");
     assert!(replayed_preparation.replayed);
     assert_eq!(replayed_preparation.revision, 1);
+    let drift_gate = Arc::new(VerifiedTestSafetyGate::default());
+    let drifted_repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
+        .with_safety_gate(
+            drift_gate.clone(),
+            AccountDeletionPrincipalKey::new(2, [0x52; 32])
+                .unwrap()
+                .bind("account-deletion-owner")
+                .unwrap(),
+        );
+    assert_eq!(
+        drifted_repository
+            .prepare(preparation.clone(), &recovery_code)
+            .await,
+        Err(AccountDeletionRepositoryError::Conflict),
+        "key drift cannot redirect an existing lifecycle to a new external identity"
+    );
+    assert_eq!(drift_gate.reservations.load(Ordering::SeqCst), 0);
     let mut changed_preparation = preparation.clone();
     changed_preparation.request_hash = [0x03; 32];
     assert_eq!(
@@ -502,6 +566,13 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
             scope.user_id,
         ),
     };
+    assert_eq!(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .begin_fence(confirmation.clone())
+            .await,
+        Err(AccountDeletionRepositoryError::Disabled),
+        "removing external configuration disables a prepared lifecycle"
+    );
     let fenced = repository
         .begin_fence(confirmation.clone())
         .await
@@ -566,6 +637,13 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         0x12,
         AccountDeletionStatus::FenceCommitting,
         AccountDeletionStatus::Fenced,
+    );
+    assert_eq!(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .advance(fenced_transition.clone())
+            .await,
+        Err(AccountDeletionRepositoryError::Disabled),
+        "removing external configuration disables tombstone promotion"
     );
     assert!(
         !repository
@@ -706,6 +784,35 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
 
 async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     assert_account_deletion_barrier_modes(pool).await;
+
+    let external_binding_guarded = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_trigger AS trigger \
+         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         JOIN pg_proc AS function ON function.oid = trigger.tgfoid \
+         WHERE namespace.nspname = current_schema() \
+         AND relation.relname = 'account_deletion_lifecycles' \
+         AND trigger.tgname = 'account_deletion_external_principal_binding_guard' \
+         AND function.proname = 'guard_account_deletion_external_principal_binding' \
+         AND trigger.tgtype = 23 AND NOT trigger.tgisinternal)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("external principal binding guard inventory");
+    assert!(external_binding_guarded);
+    let public_can_execute_binding_guard = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_proc AS function \
+         CROSS JOIN LATERAL aclexplode(COALESCE(function.proacl, \
+             acldefault('f', function.proowner))) AS acl \
+         JOIN pg_namespace AS namespace ON namespace.oid = function.pronamespace \
+         WHERE namespace.nspname = current_schema() \
+         AND function.proname = 'guard_account_deletion_external_principal_binding' \
+         AND acl.grantee = 0 AND acl.privilege_type = 'EXECUTE')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("external principal guard privilege inventory");
+    assert!(!public_can_execute_binding_guard);
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
@@ -988,11 +1095,13 @@ async fn prepare_test_fence(pool: &PgPool, scope: DatabaseScope) -> TestFence {
     sqlx::query(
         "INSERT INTO account_deletion_lifecycles (id, workspace_id, user_id, \
          owner_subject_hash, prepare_request_hash, explicit_approval_digest, \
-         principal_rate_limit_evidence_hash, authorizing_session_id, \
+         principal_rate_limit_evidence_hash, external_principal_key_version, \
+         external_principal_pseudonym, authorizing_session_id, \
          authorizing_session_revision, authorizing_credential_issued_at, \
          authorizing_recovery_code_id, authorizing_recovery_code_revision, \
          authorizing_recovery_code_created_at, prepared_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, 1, $11, $12, $12, $12)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, 1, $10, $11, 1, $12, \
+         $13, $13, $13)",
     )
     .bind(deletion_id)
     .bind(scope.workspace_id)
@@ -1001,6 +1110,7 @@ async fn prepare_test_fence(pool: &PgPool, scope: DatabaseScope) -> TestFence {
     .bind([0xb1_u8; 32].as_slice())
     .bind([0xb2_u8; 32].as_slice())
     .bind([0xb3_u8; 32].as_slice())
+    .bind([0xb5_u8; 32].as_slice())
     .bind(Uuid::new_v4())
     .bind(prepared_at - Duration::hours(1))
     .bind(Uuid::new_v4())

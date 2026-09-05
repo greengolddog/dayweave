@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     account_deletion::{
         AccountDeletionFenceConfirmation, AccountDeletionLifecycle, AccountDeletionMutation,
-        AccountDeletionPreparation, AccountDeletionRepository, AccountDeletionRepositoryError,
-        AccountDeletionSafetyGate, AccountDeletionSafetyGateError, AccountDeletionScope,
+        AccountDeletionPreparation, AccountDeletionPrincipalBinding, AccountDeletionRepository,
+        AccountDeletionRepositoryError, AccountDeletionSafetyGate, AccountDeletionSafetyGateError,
         AccountDeletionStatus, AccountDeletionTransition, DisabledAccountDeletionSafetyGate,
         account_deletion_approval_digest,
     },
@@ -29,6 +29,7 @@ pub struct PostgresAccountDeletionRepository {
     pool: PgPool,
     scope: DatabaseScope,
     safety_gate: Arc<dyn AccountDeletionSafetyGate>,
+    external_principal: Option<AccountDeletionPrincipalBinding>,
 }
 
 impl std::fmt::Debug for PostgresAccountDeletionRepository {
@@ -37,6 +38,7 @@ impl std::fmt::Debug for PostgresAccountDeletionRepository {
             .debug_struct("PostgresAccountDeletionRepository")
             .field("scope", &self.scope)
             .field("safety_gate", &"[REDACTED]")
+            .field("external_principal", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -50,12 +52,21 @@ impl PostgresAccountDeletionRepository {
             pool,
             scope,
             safety_gate: Arc::new(DisabledAccountDeletionSafetyGate),
+            external_principal: None,
         }
     }
 
+    /// Supplies the external authority together with the deployment-keyed
+    /// principal it must use. There is intentionally no gate-only overload:
+    /// the database's local unkeyed owner digest may never be substituted.
     #[must_use]
-    pub fn with_safety_gate(mut self, gate: Arc<dyn AccountDeletionSafetyGate>) -> Self {
+    pub fn with_safety_gate(
+        mut self,
+        gate: Arc<dyn AccountDeletionSafetyGate>,
+        principal: AccountDeletionPrincipalBinding,
+    ) -> Self {
         self.safety_gate = gate;
+        self.external_principal = Some(principal);
         self
     }
 }
@@ -90,21 +101,28 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         recovery_code: &OpaqueCredential<'_>,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError> {
         validate_preparation(&preparation, self.scope, recovery_code)?;
+        let principal = self
+            .external_principal
+            .ok_or(AccountDeletionRepositoryError::Disabled)?;
         let recovery_digest = recovery_code.persistence_digest();
-        if let Some(replay) =
-            lookup_preparation(&self.pool, self.scope, &preparation, &recovery_digest).await?
-        {
-            return Ok(replay);
-        }
 
         // Reject stale/under-scoped/shared requests before the external
         // per-principal allowance can be consumed. The durable insert repeats
         // this entire preflight after the external call.
         let mut preflight = self.pool.begin().await.map_err(internal)?;
         let preflight_subject_hash = fetch_subject_hash(&mut preflight, self.scope).await?;
+        if !principal.matches_local_subject_hash(&preflight_subject_hash) {
+            return Err(AccountDeletionRepositoryError::InvalidAuthority);
+        }
         lock_deletion_scope(&mut preflight, self.scope, &preflight_subject_hash).await?;
-        if let Some(replay) =
-            lookup_preparation(&mut *preflight, self.scope, &preparation, &recovery_digest).await?
+        if let Some(replay) = lookup_preparation(
+            &mut *preflight,
+            self.scope,
+            &preparation,
+            &recovery_digest,
+            principal,
+        )
+        .await?
         {
             preflight.commit().await.map_err(internal)?;
             return Ok(replay);
@@ -133,13 +151,7 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
 
         let evidence = self
             .safety_gate
-            .authorize_preparation(
-                AccountDeletionScope {
-                    workspace_id: self.scope.workspace_id,
-                    user_id: self.scope.user_id,
-                },
-                preparation.id,
-            )
+            .authorize_preparation(principal.pseudonym(), preparation.id)
             .await
             .map_err(safety_gate_error)?;
         if evidence
@@ -152,12 +164,16 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
 
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         let subject_hash = fetch_subject_hash(&mut transaction, self.scope).await?;
+        if !principal.matches_local_subject_hash(&subject_hash) {
+            return Err(AccountDeletionRepositoryError::InvalidAuthority);
+        }
         lock_deletion_scope(&mut transaction, self.scope, &subject_hash).await?;
         if let Some(replay) = lookup_preparation(
             &mut *transaction,
             self.scope,
             &preparation,
             &recovery_digest,
+            principal,
         )
         .await?
         {
@@ -188,13 +204,14 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         let inserted = sqlx::query_scalar::<_, i64>(
             "INSERT INTO account_deletion_lifecycles (id, workspace_id, user_id, \
              owner_subject_hash, prepare_request_hash, explicit_approval_digest, \
-             principal_rate_limit_evidence_hash, \
+             principal_rate_limit_evidence_hash, external_principal_key_version, \
+             external_principal_pseudonym, \
              authorizing_session_id, authorizing_session_revision, \
              authorizing_credential_issued_at, authorizing_recovery_code_id, \
              authorizing_recovery_code_revision, authorizing_recovery_code_created_at, \
              status, revision, prepared_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
-             'prepared', 1, $14, $14, $14) RETURNING revision",
+             $14, $15, 'prepared', 1, $16, $16, $16) RETURNING revision",
         )
         .bind(preparation.id)
         .bind(self.scope.workspace_id)
@@ -203,6 +220,11 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         .bind(preparation.request_hash.as_slice())
         .bind(preparation.explicit_approval_digest.as_slice())
         .bind(evidence.principal_rate_limit_hash.as_slice())
+        .bind(
+            i32::try_from(principal.pseudonym().key_version())
+                .map_err(|_| AccountDeletionRepositoryError::InvalidInput)?,
+        )
+        .bind(principal.pseudonym().digest().as_slice())
         .bind(preparation.authorizing_session_id)
         .bind(
             i64::try_from(preparation.authorizing_session_revision)
@@ -231,12 +253,20 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         &self,
         confirmation: AccountDeletionFenceConfirmation,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError> {
+        let principal = self
+            .external_principal
+            .ok_or(AccountDeletionRepositoryError::Disabled)?;
         let transition = confirmation.transition.clone();
         validate_transition(&transition)?;
         validate_fence_confirmation(&confirmation, &transition, self.scope)?;
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         let lifecycle =
             lock_lifecycle(&mut transaction, self.scope, transition.deletion_id).await?;
+        if !principal.matches_local_subject_hash(&lifecycle.owner_subject_hash)
+            || !lifecycle.matches_external_principal(principal)
+        {
+            return Err(AccountDeletionRepositoryError::InvalidAuthority);
+        }
         lock_deletion_scope(
             &mut transaction,
             self.scope,
@@ -359,7 +389,17 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         {
             advance_with_external_tombstone(self, transition).await
         } else {
-            advance_local_transition(&self.pool, self.scope, transition).await
+            let principal = if transition.from == AccountDeletionStatus::Prepared
+                && transition.to == AccountDeletionStatus::Cancelled
+            {
+                None
+            } else {
+                Some(
+                    self.external_principal
+                        .ok_or(AccountDeletionRepositoryError::Disabled)?,
+                )
+            };
+            advance_local_transition(&self.pool, self.scope, transition, principal).await
         }
     }
 }
@@ -368,9 +408,16 @@ async fn advance_local_transition(
     pool: &PgPool,
     scope: DatabaseScope,
     transition: AccountDeletionTransition,
+    principal: Option<AccountDeletionPrincipalBinding>,
 ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError> {
     let mut transaction = pool.begin().await.map_err(internal)?;
     let lifecycle = lock_lifecycle(&mut transaction, scope, transition.deletion_id).await?;
+    if principal.is_some_and(|principal| {
+        !principal.matches_local_subject_hash(&lifecycle.owner_subject_hash)
+            || !lifecycle.matches_external_principal(principal)
+    }) {
+        return Err(AccountDeletionRepositoryError::InvalidAuthority);
+    }
     lock_deletion_scope(
         &mut transaction,
         scope,
@@ -401,6 +448,9 @@ async fn advance_with_external_tombstone(
     repository: &PostgresAccountDeletionRepository,
     transition: AccountDeletionTransition,
 ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError> {
+    let principal = repository
+        .external_principal
+        .ok_or(AccountDeletionRepositoryError::Disabled)?;
     let mut preflight = repository.pool.begin().await.map_err(internal)?;
     let lifecycle =
         lock_lifecycle(&mut preflight, repository.scope, transition.deletion_id).await?;
@@ -421,15 +471,14 @@ async fn advance_with_external_tombstone(
     }
     preflight.commit().await.map_err(internal)?;
 
+    if !principal.matches_local_subject_hash(&current_subject_hash)
+        || !lifecycle.matches_external_principal(principal)
+    {
+        return Err(AccountDeletionRepositoryError::InvalidAuthority);
+    }
     let evidence = repository
         .safety_gate
-        .commit_tombstone(
-            AccountDeletionScope {
-                workspace_id: repository.scope.workspace_id,
-                user_id: repository.scope.user_id,
-            },
-            transition.deletion_id,
-        )
+        .commit_tombstone(principal.pseudonym(), transition.deletion_id)
         .await
         .map_err(safety_gate_error)?;
     if evidence
@@ -536,6 +585,8 @@ struct LockedLifecycle {
     prepared_at: DateTime<Utc>,
     owner_subject_hash: Vec<u8>,
     external_tombstone_evidence_hash: Option<[u8; 32]>,
+    external_principal_key_version: Option<i32>,
+    external_principal_pseudonym: Option<Vec<u8>>,
     authorizing_session_id: Uuid,
     authorizing_session_revision: u64,
     authorizing_recovery_code_id: Uuid,
@@ -543,11 +594,20 @@ struct LockedLifecycle {
     authorizing_recovery_code_created_at: DateTime<Utc>,
 }
 
+impl LockedLifecycle {
+    fn matches_external_principal(&self, binding: AccountDeletionPrincipalBinding) -> bool {
+        let pseudonym = binding.pseudonym();
+        self.external_principal_key_version == i32::try_from(pseudonym.key_version()).ok()
+            && self.external_principal_pseudonym.as_deref() == Some(pseudonym.digest().as_slice())
+    }
+}
+
 async fn lookup_preparation<'e, E>(
     executor: E,
     scope: DatabaseScope,
     preparation: &AccountDeletionPreparation,
     recovery_digest: &[u8; 32],
+    principal: AccountDeletionPrincipalBinding,
 ) -> Result<Option<AccountDeletionMutation>, AccountDeletionRepositoryError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
@@ -558,13 +618,15 @@ where
              AND authorizing_session_id = $6 \
              AND authorizing_session_revision = $7 \
              AND authorizing_recovery_code_id = $8 \
-             AND authorizing_recovery_code_revision = $9 AS exact, \
+             AND authorizing_recovery_code_revision = $9 \
+             AND external_principal_key_version = $10 \
+             AND external_principal_pseudonym = $11 AS exact, \
              EXISTS(SELECT 1 FROM account_recovery_codes AS recovery \
                  WHERE recovery.workspace_id = lifecycle.workspace_id \
                  AND recovery.user_id = lifecycle.user_id \
                  AND recovery.id = lifecycle.authorizing_recovery_code_id \
                  AND recovery.revision = lifecycle.authorizing_recovery_code_revision \
-                 AND recovery.token_hash = $10 \
+                 AND recovery.token_hash = $12 \
                  AND recovery.consumed_at IS NULL AND recovery.revoked_at IS NULL) \
                  AS recovery_exact, \
              status, revision \
@@ -582,6 +644,11 @@ where
     .bind(revision_to_i64(
         preparation.authorizing_recovery_code_revision,
     )?)
+    .bind(
+        i32::try_from(principal.pseudonym().key_version())
+            .map_err(|_| AccountDeletionRepositoryError::InvalidInput)?,
+    )
+    .bind(principal.pseudonym().digest().as_slice())
     .bind(recovery_digest.as_slice())
     .fetch_optional(executor)
     .await
@@ -612,7 +679,8 @@ async fn lock_lifecycle(
 ) -> Result<LockedLifecycle, AccountDeletionRepositoryError> {
     let row = sqlx::query(
         "SELECT status, revision, prepared_at, owner_subject_hash, \
-         external_tombstone_evidence_hash, authorizing_session_id, \
+         external_tombstone_evidence_hash, external_principal_key_version, \
+         external_principal_pseudonym, authorizing_session_id, \
          authorizing_session_revision, \
          authorizing_recovery_code_id, authorizing_recovery_code_revision, \
          authorizing_recovery_code_created_at \
@@ -645,6 +713,12 @@ async fn lock_lifecycle(
         prepared_at: row.try_get("prepared_at").map_err(internal)?,
         owner_subject_hash: subject_hash,
         external_tombstone_evidence_hash,
+        external_principal_key_version: row
+            .try_get("external_principal_key_version")
+            .map_err(internal)?,
+        external_principal_pseudonym: row
+            .try_get("external_principal_pseudonym")
+            .map_err(internal)?,
         authorizing_session_id: row.try_get("authorizing_session_id").map_err(internal)?,
         authorizing_session_revision: revision_from_i64(
             row.try_get("authorizing_session_revision")

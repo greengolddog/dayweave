@@ -7,14 +7,8 @@ use crate::credential_auth::OpaqueCredential;
 use super::{
     AccountDeletionFenceConfirmation, AccountDeletionFenceSafetyEvidence, AccountDeletionLifecycle,
     AccountDeletionMutation, AccountDeletionPreparation, AccountDeletionPreparationSafetyEvidence,
-    AccountDeletionTransition,
+    AccountDeletionPrincipalPseudonym, AccountDeletionTransition,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccountDeletionScope {
-    pub workspace_id: Uuid,
-    pub user_id: Uuid,
-}
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum AccountDeletionSafetyGateError {
@@ -31,18 +25,19 @@ pub trait AccountDeletionSafetyGate: Send + Sync {
     /// fence or tombstone; a still-prepared lifecycle remains cancellable.
     async fn authorize_preparation(
         &self,
-        scope: AccountDeletionScope,
+        principal: AccountDeletionPrincipalPseudonym,
         deletion_id: Uuid,
     ) -> Result<AccountDeletionPreparationSafetyEvidence, AccountDeletionSafetyGateError>;
 
     /// Commits the permanent external anti-resurrection tombstone after the
     /// local hard fence exists. Calls at this lower layer must be exactly
-    /// idempotent by deletion id. Activation additionally needs a separately
-    /// typed, deployment-keyed principal pseudonym for restore lookup; the
-    /// database's local unkeyed fence digest is never acceptable.
+    /// idempotent by deletion id. Activation additionally requires an
+    /// exclusive external permit held for the runtime's admission lifetime;
+    /// a one-shot restore lookup is racy. The database's local unkeyed fence
+    /// digest is never acceptable as the external principal.
     async fn commit_tombstone(
         &self,
-        scope: AccountDeletionScope,
+        principal: AccountDeletionPrincipalPseudonym,
         deletion_id: Uuid,
     ) -> Result<AccountDeletionFenceSafetyEvidence, AccountDeletionSafetyGateError>;
 }
@@ -54,7 +49,7 @@ pub struct DisabledAccountDeletionSafetyGate;
 impl AccountDeletionSafetyGate for DisabledAccountDeletionSafetyGate {
     async fn authorize_preparation(
         &self,
-        _scope: AccountDeletionScope,
+        _principal: AccountDeletionPrincipalPseudonym,
         _deletion_id: Uuid,
     ) -> Result<AccountDeletionPreparationSafetyEvidence, AccountDeletionSafetyGateError> {
         Err(AccountDeletionSafetyGateError::Disabled)
@@ -62,7 +57,7 @@ impl AccountDeletionSafetyGate for DisabledAccountDeletionSafetyGate {
 
     async fn commit_tombstone(
         &self,
-        _scope: AccountDeletionScope,
+        _principal: AccountDeletionPrincipalPseudonym,
         _deletion_id: Uuid,
     ) -> Result<AccountDeletionFenceSafetyEvidence, AccountDeletionSafetyGateError> {
         Err(AccountDeletionSafetyGateError::Disabled)
@@ -116,8 +111,9 @@ pub trait AccountDeletionRepository: Send + Sync {
     /// Advances an exact lifecycle edge only through `provider_cleanup` intent.
     /// This foundation deliberately exposes no provider-cleanup-to-purge edge:
     /// durable per-provider revocation outcomes/retries, a bounded policy, and
-    /// restore-time external tombstone lookup must exist first. Completion is
-    /// likewise unavailable until backup-erasure evidence is real.
+    /// an exclusive runtime-held external restore permit must exist first.
+    /// Completion is likewise unavailable until backup-erasure evidence is
+    /// real.
     async fn advance(
         &self,
         transition: AccountDeletionTransition,
