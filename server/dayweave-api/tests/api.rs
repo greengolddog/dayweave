@@ -441,6 +441,19 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
             .is_object()
     );
     assert!(document["components"]["securitySchemes"].is_object());
+    assert!(document["paths"]["/v1/auth/recovery-codes/current"]["get"].is_object());
+    assert!(document["paths"]["/v1/auth/recovery-codes"]["post"].is_object());
+    assert!(document["paths"]["/v1/auth/recovery-codes/consume"]["post"].is_object());
+    for path in ["/v1/auth/recovery-codes", "/v1/auth/recovery-codes/consume"] {
+        assert!(document["paths"][path]["post"]["responses"]["400"].is_object());
+        assert!(document["paths"][path]["post"]["responses"]["413"].is_object());
+    }
+    assert!(
+        document["paths"]["/v1/auth/recovery-codes/current"]["get"]["responses"]["400"].is_null()
+    );
+    assert!(
+        document["paths"]["/v1/auth/recovery-codes/current"]["get"]["responses"]["413"].is_null()
+    );
     assert!(document["paths"]["/v1/auth/device-enrollments"]["post"].is_object());
     assert!(
         document["paths"]["/v1/auth/device-enrollments"]["post"]["responses"]["200"].is_object()

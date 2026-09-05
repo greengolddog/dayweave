@@ -16,6 +16,7 @@ pub enum CredentialKind {
     DeviceRefresh,
     McpClient,
     Enrollment,
+    AccountRecovery,
 }
 
 /// A newly generated credential whose plaintext is erased when dropped.
@@ -85,6 +86,7 @@ impl CredentialKind {
             Self::DeviceRefresh => "dw_dr1_",
             Self::McpClient => "dw_mc1_",
             Self::Enrollment => "dw_en1_",
+            Self::AccountRecovery => "dw_rc1_",
         }
     }
 
@@ -94,6 +96,7 @@ impl CredentialKind {
             Self::DeviceRefresh => b"device-refresh",
             Self::McpClient => b"mcp-client",
             Self::Enrollment => b"enrollment",
+            Self::AccountRecovery => b"account-recovery",
         }
     }
 }
@@ -255,16 +258,21 @@ mod tests {
     fn persistence_hashes_are_stable_and_domain_separated() {
         let access_raw = token(CredentialKind::DeviceAccess, 11);
         let refresh_raw = token(CredentialKind::DeviceRefresh, 11);
+        let recovery_raw = token(CredentialKind::AccountRecovery, 11);
         let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
         let access_again =
             OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
         let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_raw).unwrap();
+        let recovery =
+            OpaqueCredential::parse(CredentialKind::AccountRecovery, &recovery_raw).unwrap();
 
         assert_eq!(
             access.persistence_digest(),
             access_again.persistence_digest()
         );
         assert_ne!(access.persistence_digest(), refresh.persistence_digest());
+        assert_ne!(access.persistence_digest(), recovery.persistence_digest());
+        assert_ne!(refresh.persistence_digest(), recovery.persistence_digest());
         assert_ne!(
             access.persistence_digest().as_slice(),
             access_raw.as_bytes()
@@ -276,13 +284,18 @@ mod tests {
         let access_raw = token(CredentialKind::DeviceAccess, 21);
         let matching_refresh_raw = token(CredentialKind::DeviceRefresh, 21);
         let different_refresh_raw = token(CredentialKind::DeviceRefresh, 22);
+        let matching_recovery_raw = token(CredentialKind::AccountRecovery, 21);
         let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
         let matching_refresh =
             OpaqueCredential::parse(CredentialKind::DeviceRefresh, &matching_refresh_raw).unwrap();
         let different_refresh =
             OpaqueCredential::parse(CredentialKind::DeviceRefresh, &different_refresh_raw).unwrap();
+        let matching_recovery =
+            OpaqueCredential::parse(CredentialKind::AccountRecovery, &matching_recovery_raw)
+                .unwrap();
 
         assert!(access.has_same_secret_material(&matching_refresh).unwrap());
+        assert!(access.has_same_secret_material(&matching_recovery).unwrap());
         assert!(!access.has_same_secret_material(&different_refresh).unwrap());
         assert_ne!(
             access.persistence_digest(),
@@ -292,6 +305,7 @@ mod tests {
         let debug = format!("{access:?} {matching_refresh:?}");
         assert!(!debug.contains(&access_raw));
         assert!(!debug.contains(&matching_refresh_raw));
+        assert!(!format!("{matching_recovery:?}").contains(&matching_recovery_raw));
     }
 
     #[test]

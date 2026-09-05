@@ -428,10 +428,15 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/integrations/google/accounts/{account_id}/schedule-publications/previews/{preview_id}/approve"
             | "/integrations/google/accounts/{account_id}/schedule-publications",
         ) => Some(Scope::GoogleWrite),
-        (&Method::GET, "/auth/sessions") => Some(Scope::AuthSessionsRead),
+        (&Method::GET, "/auth/sessions" | "/auth/recovery-codes/current") => {
+            Some(Scope::AuthSessionsRead)
+        }
         (
             &Method::POST | &Method::DELETE,
-            "/auth/device-enrollments" | "/auth/device-enrollments/{id}" | "/auth/sessions/{id}",
+            "/auth/device-enrollments"
+            | "/auth/device-enrollments/{id}"
+            | "/auth/sessions/{id}"
+            | "/auth/recovery-codes",
         ) => Some(Scope::AuthSessionsWrite),
         (&Method::GET, "/auth/mcp-clients") => Some(Scope::AuthMcpClientsRead),
         (&Method::POST | &Method::DELETE, "/auth/mcp-clients" | "/auth/mcp-clients/{id}") => {
@@ -461,8 +466,9 @@ pub fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::credential_auth::{
-        CredentialMutation, CredentialRepositoryError, DeviceClientKind, DeviceEnrollmentSpec,
-        DeviceSession, McpClient, McpClientSpec,
+        AccountRecoveryCode, AccountRecoveryCodeSpec, AccountRecoveryConsumption,
+        AccountRecoverySessionSpec, CredentialMutation, CredentialRepositoryError,
+        DeviceClientKind, DeviceEnrollmentSpec, DeviceSession, McpClient, McpClientSpec,
     };
     use chrono::{DateTime, Duration, Utc};
 
@@ -482,6 +488,34 @@ mod tests {
 
     #[async_trait]
     impl CredentialRepository for SyntheticCredentialRepository {
+        async fn get_active_account_recovery_code(
+            &self,
+        ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError> {
+            Ok(None)
+        }
+
+        async fn create_or_rotate_account_recovery_code(
+            &self,
+            _spec: AccountRecoveryCodeSpec,
+            _recovery_code: &OpaqueCredential<'_>,
+            _authorizing_session_id: Uuid,
+        ) -> Result<CredentialMutation<AccountRecoveryCode>, CredentialRepositoryError> {
+            Err(CredentialRepositoryError::InvalidCredential)
+        }
+
+        async fn consume_account_recovery_code(
+            &self,
+            _recovery_code: &OpaqueCredential<'_>,
+            _spec: AccountRecoverySessionSpec,
+            _access_token: &OpaqueCredential<'_>,
+            _refresh_token: &OpaqueCredential<'_>,
+            _successor_recovery_code: &OpaqueCredential<'_>,
+            _now: DateTime<Utc>,
+        ) -> Result<CredentialMutation<AccountRecoveryConsumption>, CredentialRepositoryError>
+        {
+            Err(CredentialRepositoryError::InvalidCredential)
+        }
+
         async fn create_device_enrollment(
             &self,
             _spec: DeviceEnrollmentSpec,
@@ -546,6 +580,7 @@ mod tests {
             &self,
             _spec: McpClientSpec,
             _credential: &OpaqueCredential<'_>,
+            _authorizing_session_id: Option<Uuid>,
         ) -> Result<McpClient, CredentialRepositoryError> {
             Err(CredentialRepositoryError::InvalidCredential)
         }
@@ -673,6 +708,14 @@ mod tests {
             Some(Scope::AuthMcpClientsRead)
         );
         assert_eq!(
+            required_rest_scope(&Method::GET, Some("/v1/auth/recovery-codes/current")),
+            Some(Scope::AuthSessionsRead)
+        );
+        assert_eq!(
+            required_rest_scope(&Method::POST, Some("/v1/auth/recovery-codes")),
+            Some(Scope::AuthSessionsWrite)
+        );
+        assert_eq!(
             required_rest_scope(&Method::GET, Some("/v1/schedule/manual-placements")),
             Some(Scope::ScheduleRead)
         );
@@ -759,6 +802,15 @@ mod tests {
                 .authenticate("dw_future_opaque")
                 .await
                 .is_err()
+        );
+        let recovery = format!(
+            "{}{}",
+            CredentialKind::AccountRecovery.prefix(),
+            "A".repeat(43)
+        );
+        assert!(
+            authenticator.authenticate(&recovery).await.is_err(),
+            "account recovery credentials never enter ordinary REST authentication"
         );
 
         let access = format!(

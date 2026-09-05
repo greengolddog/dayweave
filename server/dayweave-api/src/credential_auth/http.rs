@@ -14,21 +14,28 @@ use zeroize::Zeroize;
 
 use crate::{
     AppState,
-    auth::{Principal, Scope, bearer_token_from_headers},
+    auth::{Principal, PrincipalAudience, Scope, bearer_token_from_headers},
     config::AuthMode,
     error::ApiError,
 };
 
 use super::{
-    CredentialKind, CredentialRepository, CredentialRepositoryError,
-    DEVICE_CLIENT_CONTRACT_VERSION, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
-    GeneratedCredential, MCP_CLIENT_CONTRACT_VERSION, McpClient, McpClientSpec, OpaqueCredential,
+    AccountRecoveryCode, AccountRecoveryCodeSpec, AccountRecoverySessionSpec, CredentialKind,
+    CredentialRepository, CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION,
+    DeviceClientKind, DeviceEnrollmentSpec, DeviceSession, GeneratedCredential,
+    MCP_CLIENT_CONTRACT_VERSION, McpClient, McpClientSpec, OpaqueCredential,
+    full_owner_device_scopes,
 };
 
 const AUTH_BODY_LIMIT: usize = 32 * 1024;
 
 pub(crate) fn protected_routes() -> Router<AppState> {
     Router::new()
+        .route("/auth/recovery-codes", post(create_recovery_code))
+        .route(
+            "/auth/recovery-codes/current",
+            get(get_current_recovery_code),
+        )
         .route("/auth/device-enrollments", post(create_device_enrollment))
         .route(
             "/auth/device-enrollments/{id}",
@@ -47,6 +54,10 @@ pub(crate) fn protected_routes() -> Router<AppState> {
 
 pub(crate) fn public_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/v1/auth/recovery-codes/consume",
+            post(consume_recovery_code),
+        )
         .route(
             "/v1/auth/device-enrollments/consume",
             post(consume_device_enrollment),
@@ -96,6 +107,58 @@ impl Drop for SecretInput {
     fn drop(&mut self) {
         self.0.zeroize();
     }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateAccountRecoveryCodeRequest {
+    id: Uuid,
+    recovery_code: SecretInput,
+    replaces_recovery_code_id: Option<Uuid>,
+    replaces_recovery_code_revision: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AccountRecoveryCodeResponse {
+    id: Uuid,
+    created_at: DateTime<Utc>,
+    revision: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AccountRecoveryCodeMutationResponse {
+    recovery_code: AccountRecoveryCodeResponse,
+    replayed: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CurrentAccountRecoveryCodeResponse {
+    recovery_code: Option<AccountRecoveryCodeResponse>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsumeAccountRecoveryCodeRequest {
+    session_id: Uuid,
+    access_token: SecretInput,
+    refresh_token: SecretInput,
+    client_instance_id: Uuid,
+    client_kind: DeviceClientKind,
+    device_label: String,
+    #[serde(default = "current_device_contract_version")]
+    client_contract_version: u16,
+    client_version: String,
+    #[serde(default)]
+    client_capabilities: Vec<String>,
+    successor_recovery_code_id: Uuid,
+    successor_recovery_code: SecretInput,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AccountRecoveryConsumptionResponse {
+    session: DeviceSessionResponse,
+    successor_recovery_code: AccountRecoveryCodeResponse,
+    replayed: bool,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -194,6 +257,170 @@ pub(crate) struct McpClientListResponse {
 }
 
 #[utoipa::path(
+    get,
+    path = "/v1/auth/recovery-codes/current",
+    tag = "authentication",
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Secret-free active recovery-code metadata or null", body = CurrentAccountRecoveryCodeResponse),
+        (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Missing auth_sessions_read", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn get_current_recovery_code(
+    State(state): State<AppState>,
+) -> Result<Json<CurrentAccountRecoveryCodeResponse>, ApiError> {
+    let recovery_code = active_repository(&state)?
+        .get_active_account_recovery_code()
+        .await
+        .map_err(map_repository_error)?
+        .as_ref()
+        .map(AccountRecoveryCodeResponse::from);
+    Ok(Json(CurrentAccountRecoveryCodeResponse { recovery_code }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/auth/recovery-codes",
+    tag = "authentication",
+    security(("bearer_token" = [])),
+    request_body = CreateAccountRecoveryCodeRequest,
+    responses(
+        (status = 201, description = "Client-journaled recovery credential installed", body = AccountRecoveryCodeMutationResponse),
+        (status = 200, description = "Exact active issuance replayed", body = AccountRecoveryCodeMutationResponse),
+        (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Caller lacks full owner device authority", body = crate::error::ErrorEnvelope),
+        (status = 400, description = "Malformed or structurally invalid JSON request", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale recovery-code compare-and-swap or identifier conflict", body = crate::error::ErrorEnvelope),
+        (status = 413, description = "Request body exceeds the authentication route limit", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid recovery-code tuple", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn create_recovery_code(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    request: Result<Json<CreateAccountRecoveryCodeRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let Some(authorizing_session_id) = principal.credential_id else {
+        return Err(ApiError::forbidden());
+    };
+    if principal.audience != PrincipalAudience::Device
+        || full_owner_device_scopes()
+            .iter()
+            .any(|scope| !principal.has_scope(*scope))
+    {
+        return Err(ApiError::forbidden());
+    }
+    let result = {
+        let recovery_code =
+            OpaqueCredential::parse(CredentialKind::AccountRecovery, &request.recovery_code.0)
+                .map_err(|_| ApiError::validation("Invalid account recovery credential"))?;
+        active_repository(&state)?
+            .create_or_rotate_account_recovery_code(
+                AccountRecoveryCodeSpec {
+                    id: request.id,
+                    replaces_recovery_code_id: request.replaces_recovery_code_id,
+                    replaces_recovery_code_revision: request.replaces_recovery_code_revision,
+                    created_at: state.clock.now(),
+                },
+                &recovery_code,
+                authorizing_session_id,
+            )
+            .await
+            .map_err(map_repository_error)?
+    };
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(AccountRecoveryCodeMutationResponse {
+            recovery_code: AccountRecoveryCodeResponse::from(&result.value),
+            replayed: result.replayed,
+        }),
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/auth/recovery-codes/consume",
+    tag = "authentication",
+    security(("bearer_token" = [])),
+    request_body = ConsumeAccountRecoveryCodeRequest,
+    responses(
+        (status = 201, description = "Recovery code consumed; owner session and successor code installed", body = AccountRecoveryConsumptionResponse),
+        (status = 200, description = "Exact committed recovery tuple replayed", body = AccountRecoveryConsumptionResponse),
+        (status = 400, description = "Malformed or structurally invalid JSON request", body = crate::error::ErrorEnvelope),
+        (status = 401, description = "Invalid, replaced, or consumed-with-another-tuple recovery credential", body = crate::error::ErrorEnvelope),
+        (status = 413, description = "Request body exceeds the authentication route limit", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid successor credential or device tuple", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn consume_recovery_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<ConsumeAccountRecoveryCodeRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let current_raw = bearer_token_from_headers(&headers).ok_or_else(ApiError::unauthorized)?;
+    let current = OpaqueCredential::parse(CredentialKind::AccountRecovery, current_raw)
+        .map_err(|_| ApiError::unauthorized())?;
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &request.access_token.0)
+        .map_err(|_| ApiError::validation("Invalid recovery device credential tuple"))?;
+    let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &request.refresh_token.0)
+        .map_err(|_| ApiError::validation("Invalid recovery device credential tuple"))?;
+    let successor = OpaqueCredential::parse(
+        CredentialKind::AccountRecovery,
+        &request.successor_recovery_code.0,
+    )
+    .map_err(|_| ApiError::validation("Invalid successor recovery credential"))?;
+    let result = active_repository(&state)?
+        .consume_account_recovery_code(
+            &current,
+            AccountRecoverySessionSpec {
+                session_id: request.session_id,
+                client_instance_id: request.client_instance_id,
+                client_kind: request.client_kind,
+                device_label: request.device_label,
+                client_contract_version: request.client_contract_version,
+                client_version: request.client_version,
+                client_capabilities: request.client_capabilities,
+                successor_recovery_code_id: request.successor_recovery_code_id,
+            },
+            &access,
+            &refresh,
+            &successor,
+            state.clock.now(),
+        )
+        .await
+        .map_err(map_recovery_consumption_error)?;
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(AccountRecoveryConsumptionResponse {
+            session: DeviceSessionResponse::from(&result.session),
+            successor_recovery_code: AccountRecoveryCodeResponse::from(
+                &result.successor_recovery_code,
+            ),
+            replayed: result.replayed,
+        }),
+    )
+        .into_response())
+}
+
+#[utoipa::path(
     post,
     path = "/v1/auth/device-enrollments",
     tag = "authentication",
@@ -244,6 +471,7 @@ pub(crate) async fn create_device_enrollment(
                     created_at: now,
                 },
                 &credential,
+                principal.credential_id,
             )
             .await
             .map_err(map_repository_error)?
@@ -458,6 +686,7 @@ pub(crate) async fn revoke_device_enrollment(
 )]
 pub(crate) async fn create_mcp_client(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     request: Result<Json<CreateMcpClientRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = request
@@ -487,6 +716,7 @@ pub(crate) async fn create_mcp_client(
                 requested_expires_at: request.expires_at,
             },
             &credential,
+            principal.credential_id,
         )
         .await
         .map_err(map_repository_error)?;
@@ -579,11 +809,7 @@ fn validate_requested_scopes(
 }
 
 fn default_device_scopes() -> Vec<Scope> {
-    Scope::ALL
-        .iter()
-        .copied()
-        .filter(|scope| scope.is_rest())
-        .collect()
+    full_owner_device_scopes()
 }
 
 fn default_mcp_scopes() -> Vec<Scope> {
@@ -610,6 +836,18 @@ fn map_repository_error(error: CredentialRepositoryError) -> ApiError {
         }
         CredentialRepositoryError::Conflict => {
             ApiError::conflict("Credential state conflicts with an existing record")
+        }
+        CredentialRepositoryError::Internal => ApiError::internal(),
+    }
+}
+
+fn map_recovery_consumption_error(error: CredentialRepositoryError) -> ApiError {
+    match error {
+        CredentialRepositoryError::InvalidCredential | CredentialRepositoryError::Conflict => {
+            ApiError::unauthorized()
+        }
+        CredentialRepositoryError::InvalidInput => {
+            ApiError::validation("Credential request is invalid")
         }
         CredentialRepositoryError::Internal => ApiError::internal(),
     }
@@ -644,6 +882,16 @@ impl From<&DeviceSession> for DeviceSessionResponse {
             refresh_idle_expires_at: session.refresh_idle_expires_at,
             absolute_expires_at: session.absolute_expires_at,
             revision: session.revision,
+        }
+    }
+}
+
+impl From<&AccountRecoveryCode> for AccountRecoveryCodeResponse {
+    fn from(recovery_code: &AccountRecoveryCode) -> Self {
+        Self {
+            id: recovery_code.id,
+            created_at: recovery_code.created_at,
+            revision: recovery_code.revision,
         }
     }
 }

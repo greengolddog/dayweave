@@ -4,8 +4,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    CredentialMutation, DeviceEnrollmentCreation, DeviceEnrollmentSpec, DeviceSession,
-    ENROLLMENT_TOKEN_TTL, McpClient, McpClientSpec, OpaqueCredential,
+    AccountRecoveryCode, AccountRecoveryCodeSpec, AccountRecoveryConsumption,
+    AccountRecoverySessionSpec, CredentialMutation, DeviceEnrollmentCreation, DeviceEnrollmentSpec,
+    DeviceSession, ENROLLMENT_TOKEN_TTL, McpClient, McpClientSpec, OpaqueCredential,
 };
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -22,6 +23,34 @@ pub enum CredentialRepositoryError {
 
 #[async_trait]
 pub trait CredentialRepository: Send + Sync {
+    async fn get_active_account_recovery_code(
+        &self,
+    ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError>;
+
+    /// Creates the first client-journaled recovery credential, rotates the
+    /// exact currently active credential, or replays only the exact active
+    /// issuance after a lost response.
+    async fn create_or_rotate_account_recovery_code(
+        &self,
+        spec: AccountRecoveryCodeSpec,
+        recovery_code: &OpaqueCredential<'_>,
+        authorizing_session_id: Uuid,
+    ) -> Result<CredentialMutation<AccountRecoveryCode>, CredentialRepositoryError>;
+
+    /// Atomically consumes one recovery credential, replaces every local
+    /// credential authority, and installs both a successor code and a full
+    /// owner device session. Only the exact committed tuple is replayable.
+    #[allow(clippy::too_many_arguments)]
+    async fn consume_account_recovery_code(
+        &self,
+        recovery_code: &OpaqueCredential<'_>,
+        spec: AccountRecoverySessionSpec,
+        access_token: &OpaqueCredential<'_>,
+        refresh_token: &OpaqueCredential<'_>,
+        successor_recovery_code: &OpaqueCredential<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<CredentialMutation<AccountRecoveryConsumption>, CredentialRepositoryError>;
+
     async fn create_device_enrollment(
         &self,
         spec: DeviceEnrollmentSpec,
@@ -37,7 +66,9 @@ pub trait CredentialRepository: Send + Sync {
         &self,
         spec: DeviceEnrollmentSpec,
         enrollment_token: &OpaqueCredential<'_>,
+        authorizing_session_id: Option<Uuid>,
     ) -> Result<CredentialMutation<DeviceEnrollmentCreation>, CredentialRepositoryError> {
+        let _ = authorizing_session_id;
         let expires_at = spec
             .created_at
             .checked_add_signed(ENROLLMENT_TOKEN_TTL)
@@ -94,6 +125,7 @@ pub trait CredentialRepository: Send + Sync {
         &self,
         spec: McpClientSpec,
         credential: &OpaqueCredential<'_>,
+        authorizing_session_id: Option<Uuid>,
     ) -> Result<McpClient, CredentialRepositoryError>;
 
     async fn authenticate_mcp_client(

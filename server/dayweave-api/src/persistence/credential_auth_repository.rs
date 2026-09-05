@@ -9,12 +9,14 @@ use uuid::Uuid;
 use crate::{
     auth::Scope,
     credential_auth::{
-        ACCESS_TOKEN_TTL, CredentialKind, CredentialMutation, CredentialRepository,
+        ACCESS_TOKEN_TTL, AccountRecoveryCode, AccountRecoveryCodeSpec, AccountRecoveryConsumption,
+        AccountRecoverySessionSpec, CredentialKind, CredentialMutation, CredentialRepository,
         CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
         DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentCreation,
         DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_ACTIVE_DEVICE_SESSIONS,
         MAX_MCP_CREDENTIAL_TTL, MAX_PENDING_DEVICE_ENROLLMENTS, MCP_CLIENT_CONTRACT_VERSION,
         MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec, OpaqueCredential,
+        full_owner_device_scopes,
     },
 };
 
@@ -33,8 +35,489 @@ impl PostgresCredentialRepository {
     }
 }
 
+// `async_trait` lifts each transactional method into the generated impl body;
+// keep the recovery reset legible as one atomic sequence instead of obscuring
+// its lock/update/insert ordering behind many one-line helpers.
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl CredentialRepository for PostgresCredentialRepository {
+    async fn get_active_account_recovery_code(
+        &self,
+    ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError> {
+        let row = sqlx::query(
+            "SELECT id, created_at, revision FROM account_recovery_codes \
+             WHERE workspace_id = $1 AND user_id = $2 \
+             AND consumed_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.as_ref().map(account_recovery_code_from_row).transpose()
+    }
+
+    async fn create_or_rotate_account_recovery_code(
+        &self,
+        spec: AccountRecoveryCodeSpec,
+        recovery_code: &OpaqueCredential<'_>,
+        authorizing_session_id: Uuid,
+    ) -> Result<CredentialMutation<AccountRecoveryCode>, CredentialRepositoryError> {
+        require_kind(recovery_code, CredentialKind::AccountRecovery)?;
+        validate_account_recovery_code(&spec)?;
+        let token_hash = recovery_code.persistence_digest();
+        let predecessor_revision = spec
+            .replaces_recovery_code_revision
+            .map(|revision| {
+                i64::try_from(revision).map_err(|_| CredentialRepositoryError::InvalidInput)
+            })
+            .transpose()?;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_device_authority_space(&mut transaction, self.scope).await?;
+        validate_authorizing_device_session(
+            &mut transaction,
+            self.scope,
+            Some(authorizing_session_id),
+            Some(DEVICE_CLIENT_CONTRACT_VERSION),
+            spec.created_at,
+        )
+        .await?;
+
+        // This branch deliberately precedes the current-code CAS. A retried
+        // request sees its exact active successor and recovers the committed
+        // response; any changed identifier, secret, or predecessor conflicts.
+        let replay = sqlx::query(
+            "SELECT id, created_at, revision FROM account_recovery_codes \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND token_hash = $4 \
+             AND predecessor_code_id IS NOT DISTINCT FROM $5 \
+             AND predecessor_revision IS NOT DISTINCT FROM $6 \
+             AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= $7 FOR SHARE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.id)
+        .bind(token_hash.as_slice())
+        .bind(spec.replaces_recovery_code_id)
+        .bind(predecessor_revision)
+        .bind(spec.created_at)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = replay {
+            let recovery_code = account_recovery_code_from_row(&row)?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CredentialMutation {
+                value: recovery_code,
+                replayed: true,
+            });
+        }
+
+        let current = sqlx::query(
+            "SELECT id, created_at, revision FROM account_recovery_codes \
+             WHERE workspace_id = $1 AND user_id = $2 \
+             AND consumed_at IS NULL AND revoked_at IS NULL FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        match current {
+            None if spec.replaces_recovery_code_id.is_none() && predecessor_revision.is_none() => {}
+            Some(row) => {
+                let current_code = account_recovery_code_from_row(&row)?;
+                if current_code.created_at > spec.created_at
+                    || spec.replaces_recovery_code_id != Some(current_code.id)
+                    || spec.replaces_recovery_code_revision != Some(current_code.revision)
+                    || current_code.id == spec.id
+                {
+                    return Err(CredentialRepositoryError::Conflict);
+                }
+                let next_revision = sqlx::query_scalar::<_, i64>(
+                    "UPDATE account_recovery_codes \
+                     SET revoked_at = $5, replacement_code_id = $4, revision = revision + 1 \
+                     WHERE workspace_id = $1 AND user_id = $2 AND id = $3 \
+                     AND revision = $6 AND consumed_at IS NULL AND revoked_at IS NULL \
+                     RETURNING revision",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(self.scope.user_id)
+                .bind(current_code.id)
+                .bind(spec.id)
+                .bind(spec.created_at)
+                .bind(
+                    i64::try_from(current_code.revision)
+                        .map_err(|_| CredentialRepositoryError::Internal)?,
+                )
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .ok_or(CredentialRepositoryError::Conflict)?;
+                insert_auth_audit(
+                    &mut transaction,
+                    self.scope,
+                    "auth.account_recovery_code.rotated",
+                    "account_recovery_code",
+                    current_code.id,
+                    Some(next_revision - 1),
+                    Some(next_revision),
+                    spec.created_at,
+                )
+                .await?;
+            }
+            None => return Err(CredentialRepositoryError::Conflict),
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO account_recovery_codes (id, workspace_id, user_id, token_hash, \
+             predecessor_code_id, predecessor_revision, created_at, revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+             RETURNING id, created_at, revision",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(token_hash.as_slice())
+        .bind(spec.replaces_recovery_code_id)
+        .bind(predecessor_revision)
+        .bind(spec.created_at)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(write_error)?;
+        let recovery_code = account_recovery_code_from_row(&inserted)?;
+        insert_auth_audit(
+            &mut transaction,
+            self.scope,
+            "auth.account_recovery_code.created",
+            "account_recovery_code",
+            spec.id,
+            None,
+            Some(1),
+            spec.created_at,
+        )
+        .await?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(CredentialMutation {
+            value: recovery_code,
+            replayed: false,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Recovery and all local authority fencing must be atomic.
+    async fn consume_account_recovery_code(
+        &self,
+        recovery_code: &OpaqueCredential<'_>,
+        spec: AccountRecoverySessionSpec,
+        access_token: &OpaqueCredential<'_>,
+        refresh_token: &OpaqueCredential<'_>,
+        successor_recovery_code: &OpaqueCredential<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<CredentialMutation<AccountRecoveryConsumption>, CredentialRepositoryError> {
+        require_kind(recovery_code, CredentialKind::AccountRecovery)?;
+        require_kind(access_token, CredentialKind::DeviceAccess)?;
+        require_kind(refresh_token, CredentialKind::DeviceRefresh)?;
+        require_kind(successor_recovery_code, CredentialKind::AccountRecovery)?;
+        require_pairwise_distinct_material(&[
+            recovery_code,
+            access_token,
+            refresh_token,
+            successor_recovery_code,
+        ])?;
+        validate_account_recovery_session(&spec)?;
+
+        let recovery_hash = recovery_code.persistence_digest();
+        let access_hash = access_token.persistence_digest();
+        let refresh_hash = refresh_token.persistence_digest();
+        let successor_hash = successor_recovery_code.persistence_digest();
+        let access_expires_at = checked_add(now, ACCESS_TOKEN_TTL)?;
+        let refresh_idle_expires_at = checked_add(now, DEVICE_SESSION_REFRESH_IDLE_TTL)?;
+        let absolute_expires_at = checked_add(now, DEVICE_SESSION_ABSOLUTE_TTL)?;
+        let owner_scopes = full_owner_device_scopes();
+        let stored_owner_scopes = scope_names(&owner_scopes);
+        let contract_version = i16::try_from(spec.client_contract_version)
+            .map_err(|_| CredentialRepositoryError::InvalidInput)?;
+
+        // Reject random bearer probes without joining the serialized owner
+        // authority queue. This is only an optimization: the row is queried
+        // and fully validated again after the advisory lock is acquired.
+        let recovery_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM account_recovery_codes \
+             WHERE workspace_id = $1 AND user_id = $2 AND token_hash = $3)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(recovery_hash.as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if !recovery_exists {
+            return Err(CredentialRepositoryError::InvalidCredential);
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_device_authority_space(&mut transaction, self.scope).await?;
+        let code = sqlx::query(
+            "SELECT id, created_at, consumed_at, revoked_at, recovered_session_id, \
+             replacement_code_id, revision FROM account_recovery_codes \
+             WHERE workspace_id = $1 AND user_id = $2 AND token_hash = $3 \
+             AND created_at <= $4 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(recovery_hash.as_slice())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or(CredentialRepositoryError::InvalidCredential)?;
+        let recovery_code_id: Uuid = code.try_get("id").map_err(storage_error)?;
+        let consumed_at: Option<DateTime<Utc>> =
+            code.try_get("consumed_at").map_err(storage_error)?;
+        let revoked_at: Option<DateTime<Utc>> =
+            code.try_get("revoked_at").map_err(storage_error)?;
+        let recovered_session_id: Option<Uuid> = code
+            .try_get("recovered_session_id")
+            .map_err(storage_error)?;
+        let replacement_code_id: Option<Uuid> =
+            code.try_get("replacement_code_id").map_err(storage_error)?;
+        let recovery_revision: i64 = code.try_get("revision").map_err(storage_error)?;
+        if recovery_revision <= 0 {
+            return Err(CredentialRepositoryError::Internal);
+        }
+        if revoked_at.is_some() {
+            return Err(CredentialRepositoryError::InvalidCredential);
+        }
+
+        // A consumed code remains as a hash-only receipt. It can recover only
+        // the exact successor/session tuple committed by the first request.
+        if consumed_at.is_some() {
+            if recovered_session_id != Some(spec.session_id)
+                || replacement_code_id != Some(spec.successor_recovery_code_id)
+                || recovery_revision <= 1
+            {
+                return Err(CredentialRepositoryError::InvalidCredential);
+            }
+            let session_row = sqlx::query(
+                "SELECT id, workspace_id, user_id, client_instance_id, client_kind, \
+                 device_label, scopes, created_at, last_seen_at, expires_at, \
+                 refresh_idle_expires_at, absolute_expires_at, credential_issued_at, revision, \
+                 client_contract_version, client_version, client_capabilities FROM sessions \
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND token_hash = $4 \
+                 AND refresh_token_hash = $5 AND client_instance_id = $6 AND client_kind = $7 \
+                 AND device_label = $8 AND scopes = $9 AND client_contract_version = $10 \
+                 AND client_version = $11 AND client_capabilities = $12 \
+                 AND auth_version = 1 AND revoked_at IS NULL AND created_at <= $13 \
+                 AND refresh_idle_expires_at > $13 AND absolute_expires_at > $13",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.session_id)
+            .bind(access_hash.as_slice())
+            .bind(refresh_hash.as_slice())
+            .bind(spec.client_instance_id)
+            .bind(spec.client_kind.as_storage_name())
+            .bind(&spec.device_label)
+            .bind(&stored_owner_scopes)
+            .bind(contract_version)
+            .bind(&spec.client_version)
+            .bind(&spec.client_capabilities)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .ok_or(CredentialRepositoryError::InvalidCredential)?;
+            let session = device_session_from_row(&session_row)?;
+            let successor_row = sqlx::query(
+                "SELECT id, created_at, revision FROM account_recovery_codes \
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND token_hash = $4 \
+                 AND predecessor_code_id = $5 AND predecessor_revision = $6 \
+                 AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= $7",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.successor_recovery_code_id)
+            .bind(successor_hash.as_slice())
+            .bind(recovery_code_id)
+            .bind(recovery_revision - 1)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .ok_or(CredentialRepositoryError::InvalidCredential)?;
+            let successor = account_recovery_code_from_row(&successor_row)?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CredentialMutation {
+                value: AccountRecoveryConsumption {
+                    session,
+                    successor_recovery_code: successor,
+                },
+                replayed: true,
+            });
+        }
+        if recovered_session_id.is_some()
+            || replacement_code_id.is_some()
+            || spec.successor_recovery_code_id == recovery_code_id
+        {
+            return Err(CredentialRepositoryError::InvalidCredential);
+        }
+
+        // Recovery is a local authority reset. Set-based updates keep the
+        // transaction's memory use bounded even if historical rows exist.
+        let revoked_device_sessions = sqlx::query(
+            "UPDATE sessions SET revoked_at = GREATEST(created_at, $3), revision = revision + 1 \
+             WHERE workspace_id = $1 AND user_id = $2 AND auth_version = 1 \
+             AND revoked_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .rows_affected();
+        let revoked_device_enrollments = sqlx::query(
+            "UPDATE device_enrollments \
+             SET revoked_at = GREATEST(created_at, $3), revision = revision + 1 \
+             WHERE workspace_id = $1 AND user_id = $2 \
+             AND consumed_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .rows_affected();
+        let revoked_mcp_clients = sqlx::query(
+            "UPDATE mcp_clients SET status = 'revoked', \
+             revoked_at = GREATEST(created_at, $3), \
+             updated_at = GREATEST(updated_at, $3), revision = revision + 1 \
+             WHERE workspace_id = $1 AND created_by_user_id = $2 AND auth_version = 1 \
+             AND status <> 'revoked' AND revoked_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .rows_affected();
+
+        let recovered_session_row = sqlx::query(
+            "INSERT INTO sessions (id, workspace_id, user_id, token_hash, client_kind, \
+             device_label, metadata, created_at, last_seen_at, expires_at, auth_version, \
+             client_instance_id, refresh_token_hash, scopes, refresh_idle_expires_at, \
+             absolute_expires_at, credential_issued_at, revision, client_contract_version, \
+             client_version, client_capabilities) \
+             VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7, $7, $8, 1, $9, $10, $11, \
+             $12, $13, $7, 1, $14, $15, $16) \
+             RETURNING id, workspace_id, user_id, client_instance_id, client_kind, \
+             device_label, scopes, created_at, last_seen_at, expires_at, \
+             refresh_idle_expires_at, absolute_expires_at, credential_issued_at, revision, \
+             client_contract_version, client_version, client_capabilities",
+        )
+        .bind(spec.session_id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(access_hash.as_slice())
+        .bind(spec.client_kind.as_storage_name())
+        .bind(&spec.device_label)
+        .bind(now)
+        .bind(access_expires_at)
+        .bind(spec.client_instance_id)
+        .bind(refresh_hash.as_slice())
+        .bind(&stored_owner_scopes)
+        .bind(refresh_idle_expires_at)
+        .bind(absolute_expires_at)
+        .bind(contract_version)
+        .bind(&spec.client_version)
+        .bind(&spec.client_capabilities)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(write_error)?;
+        let recovered_session = device_session_from_row(&recovered_session_row)?;
+
+        let consumed_revision = sqlx::query_scalar::<_, i64>(
+            "UPDATE account_recovery_codes SET consumed_at = $6, recovered_session_id = $4, \
+             replacement_code_id = $5, revision = revision + 1 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND revision = $7 \
+             AND consumed_at IS NULL AND revoked_at IS NULL RETURNING revision",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(recovery_code_id)
+        .bind(spec.session_id)
+        .bind(spec.successor_recovery_code_id)
+        .bind(now)
+        .bind(recovery_revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or(CredentialRepositoryError::InvalidCredential)?;
+
+        let successor_row = sqlx::query(
+            "INSERT INTO account_recovery_codes (id, workspace_id, user_id, token_hash, \
+             predecessor_code_id, predecessor_revision, created_at, revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+             RETURNING id, created_at, revision",
+        )
+        .bind(spec.successor_recovery_code_id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(successor_hash.as_slice())
+        .bind(recovery_code_id)
+        .bind(recovery_revision)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(write_error)?;
+        let successor = account_recovery_code_from_row(&successor_row)?;
+
+        insert_account_recovery_consumption_audit(
+            &mut transaction,
+            self.scope,
+            recovery_code_id,
+            recovery_revision,
+            consumed_revision,
+            revoked_device_sessions,
+            revoked_device_enrollments,
+            revoked_mcp_clients,
+            now,
+        )
+        .await?;
+        insert_auth_audit(
+            &mut transaction,
+            self.scope,
+            "auth.device_session.recovered",
+            "device_session",
+            spec.session_id,
+            None,
+            Some(1),
+            now,
+        )
+        .await?;
+        insert_auth_audit(
+            &mut transaction,
+            self.scope,
+            "auth.account_recovery_code.created",
+            "account_recovery_code",
+            spec.successor_recovery_code_id,
+            None,
+            Some(1),
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(storage_error)?;
+
+        Ok(CredentialMutation {
+            value: AccountRecoveryConsumption {
+                session: recovered_session,
+                successor_recovery_code: successor,
+            },
+            replayed: false,
+        })
+    }
+
     async fn create_device_enrollment(
         &self,
         spec: DeviceEnrollmentSpec,
@@ -95,6 +578,7 @@ impl CredentialRepository for PostgresCredentialRepository {
         &self,
         spec: DeviceEnrollmentSpec,
         enrollment_token: &OpaqueCredential<'_>,
+        authorizing_session_id: Option<Uuid>,
     ) -> Result<CredentialMutation<DeviceEnrollmentCreation>, CredentialRepositoryError> {
         require_kind(enrollment_token, CredentialKind::Enrollment)?;
         validate_device_enrollment(&spec)?;
@@ -103,6 +587,14 @@ impl CredentialRepository for PostgresCredentialRepository {
         let scopes = scope_names(&spec.scopes);
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_device_authority_space(&mut transaction, self.scope).await?;
+        validate_authorizing_device_session(
+            &mut transaction,
+            self.scope,
+            authorizing_session_id,
+            None,
+            spec.created_at,
+        )
+        .await?;
 
         // Capacity must not break response-loss recovery: the exact same live
         // request remains replayable even when all pending slots are occupied.
@@ -204,6 +696,22 @@ impl CredentialRepository for PostgresCredentialRepository {
         let access_expires_at = checked_add(now, ACCESS_TOKEN_TTL)?;
         let refresh_idle_expires_at = checked_add(now, DEVICE_SESSION_REFRESH_IDLE_TTL)?;
         let absolute_expires_at = checked_add(now, DEVICE_SESSION_ABSOLUTE_TTL)?;
+
+        // Unknown enrollment secrets must not contend on the per-owner lock.
+        // The locked query below remains the authority for state and replay.
+        let enrollment_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM device_enrollments \
+             WHERE workspace_id = $1 AND user_id = $2 AND token_hash = $3)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(enrollment_hash.as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if !enrollment_exists {
+            return Err(CredentialRepositoryError::InvalidCredential);
+        }
 
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         // Lock before any enrollment row so every writer uses one canonical
@@ -666,6 +1174,7 @@ impl CredentialRepository for PostgresCredentialRepository {
         &self,
         spec: McpClientSpec,
         credential: &OpaqueCredential<'_>,
+        authorizing_session_id: Option<Uuid>,
     ) -> Result<McpClient, CredentialRepositoryError> {
         require_kind(credential, CredentialKind::McpClient)?;
         validate_mcp_client(&spec)?;
@@ -678,6 +1187,15 @@ impl CredentialRepository for PostgresCredentialRepository {
         let credential_hash = credential.persistence_digest();
         let scopes = scope_names(&spec.scopes);
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_device_authority_space(&mut transaction, self.scope).await?;
+        validate_authorizing_device_session(
+            &mut transaction,
+            self.scope,
+            authorizing_session_id,
+            None,
+            spec.created_at,
+        )
+        .await?;
         let row = sqlx::query(
             "INSERT INTO mcp_clients (id, workspace_id, created_by_user_id, client_identifier, \
              display_name, credential_hash, scopes, allowed_origins, status, revision, \
@@ -870,6 +1388,47 @@ async fn lock_device_authority_space(
     Ok(())
 }
 
+/// Rechecks a pre-authenticated device only after acquiring the owner
+/// authority lock. `None` is reserved for the configured legacy bootstrap
+/// principal during the bounded hybrid rollout.
+async fn validate_authorizing_device_session(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    authorizing_session_id: Option<Uuid>,
+    required_contract_version: Option<u16>,
+    now: DateTime<Utc>,
+) -> Result<(), CredentialRepositoryError> {
+    let Some(session_id) = authorizing_session_id else {
+        return Ok(());
+    };
+    if session_id.is_nil() {
+        return Err(CredentialRepositoryError::InvalidCredential);
+    }
+    let required_contract_version = required_contract_version
+        .map(|version| i16::try_from(version).map_err(|_| CredentialRepositoryError::Internal))
+        .transpose()?;
+    let authorized = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = $1 AND user_id = $2 \
+         AND id = $3 AND auth_version = 1 AND revoked_at IS NULL AND created_at <= $4 \
+         AND credential_issued_at <= $4 AND expires_at > $4 \
+         AND refresh_idle_expires_at > $4 AND absolute_expires_at > $4 \
+         AND ($5::smallint IS NULL OR client_contract_version = $5))",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(session_id)
+    .bind(now)
+    .bind(required_contract_version)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if authorized {
+        Ok(())
+    } else {
+        Err(CredentialRepositoryError::InvalidCredential)
+    }
+}
+
 async fn ensure_pending_enrollment_capacity(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -929,6 +1488,42 @@ fn validate_device_enrollment(
         || !valid_label(&spec.device_label, 200)
         || !valid_scopes(&spec.scopes)
         || !spec.scopes.iter().all(|scope| scope.is_rest())
+        || !valid_client_metadata(
+            spec.client_contract_version,
+            DEVICE_CLIENT_CONTRACT_VERSION,
+            &spec.client_version,
+            &spec.client_capabilities,
+        )
+    {
+        return Err(CredentialRepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_account_recovery_code(
+    spec: &AccountRecoveryCodeSpec,
+) -> Result<(), CredentialRepositoryError> {
+    let predecessor_is_valid = match (
+        spec.replaces_recovery_code_id,
+        spec.replaces_recovery_code_revision,
+    ) {
+        (None, None) => true,
+        (Some(id), Some(revision)) => !id.is_nil() && id != spec.id && revision > 0,
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    if spec.id.is_nil() || !predecessor_is_valid {
+        return Err(CredentialRepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_account_recovery_session(
+    spec: &AccountRecoverySessionSpec,
+) -> Result<(), CredentialRepositoryError> {
+    if spec.session_id.is_nil()
+        || spec.client_instance_id.is_nil()
+        || spec.successor_recovery_code_id.is_nil()
+        || !valid_label(&spec.device_label, 200)
         || !valid_client_metadata(
             spec.client_contract_version,
             DEVICE_CLIENT_CONTRACT_VERSION,
@@ -1012,6 +1607,43 @@ fn valid_scopes(scopes: &[Scope]) -> bool {
     scopes
         .iter()
         .all(|scope| names.insert(scope.as_storage_name()))
+}
+
+#[allow(clippy::too_many_arguments)] // Counts are the bounded, content-free recovery evidence.
+async fn insert_account_recovery_consumption_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    recovery_code_id: Uuid,
+    base_revision: i64,
+    result_revision: i64,
+    revoked_device_sessions: u64,
+    revoked_device_enrollments: u64,
+    revoked_mcp_clients: u64,
+    occurred_at: DateTime<Utc>,
+) -> Result<(), CredentialRepositoryError> {
+    let metadata = serde_json::json!({
+        "revoked_device_sessions": revoked_device_sessions,
+        "revoked_device_enrollments": revoked_device_enrollments,
+        "revoked_mcp_clients": revoked_mcp_clients,
+    });
+    sqlx::query(
+        "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+         entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
+         VALUES ($1, $2, $3, 'auth.account_recovery_code.consumed', \
+         'account_recovery_code', $4, $5, $6, 'succeeded', $7, $8)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(recovery_code_id)
+    .bind(base_revision)
+    .bind(result_revision)
+    .bind(metadata)
+    .bind(occurred_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // A flat, content-free row makes every audit field explicit.
@@ -1139,6 +1771,23 @@ fn device_session_from_row(row: &PgRow) -> Result<DeviceSession, CredentialRepos
         return Err(CredentialRepositoryError::Internal);
     }
     Ok(session)
+}
+
+fn account_recovery_code_from_row(
+    row: &PgRow,
+) -> Result<AccountRecoveryCode, CredentialRepositoryError> {
+    let id: Uuid = row.try_get("id").map_err(storage_error)?;
+    let revision: i64 = row.try_get("revision").map_err(storage_error)?;
+    if id.is_nil() || revision <= 0 {
+        return Err(CredentialRepositoryError::Internal);
+    }
+    Ok(AccountRecoveryCode {
+        id,
+        created_at: row.try_get("created_at").map_err(storage_error)?,
+        revision: revision
+            .try_into()
+            .map_err(|_| CredentialRepositoryError::Internal)?,
+    })
 }
 
 fn valid_device_session_timestamps(session: &DeviceSession) -> bool {

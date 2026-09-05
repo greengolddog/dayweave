@@ -18,6 +18,16 @@ pub const MAX_MCP_CREDENTIAL_TTL: Duration = Duration::days(365);
 pub const DEVICE_CLIENT_CONTRACT_VERSION: u16 = 2;
 pub const MCP_CLIENT_CONTRACT_VERSION: u16 = 1;
 
+/// Exact v2 REST authority restored by a valid account-recovery credential.
+#[must_use]
+pub fn full_owner_device_scopes() -> Vec<Scope> {
+    Scope::ALL
+        .iter()
+        .copied()
+        .filter(|scope| scope.is_rest())
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialMutation<T> {
     pub value: T,
@@ -94,6 +104,43 @@ pub struct DeviceSession {
     pub refresh_idle_expires_at: DateTime<Utc>,
     pub absolute_expires_at: DateTime<Utc>,
     pub revision: u64,
+}
+
+/// Secret-free metadata for the one active account-recovery credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRecoveryCode {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub revision: u64,
+}
+
+/// Client-journaled initial issuance or compare-and-swap rotation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRecoveryCodeSpec {
+    pub id: Uuid,
+    pub replaces_recovery_code_id: Option<Uuid>,
+    pub replaces_recovery_code_revision: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Complete native-device metadata bound to a recovery consumption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRecoverySessionSpec {
+    pub session_id: Uuid,
+    pub client_instance_id: Uuid,
+    pub client_kind: DeviceClientKind,
+    pub device_label: String,
+    pub client_contract_version: u16,
+    pub client_version: String,
+    pub client_capabilities: Vec<String>,
+    pub successor_recovery_code_id: Uuid,
+}
+
+/// The two durable authorities committed by one recovery consumption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRecoveryConsumption {
+    pub session: DeviceSession,
+    pub successor_recovery_code: AccountRecoveryCode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

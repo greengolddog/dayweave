@@ -11,11 +11,12 @@ use dayweave_api::{
     auth::{RuntimeAuthenticator, Scope, hash_token},
     config::AuthMode,
     credential_auth::{
-        ACCESS_TOKEN_TTL, CredentialKind, CredentialMutation, CredentialRepository,
-        CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
+        ACCESS_TOKEN_TTL, AccountRecoveryCodeSpec, AccountRecoverySessionSpec, CredentialKind,
+        CredentialMutation, CredentialRepository, CredentialRepositoryError,
+        DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
         DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
         MAX_ACTIVE_DEVICE_SESSIONS, MAX_PENDING_DEVICE_ENROLLMENTS, McpClientSpec,
-        OpaqueCredential,
+        OpaqueCredential, full_owner_device_scopes,
     },
     http::router,
     persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository},
@@ -61,8 +62,8 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
     };
 
     let (first, second) = tokio::join!(
-        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment),
-        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment),
+        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment, None),
+        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment, None),
     );
     let first = first.expect("first concurrent create succeeds");
     let second = second.expect("second concurrent create succeeds");
@@ -117,7 +118,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
     for changed in changed_semantic_tuples {
         assert_eq!(
             repository
-                .create_or_replay_device_enrollment(changed, &enrollment)
+                .create_or_replay_device_enrollment(changed, &enrollment, None)
                 .await,
             Err(CredentialRepositoryError::Conflict),
             "every changed semantic field must make the creation non-replayable"
@@ -128,7 +129,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         OpaqueCredential::parse(CredentialKind::Enrollment, &different_enrollment_raw).unwrap();
     assert_eq!(
         repository
-            .create_or_replay_device_enrollment(spec.clone(), &different_enrollment)
+            .create_or_replay_device_enrollment(spec.clone(), &different_enrollment, None)
             .await,
         Err(CredentialRepositoryError::Conflict)
     );
@@ -136,13 +137,13 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
     changed_id.id = Uuid::new_v4();
     assert_eq!(
         repository
-            .create_or_replay_device_enrollment(changed_id, &enrollment)
+            .create_or_replay_device_enrollment(changed_id, &enrollment, None)
             .await,
         Err(CredentialRepositoryError::Conflict)
     );
     assert_eq!(
         other_repository
-            .create_or_replay_device_enrollment(spec.clone(), &enrollment)
+            .create_or_replay_device_enrollment(spec.clone(), &enrollment, None)
             .await,
         Err(CredentialRepositoryError::Conflict),
         "a global token or identifier collision cannot cross a workspace boundary"
@@ -166,7 +167,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
     consumed_retry.created_at = now + ChronoDuration::seconds(2);
     assert_eq!(
         repository
-            .create_or_replay_device_enrollment(consumed_retry, &enrollment)
+            .create_or_replay_device_enrollment(consumed_retry, &enrollment, None)
             .await,
         Err(CredentialRepositoryError::Conflict),
         "a consumed one-time enrollment is never recreated or replayed"
@@ -187,14 +188,14 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         created_at: expired_created_at,
     };
     repository
-        .create_or_replay_device_enrollment(expired_spec.clone(), &expired)
+        .create_or_replay_device_enrollment(expired_spec.clone(), &expired, None)
         .await
         .expect("historical fixture created");
     let mut expired_retry = expired_spec;
     expired_retry.created_at = now;
     assert_eq!(
         repository
-            .create_or_replay_device_enrollment(expired_retry, &expired)
+            .create_or_replay_device_enrollment(expired_retry, &expired, None)
             .await,
         Err(CredentialRepositoryError::Conflict),
         "expiry is exclusive and an expired issuance cannot be recovered"
@@ -214,7 +215,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         created_at: now,
     };
     repository
-        .create_or_replay_device_enrollment(revoked_spec.clone(), &revoked)
+        .create_or_replay_device_enrollment(revoked_spec.clone(), &revoked, None)
         .await
         .expect("revocation fixture created");
     assert!(
@@ -227,7 +228,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
     revoked_retry.created_at = now + ChronoDuration::seconds(2);
     assert_eq!(
         repository
-            .create_or_replay_device_enrollment(revoked_retry, &revoked)
+            .create_or_replay_device_enrollment(revoked_retry, &revoked, None)
             .await,
         Err(CredentialRepositoryError::Conflict),
         "a revoked enrollment can never be recreated or replayed"
@@ -1212,6 +1213,7 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                 requested_expires_at: None,
             },
             &credential,
+            None,
         )
         .await
         .expect("MCP client registered");
@@ -1344,6 +1346,7 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                 requested_expires_at: Some(now + ChronoDuration::minutes(1)),
             },
             &expired,
+            None,
         )
         .await
         .expect("short-lived MCP credential");
@@ -1375,10 +1378,1142 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                     ),
                 },
                 &too_long,
+                None,
             )
             .await,
         Err(CredentialRepositoryError::InvalidInput)
     );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn unknown_public_credentials_bypass_the_held_owner_authority_lock() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(
+        pool,
+        "unknown-credential-preflight-owner",
+        "unknown-credential-preflight",
+    )
+    .await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let now = Utc::now();
+
+    let mut held_owner_lock = pool.begin().await.expect("owner lock transaction");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.device-authority.v1:' || $1::text || ':' || $2::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&mut *held_owner_lock)
+    .await
+    .expect("hold owner authority lock");
+
+    let recovery_raw = token(CredentialKind::AccountRecovery, 230);
+    let access_raw = token(CredentialKind::DeviceAccess, 231);
+    let refresh_raw = token(CredentialKind::DeviceRefresh, 232);
+    let successor_raw = token(CredentialKind::AccountRecovery, 233);
+    let recovery = OpaqueCredential::parse(CredentialKind::AccountRecovery, &recovery_raw).unwrap();
+    let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
+    let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_raw).unwrap();
+    let successor =
+        OpaqueCredential::parse(CredentialKind::AccountRecovery, &successor_raw).unwrap();
+    let recovery_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        repository.consume_account_recovery_code(
+            &recovery,
+            AccountRecoverySessionSpec {
+                session_id: Uuid::new_v4(),
+                client_instance_id: Uuid::new_v4(),
+                client_kind: DeviceClientKind::Android,
+                device_label: "Unknown recovery preflight".to_owned(),
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+                client_version: "preflight-test-1".to_owned(),
+                client_capabilities: Vec::new(),
+                successor_recovery_code_id: Uuid::new_v4(),
+            },
+            &access,
+            &refresh,
+            &successor,
+            now,
+        ),
+    )
+    .await
+    .expect("unknown recovery token must not wait for owner lock");
+    assert_eq!(
+        recovery_result,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+
+    let enrollment_raw = token(CredentialKind::Enrollment, 234);
+    let enrollment_access_raw = token(CredentialKind::DeviceAccess, 235);
+    let enrollment_refresh_raw = token(CredentialKind::DeviceRefresh, 236);
+    let enrollment = OpaqueCredential::parse(CredentialKind::Enrollment, &enrollment_raw).unwrap();
+    let enrollment_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &enrollment_access_raw).unwrap();
+    let enrollment_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &enrollment_refresh_raw).unwrap();
+    let enrollment_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        repository.consume_device_enrollment(
+            &enrollment,
+            Uuid::new_v4(),
+            &enrollment_access,
+            &enrollment_refresh,
+            now,
+        ),
+    )
+    .await
+    .expect("unknown enrollment token must not wait for owner lock");
+    assert_eq!(
+        enrollment_result,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+
+    held_owner_lock
+        .rollback()
+        .await
+        .expect("release owner authority lock");
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One lifecycle test keeps the recovery authority reset auditable.
+async fn account_recovery_is_hash_only_cas_serialized_and_exactly_replayable() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "account-recovery-owner", "account-recovery").await;
+    let other_scope = seed_scope(pool, "account-recovery-other", "account-recovery-other").await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let other_repository = PostgresCredentialRepository::new(pool.clone(), other_scope);
+    let now = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("current timestamp");
+    let legacy_v1 = issue_device_session_with_metadata(
+        &repository,
+        now - ChronoDuration::seconds(2),
+        210,
+        DeviceClientKind::Macos,
+        "Legacy v1 recovery authorizer",
+        vec![Scope::ItemsRead],
+        "recovery-test-v1",
+        Vec::new(),
+    )
+    .await;
+    sqlx::query("UPDATE sessions SET client_contract_version = 1 WHERE id = $1")
+        .bind(legacy_v1.session.id)
+        .execute(pool)
+        .await
+        .expect("downgrade recovery authorizer fixture to v1");
+    let old_mac = issue_device_session_with_metadata(
+        &repository,
+        now - ChronoDuration::seconds(1),
+        10,
+        DeviceClientKind::Macos,
+        "Recovery old Mac",
+        full_owner_device_scopes(),
+        "recovery-test-1",
+        vec!["account-recovery".to_owned()],
+    )
+    .await;
+
+    assert_eq!(
+        repository
+            .get_active_account_recovery_code()
+            .await
+            .expect("empty recovery inventory"),
+        None
+    );
+    let initial_id = Uuid::new_v4();
+    let initial_raw = token(CredentialKind::AccountRecovery, 200);
+    let initial = OpaqueCredential::parse(CredentialKind::AccountRecovery, &initial_raw).unwrap();
+    let initial_spec = AccountRecoveryCodeSpec {
+        id: initial_id,
+        replaces_recovery_code_id: None,
+        replaces_recovery_code_revision: None,
+        created_at: now,
+    };
+    assert_eq!(
+        repository
+            .create_or_rotate_account_recovery_code(
+                initial_spec.clone(),
+                &initial,
+                legacy_v1.session.id,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "only a persisted current-contract device session may install recovery authority"
+    );
+    assert!(
+        repository
+            .revoke_device_session(legacy_v1.session.id, now)
+            .await
+            .expect("retire v1 recovery authorizer fixture")
+    );
+    let (first_initial, second_initial) = tokio::join!(
+        repository.create_or_rotate_account_recovery_code(
+            initial_spec.clone(),
+            &initial,
+            old_mac.session.id,
+        ),
+        repository.create_or_rotate_account_recovery_code(
+            initial_spec.clone(),
+            &initial,
+            old_mac.session.id,
+        ),
+    );
+    let first_initial = first_initial.expect("first concurrent initial issue");
+    let second_initial = second_initial.expect("exact concurrent initial replay");
+    assert_ne!(first_initial.replayed, second_initial.replayed);
+    assert_eq!(first_initial.id, initial_id);
+    assert_eq!(first_initial.value, second_initial.value);
+    assert_eq!(first_initial.revision, 1);
+
+    let initial_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT token_hash FROM account_recovery_codes WHERE id = $1")
+            .bind(initial_id)
+            .fetch_one(pool)
+            .await
+            .expect("initial digest");
+    assert_eq!(initial_hash.len(), 32);
+    assert_ne!(initial_hash, initial_raw.as_bytes());
+
+    let rotated_id = Uuid::new_v4();
+    let rotated_raw = token(CredentialKind::AccountRecovery, 201);
+    let rotated = OpaqueCredential::parse(CredentialKind::AccountRecovery, &rotated_raw).unwrap();
+    let stale_rotation = AccountRecoveryCodeSpec {
+        id: rotated_id,
+        replaces_recovery_code_id: Some(initial_id),
+        replaces_recovery_code_revision: Some(2),
+        created_at: now + ChronoDuration::seconds(1),
+    };
+    assert_eq!(
+        repository
+            .create_or_rotate_account_recovery_code(stale_rotation, &rotated, old_mac.session.id,)
+            .await,
+        Err(CredentialRepositoryError::Conflict)
+    );
+    let rotation_spec = AccountRecoveryCodeSpec {
+        id: rotated_id,
+        replaces_recovery_code_id: Some(initial_id),
+        replaces_recovery_code_revision: Some(1),
+        created_at: now + ChronoDuration::seconds(1),
+    };
+    let (first_rotation, second_rotation) = tokio::join!(
+        repository.create_or_rotate_account_recovery_code(
+            rotation_spec.clone(),
+            &rotated,
+            old_mac.session.id,
+        ),
+        repository.create_or_rotate_account_recovery_code(
+            rotation_spec.clone(),
+            &rotated,
+            old_mac.session.id,
+        ),
+    );
+    let first_rotation = first_rotation.expect("first concurrent rotation");
+    let second_rotation = second_rotation.expect("exact concurrent rotation replay");
+    assert_ne!(first_rotation.replayed, second_rotation.replayed);
+    assert_eq!(first_rotation.value, second_rotation.value);
+    assert_eq!(
+        repository
+            .get_active_account_recovery_code()
+            .await
+            .expect("active recovery metadata")
+            .expect("one active recovery code")
+            .id,
+        rotated_id
+    );
+
+    let old_android = issue_device_session_with_metadata(
+        &repository,
+        now + ChronoDuration::seconds(3),
+        20,
+        DeviceClientKind::Android,
+        "Recovery old Pixel",
+        vec![Scope::ItemsRead, Scope::AuthSessionsRead],
+        "recovery-test-1",
+        vec!["account-recovery".to_owned()],
+    )
+    .await;
+    for index in 0_u8..14 {
+        issue_device_session_with_metadata(
+            &repository,
+            now + ChronoDuration::seconds(4),
+            50 + index * 3,
+            if index % 2 == 0 {
+                DeviceClientKind::Macos
+            } else {
+                DeviceClientKind::Android
+            },
+            "Recovery capacity device",
+            vec![Scope::ItemsRead],
+            "recovery-capacity-1",
+            Vec::new(),
+        )
+        .await;
+    }
+    let pending = pending_device_enrollment_fixture(
+        now + ChronoDuration::seconds(4),
+        30,
+        Uuid::new_v4(),
+        DeviceClientKind::Macos,
+        "Pending recovery Mac",
+        vec![Scope::ItemsRead],
+    );
+    persist_pending_device_enrollment(&repository, &pending).await;
+    for index in 0_u8..15 {
+        let additional_pending = pending_device_enrollment_fixture(
+            now + ChronoDuration::seconds(4),
+            100 + index * 3,
+            Uuid::new_v4(),
+            DeviceClientKind::Android,
+            "Recovery capacity enrollment",
+            vec![Scope::ItemsRead],
+        );
+        persist_pending_device_enrollment(&repository, &additional_pending).await;
+    }
+    assert_eq!(
+        repository
+            .list_device_sessions(now + ChronoDuration::seconds(4))
+            .await
+            .expect("full pre-recovery session inventory")
+            .len(),
+        MAX_ACTIVE_DEVICE_SESSIONS
+    );
+    let mcp_raw = token(CredentialKind::McpClient, 40);
+    let mcp = OpaqueCredential::parse(CredentialKind::McpClient, &mcp_raw).unwrap();
+    let mcp_client = repository
+        .register_mcp_client(
+            McpClientSpec {
+                id: Uuid::new_v4(),
+                client_identifier: "recovery-test-mcp".to_owned(),
+                display_name: "Recovery test MCP".to_owned(),
+                scopes: vec![Scope::ScheduleRead],
+                allowed_origins: Vec::new(),
+                client_contract_version: 1,
+                client_version: "recovery-test-1".to_owned(),
+                client_capabilities: Vec::new(),
+                created_at: now + ChronoDuration::seconds(4),
+                requested_expires_at: None,
+            },
+            &mcp,
+            None,
+        )
+        .await
+        .expect("MCP credential fixture");
+
+    let canonical_item_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         duration_kind, deadline_kind, has_own_effort) \
+         VALUES ($1, $2, $3, 'task', 'inbox', 'Recovery preserves this item', \
+         'unknown', 'none', false)",
+    )
+    .bind(canonical_item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(pool)
+    .await
+    .expect("canonical item fixture");
+    let provider_account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, external_account_id, \
+         display_label, encrypted_credentials, credential_key_version, status, sync_enabled, \
+         is_default) VALUES ($1,$2,$3,'google',$4,'Recovery provider',$5,1, \
+         'active',true,false)",
+    )
+    .bind(provider_account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(format!("recovery-provider-{provider_account_id}"))
+    .bind(vec![0xA5_u8; 64])
+    .execute(pool)
+    .await
+    .expect("provider account fixture");
+
+    let recovered_at = now + ChronoDuration::seconds(5);
+    let recovery_spec = AccountRecoverySessionSpec {
+        session_id: Uuid::new_v4(),
+        client_instance_id: Uuid::new_v4(),
+        client_kind: DeviceClientKind::Android,
+        device_label: "Recovered Pixel".to_owned(),
+        client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+        client_version: "recovery-test-2".to_owned(),
+        client_capabilities: vec!["account-recovery".to_owned(), "exact-replay".to_owned()],
+        successor_recovery_code_id: Uuid::new_v4(),
+    };
+    let recovered_access_raw = token(CredentialKind::DeviceAccess, 202);
+    let recovered_refresh_raw = token(CredentialKind::DeviceRefresh, 203);
+    let successor_raw = token(CredentialKind::AccountRecovery, 204);
+    let recovered_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &recovered_access_raw).unwrap();
+    let recovered_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &recovered_refresh_raw).unwrap();
+    let successor =
+        OpaqueCredential::parse(CredentialKind::AccountRecovery, &successor_raw).unwrap();
+
+    assert_eq!(
+        other_repository
+            .consume_account_recovery_code(
+                &rotated,
+                recovery_spec.clone(),
+                &recovered_access,
+                &recovered_refresh,
+                &successor,
+                recovered_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "a recovery secret cannot cross its configured owner scope"
+    );
+    let reused_material_raw = token(CredentialKind::DeviceAccess, 201);
+    let reused_material =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &reused_material_raw).unwrap();
+    assert_eq!(
+        repository
+            .consume_account_recovery_code(
+                &rotated,
+                recovery_spec.clone(),
+                &reused_material,
+                &recovered_refresh,
+                &successor,
+                recovered_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidInput),
+        "changing a prefix cannot reuse recovery material as device material"
+    );
+
+    let (first_consume, second_consume) = tokio::join!(
+        repository.consume_account_recovery_code(
+            &rotated,
+            recovery_spec.clone(),
+            &recovered_access,
+            &recovered_refresh,
+            &successor,
+            recovered_at,
+        ),
+        repository.consume_account_recovery_code(
+            &rotated,
+            recovery_spec.clone(),
+            &recovered_access,
+            &recovered_refresh,
+            &successor,
+            recovered_at,
+        ),
+    );
+    let first_consume = first_consume.expect("first recovery consumption");
+    let second_consume = second_consume.expect("exact concurrent recovery replay");
+    assert_ne!(first_consume.replayed, second_consume.replayed);
+    assert_eq!(first_consume.value, second_consume.value);
+    assert_eq!(first_consume.session.scopes, full_owner_device_scopes());
+    assert_eq!(first_consume.session.client_contract_version, 2);
+    assert_eq!(
+        first_consume.successor_recovery_code.id,
+        recovery_spec.successor_recovery_code_id
+    );
+    let expired_access_replay = repository
+        .consume_account_recovery_code(
+            &rotated,
+            recovery_spec.clone(),
+            &recovered_access,
+            &recovered_refresh,
+            &successor,
+            recovered_at + ACCESS_TOKEN_TTL + ChronoDuration::seconds(1),
+        )
+        .await
+        .expect("lost recovery response remains replayable after access expiry");
+    assert!(expired_access_replay.replayed);
+    assert_eq!(expired_access_replay.value, first_consume.value);
+    assert!(
+        expired_access_replay.session.access_expires_at
+            <= recovered_at + ACCESS_TOKEN_TTL + ChronoDuration::seconds(1)
+    );
+
+    let mut competing_spec = recovery_spec.clone();
+    competing_spec.session_id = Uuid::new_v4();
+    assert_eq!(
+        repository
+            .consume_account_recovery_code(
+                &rotated,
+                competing_spec,
+                &recovered_access,
+                &recovered_refresh,
+                &successor,
+                recovered_at + ChronoDuration::seconds(2),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+    assert_eq!(
+        repository
+            .authenticate_device_access(
+                &OpaqueCredential::parse(CredentialKind::DeviceAccess, &old_mac.access_raw)
+                    .unwrap(),
+                recovered_at + ChronoDuration::seconds(2),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+    let rejected_next_access_raw = token(CredentialKind::DeviceAccess, 205);
+    let rejected_next_refresh_raw = token(CredentialKind::DeviceRefresh, 206);
+    let rejected_next_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &rejected_next_access_raw).unwrap();
+    let rejected_next_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &rejected_next_refresh_raw).unwrap();
+    assert_eq!(
+        repository
+            .refresh_device_session(
+                &OpaqueCredential::parse(CredentialKind::DeviceRefresh, &old_android.refresh_raw)
+                    .unwrap(),
+                &rejected_next_access,
+                &rejected_next_refresh,
+                recovered_at + ChronoDuration::seconds(2),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+    assert_eq!(
+        consume_pending_device_enrollment(
+            &repository,
+            &pending,
+            recovered_at + ChronoDuration::seconds(2),
+        )
+        .await,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+    assert_eq!(
+        repository
+            .authenticate_mcp_client(&mcp, recovered_at + ChronoDuration::seconds(2))
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential)
+    );
+
+    let stale_rotation_raw = token(CredentialKind::AccountRecovery, 209);
+    let stale_rotation =
+        OpaqueCredential::parse(CredentialKind::AccountRecovery, &stale_rotation_raw).unwrap();
+    assert_eq!(
+        repository
+            .create_or_rotate_account_recovery_code(
+                AccountRecoveryCodeSpec {
+                    id: Uuid::new_v4(),
+                    replaces_recovery_code_id: Some(first_consume.successor_recovery_code.id,),
+                    replaces_recovery_code_revision: Some(
+                        first_consume.successor_recovery_code.revision,
+                    ),
+                    created_at: recovered_at + ChronoDuration::seconds(2),
+                },
+                &stale_rotation,
+                old_mac.session.id,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "a device authenticated before recovery cannot rotate authority after the reset"
+    );
+    let stale_enrollment_raw = token(CredentialKind::Enrollment, 207);
+    let stale_enrollment =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &stale_enrollment_raw).unwrap();
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(
+                DeviceEnrollmentSpec {
+                    id: Uuid::new_v4(),
+                    client_instance_id: Uuid::new_v4(),
+                    client_kind: DeviceClientKind::Android,
+                    device_label: "Stale recovered enrollment".to_owned(),
+                    scopes: vec![Scope::ItemsRead],
+                    client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+                    client_version: "recovery-stale-1".to_owned(),
+                    client_capabilities: Vec::new(),
+                    created_at: recovered_at + ChronoDuration::seconds(2),
+                },
+                &stale_enrollment,
+                Some(old_mac.session.id),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "a pre-authenticated device cannot mint an enrollment after recovery"
+    );
+    let stale_mcp_raw = token(CredentialKind::McpClient, 208);
+    let stale_mcp = OpaqueCredential::parse(CredentialKind::McpClient, &stale_mcp_raw).unwrap();
+    assert_eq!(
+        repository
+            .register_mcp_client(
+                McpClientSpec {
+                    id: Uuid::new_v4(),
+                    client_identifier: "stale-recovery-client".to_owned(),
+                    display_name: "Stale recovery client".to_owned(),
+                    scopes: vec![Scope::ScheduleRead],
+                    allowed_origins: Vec::new(),
+                    client_contract_version: 1,
+                    client_version: "recovery-stale-1".to_owned(),
+                    client_capabilities: Vec::new(),
+                    created_at: recovered_at + ChronoDuration::seconds(2),
+                    requested_expires_at: None,
+                },
+                &stale_mcp,
+                Some(old_mac.session.id),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "a pre-authenticated device cannot mint an MCP credential after recovery"
+    );
+    assert_eq!(
+        repository
+            .list_device_sessions(recovered_at + ChronoDuration::seconds(2))
+            .await
+            .expect("post-recovery inventory"),
+        vec![first_consume.session.clone()]
+    );
+    assert_eq!(
+        repository
+            .get_active_account_recovery_code()
+            .await
+            .expect("post-recovery code")
+            .expect("successor remains active"),
+        first_consume.successor_recovery_code
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(canonical_item_id)
+        .fetch_one(pool)
+        .await
+        .expect("canonical item count"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM provider_accounts WHERE workspace_id = $1 AND id = $2 \
+             AND status = 'active'",
+        )
+        .bind(scope.workspace_id)
+        .bind(provider_account_id)
+        .fetch_one(pool)
+        .await
+        .expect("provider account count"),
+        1
+    );
+
+    let recovery_audit: Value = sqlx::query_scalar(
+        "SELECT metadata FROM audit_operations WHERE workspace_id = $1 \
+         AND operation_type = 'auth.account_recovery_code.consumed' AND entity_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(rotated_id)
+    .fetch_one(pool)
+    .await
+    .expect("aggregate recovery audit");
+    assert_eq!(
+        recovery_audit["revoked_device_sessions"],
+        MAX_ACTIVE_DEVICE_SESSIONS
+    );
+    assert_eq!(
+        recovery_audit["revoked_device_enrollments"],
+        MAX_PENDING_DEVICE_ENROLLMENTS
+    );
+    assert_eq!(recovery_audit["revoked_mcp_clients"], 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \
+             AND operation_type = 'auth.account_recovery_code.consumed' AND entity_id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(rotated_id)
+        .fetch_one(pool)
+        .await
+        .expect("one recovery audit"),
+        1,
+        "exact replay must not duplicate audit evidence"
+    );
+    let audit_text: String = sqlx::query_scalar(
+        "SELECT COALESCE(string_agg(metadata::text, ''), '') FROM audit_operations \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .expect("audit metadata text");
+    for secret in [
+        &initial_raw,
+        &rotated_raw,
+        &recovered_access_raw,
+        &recovered_refresh_raw,
+        &successor_raw,
+        &mcp_raw,
+    ] {
+        assert!(!audit_text.contains(secret));
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM mcp_clients WHERE id = $1")
+            .bind(mcp_client.id)
+            .fetch_one(pool)
+            .await
+            .expect("recovered MCP status"),
+        "revoked"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers the public/protected recovery protocol as one client flow.
+async fn account_recovery_http_is_scoped_strict_no_store_and_secret_free() {
+    const LEGACY_TOKEN: &str = "legacy-full-owner-recovery-http-test-token";
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "account-recovery-http-owner", "account-recovery-http").await;
+    let postgres_repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let fixture_time = Utc::now() - ChronoDuration::minutes(1);
+    let reader = issue_device_session_with_metadata(
+        &postgres_repository,
+        fixture_time,
+        50,
+        DeviceClientKind::Android,
+        "Recovery reader Pixel",
+        vec![Scope::AuthSessionsRead],
+        "recovery-http-1",
+        vec!["recovery-code-status".to_owned()],
+    )
+    .await;
+    let writer = issue_device_session_with_metadata(
+        &postgres_repository,
+        fixture_time + ChronoDuration::seconds(1),
+        55,
+        DeviceClientKind::Android,
+        "Recovery writer Pixel",
+        vec![Scope::AuthSessionsWrite],
+        "recovery-http-1",
+        vec!["recovery-code-write".to_owned()],
+    )
+    .await;
+    let owner = issue_device_session_with_metadata(
+        &postgres_repository,
+        fixture_time + ChronoDuration::seconds(2),
+        60,
+        DeviceClientKind::Macos,
+        "Recovery owner Mac",
+        full_owner_device_scopes(),
+        "recovery-http-1",
+        vec!["account-recovery".to_owned()],
+    )
+    .await;
+    let repository: Arc<dyn CredentialRepository> = Arc::new(postgres_repository);
+    let clock = Arc::new(SystemClock);
+    let authenticator = Arc::new(RuntimeAuthenticator::new(
+        Some(Arc::new(vec![hash_token(LEGACY_TOKEN)])),
+        repository.clone(),
+        clock.clone(),
+    ));
+    let proposal_repository: Arc<dyn ProposalRepository> =
+        Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposal_repository,
+        clock,
+        Duration::from_hours(24),
+    ));
+    let app =
+        router(
+            AppState::new(proposals, authenticator.clone(), Readiness::default())
+                .with_credential_auth(repository, authenticator, AuthMode::Hybrid),
+        );
+
+    let empty = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/recovery-codes/current",
+            &reader.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(
+        empty.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    assert_eq!(response_json(empty).await, json!({"recovery_code": null}));
+    let writer_cannot_read = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/recovery-codes/current",
+            &writer.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(writer_cannot_read.status(), StatusCode::FORBIDDEN);
+
+    let recovery_code_id = Uuid::new_v4();
+    let recovery_raw = token(CredentialKind::AccountRecovery, 70);
+    let issue_body = json!({
+        "id": recovery_code_id,
+        "recovery_code": recovery_raw,
+        "replaces_recovery_code_id": null,
+        "replaces_recovery_code_revision": null,
+    });
+    let reader_cannot_issue = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &writer.access_raw,
+            Some(issue_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reader_cannot_issue.status(), StatusCode::FORBIDDEN);
+    let legacy_cannot_issue = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            LEGACY_TOKEN,
+            Some(issue_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_cannot_issue.status(), StatusCode::FORBIDDEN);
+
+    let mut unknown_issue_body = issue_body.clone();
+    unknown_issue_body["workspace_id"] = json!(scope.workspace_id);
+    let unknown_issue = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &owner.access_raw,
+            Some(unknown_issue_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_issue.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unknown_issue.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let unknown_issue_text = String::from_utf8(
+        unknown_issue
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!unknown_issue_text.contains(&recovery_raw));
+
+    let oversized_issue = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &owner.access_raw,
+            Some(json!({"padding": "x".repeat(33 * 1024)})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized_issue.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized_issue.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+
+    let issued = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &owner.access_raw,
+            Some(issue_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    assert_eq!(
+        issued.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let issued_text = String::from_utf8(
+        issued
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!issued_text.contains(&recovery_raw));
+    let issued_json: Value = serde_json::from_str(&issued_text).unwrap();
+    assert_eq!(
+        issued_json["recovery_code"]["id"],
+        recovery_code_id.to_string()
+    );
+    assert_eq!(issued_json["recovery_code"]["revision"], 1);
+    assert_eq!(issued_json["replayed"], false);
+
+    let visible_to_reader = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/recovery-codes/current",
+            &reader.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(visible_to_reader.status(), StatusCode::OK);
+    let visible_to_reader = response_json(visible_to_reader).await;
+    assert_eq!(
+        visible_to_reader["recovery_code"],
+        issued_json["recovery_code"]
+    );
+    assert!(!visible_to_reader.to_string().contains(&recovery_raw));
+
+    let stale_secret = token(CredentialKind::AccountRecovery, 74);
+    let stale_rotation = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &owner.access_raw,
+            Some(json!({
+                "id": Uuid::new_v4(),
+                "recovery_code": stale_secret,
+                "replaces_recovery_code_id": recovery_code_id,
+                "replaces_recovery_code_revision": 2,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_rotation.status(), StatusCode::CONFLICT);
+    let stale_text = String::from_utf8(
+        stale_rotation
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!stale_text.contains(&stale_secret));
+
+    let replayed_issue = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes",
+            &owner.access_raw,
+            Some(issue_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed_issue.status(), StatusCode::OK);
+    let replayed_issue = response_json(replayed_issue).await;
+    assert_eq!(
+        replayed_issue["recovery_code"],
+        issued_json["recovery_code"]
+    );
+    assert_eq!(replayed_issue["replayed"], true);
+
+    let session_id = Uuid::new_v4();
+    let successor_id = Uuid::new_v4();
+    let recovered_access = token(CredentialKind::DeviceAccess, 71);
+    let recovered_refresh = token(CredentialKind::DeviceRefresh, 72);
+    let successor_raw = token(CredentialKind::AccountRecovery, 73);
+    let consume_body = json!({
+        "session_id": session_id,
+        "access_token": recovered_access,
+        "refresh_token": recovered_refresh,
+        "client_instance_id": Uuid::new_v4(),
+        "client_kind": "android",
+        "device_label": "Recovered HTTP Pixel",
+        "client_contract_version": DEVICE_CLIENT_CONTRACT_VERSION,
+        "client_version": "recovery-http-2",
+        "client_capabilities": ["account-recovery", "exact-replay"],
+        "successor_recovery_code_id": successor_id,
+        "successor_recovery_code": successor_raw,
+    });
+    let mut unknown_consume_body = consume_body.clone();
+    unknown_consume_body["user_id"] = json!(scope.user_id);
+    let unknown_consume = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes/consume",
+            &recovery_raw,
+            Some(unknown_consume_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_consume.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unknown_consume.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let oversized_consume = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes/consume",
+            &recovery_raw,
+            Some(json!({"padding": "x".repeat(33 * 1024)})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized_consume.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized_consume.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let consumed = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes/consume",
+            &recovery_raw,
+            Some(consume_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(consumed.status(), StatusCode::CREATED);
+    assert_eq!(
+        consumed.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let consumed_text = String::from_utf8(
+        consumed
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for secret in [
+        &recovery_raw,
+        &recovered_access,
+        &recovered_refresh,
+        &successor_raw,
+    ] {
+        assert!(!consumed_text.contains(secret));
+    }
+    assert!(!consumed_text.contains(&scope.workspace_id.to_string()));
+    assert!(!consumed_text.contains(&scope.user_id.to_string()));
+    let consumed_json: Value = serde_json::from_str(&consumed_text).unwrap();
+    assert_eq!(
+        consumed_json
+            .as_object()
+            .expect("recovery response object")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["replayed", "session", "successor_recovery_code"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(consumed_json["session"]["id"], session_id.to_string());
+    assert_eq!(
+        consumed_json["session"]["scopes"],
+        serde_json::to_value(full_owner_device_scopes()).unwrap()
+    );
+    assert_eq!(
+        consumed_json["successor_recovery_code"]["id"],
+        successor_id.to_string()
+    );
+    assert_eq!(consumed_json["replayed"], false);
+
+    let replayed_consume = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes/consume",
+            &recovery_raw,
+            Some(consume_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed_consume.status(), StatusCode::OK);
+    let replayed_consume = response_json(replayed_consume).await;
+    assert_eq!(replayed_consume["session"], consumed_json["session"]);
+    assert_eq!(
+        replayed_consume["successor_recovery_code"],
+        consumed_json["successor_recovery_code"]
+    );
+    assert_eq!(replayed_consume["replayed"], true);
+
+    let mut changed_consume = consume_body;
+    changed_consume["session_id"] = json!(Uuid::new_v4());
+    let competing = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/recovery-codes/consume",
+            &recovery_raw,
+            Some(changed_consume),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(competing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(competing).await["error"]["code"],
+        "unauthorized"
+    );
+
+    let old_reader_rejected = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/recovery-codes/current",
+            &reader.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old_reader_rejected.status(), StatusCode::UNAUTHORIZED);
+    let current = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/recovery-codes/current",
+            &recovered_access,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(current).await["recovery_code"]["id"],
+        successor_id.to_string()
+    );
+    for reserved in [&recovery_raw, &successor_raw] {
+        let rejected = app
+            .clone()
+            .oneshot(auth_request("GET", "/v1/items", reserved, None))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
 
     test_database.destroy().await;
 }
@@ -2192,8 +3327,8 @@ async fn pending_device_enrollment_capacity_is_live_bounded_and_concurrent_safe(
     let second_token =
         OpaqueCredential::parse(CredentialKind::Enrollment, &second.enrollment_raw).unwrap();
     let (first_result, second_result) = tokio::join!(
-        repository.create_or_replay_device_enrollment(first.spec.clone(), &first_token),
-        repository.create_or_replay_device_enrollment(second.spec.clone(), &second_token),
+        repository.create_or_replay_device_enrollment(first.spec.clone(), &first_token, None),
+        repository.create_or_replay_device_enrollment(second.spec.clone(), &second_token, None),
     );
     let (winner, loser) = match (first_result, second_result) {
         (Ok(created), Err(CredentialRepositoryError::Conflict)) => {
@@ -2226,7 +3361,7 @@ async fn pending_device_enrollment_capacity_is_live_bounded_and_concurrent_safe(
     let mut replay_spec = winner.spec.clone();
     replay_spec.created_at = base + ChronoDuration::seconds(1);
     let replay = repository
-        .create_or_replay_device_enrollment(replay_spec, &winner_token)
+        .create_or_replay_device_enrollment(replay_spec, &winner_token, None)
         .await
         .expect("exact pending request remains replayable at capacity");
     assert!(replay.replayed);
@@ -2249,7 +3384,7 @@ async fn pending_device_enrollment_capacity_is_live_bounded_and_concurrent_safe(
             .expect("one pending authority revoked")
     );
     let admitted = repository
-        .create_or_replay_device_enrollment(loser.spec.clone(), &loser_token)
+        .create_or_replay_device_enrollment(loser.spec.clone(), &loser_token, None)
         .await
         .expect("revocation frees one pending slot");
     assert!(!admitted.replayed);
