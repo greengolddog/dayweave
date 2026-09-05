@@ -89,6 +89,8 @@ impl Readiness {
             std::time::Duration::from_secs(2),
             sqlx::query_scalar::<_, bool>(
                 "SELECT NOT ( \
+                    EXISTS(SELECT 1 FROM account_deletion_fences \
+                        WHERE workspace_id = $1 OR user_id = $2) OR \
                     EXISTS(SELECT 1 FROM google_oauth_scope_state WHERE workspace_id = $1 \
                         AND user_id = $2 AND revocation_kind IS NOT NULL) OR \
                     EXISTS(SELECT 1 FROM google_oauth_sessions WHERE workspace_id = $1 \

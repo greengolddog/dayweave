@@ -1,3 +1,4 @@
+mod account_deletion_repository;
 mod credential_auth_repository;
 mod database;
 mod execution_repository;
@@ -10,6 +11,7 @@ mod outbox;
 mod proposal_application_repository;
 mod proposal_repository;
 
+pub use account_deletion_repository::PostgresAccountDeletionRepository;
 pub use credential_auth_repository::PostgresCredentialRepository;
 pub use database::{Database, DatabaseScope, MIGRATOR, PersistenceError};
 pub(crate) use database::{lock_canonical_item_space, lock_execution_and_canonical_item_space};

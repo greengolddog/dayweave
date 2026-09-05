@@ -23,6 +23,13 @@ pub enum CredentialRepositoryError {
 
 #[async_trait]
 pub trait CredentialRepository: Send + Sync {
+    /// Fail-closed scope fence consulted after authentication and before every
+    /// authenticated REST/MCP request. Adapters must opt into an explicit
+    /// unfenced answer; an omitted implementation can never fail open.
+    async fn is_account_deletion_fenced(&self) -> Result<bool, CredentialRepositoryError> {
+        Err(CredentialRepositoryError::Internal)
+    }
+
     async fn get_active_account_recovery_code(
         &self,
     ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError>;

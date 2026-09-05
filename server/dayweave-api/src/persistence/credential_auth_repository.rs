@@ -41,6 +41,18 @@ impl PostgresCredentialRepository {
 #[allow(clippy::too_many_lines)]
 #[async_trait]
 impl CredentialRepository for PostgresCredentialRepository {
+    async fn is_account_deletion_fenced(&self) -> Result<bool, CredentialRepositoryError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM account_deletion_fences \
+             WHERE workspace_id = $1 OR user_id = $2)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_error)
+    }
+
     async fn get_active_account_recovery_code(
         &self,
     ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError> {

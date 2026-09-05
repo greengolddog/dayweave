@@ -5,6 +5,7 @@
 //! repository for isolated tests and a durable `PostgreSQL` adapter in deployed
 //! environments without changing the HTTP contract.
 
+pub mod account_deletion;
 pub mod assistant;
 pub mod auth;
 pub mod config;

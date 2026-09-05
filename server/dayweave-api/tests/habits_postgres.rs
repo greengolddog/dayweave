@@ -293,10 +293,14 @@ async fn published_habit_evidence_drives_audited_cas_delta_pause_and_recompositi
         .commit()
         .await
         .expect("release habit projection lock");
-    assert!(matches!(
-        concurrent_publish.await.expect("join queued publication"),
-        Err(SchedulePublicationError::StaleComposition)
-    ));
+    let concurrent_result = concurrent_publish.await.expect("join queued publication");
+    assert!(
+        matches!(
+            &concurrent_result,
+            Err(SchedulePublicationError::StaleComposition)
+        ),
+        "unexpected queued-publication result: {concurrent_result:?}"
+    );
 
     let operation_id = Uuid::new_v4();
     let partial_command = partial_command(operation_id, 0, PRIVATE_NOTE);

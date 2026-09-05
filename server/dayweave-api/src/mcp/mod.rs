@@ -66,6 +66,11 @@ pub async fn handle_post(
         };
         principal
     };
+    if let Some(credentials) = state.credential_repository.as_ref()
+        && credentials.is_account_deletion_fenced().await != Ok(false)
+    {
+        return unauthorized(&request_id, state.mcp_oauth.as_deref(), true);
+    }
     if !matches!(
         principal.audience,
         PrincipalAudience::Legacy | PrincipalAudience::Mcp | PrincipalAudience::McpOAuth

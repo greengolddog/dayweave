@@ -32,7 +32,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28
+            25, 26, 27, 28, 29
         ]
     );
 
@@ -65,6 +65,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0026_habit_occurrence_ledger.sql"),
         include_str!("../migrations/0027_habit_missed_resolutions.sql"),
         include_str!("../migrations/0028_account_recovery_codes.sql"),
+        include_str!("../migrations/0029_account_deletion_lifecycle.sql"),
     ]
     .join("\n");
     for table in [
@@ -89,6 +90,9 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "mcp_clients",
         "device_enrollments",
         "account_recovery_codes",
+        "account_deletion_lifecycles",
+        "account_deletion_transition_receipts",
+        "account_deletion_fences",
         "idempotency_keys",
         "item_changes",
         "execution_sessions",
@@ -167,6 +171,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("trashed_at"));
     assert!(schema.contains("tombstoned_at"));
     assert!(schema.contains("account_recovery_codes_one_active_owner_uq"));
+    assert!(schema.contains("purge_fenced_personal_account_scope"));
+    assert!(schema.contains("account deletion fence is active"));
     assert!(schema.contains("DEFERRABLE INITIALLY DEFERRED"));
     assert!(schema.contains("DELETE FROM provider_sync_cursors cursor"));
     assert!(schema.contains("cursor.collection_key = 'calendar:' || collection.id::text"));
@@ -4084,6 +4090,15 @@ async fn google_oauth_migration_quarantines_until_verified_operator_recovery() {
         vec![2_u8; 64],
         1,
     )));
+
+    // The assertions above freeze the immediate v6/v7 quarantine result.
+    // Bring the fixture to the current schema before exercising current
+    // repository/readiness code, just as production does before serving.
+    for migration in MIGRATOR.iter().filter(|migration| migration.version >= 8) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("post-Google migration applies");
+    }
 
     let repository = PostgresGoogleOAuthRepository::new(pool.clone(), scope);
     let readiness = Readiness::with_database(pool.clone(), scope.workspace_id, scope.user_id);

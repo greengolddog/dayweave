@@ -98,9 +98,13 @@ impl Database {
             workspace_id: config.workspace_id,
             user_id: config.user_id,
         };
-        if bootstrap_personal_scope(&pool, config).await.is_err() {
+        if let Err(error) = bootstrap_personal_scope(&pool, config).await {
+            let persistence_error = match error {
+                ScopeBootstrapError::Fenced => PersistenceError::AccountDeletionFenced,
+                ScopeBootstrapError::Database => PersistenceError::ScopeBootstrapFailed,
+            };
             pool.close().await;
-            return Err(PersistenceError::ScopeBootstrapFailed);
+            return Err(persistence_error);
         }
         Ok(Self { pool, scope })
     }
@@ -126,6 +130,8 @@ pub enum PersistenceError {
     MigrationFailed,
     #[error("database personal scope initialization failed")]
     ScopeBootstrapFailed,
+    #[error("database personal scope is permanently fenced for account deletion")]
+    AccountDeletionFenced,
     #[error("external integration initialization failed")]
     IntegrationInitializationFailed,
     #[error("Google provider identity root does not match its durable binding")]
@@ -137,8 +143,56 @@ pub enum PersistenceError {
 async fn bootstrap_personal_scope(
     pool: &PgPool,
     config: &DatabaseConfig,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), ScopeBootstrapError> {
     let mut transaction = pool.begin().await?;
+    let subject_hash: Vec<u8> = sqlx::query_scalar("SELECT sha256(convert_to($1, 'UTF8'))")
+        .bind(&config.owner_subject)
+        .fetch_one(&mut *transaction)
+        .await?;
+    // Bootstrap participates in the same global barrier as every mutation and
+    // fence. Taking it first prevents a scope-specific lock from deadlocking a
+    // pending fence that is waiting for bootstrap to finish.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.account-deletion.global-mutation-barrier.v1', 0))",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    // Use separate statements so the subject -> user -> workspace order is
+    // guaranteed rather than depending on SELECT-expression evaluation order.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.account-deletion.subject.v1:' || encode($1::bytea, 'hex'), 0))",
+    )
+    .bind(subject_hash.as_slice())
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.account-deletion.user.v1:' || $1::text, 0))",
+    )
+    .bind(config.user_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.account-deletion.workspace.v1:' || $1::text, 0))",
+    )
+    .bind(config.workspace_id)
+    .execute(&mut *transaction)
+    .await?;
+    let fenced = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM account_deletion_fences \
+         WHERE workspace_id = $1 OR user_id = $2 OR owner_subject_hash = $3)",
+    )
+    .bind(config.workspace_id)
+    .bind(config.user_id)
+    .bind(subject_hash.as_slice())
+    .fetch_one(&mut *transaction)
+    .await?;
+    if fenced {
+        return Err(ScopeBootstrapError::Fenced);
+    }
     sqlx::query(
         "INSERT INTO users (id, auth_subject, display_name, timezone_name) \
          VALUES ($1, $2, 'Personal', $3) ON CONFLICT (id) DO NOTHING",
@@ -157,7 +211,8 @@ async fn bootstrap_personal_scope(
     if stored_subject != config.owner_subject {
         return Err(sqlx::Error::Protocol(
             "configured user id belongs to a different subject".to_owned(),
-        ));
+        )
+        .into());
     }
 
     sqlx::query(
@@ -179,7 +234,8 @@ async fn bootstrap_personal_scope(
     if stored_owner != config.user_id {
         return Err(sqlx::Error::Protocol(
             "configured workspace id belongs to a different owner".to_owned(),
-        ));
+        )
+        .into());
     }
 
     sqlx::query(
@@ -191,5 +247,27 @@ async fn bootstrap_personal_scope(
     .bind(config.user_id)
     .execute(&mut *transaction)
     .await?;
-    transaction.commit().await
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+enum ScopeBootstrapError {
+    Fenced,
+    Database,
+}
+
+impl From<sqlx::Error> for ScopeBootstrapError {
+    fn from(error: sqlx::Error) -> Self {
+        if error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .is_some_and(|code| code == "DWDEL")
+        {
+            Self::Fenced
+        } else {
+            drop(error);
+            Self::Database
+        }
+    }
 }

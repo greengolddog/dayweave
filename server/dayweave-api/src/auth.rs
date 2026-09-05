@@ -326,6 +326,11 @@ pub async fn require_authentication(
         .authenticate(token)
         .await
         .map_err(|_| ApiError::unauthorized())?;
+    if let Some(credentials) = state.credential_repository.as_ref()
+        && credentials.is_account_deletion_fenced().await != Ok(false)
+    {
+        return Err(ApiError::unauthorized());
+    }
     if !matches!(
         principal.audience,
         PrincipalAudience::Legacy | PrincipalAudience::Device
@@ -488,6 +493,10 @@ mod tests {
 
     #[async_trait]
     impl CredentialRepository for SyntheticCredentialRepository {
+        async fn is_account_deletion_fenced(&self) -> Result<bool, CredentialRepositoryError> {
+            Ok(false)
+        }
+
         async fn get_active_account_recovery_code(
             &self,
         ) -> Result<Option<AccountRecoveryCode>, CredentialRepositoryError> {
