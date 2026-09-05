@@ -87,6 +87,34 @@ All management endpoints below are under `/v1` and require their named scope.
    `suggestions_submit`. A browser Origin must match both the global server
    allowlist and the exact per-client origin list.
 
+### Native active-device inventory
+
+The macOS and Android account surfaces read `GET /auth/sessions` only through
+their coordinated authenticated-request path. They identify the current device
+by exact comparison with the session UUID and client-instance UUID in the local
+durable-auth envelope, plus the expected native client kind; labels are
+presentation only and never authority. Inventory metadata remains memory-only,
+is cleared at the privacy or credential-binding boundary, and is read-only
+whenever its last refresh is stale, failed, or its exact current row lacks
+`auth_sessions_write`.
+
+A remote-device revoke requires an explicit, binding-bound confirmation and
+must never delete the current device's local credential envelope. After an
+ambiguous delete or a not-found response, the client re-lists sessions and
+reports success only when that exact remote UUID is authoritatively absent.
+The current device continues to use the stricter revoke-first sign-out flow:
+local credential and API-bound cache removal occurs only through its dedicated
+cross-store teardown choreography.
+
+One owner may have at most 16 active refreshable device sessions and 16 live,
+unconsumed device enrollments. The PostgreSQL repository serializes admission
+per workspace and user. Exact response-loss replays remain valid at capacity,
+and a same-installation replacement revokes its prior session before counting
+the replacement. A distinct request beyond either cap returns `409`; access
+token expiry alone does not release a refreshable-session slot. Session listing
+never truncates authority: historical state above the cap fails closed instead
+of hiding a revocable session.
+
 ### Published ChatGPT/Codex MCP account linking
 
 The `dw_mc1_` credential remains a native bearer for first-party and local MCP
@@ -116,8 +144,31 @@ is never retried against the static-token authenticator.
    exact retry, list/revoke, and device/MCP audience rejection. Revoke test
    credentials.
 5. Audit any session, enrollment, or MCP rows created by the earlier foundation
-   migration. Reissue rows carrying a scope that is invalid for their audience,
-   then validate `sessions_v1_runtime_shape_check`,
+   migration. The following two queries must each return zero rows before a
+   deploy or upgrade; resolve an over-cap owner explicitly rather than deleting
+   or truncating authority automatically:
+
+   ```sql
+   SELECT workspace_id, user_id, count(*) AS active_refreshable_sessions
+   FROM sessions
+   WHERE auth_version = 1
+     AND revoked_at IS NULL
+     AND refresh_idle_expires_at > CURRENT_TIMESTAMP
+     AND absolute_expires_at > CURRENT_TIMESTAMP
+   GROUP BY workspace_id, user_id
+   HAVING count(*) > 16;
+
+   SELECT workspace_id, user_id, count(*) AS live_pending_enrollments
+   FROM device_enrollments
+   WHERE consumed_at IS NULL
+     AND revoked_at IS NULL
+     AND expires_at > CURRENT_TIMESTAMP
+   GROUP BY workspace_id, user_id
+   HAVING count(*) > 16;
+   ```
+
+   Reissue rows carrying a scope that is invalid for their audience, then
+   validate `sessions_v1_runtime_shape_check`,
    `sessions_schedule_publish_contract_check`,
    `device_enrollments_runtime_scopes_check`,
    `device_enrollments_schedule_publish_contract_check`,
