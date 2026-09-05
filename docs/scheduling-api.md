@@ -668,6 +668,51 @@ demand. For completion-relative rules, the next due instant is conservatively
 bounded by `completion + max(interval, spacing)` because completion is the only
 authoritative prior-occurrence boundary in the recurrence context.
 
+Missed handling is projected by the habit service, not inferred independently
+by each scheduler caller. A bounded `POST /v1/habits/missed/reconcile` scan uses
+the server clock and persisted policy and requires both `items_write` and
+`items_read` because it returns workspace-wide resolution metadata; `ask`
+creates a durable review prompt.
+`PUT /v1/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution` resolves
+it with an explicit skip, carry, or reduce-frequency choice. The server alone
+chooses carry windows and reduction targets. Only active, executable leaf
+habits with recurrence can hold an active missed projection.
+
+Composition consumes only projections whose policy fingerprint still matches
+the current habit. Historical source evidence need not reappear in each moving
+publication horizon. If the current publication fully covers a selected
+reduction target's window, the exact target must still be generated (or be the
+same already-bound skipped member); outside that horizon, the historical edge
+remains effective so reduction chains cannot cascade. Unrelated item edits
+therefore preserve valid missed handling, while a recurrence/policy edit or
+hierarchy/status change fails closed. Outcome completion or explicit skip takes
+precedence, then an active pause, then missed skip/carry/reduction. Before
+recurrence context is built, stored manual moves are removed for planner
+occurrence IDs owned by an active missed projection; an old move cannot
+resurrect skipped, carried, or frequency-reduced work. Carry keeps the source
+identity and uses its server-derived window. Reduction considers exactly the
+immediate next occurrence in the current series and suppresses that one only
+when eligible; otherwise it remains pending rather than substituting a later
+candidate.
+
+Habit analytics uses the same current-policy projection. An effective
+frequency-reduction target is excluded from expected, eligible, missed, trend,
+and streak demand while the missed source remains counted. Carry keeps the
+source's original local-date bucket but uses its server-derived window for
+due-state, pause overlap, and streak evaluation, so it remains unresolved until
+that window ends and becomes missed only afterward. Stale-policy or inactive
+reductions do not suppress analytics demand.
+
+Native replicas encrypt the exact occurrence-membership set independently of
+rendered-block authority and persist a binding-scoped schedule-revision
+high-water before accepting an invalidation event. A lower proof is inert for
+missed handling, block execution, onboarding completion, and new generated
+schedule provider writes after a failed fetch or process restart. An already-
+submitted ambiguous write remains recoverable without minting fresh authority.
+A lower current head can be installed only through the one-shot recovery path
+opened by an authenticated cursor-ahead response, which handles a server
+revision-epoch reset without weakening the ordinary stale-response fence.
+
 A blocking event uses this metadata (recurring Google series are expanded by
 the calendar integration before composition):
 
