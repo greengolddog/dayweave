@@ -243,9 +243,11 @@ approval; it must not happen automatically.
 ## Remaining release gates
 
 The server slice does not configure ingress/per-principal rate limiting or
-suspicious-authentication alerts. Existing first-party credential flows
-implement the exact journal/atomic-store protocol; native recovery journals,
-independent audit, and a real-device cutover rehearsal remain in progress.
+suspicious-authentication alerts. Existing first-party credential flows and
+both native recovery clients implement the exact journal/atomic-store protocol;
+their automated gates and independent code audits pass. A controlled
+two-client/service recovery run, owner-device UI acceptance, and a real-device
+credential-only cutover rehearsal remain in progress.
 Published ChatGPT/Codex account linking remains
 blocked until the documented Auth0/tunnel activation preflight, a
 deployed end-to-end schedule read and simulation rehearsal, and an independent
