@@ -50,6 +50,7 @@ is complete.
 | Managed Codex App Server login/runtime foundation and planner-aware conversations on macOS, plus authenticated advisory assistant transport on Android | `ID-003`–`ID-004`, parts of `AI-001`–`AI-009` | [macOS Codex controller](../apps/macos/Sources/DayWeaveMac/Store/CodexConversationController.swift), [Android assistant manager](../apps/android/app/src/main/java/com/greengolddog/dayweave/sync/AssistantManager.kt), and [auth rollout](auth-rollout.md) |
 | Owner-visible active-device inventory and remote revocation on macOS and Android, with exact session UUID/client-instance/client-kind binding, current-row-derived write authority, memory-only stale-state fencing, confirmed remote revocation with ambiguous-result reconciliation, immediate access/refresh rejection, and transactional 16-session/16-pending-enrollment server bounds | `ID-005`, `SEC-008` | [credential-auth repository](../server/dayweave-api/src/persistence/credential_auth_repository.rs), [PostgreSQL acceptance tests](../server/dayweave-api/tests/credential_auth_postgres.rs), [macOS active-device UI](../apps/macos/Sources/DayWeaveMac/Views/DeviceSessionSettingsView.swift), [Android session manager](../apps/android/app/src/main/java/com/greengolddog/dayweave/sync/DeviceSessionManager.kt), and [auth rollout](auth-rollout.md) |
 | Cross-platform account recovery with client-generated 256-bit codes, hash-only server storage, exact issue/rotation/consume replay, one-active-code CAS, full-owner v2 authorization, old-authority fencing, set-based device/enrollment/MCP revocation, successor installation, secure native Keychain/Keystore journals, crash-safe credential/cache handoff, privacy-safe disclosure, and owner-facing recovery controls | `ID-006`, parts of `SEC-004`, `SEC-008`, and `SEC-011` | [recovery migration](../server/dayweave-api/migrations/0028_account_recovery_codes.sql), [PostgreSQL acceptance tests](../server/dayweave-api/tests/credential_auth_postgres.rs), [macOS recovery store](../apps/macos/Sources/DayWeaveMac/Store/AccountRecoveryStore.swift), [Android recovery manager](../apps/android/app/src/main/java/com/greengolddog/dayweave/network/AccountRecoveryManager.kt), and [auth rollout](auth-rollout.md) |
+| Route-less, default-disabled server foundation for secure personal-account deletion: detached content-free lifecycle/fence evidence, exact transition replay, a 24-hour confirmation boundary, database-level mutation fencing across the current tenant catalog and identity roots, anti-resurrection readiness/auth/bootstrap checks, and an atomic personal-scope purge primitive that retains the fence | Part of `ID-005`, `DATA`, `REL`, and `SEC` | [deletion lifecycle migration](../server/dayweave-api/migrations/0029_account_deletion_lifecycle.sql), [repository foundation](../server/dayweave-api/src/persistence/account_deletion_repository.rs), and [PostgreSQL integrity tests](../server/dayweave-api/tests/account_deletion_postgres.rs). This proves only the bounded server primitive and its fail-closed disabled state; it is not a production deletion workflow. |
 | Native SwiftUI and Jetpack Compose shells with Today/Calendar/Inbox/Assistant navigation, canonical item editors, planning profiles, privacy-first onboarding, and Google review surfaces | Parts of `UX-001`–`UX-012` | [macOS views](../apps/macos/Sources/DayWeaveMac/Views), [Android UI](../apps/android/app/src/main/java/com/greengolddog/dayweave/ui), and platform test suites |
 | Health Connect energy-signal provider on Android with explicit permissions, private projection, and manual-safe fallback boundaries | `CTX-006`, future boundary for `CTX-008` | [Health Connect integration](../apps/android/app/src/main/java/com/greengolddog/dayweave/health) |
 | Reproducible local macOS and signed-APK build paths, guarded signing boundaries, CI security scans, container builds, encrypted backup scripts, and a cost-guarded Nebius Terraform plan | Parts of `OPS`, `SEC-004`, `SEC-011`, and `DATA-003`–`DATA-006` | [release workflow](../.github/workflows/release.yml), [local build scripts](../scripts), and [deployment assets](../deploy) |
@@ -61,12 +62,14 @@ is complete.
 ## Active implementation
 
 The current milestone is full-product closure after the cross-platform habit
-core. Account-recovery codes are now implemented across the authoritative
-backend and both native clients. The atomic hash-only server lifecycle,
-authorization fencing, exact replay, local-authority reset, secure native
-journals, crash-safe credential handoff, privacy-safe disclosure, and native UI
-have automated coverage and independent review. Controlled service integration
-and owner-device acceptance remain in progress.
+core. Account-recovery codes are implemented across the authoritative backend
+and both native clients, with controlled service integration and owner-device
+acceptance still open. Work has started on secure account deletion: the
+route-less server/database foundation is deliberately disabled unless an
+external safety gate is supplied, and its fenced personal-scope invariants have
+automated PostgreSQL coverage. It does not yet provide an HTTP operation,
+provider cleanup, native-client workflow, restore-time tombstone enforcement,
+or verified backup erasure.
 
 Every feature slice whose status is **In progress** has its own approximate
 completion value below. These are evidence-based scope estimates, not elapsed
@@ -76,6 +79,7 @@ integration, or verification checkpoint; the notes state what prevents 100%.
 | In-progress feature slice | Approx. complete | Evidence and next checkpoint |
 | --- | ---: | --- |
 | Cross-platform account-recovery code flow | **90%** | The independently reviewed server, macOS, and Android implementations cover exact replay, secure journals, crash-safe authority replacement, cache quarantine, successor acknowledgement, privacy clearing, and strict transport validation; close a controlled two-client/service recovery rehearsal and owner-device UI acceptance. |
+| Secure account-deletion lifecycle | **25%** | The committed server foundation is route-less and default-disabled; it proves detached lifecycle evidence, exact replay, database fencing, personal-scope validation, and atomic local purge behavior under PostgreSQL tests. Next implement and verify a deployment-keyed external tombstone/restore lookup, provider-revocation outcomes and bounded retries, a credential-only HTTP service, secure native clients, a least-privilege runtime/migration role split, and backup-expiry evidence. |
 | Native active-device inventory and session revocation | **95%** | The bounded PostgreSQL contract and both native account surfaces have strict identity, scope, privacy, stale-state, and proof-based ambiguous-result recovery for remote and current-device revocation; close a controlled two-client/service run plus Android instrumented and owner-device UI acceptance. |
 | Native rich duration shape and provenance | **95%** | Exact, ranged, and unknown durations, provenance, rollback-safe persistence, and request replay are covered by the full macOS and Android gates; close the controlled native/service contract run and device acceptance. |
 | General habit minimum spacing | **95%** | Both native authoring paths and every shared recurrence family enforce the stricter applicable floor with explicit unmet demand; close the controlled native/service run and device acceptance. |
@@ -105,7 +109,7 @@ percentage.
 
 | Product area | Status | Approx. complete | Work still required for full acceptance |
 | --- | --- | ---: | --- |
-| Identity and accounts (`ID`) | **In progress** | **75%** | Close controlled active-device, recovery, and credential-only cutover acceptance; finish integration disconnect/reconnect parity, account deletion, and final managed Codex login verification on both platforms. |
+| Identity and accounts (`ID`) | **In progress** | **77%** | Close controlled active-device, recovery, and credential-only cutover acceptance; finish integration disconnect/reconnect parity, the still-disabled account-deletion workflow and external safety gates, and final managed Codex login verification on both platforms. |
 | Common item model (`DOM`) | **In progress** | **70%** | Complete the remaining rich fields, templates, bulk operations, progress modes, audit/undo presentation, and cross-platform editing paths. |
 | Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
 | Scheduling restrictions and profiles (`CON`) | **In progress** | **65%** | Close the remaining per-item hard/soft restrictions, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence cases. |

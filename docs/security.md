@@ -129,6 +129,17 @@ effects must flow through an auditable proposal or outbox boundary.
   Persistence contains only domain-separated hashes. Successful credential
   lifecycle mutations write content-free audit rows in the same database
   transaction.
+- The account-deletion migration and repository are a route-less,
+  default-disabled foundation, not a production deletion feature. PostgreSQL
+  tests cover detached content-free lifecycle/fence evidence, exact replay,
+  current-schema mutation guards, identity anti-resurrection checks, and the
+  atomic personal-scope purge primitive. Activation remains prohibited until a
+  deployment-keyed tombstone authority outside PostgreSQL/backups participates
+  in both deletion and restore, provider-revocation outcomes and retries are
+  durable, only credential-only HTTP/native approval paths can enter the
+  lifecycle, migration/runtime database roles are separated, and backup expiry
+  is proven. The foundation alone does not establish provider cleanup, native
+  teardown, restore safety, or backup erasure.
 - PostgreSQL adapters are explicitly scoped by the configured user/workspace,
   and every durable credential row carries that user/workspace/client scope.
   Static bootstrap principals do not independently prove that scope and must be
@@ -313,6 +324,10 @@ ready:
   suspicious-authentication alerts;
 - provision and verify least-privilege PostgreSQL migration/runtime roles so no
   unrelated role can write canonical execution, assessment, or claim tables;
+- keep account deletion disabled while implementing and rehearsing its external
+  tombstone/restore lookup, provider cleanup outcomes and bounded retries,
+  credential-only HTTP and native confirmation paths, scoped database grants,
+  and backup-expiry evidence;
 - provision least-privilege Nebius identities, private versioned storage,
   tunnel HTTPS, budget alerts, and automated security patch/restart reporting;
 - rehearse backup restore and credential/key rotation against the deployed

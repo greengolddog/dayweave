@@ -165,6 +165,27 @@ procedure. Hash-only indexed preflights reject unknown recovery and enrollment
 bearers before the owner-wide transaction lock; ingress rate limiting and
 suspicious-authentication alerts remain required defense in depth.
 
+### Account deletion foundation (not active)
+
+Migration `0029_account_deletion_lifecycle.sql` and its PostgreSQL repository
+are a route-less, default-disabled foundation. They provide content-free
+lifecycle evidence, exact transition receipts, a hard tenant/identity mutation
+fence, anti-resurrection checks, and a narrowly tested personal-scope purge
+primitive. No HTTP route, configuration switch, or native client currently
+turns that primitive into an account-deletion workflow, and operators must not
+invoke it directly as a substitute.
+
+Activation requires all of the following to be wired and reviewed together:
+a deployment-keyed, append-only external tombstone service outside PostgreSQL
+and its backups, including restore-time lookup and replay; durable Google and
+other provider-revocation outcomes with bounded retries; a credential-only HTTP
+service with the full fresh-owner/recovery/confirmation policy; secure native
+journals and explicit owner approval; separate least-privilege migration and
+runtime database roles; and verifiable expiry evidence for every retained
+backup. Until those controls and destructive restore rehearsals pass, account
+deletion is unavailable. The current foundation does not prove provider
+cleanup, restore safety, native teardown, or backup erasure.
+
 ### Published ChatGPT/Codex MCP account linking
 
 The `dw_mc1_` credential remains a native bearer for first-party and local MCP
@@ -183,8 +204,8 @@ is never retried against the static-token authenticator.
 ## Cutover checklist
 
 1. Back up PostgreSQL, restore it in isolation, and apply migrations through
-   `0028_account_recovery_codes.sql` before changing authentication
-   mode.
+   `0029_account_deletion_lifecycle.sql` before changing authentication mode.
+   Applying migration 0029 does not activate account deletion.
 2. Deploy in `legacy_static`; verify existing clients and inspect migration and
    audit health.
 3. Set `DAYWEAVE_AUTH_MODE=hybrid` while retaining the existing static token.
@@ -248,6 +269,10 @@ both native recovery clients implement the exact journal/atomic-store protocol;
 their automated gates and independent code audits pass. A controlled
 two-client/service recovery run, owner-device UI acceptance, and a real-device
 credential-only cutover rehearsal remain in progress.
+Account deletion remains unavailable: its route-less foundation must stay
+default-disabled until the external tombstone/restore authority, provider
+cleanup ledger and retries, credential-only HTTP/native flows, database role
+split, and backup-expiry evidence are implemented and independently rehearsed.
 Published ChatGPT/Codex account linking remains
 blocked until the documented Auth0/tunnel activation preflight, a
 deployed end-to-end schedule read and simulation rehearsal, and an independent
