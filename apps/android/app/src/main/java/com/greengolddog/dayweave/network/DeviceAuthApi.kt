@@ -489,7 +489,7 @@ internal fun isTrustedDeviceAuthUnauthorized(response: Response): Boolean {
     }
 }
 
-private fun decodeTrustedDeviceAuthError(response: Response): DeviceAuthApiException {
+internal fun decodeTrustedDeviceAuthError(response: Response): DeviceAuthApiException {
     if (!hasExactJsonMediaType(response)) return DeviceAuthApiException.Unavailable()
     val status = response.code
     if (status == 401) {
@@ -558,7 +558,7 @@ private fun readBoundedDeviceAuthErrorBytes(input: java.io.InputStream): ByteArr
     }
 }
 
-private fun decodeStrictUtf8(bytes: ByteArray): String? = try {
+internal fun decodeStrictUtf8(bytes: ByteArray): String? = try {
     StandardCharsets.UTF_8.newDecoder()
         .onMalformedInput(CodingErrorAction.REPORT)
         .onUnmappableCharacter(CodingErrorAction.REPORT)
@@ -568,7 +568,7 @@ private fun decodeStrictUtf8(bytes: ByteArray): String? = try {
     null
 }
 
-private fun hasStrictNoStoreHeaders(response: Response): Boolean {
+internal fun hasStrictNoStoreHeaders(response: Response): Boolean {
     val directives = response.headers.values("Cache-Control")
         .flatMap { value -> value.split(',', limit = Int.MAX_VALUE) }
         .map { it.trim().lowercase() }
@@ -579,7 +579,7 @@ private fun hasStrictNoStoreHeaders(response: Response): Boolean {
         }
 }
 
-private fun hasExactJsonMediaType(response: Response): Boolean {
+internal fun hasExactJsonMediaType(response: Response): Boolean {
     val values = response.headers.values("Content-Type")
     if (values.size != 1) return false
     val components = values.single().split(';', limit = Int.MAX_VALUE)
@@ -609,7 +609,7 @@ internal val DEVICE_AUTH_JSON = Json {
     encodeDefaults = true
 }
 
-private const val MAX_DEVICE_AUTH_RESPONSE_BYTES = 64 * 1024
+internal const val MAX_DEVICE_AUTH_RESPONSE_BYTES = 64 * 1024
 private const val MAX_DEVICE_AUTH_ERROR_TEXT_CHARS = 512
 private const val DEVICE_ENROLLMENT_CREATION_PATH = "v1/auth/device-enrollments"
 private const val DEVICE_ENROLLMENT_CREATION_METHOD = "POST"

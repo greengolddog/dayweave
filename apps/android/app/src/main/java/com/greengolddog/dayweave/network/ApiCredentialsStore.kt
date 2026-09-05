@@ -28,6 +28,8 @@ data class ApiConnectionSnapshot(
     val hasBearerToken: Boolean,
     val lastSuccessfulSyncEpochMillis: Long?,
     val configurationId: String? = null,
+    /** Exact durable device identity bound to [configurationId], never inferred from the server. */
+    val clientInstanceId: String? = null,
 )
 
 /**

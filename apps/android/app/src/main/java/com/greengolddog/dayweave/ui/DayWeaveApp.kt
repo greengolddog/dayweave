@@ -35,6 +35,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -452,6 +453,9 @@ private fun DayWeaveRoot(
         viewModel.googleSchedulePublicationState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
+    // Unlike durable planner projections, this private inventory must observe its memory-only
+    // quarantine even while the Activity lifecycle is stopped.
+    val deviceSessionsState by viewModel.deviceSessionsState.collectAsState()
     val timedBreakNotificationPermissionRequestDigest by
         viewModel.timedBreakNotificationPermissionRequestDigest.collectAsStateWithLifecycle()
     val scheduleCompositionProfileUpdateState by
@@ -613,6 +617,16 @@ private fun DayWeaveRoot(
     }
 
     LaunchedEffect(
+        state.destination,
+        deviceAuthState.sessionId,
+        deviceAuthState.isConfigured,
+    ) {
+        if (state.destination == AppDestination.MORE && deviceAuthState.isConfigured) {
+            viewModel.refreshDeviceSessions()
+        }
+    }
+
+    LaunchedEffect(
         lifecycleOwner,
         viewModel,
         deviceAuthState.baseUrl,
@@ -625,6 +639,9 @@ private fun DayWeaveRoot(
                 viewModel.refreshExecution()
                 viewModel.refreshGoogleAccounts()
                 viewModel.refreshEnergySignal()
+                if (deviceAuthState.isConfigured) {
+                    viewModel.refreshDeviceSessions()
+                }
                 runForegroundInvalidationWorkers(
                     executionInvalidationStream = if (deviceAuthState.isConfigured) {
                         viewModel::collectForegroundExecutionInvalidations
@@ -1122,6 +1139,12 @@ private fun DayWeaveRoot(
                     viewModel::acknowledgeScheduleCompositionProfileUpdate,
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
+                deviceSessionsState = deviceSessionsState,
+                onRefreshDeviceSessions = viewModel::refreshDeviceSessions,
+                deviceSessionRevocationConfirmationProvider =
+                    viewModel::deviceSessionRevocationConfirmation,
+                onRevokeRemoteDeviceSession = viewModel::revokeRemoteDeviceSession,
+                onSignOutCurrentDeviceSession = viewModel::signOutDeviceSessionIfCurrent,
                 googleAccountState = googleAccountState,
                 googleCalendarImportState = googleCalendarImportState,
                 energySignalState = energySignalState,

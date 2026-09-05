@@ -32,6 +32,9 @@ import com.greengolddog.dayweave.sync.AssistantState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
+import com.greengolddog.dayweave.sync.DeviceSessionManager
+import com.greengolddog.dayweave.sync.DeviceSessionRevocationConfirmation
+import com.greengolddog.dayweave.sync.DeviceSessionsState
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAuthorizationAction
@@ -82,6 +85,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.googleSchedulePublicationCoordinator
     private val energySignalManager = dayWeaveApplication.energySignalManager
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
+    private val deviceSessionManager: DeviceSessionManager =
+        dayWeaveApplication.deviceSessionManager
     private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
     private val timedBreakNotificationRouteAccess =
         PlannerTimedBreakNotificationRouteAccess(plannerStore)
@@ -110,6 +115,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         googleSchedulePublicationCoordinator.state
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
     val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
+    val deviceSessionsState: StateFlow<DeviceSessionsState> = deviceSessionManager.state
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
     val timedBreakNotificationPermissionRequestDigest: StateFlow<String?> =
         timedBreakNotificationPermissionRequestState.requestDigest
@@ -419,6 +425,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 if (result == DeviceAuthActionResult.SUCCESS) {
                     dayWeaveApplication.refreshCanonicalState()
                     googleAccountManager.refresh()
+                    deviceSessionManager.refresh()
                 }
             } finally {
                 assistantManager.restoreForegroundState()
@@ -436,6 +443,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 if (result == DeviceAuthActionResult.SUCCESS) {
                     dayWeaveApplication.refreshCanonicalState()
                     googleAccountManager.refresh()
+                    deviceSessionManager.refresh()
                 }
             } finally {
                 assistantManager.restoreForegroundState()
@@ -452,6 +460,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 if (result == DeviceAuthActionResult.SUCCESS) {
                     dayWeaveApplication.refreshCanonicalState()
                     googleAccountManager.refresh()
+                    deviceSessionManager.refresh()
                 }
             } finally {
                 assistantManager.restoreForegroundState()
@@ -460,7 +469,21 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun signOutDeviceSession() {
+        launchDeviceSessionSignOut(expectedSessionId = null)
+    }
+
+    fun signOutDeviceSessionIfCurrent(expectedSessionId: String) {
+        launchDeviceSessionSignOut(expectedSessionId)
+    }
+
+    private fun launchDeviceSessionSignOut(expectedSessionId: String?) {
         dayWeaveApplication.launchCanonicalAction {
+            if (
+                expectedSessionId != null &&
+                deviceAuthCoordinator.uiState.value.sessionId != expectedSessionId
+            ) {
+                return@launchCanonicalAction
+            }
             assistantManager.cancelForPrivacyBoundary()
             try {
                 deviceAuthCoordinator.signOutRevokeFirst()
@@ -470,6 +493,19 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 assistantManager.restoreForegroundState()
             }
         }
+    }
+
+    fun refreshDeviceSessions() {
+        viewModelScope.launch { deviceSessionManager.refresh() }
+    }
+
+    fun deviceSessionRevocationConfirmation(
+        sessionId: String,
+    ): DeviceSessionRevocationConfirmation? =
+        deviceSessionManager.revocationConfirmation(sessionId)
+
+    fun revokeRemoteDeviceSession(confirmation: DeviceSessionRevocationConfirmation) {
+        viewModelScope.launch { deviceSessionManager.revokeRemote(confirmation) }
     }
 
     fun destroyLocalDeviceAuthentication(confirmed: Boolean) {

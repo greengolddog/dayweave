@@ -17,14 +17,17 @@ import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.HealthAndSafety
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.PrivacyTip
+import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.Card
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -32,9 +35,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,6 +54,9 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.greengolddog.dayweave.health.EnergySignalPhase
 import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.DayWeaveUiState
@@ -63,6 +71,10 @@ import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncState
+import com.greengolddog.dayweave.sync.DeviceSessionRevocationConfirmation
+import com.greengolddog.dayweave.sync.DeviceSessionSummary
+import com.greengolddog.dayweave.sync.DeviceSessionsPhase
+import com.greengolddog.dayweave.sync.DeviceSessionsState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
@@ -74,6 +86,8 @@ import com.greengolddog.dayweave.network.RemoteGoogleSyncRunState
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
+import java.time.Duration
+import java.time.Instant
 
 @Composable
 fun MoreScreen(
@@ -86,6 +100,12 @@ fun MoreScreen(
     onAcknowledgeScheduleCompositionProfileUpdate: () -> Unit,
     suggestionSyncState: SuggestionSyncState,
     canonicalSyncState: CanonicalSyncState,
+    deviceSessionsState: DeviceSessionsState,
+    onRefreshDeviceSessions: () -> Unit,
+    deviceSessionRevocationConfirmationProvider:
+        (String) -> DeviceSessionRevocationConfirmation?,
+    onRevokeRemoteDeviceSession: (DeviceSessionRevocationConfirmation) -> Unit,
+    onSignOutCurrentDeviceSession: (String) -> Unit,
     googleAccountState: GoogleAccountState,
     googleCalendarImportState: GoogleCalendarImportState,
     energySignalState: EnergySignalState,
@@ -292,6 +312,17 @@ fun MoreScreen(
                     },
                 )
             }
+        }
+        item {
+            ActiveDevicesCard(
+                state = deviceSessionsState,
+                onRefresh = onRefreshDeviceSessions,
+                revocationConfirmationProvider =
+                    deviceSessionRevocationConfirmationProvider,
+                onRevokeRemote = onRevokeRemoteDeviceSession,
+                onSignOutCurrent = onSignOutCurrentDeviceSession,
+                onConfigureApiConnection = onConfigureApiConnection,
+            )
         }
         habitStatisticsContent?.let { content ->
             item {
@@ -505,6 +536,272 @@ fun MoreScreen(
             },
         )
     }
+}
+
+@Composable
+internal fun ActiveDevicesCard(
+    state: DeviceSessionsState,
+    onRefresh: () -> Unit,
+    revocationConfirmationProvider: (String) -> DeviceSessionRevocationConfirmation?,
+    onRevokeRemote: (DeviceSessionRevocationConfirmation) -> Unit,
+    onSignOutCurrent: (String) -> Unit,
+    onConfigureApiConnection: () -> Unit,
+    referenceTime: Instant = Instant.now(),
+) {
+    var pendingRemote by remember {
+        mutableStateOf<DeviceSessionRevocationConfirmation?>(null)
+    }
+    var pendingCurrentSessionId by remember { mutableStateOf<String?>(null) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                pendingRemote = null
+                pendingCurrentSessionId = null
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(state) {
+        pendingRemote = pendingRemote?.takeIf { confirmation ->
+            state.canRevokeRemoteSessions &&
+                state.sessions.singleOrNull { it.id == confirmation.sessionId }?.let { session ->
+                    !session.isCurrent && session.revision == confirmation.sessionRevision
+                } == true
+        }
+        pendingCurrentSessionId = pendingCurrentSessionId?.takeIf { currentSessionId ->
+            state.canRevokeRemoteSessions &&
+                state.sessions.singleOrNull { it.id == currentSessionId }?.isCurrent == true
+        }
+    }
+
+    pendingRemote?.let { confirmation ->
+        val remote = state.sessions.singleOrNull {
+            it.id == confirmation.sessionId && !it.isCurrent &&
+                it.revision == confirmation.sessionRevision
+        }
+        if (remote != null) {
+            AlertDialog(
+                onDismissRequest = { pendingRemote = null },
+                icon = { Icon(Icons.Outlined.Devices, contentDescription = null) },
+                title = { Text("Revoke ${remote.deviceLabel}?") },
+                text = {
+                    Text(
+                        "That device will lose DayWeave access and must be enrolled again. " +
+                            "DayWeave will verify the server’s active-device list before " +
+                            "showing the revocation as complete.",
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            pendingRemote = null
+                            onRevokeRemote(confirmation)
+                        },
+                        enabled = state.canRevokeRemoteSessions,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                        modifier = Modifier.testTag("confirm_remote_device_revocation"),
+                    ) { Text("Revoke device") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingRemote = null }) { Text("Keep device") }
+                },
+            )
+        }
+    }
+
+    pendingCurrentSessionId?.let { currentSessionId ->
+        AlertDialog(
+            onDismissRequest = { pendingCurrentSessionId = null },
+            icon = { Icon(Icons.Outlined.PhoneAndroid, contentDescription = null) },
+            title = { Text("Revoke this device session?") },
+            text = {
+                Text(
+                    "DayWeave will ask the server to revoke this exact session. Local " +
+                        "credentials and API-bound data are cleared only after revocation is " +
+                        "confirmed; a failure keeps them available for retry.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingCurrentSessionId = null
+                        onSignOutCurrent(currentSessionId)
+                    },
+                    enabled = state.canRevokeRemoteSessions,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                    modifier = Modifier.testTag("confirm_current_device_sign_out"),
+                ) { Text("Revoke & sign out") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingCurrentSessionId = null }) {
+                    Text("Keep session")
+                }
+            },
+        )
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("active_devices_card")
+            .semantics { stateDescription = state.message },
+    ) {
+        ListItem(
+            headlineContent = { Text("Active devices") },
+            supportingContent = { Text(state.message) },
+            leadingContent = { Icon(Icons.Outlined.Devices, contentDescription = null) },
+            trailingContent = {
+                if (state.isBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    IconButton(
+                        onClick = onRefresh,
+                        enabled = state.phase !in setOf(
+                            DeviceSessionsPhase.NOT_CONFIGURED,
+                            DeviceSessionsPhase.AUTH_REQUIRED,
+                        ),
+                        modifier = Modifier.testTag("refresh_active_devices"),
+                    ) {
+                        Icon(Icons.Outlined.Sync, contentDescription = "Refresh active devices")
+                    }
+                }
+            },
+        )
+
+        state.sessions.forEach { session ->
+            HorizontalDivider()
+            ListItem(
+                modifier = Modifier.testTag("active_device_${session.id}"),
+                headlineContent = {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            session.deviceLabel,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (session.isCurrent) {
+                            Surface(
+                                shape = MaterialTheme.shapes.small,
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                            ) {
+                                Text(
+                                    "This device",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                )
+                            }
+                        }
+                    }
+                },
+                supportingContent = {
+                    Text(deviceSessionSupportingText(session, referenceTime))
+                },
+                leadingContent = {
+                    Icon(
+                        if (session.clientKind == "android") {
+                            Icons.Outlined.PhoneAndroid
+                        } else {
+                            Icons.Outlined.Devices
+                        },
+                        contentDescription = null,
+                    )
+                },
+                trailingContent = {
+                    TextButton(
+                        onClick = {
+                            if (session.isCurrent) {
+                                pendingCurrentSessionId = session.id
+                            } else {
+                                pendingRemote =
+                                    revocationConfirmationProvider(session.id)
+                            }
+                        },
+                        enabled = state.canRevokeRemoteSessions,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                        modifier = Modifier.testTag(
+                            if (session.isCurrent) {
+                                "sign_out_current_device"
+                            } else {
+                                "revoke_device_${session.id}"
+                            },
+                        ),
+                    ) {
+                        Text(if (session.isCurrent) "Sign out" else "Revoke")
+                    }
+                },
+            )
+        }
+
+        if (
+            state.phase in setOf(
+                DeviceSessionsPhase.NOT_CONFIGURED,
+                DeviceSessionsPhase.AUTH_REQUIRED,
+            )
+        ) {
+            TextButton(
+                onClick = onConfigureApiConnection,
+                enabled = !state.isBusy,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            ) { Text("Set up device access") }
+        }
+        Text(
+            deviceSessionInventoryPrivacyMessage(state),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        )
+    }
+}
+
+internal fun deviceSessionInventoryPrivacyMessage(state: DeviceSessionsState): String =
+    if (state.phase == DeviceSessionsPhase.READY && !state.currentSessionCanRevoke) {
+        "Read-only access: this device can view active sessions, but it cannot revoke or sign " +
+            "out sessions. The list is fetched directly and kept only in memory while unlocked."
+    } else {
+        "Fetched directly from your Planner API and kept only in memory while DayWeave " +
+            "is unlocked. Revocation actions are unavailable when the list is stale or offline."
+    }
+
+internal fun deviceSessionSupportingText(
+    session: DeviceSessionSummary,
+    referenceTime: Instant,
+): String {
+    val platform = if (session.clientKind == "android") "Android" else "macOS"
+    val elapsedSeconds = Duration.between(session.lastSeenAt, referenceTime)
+        .seconds
+        .coerceAtLeast(0)
+    val activity = when {
+        elapsedSeconds < 60 -> "just now"
+        elapsedSeconds < 3_600 -> {
+            val minutes = elapsedSeconds / 60
+            "$minutes ${if (minutes == 1L) "minute" else "minutes"} ago"
+        }
+        elapsedSeconds < 86_400 -> {
+            val hours = elapsedSeconds / 3_600
+            "$hours ${if (hours == 1L) "hour" else "hours"} ago"
+        }
+        else -> {
+            val days = elapsedSeconds / 86_400
+            "$days ${if (days == 1L) "day" else "days"} ago"
+        }
+    }
+    return "$platform · DayWeave ${session.clientVersion} · Active $activity"
 }
 
 @Composable

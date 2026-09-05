@@ -20,6 +20,7 @@ import com.greengolddog.dayweave.network.OkHttpAssistantTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalItemInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
+import com.greengolddog.dayweave.network.OkHttpDeviceSessionsTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpScheduleInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
@@ -59,6 +60,7 @@ import com.greengolddog.dayweave.sync.DurableCanonicalItemInvalidationCursor
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
+import com.greengolddog.dayweave.sync.DeviceSessionManager
 import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
 import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.DurableScheduleInvalidationCursor
@@ -262,6 +264,9 @@ class DayWeaveApplication : Application() {
                         if (habitSyncManagerDelegate.isInitialized()) {
                             habitSyncManager.quarantineBindingState()
                         }
+                        if (deviceSessionManagerDelegate.isInitialized()) {
+                            deviceSessionManager.quarantineBindingState()
+                        }
                         if (googleAccountManagerDelegate.isInitialized()) {
                             googleAccountManager.quarantineBindingState()
                         }
@@ -292,6 +297,15 @@ class DayWeaveApplication : Application() {
     }
 
     private val apiCredentialStore by lazy { deviceAuthCoordinator }
+
+    private val deviceSessionManagerDelegate = lazy {
+        DeviceSessionManager(
+            credentialStore = apiCredentialStore,
+            transport = OkHttpDeviceSessionsTransport(),
+            operationAllowed = privatePresentationAllowed::get,
+        )
+    }
+    val deviceSessionManager: DeviceSessionManager get() = deviceSessionManagerDelegate.value
 
     private val assistantManagerDelegate = lazy {
         AssistantManager(
@@ -1035,6 +1049,9 @@ class DayWeaveApplication : Application() {
         }
         if (googleAccountManagerDelegate.isInitialized()) {
             googleAccountManager.quarantineBindingState()
+        }
+        if (deviceSessionManagerDelegate.isInitialized()) {
+            deviceSessionManager.quarantineBindingState()
         }
         ScheduleCompositionProfileDraftMemory.clear()
         setLocalScheduleCompositionForegroundActive(false)

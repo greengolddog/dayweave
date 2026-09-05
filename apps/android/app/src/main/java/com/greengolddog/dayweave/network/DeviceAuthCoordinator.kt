@@ -172,6 +172,7 @@ internal class DurableDeviceAuthCoordinator(
             hasBearerToken = usable,
             lastSuccessfulSyncEpochMillis = store.lastSuccessfulSyncEpochMillis(),
             configurationId = state.bindingId(),
+            clientInstanceId = state.clientInstanceId,
         )
     }
 
