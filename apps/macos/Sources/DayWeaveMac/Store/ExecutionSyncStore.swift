@@ -2505,7 +2505,9 @@ final class ExecutionSyncStore: ObservableObject {
         case let DayWeaveAPIError.durableAuthentication(authError):
             switch authError {
             case .notConfigured, .originMismatch, .invalidBootstrapCredential,
-                 .invalidEnrollmentCode,
+                 .invalidEnrollmentCode, .invalidAccountRecoveryCode,
+                 .accountRecoveryPending, .accountRecoveryAcknowledgementRequired,
+                 .accountRecoveryAuthorityRequired,
                  .durableSessionRequiresExplicitReenrollment, .remoteRevocationUnavailable,
                  .activeSessionMustBeRevoked,
                  .enrollmentRequired,

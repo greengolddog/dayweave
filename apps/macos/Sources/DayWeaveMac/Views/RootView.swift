@@ -6850,7 +6850,11 @@ struct SettingsView: View {
             Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
                     .textContentType(.URL)
-                    .disabled(durableAuth.isBusy || durableAuth.isManagingDeviceSessions)
+                    .disabled(
+                        durableAuth.isBusy
+                            || durableAuth.isManagingDeviceSessions
+                            || accountRecoveryFencesAuthMutation
+                    )
                 SecureField(
                     durableAuth.presentation.phase == .active
                         ? "Revoke current session before replacement"
@@ -6864,6 +6868,7 @@ struct SettingsView: View {
                 .disabled(
                     durableAuth.isBusy
                         || durableAuth.isManagingDeviceSessions
+                        || accountRecoveryFencesAuthMutation
                         || !authReplacementControlsEnabled
                 )
                 SecureField(
@@ -6873,6 +6878,7 @@ struct SettingsView: View {
                 .disabled(
                     durableAuth.isBusy
                         || durableAuth.isManagingDeviceSessions
+                        || accountRecoveryFencesAuthMutation
                         || !authReplacementControlsEnabled
                 )
                 HStack {
@@ -6886,6 +6892,7 @@ struct SettingsView: View {
                             || !durableAuth.presentation.canConsumeEnrollmentCode
                             || durableAuth.isBusy
                             || durableAuth.isManagingDeviceSessions
+                            || accountRecoveryFencesAuthMutation
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
@@ -6914,6 +6921,7 @@ struct SettingsView: View {
                             || canonicalSync.isSyncing
                             || durableAuth.isBusy
                             || durableAuth.isManagingDeviceSessions
+                            || accountRecoveryFencesAuthMutation
                             || (!authReplacementControlsEnabled
                                 && !dayWeaveBearerToken.isEmpty)
                             || !store.canMutatePlan
@@ -6935,6 +6943,7 @@ struct SettingsView: View {
                                     || canonicalSync.isSyncing
                                     || durableAuth.isBusy
                                     || durableAuth.isManagingDeviceSessions
+                                    || accountRecoveryFencesAuthMutation
                                     || !store.canMutatePlan
                                     || executionSync.credentialReplacementIsBlocked
                                     || googleCredentialTransitionIsBlocked
@@ -6953,6 +6962,7 @@ struct SettingsView: View {
                                 || canonicalSync.isSyncing
                                 || durableAuth.isBusy
                                 || durableAuth.isManagingDeviceSessions
+                                || accountRecoveryFencesAuthMutation
                                 || !store.canMutatePlan
                                 || executionSync.credentialReplacementIsBlocked
                                 || googleCredentialTransitionIsBlocked
@@ -6987,6 +6997,7 @@ struct SettingsView: View {
                     .disabled(
                         durableAuth.isBusy
                             || durableAuth.isManagingDeviceSessions
+                            || accountRecoveryFencesAuthMutation
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
@@ -7085,6 +7096,27 @@ struct SettingsView: View {
                     )
                 }
             )
+            AccountRecoverySettingsView(
+                durableAuth: durableAuth,
+                baseURLString: dayWeaveAPIBaseURL,
+                credentialReplacementDisabled:
+                    suggestionSync.isRefreshing
+                        || !suggestionSync.activeProposalIDs.isEmpty
+                        || executionSync.isSyncing
+                        || canonicalSync.isSyncing
+                        || durableAuth.isBusy
+                        || durableAuth.isManagingDeviceSessions
+                        || durableAuth.isManagingAccountRecovery
+                        || !store.canMutatePlan
+                        || executionSync.credentialReplacementIsBlocked
+                        || googleAuthenticationUpdateIsBlocked,
+                onRecover: { code in
+                    await recoverAccount(using: code)
+                },
+                onResumeCredentialReplacement: {
+                    await resumeAccountRecovery()
+                }
+            )
             Section("Local data") {
                 LabeledContent(
                     "Planner storage",
@@ -7170,6 +7202,7 @@ struct SettingsView: View {
         }
         .onDisappear {
             pendingCurrentSessionRevocationApproval = nil
+            durableAuth.clearAccountRecoveryMemory()
         }
     }
 
@@ -7308,6 +7341,16 @@ struct SettingsView: View {
             true
         case .enrollmentCreationPending, .enrollmentPending, .active,
              .refreshPending, .incompatible:
+            false
+        }
+    }
+
+    private var accountRecoveryFencesAuthMutation: Bool {
+        switch durableAuth.accountRecoveryPresentation.phase {
+        case .issuePending, .consumePending, .committedAwaitingInstallation,
+             .installedAwaitingHandoff:
+            true
+        case .idle, .awaitingAcknowledgement, .incompatible:
             false
         }
     }
@@ -7599,6 +7642,102 @@ struct SettingsView: View {
             googleIntegration.endCredentialTransition()
             apiSettingsError = error.localizedDescription
         }
+    }
+
+    private func recoverAccount(using code: String) async -> Bool {
+        await completeAccountRecoveryCredentialReplacement(code: code)
+    }
+
+    private func resumeAccountRecovery() async -> Bool {
+        await completeAccountRecoveryCredentialReplacement(code: nil)
+    }
+
+    private func completeAccountRecoveryCredentialReplacement(code: String?) async -> Bool {
+        apiSettingsError = nil
+        guard appLock.isContentAvailable else { return false }
+        let privacyGeneration = durableAuth.recoveryPrivacyGeneration
+        guard allowGoogleCredentialTransition(allowSameAPIBaseRepair: true) else { return false }
+        let baseURL: DayWeaveAPIBaseURL
+        do {
+            baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+        } catch {
+            googleIntegration.endCredentialTransition()
+            apiSettingsError = error.localizedDescription
+            return false
+        }
+        let capturedBaseURL = baseURL.url.absoluteString
+        defer { googleIntegration.endCredentialTransition() }
+        do {
+            try await executionSync.prepareForCredentialReplacement()
+        } catch {
+            apiSettingsError = error.localizedDescription
+            return false
+        }
+        guard appLock.isContentAvailable,
+              durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
+            return false
+        }
+        let recovered: Bool
+        if let code {
+            recovered = await durableAuth.consumeAccountRecoveryCode(
+                baseURL: baseURL,
+                code: code
+            )
+        } else {
+            recovered = await durableAuth.resumeAccountRecovery(baseURL: baseURL)
+        }
+        guard recovered else {
+            apiSettingsError = durableAuth.accountRecoveryErrorMessage
+            return false
+        }
+        guard appLock.isContentAvailable,
+              durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
+            return false
+        }
+
+        // The server and Keychain transition are already committed. Clear all
+        // transient credential inputs before notifying dependent stores.
+        dayWeaveBearerToken = ""
+        dayWeaveEnrollmentCode = ""
+        guard suggestionSync.applyConfiguration(
+            baseURL: capturedBaseURL,
+            newToken: ""
+        ) else {
+            apiSettingsError = suggestionSync.status.message
+            return false
+        }
+        dayWeaveAPIBaseURL = suggestionSync.baseURLString
+        suggestionSync.durableAuthenticationDidChange()
+        googleIntegration.configurationDidChange()
+        googleOutbound.configurationDidChange()
+        googleSchedulePublication.configurationDidChange()
+        canonicalSync.configurationDidChange()
+        await executionSync.configurationDidChange()
+        guard appLock.isContentAvailable,
+              durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
+            return false
+        }
+        guard await durableAuth.completeAccountRecoveryCredentialHandoff(
+            baseURL: baseURL
+        ) else {
+            apiSettingsError = durableAuth.accountRecoveryErrorMessage
+            return false
+        }
+        guard appLock.isContentAvailable,
+              durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
+            return false
+        }
+        // The first pass invalidated every stale binding while authorization
+        // was quarantined. This second lightweight pass lets stores restart
+        // from the now-released recovered binding instead of retaining a
+        // transient quarantine error from an eager reload task.
+        suggestionSync.durableAuthenticationDidChange()
+        googleIntegration.configurationDidChange()
+        googleOutbound.configurationDidChange()
+        googleSchedulePublication.configurationDidChange()
+        canonicalSync.configurationDidChange()
+        executionSync.startForegroundPolling()
+        return true
     }
 
     private func upgradeDurableAuthentication() {

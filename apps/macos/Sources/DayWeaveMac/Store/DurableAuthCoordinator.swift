@@ -278,7 +278,7 @@ struct DurableDeviceSessionMetadata: Codable, Equatable, Sendable {
     }
 }
 
-struct DurableDeviceSessionInventoryFence: Equatable, Sendable {
+struct DurableDeviceSessionInventoryFence: Codable, Equatable, Sendable {
     let configurationIdentifier: String
     let originIdentifier: String
     let authorizationBindingIdentifier: String
@@ -1344,6 +1344,10 @@ enum DurableAuthError: Error, Equatable, Sendable {
     case originMismatch
     case invalidBootstrapCredential
     case invalidEnrollmentCode
+    case invalidAccountRecoveryCode
+    case accountRecoveryPending
+    case accountRecoveryAcknowledgementRequired
+    case accountRecoveryAuthorityRequired
     case durableSessionRequiresExplicitReenrollment
     case remoteRevocationUnavailable
     case activeSessionMustBeRevoked
@@ -1372,6 +1376,14 @@ extension DurableAuthError: LocalizedError {
             "The bootstrap credential is invalid. Re-enter it without leading or trailing spaces."
         case .invalidEnrollmentCode:
             "The one-time enrollment code is invalid. It must be an exact unmodified DayWeave enrollment code."
+        case .invalidAccountRecoveryCode:
+            "The account recovery code is invalid or was already replaced. Enter the exact saved DayWeave recovery code."
+        case .accountRecoveryPending:
+            "A durable account-recovery request is already saved in Keychain. Resume it before starting another."
+        case .accountRecoveryAcknowledgementRequired:
+            "Save and acknowledge the current recovery code before starting another recovery operation."
+        case .accountRecoveryAuthorityRequired:
+            "A full-owner rotating device session is required to generate or replace a recovery code."
         case .durableSessionRequiresExplicitReenrollment:
             "A rotating device session is already active. Use Re-enroll explicitly to replace it."
         case .remoteRevocationUnavailable:
@@ -1531,6 +1543,8 @@ actor DurableAuthCoordinator {
 
     nonisolated let stateStore: any DurableAuthStateStoring
     nonisolated let legacyStore: any BearerTokenStoring
+    nonisolated let recoveryStore: any DurableAccountRecoveryStateStoring
+    private let authRecoveryTransactionGate: any DurableAuthRecoveryTransactionGating
     private let transport: any DurableAuthHTTPTransport
     private let generator: any DurableCredentialGenerating
     private let now: @Sendable () -> Date
@@ -1553,12 +1567,18 @@ actor DurableAuthCoordinator {
     init(
         stateStore: any DurableAuthStateStoring = KeychainDurableAuthStateStore(),
         legacyStore: any BearerTokenStoring = KeychainBearerTokenStore(),
+        recoveryStore: any DurableAccountRecoveryStateStoring =
+            KeychainDurableAccountRecoveryStateStore(),
+        authRecoveryTransactionGate: any DurableAuthRecoveryTransactionGating =
+            FileDurableAuthRecoveryTransactionGate.shared,
         transport: any DurableAuthHTTPTransport = URLSessionDurableAuthHTTPTransport(),
         generator: any DurableCredentialGenerating = SystemDurableCredentialGenerator(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.stateStore = stateStore
         self.legacyStore = legacyStore
+        self.recoveryStore = recoveryStore
+        self.authRecoveryTransactionGate = authRecoveryTransactionGate
         self.transport = transport
         self.generator = generator
         self.now = now
@@ -1566,6 +1586,9 @@ actor DurableAuthCoordinator {
 
     nonisolated func hasUsableCredential(boundTo baseURL: DayWeaveAPIBaseURL) -> Bool {
         do {
+            if try Self.recoveryJournalBlocksAuthorization(recoveryStore.loadEnvelope()) {
+                return false
+            }
             if let envelope = try stateStore.loadEnvelope() {
                 guard envelope.origin == baseURL.credentialOriginIdentifier else { return false }
                 switch envelope.state {
@@ -1590,6 +1613,15 @@ actor DurableAuthCoordinator {
     }
 
     nonisolated func bindingIdentifier(boundTo baseURL: DayWeaveAPIBaseURL) throws -> String {
+        do {
+            if try Self.recoveryJournalBlocksAuthorization(recoveryStore.loadEnvelope()) {
+                throw DurableAuthError.accountRecoveryPending
+            }
+        } catch let error as DurableAuthError {
+            throw error
+        } catch {
+            throw DurableAuthError.localStateUnavailable
+        }
         if let envelope = try stateStore.loadEnvelope() {
             guard envelope.origin == baseURL.credentialOriginIdentifier else {
                 throw DurableAuthError.originMismatch
@@ -1703,6 +1735,7 @@ actor DurableAuthCoordinator {
         _ token: String,
         boundTo baseURL: DayWeaveAPIBaseURL
     ) throws {
+        try requireNoRecoveryJournalFencingAuthMutation()
         guard Self.isValidLegacyToken(token) else {
             throw DurableAuthError.invalidBootstrapCredential
         }
@@ -1733,7 +1766,7 @@ actor DurableAuthCoordinator {
             clientInstanceID: resolvedClientID,
             state: .legacy(.init(bearerToken: token))
         )
-        guard try stateStore.compareAndSwap(expected: current, replacement: replacement) else {
+        guard try compareAndSwapAuthState(expected: current, replacement: replacement) else {
             throw DurableAuthError.concurrentStateChange
         }
         try removeLegacyDuplicate()
@@ -1745,6 +1778,7 @@ actor DurableAuthCoordinator {
         descriptor: DurableAuthClientDescriptor,
         bootstrapToken: String? = nil
     ) async throws -> DurableDeviceSessionMetadata {
+        try requireNoRecoveryJournalFencingAuthMutation()
         guard descriptor.isValid else { throw DurableAuthError.requestEncodingFailed }
         var current = try loadState()
         if current == nil {
@@ -1841,6 +1875,7 @@ actor DurableAuthCoordinator {
         boundTo baseURL: DayWeaveAPIBaseURL,
         descriptor: DurableAuthClientDescriptor
     ) async throws -> DurableDeviceSessionMetadata {
+        try requireNoRecoveryJournalFencingAuthMutation()
         guard descriptor.isValid,
               Self.isCredential(enrollmentCode, prefix: "dw_en1_") else {
             throw DurableAuthError.invalidEnrollmentCode
@@ -1921,7 +1956,7 @@ actor DurableAuthCoordinator {
             clientInstanceID: sameOrigin ? current?.clientInstanceID : nil,
             state: .enrollmentPending(pending)
         )
-        guard try stateStore.compareAndSwap(expected: current, replacement: replacement) else {
+        guard try compareAndSwapAuthState(expected: current, replacement: replacement) else {
             throw DurableAuthError.concurrentStateChange
         }
         try removeLegacyDuplicate()
@@ -1954,6 +1989,7 @@ actor DurableAuthCoordinator {
     }
 
     func authorization(boundTo baseURL: DayWeaveAPIBaseURL) async throws -> DurableAuthorization {
+        try requireNoRecoveryCredentialReplacementPending()
         var envelope = try loadState()
         if envelope == nil {
             try adoptLegacyCredentialIfPresent(boundTo: baseURL)
@@ -2221,6 +2257,7 @@ actor DurableAuthCoordinator {
         boundTo baseURL: DayWeaveAPIBaseURL,
         approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot? = nil
     ) async throws {
+        try requireNoRecoveryJournalFencingAuthMutation()
         if let expectedInventory {
             guard let sessionID = expectedInventory.currentSessionID else {
                 throw DurableAuthError.concurrentStateChange
@@ -2248,6 +2285,7 @@ actor DurableAuthCoordinator {
         boundTo baseURL: DayWeaveAPIBaseURL,
         approvedBy approval: DurableCurrentSessionRevocationApproval
     ) async throws {
+        try requireNoRecoveryJournalFencingAuthMutation()
         try await revokeApprovedCurrentSession(
             boundTo: baseURL,
             approval: .init(currentSession: approval)
@@ -2399,7 +2437,7 @@ actor DurableAuthCoordinator {
             throw DurableAuthError.concurrentStateChange
         }
         try removeLegacyDuplicate()
-        guard try stateStore.compareAndSwap(expected: expected, replacement: nil) else {
+        guard try compareAndSwapAuthState(expected: expected, replacement: nil) else {
             throw DurableAuthError.concurrentStateChange
         }
     }
@@ -2420,7 +2458,7 @@ actor DurableAuthCoordinator {
             throw DurableAuthError.concurrentStateChange
         }
         try removeLegacyDuplicate()
-        guard try stateStore.compareAndSwap(expected: expected, replacement: nil) else {
+        guard try compareAndSwapAuthState(expected: expected, replacement: nil) else {
             throw DurableAuthError.concurrentStateChange
         }
     }
@@ -2428,6 +2466,7 @@ actor DurableAuthCoordinator {
     /// Explicit recovery-only path. The caller must present a warning that
     /// this does not revoke server-side session or bootstrap authority.
     func confirmLocalOnlyForget() throws {
+        try requireNoRecoveryJournalFencingAuthMutation()
         let current = try loadState()
         // Remove any pre-envelope duplicate before changing the authoritative
         // state. If Keychain refuses, leave the envelope untouched and fail.
@@ -2443,7 +2482,7 @@ actor DurableAuthCoordinator {
         } else {
             replacement = nil
         }
-        guard try stateStore.compareAndSwap(expected: current, replacement: replacement) else {
+        guard try compareAndSwapAuthState(expected: current, replacement: replacement) else {
             throw DurableAuthError.concurrentStateChange
         }
     }
@@ -2509,7 +2548,7 @@ actor DurableAuthCoordinator {
             clientInstanceID: clientInstanceID,
             state: .enrollmentCreationPending(pending)
         )
-        guard try stateStore.compareAndSwap(expected: expected, replacement: replacement) else {
+        guard try compareAndSwapAuthState(expected: expected, replacement: replacement) else {
             throw DurableAuthError.concurrentStateChange
         }
         try removeLegacyDuplicate()
@@ -2652,7 +2691,10 @@ actor DurableAuthCoordinator {
                 durableWasPreviouslyActivated: pending.durableWasPreviouslyActivated
             )
             let replacement = try envelope.replacingState(.enrollmentPending(enrollmentPending))
-            guard try stateStore.compareAndSwap(expected: envelope, replacement: replacement) else {
+            guard try compareAndSwapAuthState(
+                expected: envelope,
+                replacement: replacement
+            ) else {
                 guard let latest = try loadState(),
                       let resolved = try await resolveEnrollmentCreationProgress(
                           latest,
@@ -2840,7 +2882,10 @@ actor DurableAuthCoordinator {
                 clientInstanceID: mutation.session.clientInstanceID,
                 state: .active(active)
             )
-            guard try stateStore.compareAndSwap(expected: envelope, replacement: replacement) else {
+            guard try compareAndSwapAuthState(
+                expected: envelope,
+                replacement: replacement
+            ) else {
                 return try resolveCommittedActive(
                     sessionID: mutation.session.id,
                     credentials: pending.proposedCredentials
@@ -2906,7 +2951,19 @@ actor DurableAuthCoordinator {
             refreshRequest: refreshRequest
         )
         let replacement = try envelope.replacingState(.refreshPending(pending))
-        guard try stateStore.compareAndSwap(expected: envelope, replacement: replacement) else {
+        // A refresh may never begin after a recovery tuple has acquired its
+        // durable installation fence. Issue-pending is the one
+        // exception: its trusted 401 recovery refreshes this same stable
+        // device session before rebasing the issue journal.
+        try requireRecoveryJournalAllowsAuthMutation(
+            expected: envelope,
+            allowingBoundIssueRefresh: true
+        )
+        guard try compareAndSwapAuthState(
+            expected: envelope,
+            replacement: replacement,
+            policy: .boundIssueRefresh
+        ) else {
             let latest = try loadState()
             if let latest, latest.origin == envelope.origin,
                case let .refreshPending(latestPending) = latest.state,
@@ -2999,6 +3056,14 @@ actor DurableAuthCoordinator {
             pending.refreshRequest,
             bearer: pending.previous.credentials.refreshToken
         )
+        // Actor methods are reentrant across the network await. Re-read the
+        // durable recovery journal before interpreting any refresh response,
+        // so an in-flight refresh cannot retire, quarantine, or replace the
+        // exact auth envelope reserved by recovery consumption.
+        try requireRecoveryJournalAllowsAuthMutation(
+            expected: envelope,
+            allowingBoundIssueRefresh: true
+        )
         if response.statusCode == 401 {
             guard Self.isDefinitiveUnauthorized(response) else {
                 throw DurableAuthError.invalidResponse
@@ -3006,7 +3071,8 @@ actor DurableAuthCoordinator {
             try transitionToReauthentication(
                 expected: envelope,
                 session: pending.previous.session,
-                reason: .rejected
+                reason: .rejected,
+                allowingBoundIssueRefresh: true
             )
             throw DurableAuthError.reauthenticationRequired
         }
@@ -3016,7 +3082,8 @@ actor DurableAuthCoordinator {
                 try transitionToIncompatible(
                     expected: envelope,
                     reason: "refresh_contract_rejected",
-                    recovery: .refresh(pending)
+                    recovery: .refresh(pending),
+                    allowingBoundIssueRefresh: true
                 )
             }
             throw try mapFailure(response)
@@ -3037,7 +3104,15 @@ actor DurableAuthCoordinator {
                 credentials: pending.nextCredentials
             )
             let replacement = try envelope.replacingState(.active(active))
-            guard try stateStore.compareAndSwap(expected: envelope, replacement: replacement) else {
+            try requireRecoveryJournalAllowsAuthMutation(
+                expected: envelope,
+                allowingBoundIssueRefresh: true
+            )
+            guard try compareAndSwapAuthState(
+                expected: envelope,
+                replacement: replacement,
+                policy: .boundIssueRefresh
+            ) else {
                 return try resolveCommittedActive(
                     sessionID: mutation.session.id,
                     credentials: pending.nextCredentials
@@ -3049,7 +3124,8 @@ actor DurableAuthCoordinator {
                 try transitionToIncompatible(
                     expected: envelope,
                     reason: "refresh_response_mismatch",
-                    recovery: .refresh(pending)
+                    recovery: .refresh(pending),
+                    allowingBoundIssueRefresh: true
                 )
             }
             throw error
@@ -3057,7 +3133,8 @@ actor DurableAuthCoordinator {
             try transitionToIncompatible(
                 expected: envelope,
                 reason: "refresh_response_mismatch",
-                recovery: .refresh(pending)
+                recovery: .refresh(pending),
+                allowingBoundIssueRefresh: true
             )
             throw DurableAuthError.invalidResponse
         }
@@ -3078,27 +3155,40 @@ actor DurableAuthCoordinator {
     private func transitionToReauthentication(
         expected: DurableAuthEnvelope,
         session: DurableDeviceSessionMetadata,
-        reason: DurableReauthenticationReason
+        reason: DurableReauthenticationReason,
+        allowingBoundIssueRefresh: Bool = true
     ) throws {
         try transitionToReauthentication(
             expected: expected,
             sessionID: session.id,
-            reason: reason
+            reason: reason,
+            allowingBoundIssueRefresh: allowingBoundIssueRefresh
         )
     }
 
     private func transitionToReauthentication(
         expected: DurableAuthEnvelope,
         sessionID: UUID?,
-        reason: DurableReauthenticationReason
+        reason: DurableReauthenticationReason,
+        allowingBoundIssueRefresh: Bool = true
     ) throws {
+        try requireRecoveryJournalAllowsAuthMutation(
+            expected: expected,
+            allowingBoundIssueRefresh: allowingBoundIssueRefresh
+        )
         let replacement = try expected.replacingState(.reauthenticationRequired(.init(
             clientInstanceID: expected.clientInstanceID,
             previousSessionID: sessionID,
             reason: reason,
             detectedAt: now()
         )))
-        guard try stateStore.compareAndSwap(expected: expected, replacement: replacement) else {
+        let policy: AuthStateMutationRecoveryPolicy = allowingBoundIssueRefresh
+            ? .boundIssueRefresh : .ordinary
+        guard try compareAndSwapAuthState(
+            expected: expected,
+            replacement: replacement,
+            policy: policy
+        ) else {
             guard try loadState() == replacement else {
                 throw DurableAuthError.concurrentStateChange
             }
@@ -3109,15 +3199,26 @@ actor DurableAuthCoordinator {
     private func transitionToIncompatible(
         expected: DurableAuthEnvelope,
         reason: String,
-        recovery: IncompatibleAuthRecovery
+        recovery: IncompatibleAuthRecovery,
+        allowingBoundIssueRefresh: Bool = false
     ) throws {
+        try requireRecoveryJournalAllowsAuthMutation(
+            expected: expected,
+            allowingBoundIssueRefresh: allowingBoundIssueRefresh
+        )
         let replacement = try expected.replacingState(.incompatible(.init(
             reasonCode: reason,
             storedSchemaVersion: DurableAuthEnvelope.currentSchemaVersion,
             detectedAt: now(),
             recovery: recovery
         )))
-        guard try stateStore.compareAndSwap(expected: expected, replacement: replacement) else {
+        let policy: AuthStateMutationRecoveryPolicy = allowingBoundIssueRefresh
+            ? .boundIssueRefresh : .ordinary
+        guard try compareAndSwapAuthState(
+            expected: expected,
+            replacement: replacement,
+            policy: policy
+        ) else {
             guard try loadState() == replacement else {
                 throw DurableAuthError.concurrentStateChange
             }
@@ -3136,7 +3237,7 @@ actor DurableAuthCoordinator {
             clientInstanceID: clientInstanceID,
             state: .legacy(.init(bearerToken: token))
         )
-        guard try stateStore.compareAndSwap(expected: nil, replacement: envelope) else { return }
+        guard try compareAndSwapAuthState(expected: nil, replacement: envelope) else { return }
         try removeLegacyDuplicate()
     }
 
@@ -3451,7 +3552,10 @@ actor DurableAuthCoordinator {
             baseURL: baseURL,
             context: &context
         )
-        guard response.statusCode == 200 else { throw try mapFailure(response) }
+        guard response.statusCode == 200 else {
+            try validateNoStore(response)
+            throw try mapFailure(response)
+        }
         let fetchedAt = now()
         let sessions = try decodeDeviceSessionInventory(
             response,
@@ -4227,6 +4331,1257 @@ extension CreateEnrollmentRequest: RedactedAuthDescribing {}
 extension ConsumeEnrollmentRequest: RedactedAuthDescribing {}
 extension RefreshRequest: RedactedAuthDescribing {}
 
+private struct AccountRecoveryCurrentResponse: Decodable {
+    let recoveryCode: DurableAccountRecoveryCodeMetadata?
+
+    private enum CodingKeys: String, CodingKey {
+        case recoveryCode = "recovery_code"
+    }
+}
+
+private struct AccountRecoveryMutationResponse: Decodable {
+    let recoveryCode: DurableAccountRecoveryCodeMetadata
+    let replayed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case recoveryCode = "recovery_code"
+        case replayed
+    }
+}
+
+private struct AccountRecoveryConsumptionResponse: Decodable {
+    let session: DurableDeviceSessionMetadata
+    let successorRecoveryCode: DurableAccountRecoveryCodeMetadata
+    let replayed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case session
+        case successorRecoveryCode = "successor_recovery_code"
+        case replayed
+    }
+}
+
+extension DurableAuthCoordinator {
+    private nonisolated static func recoveryJournalBlocksAuthorization(
+        _ envelope: DurableAccountRecoveryEnvelope?
+    ) -> Bool {
+        guard let envelope else { return false }
+        return switch envelope.state {
+        case .consumePending, .consumeCommittedAwaitingInstallation,
+             .consumeInstalledAwaitingHandoff:
+            true
+        case .issuePending, .awaitingAcknowledgement, .incompatible:
+            false
+        }
+    }
+
+    private func requireNoRecoveryCredentialReplacementPending() throws {
+        guard let envelope = try loadRecoveryState() else { return }
+        switch envelope.state {
+        case .consumePending, .consumeCommittedAwaitingInstallation,
+             .consumeInstalledAwaitingHandoff:
+            throw DurableAuthError.accountRecoveryPending
+        case .issuePending, .awaitingAcknowledgement:
+            return
+        case .incompatible:
+            // The recovery journal is deliberately independent. Quarantined
+            // recovery bytes cannot acquire authority or disable an otherwise
+            // valid ordinary device session.
+            return
+        }
+    }
+
+    private func requireNoRecoveryJournalFencingAuthMutation() throws {
+        guard let envelope = try loadRecoveryState() else { return }
+        switch envelope.state {
+        case .issuePending, .consumePending, .consumeCommittedAwaitingInstallation,
+             .consumeInstalledAwaitingHandoff:
+            throw DurableAuthError.accountRecoveryPending
+        case .awaitingAcknowledgement, .incompatible:
+            return
+        }
+    }
+
+    private enum AuthStateMutationRecoveryPolicy {
+        case ordinary
+        case boundIssueRefresh
+        case recoveryInstallation(DurableAccountRecoveryEnvelope)
+    }
+
+    /// Performs the recovery-policy read and auth CAS under the one shared
+    /// in-process/interprocess transaction gate. The state stores retain their
+    /// own item locks, but no peer following this protocol can cross the
+    /// decision between these two calls.
+    private func compareAndSwapAuthState(
+        expected: DurableAuthEnvelope?,
+        replacement: DurableAuthEnvelope?,
+        policy: AuthStateMutationRecoveryPolicy = .ordinary
+    ) throws -> Bool {
+        var didSwap = false
+        try authRecoveryTransactionGate.withTransaction {
+            switch policy {
+            case .ordinary:
+                try requireRecoveryJournalAllowsAuthMutation(expected: expected)
+            case .boundIssueRefresh:
+                try requireRecoveryJournalAllowsAuthMutation(
+                    expected: expected,
+                    allowingBoundIssueRefresh: true
+                )
+            case let .recoveryInstallation(recoveryEnvelope):
+                guard try loadRecoveryState() == recoveryEnvelope,
+                      case .consumeCommittedAwaitingInstallation = recoveryEnvelope.state else {
+                    throw DurableAuthError.concurrentStateChange
+                }
+            }
+            didSwap = try stateStore.compareAndSwap(
+                expected: expected,
+                replacement: replacement
+            )
+        }
+        return didSwap
+    }
+
+    private func installInitialRecoveryIssueJournal(
+        _ recoveryEnvelope: DurableAccountRecoveryEnvelope,
+        expectedAuthFence: DurableDeviceSessionInventoryFence,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> Bool {
+        var didSwap = false
+        try authRecoveryTransactionGate.withTransaction {
+            guard try recoveryStore.loadEnvelope() == nil else { return }
+            guard let authEnvelope = try stateStore.loadEnvelope(),
+                  try Self.deviceSessionInventoryFence(
+                      envelope: authEnvelope,
+                      baseURL: baseURL
+                  ) == expectedAuthFence else {
+                throw DurableAuthError.concurrentStateChange
+            }
+            didSwap = try recoveryStore.compareAndSwap(
+                expected: nil,
+                replacement: recoveryEnvelope
+            )
+        }
+        return didSwap
+    }
+
+    private func installInitialRecoveryConsumeJournal(
+        _ recoveryEnvelope: DurableAccountRecoveryEnvelope,
+        expectedAuthFence: DurableAccountRecoveryAuthFence,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> Bool {
+        var didSwap = false
+        try authRecoveryTransactionGate.withTransaction {
+            guard try recoveryStore.loadEnvelope() == nil else { return }
+            let authEnvelope = try stateStore.loadEnvelope()
+            guard try recoveryAuthFenceMatches(
+                expectedAuthFence,
+                envelope: authEnvelope,
+                baseURL: baseURL
+            ) else { throw DurableAuthError.concurrentStateChange }
+            didSwap = try recoveryStore.compareAndSwap(
+                expected: nil,
+                replacement: recoveryEnvelope
+            )
+        }
+        return didSwap
+    }
+
+    /// Final commit gate for ordinary auth-state mutations. It is deliberately
+    /// re-read after network suspension points: a consume journal owns the
+    /// exact auth envelope until recovered credentials are installed. The
+    /// only journaled operation allowed to advance that envelope is the
+    /// single stable-session refresh used by protected recovery-code issue.
+    private func requireRecoveryJournalAllowsAuthMutation(
+        expected: DurableAuthEnvelope?,
+        allowingBoundIssueRefresh: Bool = false
+    ) throws {
+        guard let recovery = try loadRecoveryState() else { return }
+        switch recovery.state {
+        case .consumePending, .consumeCommittedAwaitingInstallation,
+             .consumeInstalledAwaitingHandoff:
+            throw DurableAuthError.accountRecoveryPending
+        case .awaitingAcknowledgement, .incompatible:
+            return
+        case let .issuePending(issue):
+            guard allowingBoundIssueRefresh,
+                  let expected,
+                  let baseURL = try? DayWeaveAPIBaseURL(
+                      issue.authorizationFence.configurationIdentifier
+                  ),
+                  issue.request.isBound(
+                      to: baseURL,
+                      authorizationBindingIdentifier:
+                          issue.authorizationFence.authorizationBindingIdentifier
+                  ),
+                  expected.origin == issue.authorizationFence.originIdentifier,
+                  expected.clientInstanceID == issue.authorizationFence.clientInstanceID
+            else { throw DurableAuthError.accountRecoveryPending }
+
+            switch expected.state {
+            case let .active(active):
+                guard try Self.deviceSessionInventoryFence(
+                    envelope: expected,
+                    baseURL: baseURL
+                ) == issue.authorizationFence else {
+                    throw DurableAuthError.concurrentStateChange
+                }
+                guard Self.deviceBinding(session: active.session)
+                        == issue.authorizationFence.authorizationBindingIdentifier else {
+                    throw DurableAuthError.concurrentStateChange
+                }
+            case let .refreshPending(refresh):
+                let issueRevision = issue.authorizationFence.envelopeRevision
+                guard issueRevision < UInt64.max,
+                      expected.revision == issueRevision + 1,
+                      refresh.previous.session.id
+                        == issue.authorizationFence.currentSessionID,
+                      refresh.previous.session.clientInstanceID
+                        == issue.authorizationFence.clientInstanceID,
+                      Self.deviceBinding(session: refresh.previous.session)
+                        == issue.authorizationFence.authorizationBindingIdentifier,
+                      refresh.refreshRequest.isBound(
+                          to: baseURL,
+                          bearer: refresh.previous.credentials.refreshToken
+                      ) else { throw DurableAuthError.concurrentStateChange }
+            case .legacy, .enrollmentCreationPending, .enrollmentPending,
+                 .reauthenticationRequired, .incompatible:
+                throw DurableAuthError.concurrentStateChange
+            }
+        }
+    }
+
+    nonisolated func accountRecoveryPresentation() -> DurableAccountRecoveryPresentation {
+        let envelope: DurableAccountRecoveryEnvelope?
+        do {
+            envelope = try recoveryStore.loadEnvelope()
+        } catch {
+            return .init(
+                phase: .incompatible,
+                title: "Recovery Keychain unavailable",
+                detail: "Saved recovery work cannot be read safely. No recovery request will be sent.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        }
+        guard let envelope else { return .idle }
+        switch envelope.state {
+        case .issuePending:
+            return .init(
+                phase: .issuePending,
+                title: "Finishing recovery-code update",
+                detail: "The exact generated request is saved in Keychain for a safe retry.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        case .consumePending:
+            return .init(
+                phase: .consumePending,
+                title: "Finishing account recovery",
+                detail: "The exact replacement session and successor code are saved in Keychain.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        case .consumeCommittedAwaitingInstallation:
+            return .init(
+                phase: .committedAwaitingInstallation,
+                title: "Recovery committed",
+                detail: "The server committed recovery. Finish installing the journaled credentials before continuing.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        case .consumeInstalledAwaitingHandoff:
+            return .init(
+                phase: .installedAwaitingHandoff,
+                title: "Finishing recovery handoff",
+                detail: "The new credentials are installed but remain quarantined until every dependent store adopts the new binding.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        case let .awaitingAcknowledgement(value):
+            return .init(
+                phase: .awaitingAcknowledgement,
+                title: "Save your recovery code",
+                detail: "This one-use code is the only recovery secret. It is not stored by the server and will be hidden after acknowledgement.",
+                awaitingMetadata: value.metadata,
+                source: value.source
+            )
+        case .incompatible:
+            return .init(
+                phase: .incompatible,
+                title: "Recovery update required",
+                detail: "Saved recovery work is quarantined because it does not match this app's contract.",
+                awaitingMetadata: nil,
+                source: nil
+            )
+        }
+    }
+
+    nonisolated func isAccountRecoverySnapshotCurrent(
+        _ snapshot: DurableAccountRecoverySnapshot,
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) -> Bool {
+        do {
+            guard let envelope = try stateStore.loadEnvelope() else { return false }
+            return try Self.deviceSessionInventoryFence(
+                envelope: envelope,
+                baseURL: baseURL
+            ) == snapshot.fence
+        } catch {
+            return false
+        }
+    }
+
+    func listCurrentAccountRecoveryCode(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableAccountRecoverySnapshot {
+        var context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        let response = try await sendSessionManagementRequest(
+            method: "GET",
+            path: ["v1", "auth", "recovery-codes", "current"],
+            baseURL: baseURL,
+            context: &context
+        )
+        guard response.statusCode == 200 else { throw try mapFailure(response) }
+        let receivedAt = now()
+        let current = try decodeCurrentRecoveryCode(response, receivedAt: receivedAt)
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        return .init(
+            recoveryCode: current,
+            fetchedAt: receivedAt,
+            fence: context.fence
+        )
+    }
+
+    @discardableResult
+    func issueAccountRecoveryCode(
+        replacing expectedSnapshot: DurableAccountRecoverySnapshot,
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableAccountRecoveryCodeMetadata {
+        guard isAccountRecoverySnapshotCurrent(expectedSnapshot, boundTo: baseURL) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard try loadRecoveryState() == nil else {
+            throw recoveryJournalConflictError()
+        }
+        let context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        guard context.fence == expectedSnapshot.fence else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        try requireFullOwnerRecoveryAuthority(context: context, baseURL: baseURL)
+
+        let recoveryCode = try generator.makeCredential(prefix: "dw_rc1_")
+        let proposedID = try generator.makeUUID()
+        guard let recoveryMaterial = Self.credentialMaterial(recoveryCode),
+              try currentCredentialMaterials().allSatisfy({ $0 != recoveryMaterial }) else {
+            throw DurableAuthError.randomnessUnavailable
+        }
+        let requestBody = try encode(AccountRecoveryIssueRequest(
+            id: proposedID,
+            recoveryCode: recoveryCode,
+            replacesRecoveryCodeID: expectedSnapshot.recoveryCode?.id,
+            replacesRecoveryCodeRevision: expectedSnapshot.recoveryCode?.revision
+        ))
+        let journaledRequest = try DurableAccountRecoveryJournaledRequest.make(
+            kind: .issue,
+            baseURL: baseURL,
+            body: requestBody,
+            authorizationBindingIdentifier: context.fence.authorizationBindingIdentifier
+        )
+        let pending = DurableAccountRecoveryIssuePending(
+            proposedID: proposedID,
+            recoveryCode: recoveryCode,
+            replaces: expectedSnapshot.recoveryCode,
+            preparedAt: now(),
+            authorizationFence: context.fence,
+            request: journaledRequest
+        )
+        let envelope = DurableAccountRecoveryEnvelope(
+            revision: 0,
+            state: .issuePending(pending)
+        )
+        guard try installInitialRecoveryIssueJournal(
+            envelope,
+            expectedAuthFence: context.fence,
+            baseURL: baseURL
+        ) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        return try await finishRecoveryCodeIssue(
+            envelope: envelope,
+            pending: pending,
+            baseURL: baseURL
+        )
+    }
+
+    @discardableResult
+    func consumeAccountRecoveryCode(
+        _ recoveryCode: String,
+        boundTo baseURL: DayWeaveAPIBaseURL,
+        descriptor: DurableAuthClientDescriptor
+    ) async throws -> DurableDeviceSessionMetadata {
+        guard Self.isCredential(recoveryCode, prefix: "dw_rc1_") else {
+            throw DurableAuthError.invalidAccountRecoveryCode
+        }
+        guard descriptor.isValid else { throw DurableAuthError.requestEncodingFailed }
+
+        if let journal = try loadRecoveryState() {
+            if case let .consumePending(pending) = journal.state,
+               pending.recoveryCode == recoveryCode,
+               pending.descriptor == descriptor {
+                return try await finishRecoveryConsumption(
+                    envelope: journal,
+                    pending: pending,
+                    baseURL: baseURL
+                )
+            }
+            if case .consumeCommittedAwaitingInstallation = journal.state {
+                return try finishCommittedRecoveryInstallation(
+                    envelope: journal,
+                    baseURL: baseURL
+                )
+            }
+            if case let .consumeInstalledAwaitingHandoff(committed) = journal.state {
+                guard let current = try loadState(),
+                      Self.installedAuthMatchesCommittedRecovery(
+                          current,
+                          committed: committed,
+                          baseURL: baseURL
+                      ) else { throw DurableAuthError.concurrentStateChange }
+                return committed.session
+            }
+            throw recoveryJournalConflictError()
+        }
+
+        var current = try loadState()
+        if current == nil {
+            try adoptLegacyCredentialIfPresent(boundTo: baseURL)
+            current = try loadState()
+        }
+        if let current {
+            guard current.origin == baseURL.credentialOriginIdentifier else {
+                throw DurableAuthError.originMismatch
+            }
+            switch current.state {
+            case .legacy, .active, .reauthenticationRequired:
+                break
+            case .enrollmentCreationPending, .enrollmentPending, .refreshPending:
+                throw DurableAuthError.activeSessionMustBeRevoked
+            case .incompatible:
+                throw DurableAuthError.incompatibleState
+            }
+        }
+
+        let pair = DurableAuthCredentialPair(
+            accessToken: try generator.makeCredential(prefix: "dw_da1_"),
+            refreshToken: try generator.makeCredential(prefix: "dw_dr1_")
+        )
+        let proposedSessionID = try generator.makeUUID()
+        let proposedClientInstanceID = try generator.makeUUID()
+        let successorID = try generator.makeUUID()
+        let successorCode = try generator.makeCredential(prefix: "dw_rc1_")
+        let materials = [
+            recoveryCode, pair.accessToken, pair.refreshToken, successorCode,
+        ].compactMap(Self.credentialMaterial)
+        guard materials.count == 4, Set(materials).count == 4 else {
+            throw DurableAuthError.randomnessUnavailable
+        }
+        let body = try encode(AccountRecoveryConsumeRequest(
+            sessionID: proposedSessionID,
+            accessToken: pair.accessToken,
+            refreshToken: pair.refreshToken,
+            clientInstanceID: proposedClientInstanceID,
+            clientKind: "macos",
+            deviceLabel: descriptor.deviceLabel,
+            clientContractVersion: DurableAuthClientDescriptor.contractVersion,
+            clientVersion: descriptor.clientVersion,
+            clientCapabilities: descriptor.clientCapabilities,
+            successorRecoveryCodeID: successorID,
+            successorRecoveryCode: successorCode
+        ))
+        let binding = DurableAccountRecoveryJournaledRequest.credentialBinding(recoveryCode)
+        let request = try DurableAccountRecoveryJournaledRequest.make(
+            kind: .consume,
+            baseURL: baseURL,
+            body: body,
+            authorizationBindingIdentifier: binding
+        )
+        let pending = DurableAccountRecoveryConsumePending(
+            recoveryCode: recoveryCode,
+            proposedSessionID: proposedSessionID,
+            proposedCredentials: pair,
+            proposedClientInstanceID: proposedClientInstanceID,
+            descriptor: descriptor,
+            successorRecoveryCodeID: successorID,
+            successorRecoveryCode: successorCode,
+            preparedAt: now(),
+            installationFence: try makeRecoveryAuthFence(
+                envelope: current,
+                baseURL: baseURL
+            ),
+            request: request
+        )
+        let journal = DurableAccountRecoveryEnvelope(
+            revision: 0,
+            state: .consumePending(pending)
+        )
+        guard try installInitialRecoveryConsumeJournal(
+            journal,
+            expectedAuthFence: pending.installationFence,
+            baseURL: baseURL
+        ) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        return try await finishRecoveryConsumption(
+            envelope: journal,
+            pending: pending,
+            baseURL: baseURL
+        )
+    }
+
+    func resumeAccountRecoveryWork(boundTo baseURL: DayWeaveAPIBaseURL) async throws {
+        guard let envelope = try loadRecoveryState() else { return }
+        switch envelope.state {
+        case let .issuePending(pending):
+            _ = try await finishRecoveryCodeIssue(
+                envelope: envelope,
+                pending: pending,
+                baseURL: baseURL
+            )
+        case let .consumePending(pending):
+            _ = try await finishRecoveryConsumption(
+                envelope: envelope,
+                pending: pending,
+                baseURL: baseURL
+            )
+        case .consumeCommittedAwaitingInstallation:
+            _ = try finishCommittedRecoveryInstallation(
+                envelope: envelope,
+                baseURL: baseURL
+            )
+        case let .consumeInstalledAwaitingHandoff(committed):
+            guard let current = try loadState(),
+                  Self.installedAuthMatchesCommittedRecovery(
+                      current,
+                      committed: committed,
+                      baseURL: baseURL
+                  ) else { throw DurableAuthError.concurrentStateChange }
+        case .awaitingAcknowledgement:
+            throw DurableAuthError.accountRecoveryAcknowledgementRequired
+        case .incompatible:
+            throw DurableAuthError.incompatibleState
+        }
+    }
+
+    func recoveryCodeAwaitingAcknowledgement(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) throws -> String? {
+        guard let envelope = try loadRecoveryState() else { return nil }
+        guard case let .awaitingAcknowledgement(value) = envelope.state else { return nil }
+        guard value.configurationIdentifier == baseURL.canonicalConfigurationIdentifier,
+              value.originIdentifier == baseURL.credentialOriginIdentifier else {
+            throw DurableAuthError.originMismatch
+        }
+        return value.recoveryCode
+    }
+
+    func acknowledgeAccountRecoveryCode(boundTo baseURL: DayWeaveAPIBaseURL) throws {
+        guard let envelope = try loadRecoveryState(),
+              case let .awaitingAcknowledgement(value) = envelope.state else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard value.configurationIdentifier == baseURL.canonicalConfigurationIdentifier,
+              value.originIdentifier == baseURL.credentialOriginIdentifier else {
+            throw DurableAuthError.originMismatch
+        }
+        guard try recoveryStore.compareAndSwap(expected: envelope, replacement: nil) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    /// Releases the recovered credential only after RootView has invalidated
+    /// every binding-sensitive consumer. Until this exact transition succeeds,
+    /// ordinary authorization remains quarantined across restarts.
+    func completeAccountRecoveryCredentialHandoff(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        guard let envelope = try loadRecoveryState(),
+              case let .consumeInstalledAwaitingHandoff(committed) = envelope.state,
+              let current = try loadState(),
+              Self.installedAuthMatchesCommittedRecovery(
+                  current,
+                  committed: committed,
+                  baseURL: baseURL
+              ) else { throw DurableAuthError.concurrentStateChange }
+        _ = try finalizeCommittedRecovery(
+            envelope: envelope,
+            committed: committed,
+            baseURL: baseURL
+        )
+    }
+
+    /// Explicit owner-confirmed repair for an unreadable/future recovery
+    /// journal. Only the recovery-journal Keychain item is destroyed; ordinary
+    /// authentication and every account/local data store remain untouched.
+    func confirmDiscardIncompatibleAccountRecoveryJournal() throws {
+        guard let envelope = try loadRecoveryState(),
+              case .incompatible = envelope.state else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard try recoveryStore.discardIncompatibleEnvelope(expected: envelope) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    /// Explicit owner-confirmed abandonment of an uncommitted consumption.
+    /// A committed response cannot use this path because its journaled session
+    /// credentials may be the account's only remaining usable authority.
+    func confirmDiscardPendingAccountRecoveryConsumption() throws {
+        guard let envelope = try loadRecoveryState(),
+              case .consumePending = envelope.state else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard try recoveryStore.compareAndSwap(expected: envelope, replacement: nil) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    /// Explicit owner-confirmed abandonment of an issuance request whose
+    /// outcome may be unknown. The server's active recovery code may therefore
+    /// differ until a newly authorized client refreshes and replaces it.
+    func confirmDiscardPendingAccountRecoveryIssue() throws {
+        guard let envelope = try loadRecoveryState(),
+              case .issuePending = envelope.state else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard try recoveryStore.compareAndSwap(expected: envelope, replacement: nil) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func finishRecoveryCodeIssue(
+        envelope: DurableAccountRecoveryEnvelope,
+        pending: DurableAccountRecoveryIssuePending,
+        baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableAccountRecoveryCodeMetadata {
+        guard pending.request.isBound(
+            to: baseURL,
+            authorizationBindingIdentifier: pending.authorizationFence
+                .authorizationBindingIdentifier
+        ) else { throw DurableAuthError.originMismatch }
+        var journal = envelope
+        var value = pending
+        var context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        guard context.fence == value.authorizationFence else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        try requireFullOwnerRecoveryAuthority(context: context, baseURL: baseURL)
+        try requireRecoveryJournal(journal)
+
+        var response = try await transport.send(
+            value.request.makeURLRequest(bearer: context.authorization.bearerToken)
+        )
+        if response.statusCode == 401 {
+            guard Self.isDefinitiveUnauthorized(response) else {
+                throw DurableAuthError.invalidResponse
+            }
+            let originalFence = context.fence
+            context.authorization = try await recoverFromUnauthorized(
+                rejectedBearer: context.authorization.bearerToken,
+                boundTo: baseURL
+            )
+            context.recoveredFromUnauthorized = true
+            guard let refreshedEnvelope = try loadState() else {
+                throw DurableAuthError.notConfigured
+            }
+            context.fence = try Self.deviceSessionInventoryFence(
+                envelope: refreshedEnvelope,
+                baseURL: baseURL
+            )
+            try requireRecoveryFenceContinuity(originalFence, refreshed: context.fence)
+            try requireFullOwnerRecoveryAuthority(context: context, baseURL: baseURL)
+            value = .init(
+                proposedID: value.proposedID,
+                recoveryCode: value.recoveryCode,
+                replaces: value.replaces,
+                preparedAt: value.preparedAt,
+                authorizationFence: context.fence,
+                request: value.request
+            )
+            let rebased = try journal.replacingState(.issuePending(value))
+            guard try recoveryStore.compareAndSwap(expected: journal, replacement: rebased) else {
+                throw DurableAuthError.concurrentStateChange
+            }
+            journal = rebased
+            try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+            response = try await transport.send(
+                value.request.makeURLRequest(bearer: context.authorization.bearerToken)
+            )
+            if response.statusCode == 401 {
+                guard Self.isDefinitiveUnauthorized(response) else {
+                    throw DurableAuthError.invalidResponse
+                }
+                try retireDefinitivelyRejectedAuthorization(
+                    context.authorization,
+                    boundTo: baseURL
+                )
+                throw DurableAuthError.reauthenticationRequired
+            }
+        }
+        guard response.statusCode == 200 || response.statusCode == 201 else {
+            try validateNoStore(response)
+            throw try mapFailure(response)
+        }
+        let receivedAt = now()
+        let mutation = try decodeRecoveryMutation(response, receivedAt: receivedAt)
+        guard (response.statusCode == 200) == mutation.replayed,
+              mutation.recoveryCode.id == value.proposedID,
+              mutation.recoveryCode.revision == 1,
+              mutation.recoveryCode.createdAt
+                >= value.preparedAt.addingTimeInterval(-Self.clockSkewAllowance),
+              mutation.replayed
+                || mutation.recoveryCode.createdAt
+                    >= receivedAt.addingTimeInterval(-Self.clockSkewAllowance) else {
+            throw DurableAuthError.invalidResponse
+        }
+        let awaiting = DurableAccountRecoveryAwaitingAcknowledgement(
+            metadata: mutation.recoveryCode,
+            recoveryCode: value.recoveryCode,
+            source: value.replaces == nil ? .initial : .rotation,
+            configurationIdentifier: baseURL.canonicalConfigurationIdentifier,
+            originIdentifier: baseURL.credentialOriginIdentifier
+        )
+        let replacement = try journal.replacingState(.awaitingAcknowledgement(awaiting))
+        guard try recoveryStore.compareAndSwap(expected: journal, replacement: replacement) else {
+            guard let latest = try loadRecoveryState(),
+                  case let .awaitingAcknowledgement(existing) = latest.state,
+                  existing == awaiting else {
+                throw DurableAuthError.concurrentStateChange
+            }
+            return mutation.recoveryCode
+        }
+        return mutation.recoveryCode
+    }
+
+    private func finishRecoveryConsumption(
+        envelope: DurableAccountRecoveryEnvelope,
+        pending: DurableAccountRecoveryConsumePending,
+        baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableDeviceSessionMetadata {
+        let binding = DurableAccountRecoveryJournaledRequest.credentialBinding(
+            pending.recoveryCode
+        )
+        guard pending.request.isBound(
+            to: baseURL,
+            authorizationBindingIdentifier: binding
+        ), try recoveryAuthFenceMatches(pending.installationFence, baseURL: baseURL) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        try requireRecoveryJournal(envelope)
+        let response = try await transport.send(
+            pending.request.makeURLRequest(bearer: pending.recoveryCode)
+        )
+        guard try recoveryAuthFenceMatches(pending.installationFence, baseURL: baseURL) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        if response.statusCode == 401 {
+            guard Self.isDefinitiveUnauthorized(response) else {
+                throw DurableAuthError.invalidResponse
+            }
+            // The public endpoint intentionally conflates invalid credentials,
+            // competing tuples, and an exact tuple whose replay window changed.
+            // Retain the only exact tuple until the owner explicitly abandons it.
+            throw DurableAuthError.invalidAccountRecoveryCode
+        }
+        guard response.statusCode == 200 || response.statusCode == 201 else {
+            try validateNoStore(response)
+            throw try mapFailure(response)
+        }
+        let receivedAt = now()
+        let mutation = try decodeRecoveryConsumption(
+            response,
+            pending: pending,
+            receivedAt: receivedAt
+        )
+        guard (response.statusCode == 200) == mutation.replayed else {
+            throw DurableAuthError.invalidResponse
+        }
+        let committed = DurableAccountRecoveryConsumeCommitted(
+            pending: pending,
+            session: mutation.session,
+            successor: mutation.successorRecoveryCode,
+            replayed: mutation.replayed
+        )
+        let committedEnvelope = try envelope.replacingState(
+            .consumeCommittedAwaitingInstallation(committed)
+        )
+        guard try recoveryStore.compareAndSwap(
+            expected: envelope,
+            replacement: committedEnvelope
+        ) else {
+            guard let latest = try loadRecoveryState() else {
+                throw DurableAuthError.concurrentStateChange
+            }
+            switch latest.state {
+            case let .consumeCommittedAwaitingInstallation(existing) where existing == committed:
+                return try finishCommittedRecoveryInstallation(
+                    envelope: latest,
+                    baseURL: baseURL
+                )
+            case let .consumeInstalledAwaitingHandoff(existing) where existing == committed:
+                return existing.session
+            case let .awaitingAcknowledgement(value)
+                where value.metadata == committed.successor
+                    && value.recoveryCode == committed.pending.successorRecoveryCode:
+                return mutation.session
+            default:
+                throw DurableAuthError.concurrentStateChange
+            }
+        }
+        return try finishCommittedRecoveryInstallation(
+            envelope: committedEnvelope,
+            baseURL: baseURL
+        )
+    }
+
+    private func finishCommittedRecoveryInstallation(
+        envelope: DurableAccountRecoveryEnvelope,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> DurableDeviceSessionMetadata {
+        guard case let .consumeCommittedAwaitingInstallation(committed) = envelope.state,
+              committed.pending.request.configurationIdentifier
+                == baseURL.canonicalConfigurationIdentifier else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        let current = try loadState()
+        let sessionAlreadyInstalled = current.map {
+            Self.installedAuthMatchesCommittedRecovery($0, committed: committed, baseURL: baseURL)
+        } ?? false
+        if !sessionAlreadyInstalled {
+            guard try recoveryAuthFenceMatches(
+                committed.pending.installationFence,
+                envelope: current,
+                baseURL: baseURL
+            ) else { throw DurableAuthError.concurrentStateChange }
+            let active = ActiveDurableAuthState(
+                session: committed.session,
+                credentials: committed.pending.proposedCredentials
+            )
+            let replacement = DurableAuthEnvelope(
+                revision: try Self.nextEnvelopeRevision(after: current),
+                origin: baseURL.credentialOriginIdentifier,
+                clientInstanceID: committed.pending.proposedClientInstanceID,
+                state: .active(active)
+            )
+            try removeLegacyDuplicate()
+            guard try compareAndSwapAuthState(
+                expected: current,
+                replacement: replacement,
+                policy: .recoveryInstallation(envelope)
+            ) else {
+                guard let latest = try loadState(),
+                      Self.installedAuthMatchesCommittedRecovery(
+                          latest,
+                          committed: committed,
+                          baseURL: baseURL
+                      ) else {
+                    throw DurableAuthError.concurrentStateChange
+                }
+                return try markInstalledRecoveryAwaitingHandoff(
+                    envelope: envelope,
+                    committed: committed,
+                    baseURL: baseURL
+                )
+            }
+        }
+        return try markInstalledRecoveryAwaitingHandoff(
+            envelope: envelope,
+            committed: committed,
+            baseURL: baseURL
+        )
+    }
+
+    private func markInstalledRecoveryAwaitingHandoff(
+        envelope: DurableAccountRecoveryEnvelope,
+        committed: DurableAccountRecoveryConsumeCommitted,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> DurableDeviceSessionMetadata {
+        guard let current = try loadState(),
+              Self.installedAuthMatchesCommittedRecovery(
+                  current,
+                  committed: committed,
+                  baseURL: baseURL
+              ) else { throw DurableAuthError.concurrentStateChange }
+        let replacement = try envelope.replacingState(
+            .consumeInstalledAwaitingHandoff(committed)
+        )
+        if try !recoveryStore.compareAndSwap(expected: envelope, replacement: replacement) {
+            guard let latest = try loadRecoveryState(),
+                  case let .consumeInstalledAwaitingHandoff(existing) = latest.state,
+                  existing == committed else {
+                throw DurableAuthError.concurrentStateChange
+            }
+        }
+        return committed.session
+    }
+
+    private func finalizeCommittedRecovery(
+        envelope: DurableAccountRecoveryEnvelope,
+        committed: DurableAccountRecoveryConsumeCommitted,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> DurableDeviceSessionMetadata {
+        let awaiting = DurableAccountRecoveryAwaitingAcknowledgement(
+            metadata: committed.successor,
+            recoveryCode: committed.pending.successorRecoveryCode,
+            source: .recoveredSuccessor,
+            configurationIdentifier: baseURL.canonicalConfigurationIdentifier,
+            originIdentifier: baseURL.credentialOriginIdentifier
+        )
+        let replacement = try envelope.replacingState(.awaitingAcknowledgement(awaiting))
+        if try !recoveryStore.compareAndSwap(expected: envelope, replacement: replacement) {
+            guard let latest = try loadRecoveryState(),
+                  case let .awaitingAcknowledgement(existing) = latest.state,
+                  existing == awaiting else {
+                throw DurableAuthError.concurrentStateChange
+            }
+        }
+        return committed.session
+    }
+
+    private func decodeCurrentRecoveryCode(
+        _ response: DurableAuthHTTPResponse,
+        receivedAt: Date
+    ) throws -> DurableAccountRecoveryCodeMetadata? {
+        try validateNoStore(response)
+        guard !response.body.isEmpty,
+              response.body.count <= URLSessionDurableAuthHTTPTransport.maximumResponseBytes,
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: response.body),
+              let root = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+              Set(root.keys) == ["recovery_code"] else {
+            throw DurableAuthError.invalidResponse
+        }
+        if root["recovery_code"] is NSNull { return nil }
+        try validateRecoveryMetadataJSON(root["recovery_code"])
+        let decoded = try decode(AccountRecoveryCurrentResponse.self, from: response.body)
+        guard let metadata = decoded.recoveryCode,
+              validRecoveryMetadata(metadata, receivedAt: receivedAt) else {
+            throw DurableAuthError.invalidResponse
+        }
+        return metadata
+    }
+
+    private func decodeRecoveryMutation(
+        _ response: DurableAuthHTTPResponse,
+        receivedAt: Date
+    ) throws -> AccountRecoveryMutationResponse {
+        try validateNoStore(response)
+        guard !response.body.isEmpty,
+              response.body.count <= URLSessionDurableAuthHTTPTransport.maximumResponseBytes,
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: response.body),
+              let root = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+              Set(root.keys) == ["recovery_code", "replayed"] else {
+            throw DurableAuthError.invalidResponse
+        }
+        try validateRecoveryMetadataJSON(root["recovery_code"])
+        guard root["replayed"] is Bool else { throw DurableAuthError.invalidResponse }
+        let result = try decode(AccountRecoveryMutationResponse.self, from: response.body)
+        guard validRecoveryMetadata(result.recoveryCode, receivedAt: receivedAt) else {
+            throw DurableAuthError.invalidResponse
+        }
+        return result
+    }
+
+    private func decodeRecoveryConsumption(
+        _ response: DurableAuthHTTPResponse,
+        pending: DurableAccountRecoveryConsumePending,
+        receivedAt: Date
+    ) throws -> AccountRecoveryConsumptionResponse {
+        try validateNoStore(response)
+        guard !response.body.isEmpty,
+              response.body.count <= URLSessionDurableAuthHTTPTransport.maximumResponseBytes,
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: response.body),
+              let root = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+              Set(root.keys) == ["session", "successor_recovery_code", "replayed"] else {
+            throw DurableAuthError.invalidResponse
+        }
+        try validateRecoveryMetadataJSON(root["successor_recovery_code"])
+        try validateRecoveredSessionJSON(root["session"])
+        guard root["replayed"] is Bool else { throw DurableAuthError.invalidResponse }
+        try validateNestedObjectKeys(
+            response.body,
+            key: "session",
+            exactly: [
+                "id", "client_instance_id", "client_kind", "device_label", "scopes",
+                "client_contract_version", "client_version", "client_capabilities",
+                "created_at", "last_seen_at", "credential_issued_at", "access_expires_at",
+                "refresh_idle_expires_at", "absolute_expires_at", "revision",
+            ]
+        )
+        let result = try decode(AccountRecoveryConsumptionResponse.self, from: response.body)
+        guard result.successorRecoveryCode.id == pending.successorRecoveryCodeID,
+              result.successorRecoveryCode.revision == 1,
+              validRecoveryMetadata(result.successorRecoveryCode, receivedAt: receivedAt),
+              result.successorRecoveryCode.createdAt
+                >= pending.preparedAt.addingTimeInterval(-Self.clockSkewAllowance),
+              result.successorRecoveryCode.createdAt == result.session.createdAt,
+              result.replayed
+                || result.successorRecoveryCode.createdAt
+                    >= receivedAt.addingTimeInterval(-Self.clockSkewAllowance),
+              validateRecoveredSession(
+                  result.session,
+                  pending: pending,
+                  receivedAt: receivedAt,
+                  replayed: result.replayed
+              ) else {
+            throw DurableAuthError.invalidResponse
+        }
+        return result
+    }
+
+    private func validateRecoveryMetadataJSON(_ raw: Any?) throws {
+        guard let object = raw as? [String: Any],
+              Set(object.keys) == ["id", "created_at", "revision"],
+              Self.isCanonicalUUIDString(object["id"]),
+              let createdAt = object["created_at"] as? String,
+              !createdAt.isEmpty,
+              createdAt.utf8.count <= 64,
+              object["revision"] is NSNumber else {
+            throw DurableAuthError.invalidResponse
+        }
+    }
+
+    private func validateRecoveredSessionJSON(_ raw: Any?) throws {
+        let expectedKeys: Set<String> = [
+            "id", "client_instance_id", "client_kind", "device_label", "scopes",
+            "client_contract_version", "client_version", "client_capabilities",
+            "created_at", "last_seen_at", "credential_issued_at", "access_expires_at",
+            "refresh_idle_expires_at", "absolute_expires_at", "revision",
+        ]
+        let timestamps = [
+            "created_at", "last_seen_at", "credential_issued_at", "access_expires_at",
+            "refresh_idle_expires_at", "absolute_expires_at",
+        ]
+        guard let object = raw as? [String: Any],
+              Set(object.keys) == expectedKeys,
+              Self.isCanonicalUUIDString(object["id"]),
+              Self.isCanonicalUUIDString(object["client_instance_id"]),
+              object["client_kind"] as? String == "macos",
+              let label = object["device_label"] as? String,
+              Self.isSafeSessionMetadataText(label, maximum: 200),
+              let scopes = object["scopes"] as? [String],
+              !scopes.isEmpty,
+              scopes.count <= DayWeaveAuthScope.deviceDefaults.count,
+              Set(scopes).count == scopes.count,
+              let version = object["client_version"] as? String,
+              Self.isSafeSessionMetadataText(version, maximum: 100),
+              let capabilities = object["client_capabilities"] as? [String],
+              capabilities.count <= 100,
+              Set(capabilities).count == capabilities.count,
+              capabilities.allSatisfy({
+                  Self.isSafeSessionMetadataText($0, maximum: 100)
+              }),
+              object["client_contract_version"] is NSNumber,
+              object["revision"] is NSNumber,
+              timestamps.allSatisfy({ key in
+                  guard let value = object[key] as? String else { return false }
+                  return !value.isEmpty && value.utf8.count <= 64
+              }) else { throw DurableAuthError.invalidResponse }
+    }
+
+    private func validateRecoveredSession(
+        _ session: DurableDeviceSessionMetadata,
+        pending: DurableAccountRecoveryConsumePending,
+        receivedAt: Date,
+        replayed: Bool
+    ) -> Bool {
+        session.id == pending.proposedSessionID
+            && session.clientInstanceID == pending.proposedClientInstanceID
+            && session.clientKind == "macos"
+            && session.deviceLabel == pending.descriptor.deviceLabel
+            && session.scopes == pending.descriptor.scopes
+            && session.clientContractVersion == DurableAuthClientDescriptor.contractVersion
+            && session.clientVersion == pending.descriptor.clientVersion
+            && session.clientCapabilities == pending.descriptor.clientCapabilities
+            && session.revision == 1
+            && validateSessionTimestamps(
+                session,
+                preparedAt: pending.preparedAt,
+                receivedAt: receivedAt,
+                replayed: replayed
+            )
+    }
+
+    private func validRecoveryMetadata(
+        _ metadata: DurableAccountRecoveryCodeMetadata,
+        receivedAt: Date
+    ) -> Bool {
+        metadata.id != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            && metadata.revision == 1
+            && metadata.createdAt.timeIntervalSinceReferenceDate.isFinite
+            && metadata.createdAt <= receivedAt.addingTimeInterval(Self.clockSkewAllowance)
+    }
+
+    private func requireFullOwnerRecoveryAuthority(
+        context: SessionManagementAuthorization,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        guard context.authorization.isDurable,
+              let envelope = try loadState(),
+              case let .active(active) = envelope.state,
+              active.session.id == context.fence.currentSessionID,
+              active.session.clientInstanceID == context.fence.clientInstanceID,
+              active.session.clientContractVersion == DurableAuthClientDescriptor.contractVersion,
+              active.session.scopes == DayWeaveAuthScope.deviceDefaults else {
+            throw DurableAuthError.accountRecoveryAuthorityRequired
+        }
+    }
+
+    private func requireRecoveryFenceContinuity(
+        _ original: DurableDeviceSessionInventoryFence,
+        refreshed: DurableDeviceSessionInventoryFence
+    ) throws {
+        guard original.configurationIdentifier == refreshed.configurationIdentifier,
+              original.originIdentifier == refreshed.originIdentifier,
+              original.authorizationBindingIdentifier
+                == refreshed.authorizationBindingIdentifier,
+              original.currentSessionID == refreshed.currentSessionID,
+              original.clientInstanceID == refreshed.clientInstanceID else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func currentCredentialMaterials() throws -> [Data] {
+        guard let envelope = try loadState() else { return [] }
+        switch envelope.state {
+        case let .active(active):
+            return [active.credentials.accessToken, active.credentials.refreshToken]
+                .compactMap(Self.credentialMaterial)
+        case let .refreshPending(pending):
+            return [
+                pending.previous.credentials.accessToken,
+                pending.previous.credentials.refreshToken,
+                pending.nextCredentials.accessToken,
+                pending.nextCredentials.refreshToken,
+            ].compactMap(Self.credentialMaterial)
+        default:
+            return []
+        }
+    }
+
+    private func loadRecoveryState() throws -> DurableAccountRecoveryEnvelope? {
+        do {
+            return try recoveryStore.loadEnvelope()
+        } catch {
+            throw DurableAuthError.localStateUnavailable
+        }
+    }
+
+    private func requireRecoveryJournal(_ expected: DurableAccountRecoveryEnvelope) throws {
+        guard try loadRecoveryState() == expected else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func recoveryJournalConflictError() -> DurableAuthError {
+        guard let envelope = try? recoveryStore.loadEnvelope() else {
+            return .localStateUnavailable
+        }
+        if case .awaitingAcknowledgement = envelope.state {
+            return .accountRecoveryAcknowledgementRequired
+        }
+        if case .incompatible = envelope.state { return .incompatibleState }
+        return .accountRecoveryPending
+    }
+
+    private func makeRecoveryAuthFence(
+        envelope: DurableAuthEnvelope?,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> DurableAccountRecoveryAuthFence {
+        if let envelope, envelope.origin != baseURL.credentialOriginIdentifier {
+            throw DurableAuthError.originMismatch
+        }
+        return .init(
+            configurationIdentifier: baseURL.canonicalConfigurationIdentifier,
+            originIdentifier: baseURL.credentialOriginIdentifier,
+            envelopeRevision: envelope?.revision,
+            envelopeSHA256: try envelope.map(Self.authEnvelopeSHA256),
+            clientInstanceID: envelope?.clientInstanceID,
+            sessionID: envelope.flatMap { Self.sessionID(in: $0.state) }
+        )
+    }
+
+    private func recoveryAuthFenceMatches(
+        _ fence: DurableAccountRecoveryAuthFence,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> Bool {
+        try recoveryAuthFenceMatches(fence, envelope: loadState(), baseURL: baseURL)
+    }
+
+    private func recoveryAuthFenceMatches(
+        _ fence: DurableAccountRecoveryAuthFence,
+        envelope: DurableAuthEnvelope?,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> Bool {
+        guard fence.configurationIdentifier == baseURL.canonicalConfigurationIdentifier,
+              fence.originIdentifier == baseURL.credentialOriginIdentifier else { return false }
+        return try makeRecoveryAuthFence(envelope: envelope, baseURL: baseURL) == fence
+    }
+
+    private static func authEnvelopeSHA256(_ envelope: DurableAuthEnvelope) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(envelope)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func installedAuthMatchesCommittedRecovery(
+        _ envelope: DurableAuthEnvelope,
+        committed: DurableAccountRecoveryConsumeCommitted,
+        baseURL: DayWeaveAPIBaseURL
+    ) -> Bool {
+        guard envelope.origin == baseURL.credentialOriginIdentifier,
+              envelope.clientInstanceID == committed.pending.proposedClientInstanceID else {
+            return false
+        }
+        switch envelope.state {
+        case let .active(active):
+            return recoveredSessionIdentityMatches(
+                active.session,
+                committed: committed
+            )
+                && (active.session.revision > committed.session.revision
+                    || active.credentials == committed.pending.proposedCredentials)
+        case let .refreshPending(pending):
+            return recoveredSessionIdentityMatches(
+                pending.previous.session,
+                committed: committed
+            )
+                && pending.previous.session.revision >= committed.session.revision
+                && (pending.previous.session.revision > committed.session.revision
+                    || pending.previous.credentials
+                        == committed.pending.proposedCredentials)
+        default:
+            return false
+        }
+    }
+
+    private static func recoveredSessionIdentityMatches(
+        _ session: DurableDeviceSessionMetadata,
+        committed: DurableAccountRecoveryConsumeCommitted
+    ) -> Bool {
+        session.id == committed.session.id
+            && session.clientInstanceID == committed.pending.proposedClientInstanceID
+            && session.clientKind == committed.session.clientKind
+            && session.deviceLabel == committed.session.deviceLabel
+            && session.scopes == committed.session.scopes
+            && session.clientContractVersion == committed.session.clientContractVersion
+            && session.clientVersion == committed.session.clientVersion
+            && session.clientCapabilities == committed.session.clientCapabilities
+            && session.createdAt == committed.session.createdAt
+            && session.absoluteExpiresAt == committed.session.absoluteExpiresAt
+    }
+}
+
 @MainActor
 final class DurableAuthSettingsModel: ObservableObject {
     @Published private(set) var presentation: DurableAuthPresentation
@@ -4238,12 +5593,22 @@ final class DurableAuthSettingsModel: ObservableObject {
     @Published private(set) var deviceSessionInventoryIsStale = false
     @Published private(set) var deviceSessionErrorMessage: String?
     @Published private(set) var deviceSessionNotice: String?
+    @Published private(set) var accountRecoveryPresentation: DurableAccountRecoveryPresentation
+    @Published private(set) var accountRecoverySnapshot: DurableAccountRecoverySnapshot?
+    @Published private(set) var isRefreshingAccountRecovery = false
+    @Published private(set) var accountRecoverySnapshotIsStale = false
+    @Published private(set) var accountRecoveryErrorMessage: String?
+    @Published private(set) var accountRecoveryNotice: String?
+    @Published private(set) var revealedAccountRecoveryCode: String?
+    @Published private(set) var recoveryPrivacyGeneration: UInt64 = 0
 
     let coordinator: DurableAuthCoordinator
     private let configurationStore: any SuggestionAPIConfigurationStoring
     private let descriptor: DurableAuthClientDescriptor
     private var deviceSessionInventoryGeneration: UInt64 = 0
     private var deviceSessionRequestConfigurationIdentifier: String?
+    private var accountRecoveryGeneration: UInt64 = 0
+    private var accountRecoveryRequestConfigurationIdentifier: String?
 
     init(
         coordinator: DurableAuthCoordinator,
@@ -4256,6 +5621,7 @@ final class DurableAuthSettingsModel: ObservableObject {
         self.descriptor = descriptor
         let baseURL = configurationStore.loadBaseURL().flatMap { try? DayWeaveAPIBaseURL($0) }
         presentation = coordinator.presentation(boundTo: baseURL)
+        accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
     }
 
     func reload() {
@@ -4265,12 +5631,18 @@ final class DurableAuthSettingsModel: ObservableObject {
 
     func reload(boundTo baseURL: DayWeaveAPIBaseURL?) {
         invalidateDeviceSessionInventoryIfNeeded(boundTo: baseURL)
+        invalidateAccountRecoverySnapshotIfNeeded(boundTo: baseURL)
         guard !isBusy else { return }
         presentation = coordinator.presentation(boundTo: baseURL)
+        accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
     }
 
     var isManagingDeviceSessions: Bool {
         isRefreshingDeviceSessions || revokingDeviceSessionID != nil
+    }
+
+    var isManagingAccountRecovery: Bool {
+        isRefreshingAccountRecovery
     }
 
     var deviceSessionInventoryIsReadOnly: Bool {
@@ -4432,6 +5804,229 @@ final class DurableAuthSettingsModel: ObservableObject {
         deviceSessionRequestConfigurationIdentifier = nil
     }
 
+    @discardableResult
+    func refreshAccountRecoveryCode(baseURL: DayWeaveAPIBaseURL) async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        accountRecoveryGeneration &+= 1
+        let generation = accountRecoveryGeneration
+        accountRecoveryRequestConfigurationIdentifier = baseURL.canonicalConfigurationIdentifier
+        isRefreshingAccountRecovery = true
+        accountRecoveryErrorMessage = nil
+        accountRecoveryNotice = nil
+        accountRecoverySnapshotIsStale = false
+        defer {
+            if accountRecoveryGeneration == generation {
+                isRefreshingAccountRecovery = false
+                accountRecoveryRequestConfigurationIdentifier = nil
+                accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            }
+        }
+        do {
+            let snapshot = try await coordinator.listCurrentAccountRecoveryCode(
+                boundTo: baseURL
+            )
+            guard accountRecoveryGeneration == generation,
+                  coordinator.isAccountRecoverySnapshotCurrent(snapshot, boundTo: baseURL)
+            else { return false }
+            accountRecoverySnapshot = snapshot
+            accountRecoverySnapshotIsStale = false
+            return true
+        } catch {
+            guard accountRecoveryGeneration == generation else { return false }
+            if let snapshot = accountRecoverySnapshot,
+               !coordinator.isAccountRecoverySnapshotCurrent(snapshot, boundTo: baseURL) {
+                clearAccountRecoveryMemory()
+                return false
+            }
+            accountRecoverySnapshotIsStale = accountRecoverySnapshot != nil
+            accountRecoveryErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func issueAccountRecoveryCode(
+        baseURL: DayWeaveAPIBaseURL,
+        approvedFrom snapshot: DurableAccountRecoverySnapshot
+    ) async -> Bool {
+        guard !accountRecoverySnapshotIsStale,
+              accountRecoverySnapshot == snapshot,
+              coordinator.isAccountRecoverySnapshotCurrent(snapshot, boundTo: baseURL) else {
+            accountRecoveryErrorMessage =
+                "Refresh Account Recovery before generating a new code."
+            return false
+        }
+        return await performAccountRecovery(baseURL: baseURL) {
+            _ = try await self.coordinator.issueAccountRecoveryCode(
+                replacing: snapshot,
+                boundTo: baseURL
+            )
+        }
+    }
+
+    @discardableResult
+    func consumeAccountRecoveryCode(
+        baseURL: DayWeaveAPIBaseURL,
+        code: String
+    ) async -> Bool {
+        await performAccountRecovery(baseURL: baseURL) {
+            _ = try await self.coordinator.consumeAccountRecoveryCode(
+                code,
+                boundTo: baseURL,
+                descriptor: self.descriptor
+            )
+        }
+    }
+
+    @discardableResult
+    func resumeAccountRecovery(baseURL: DayWeaveAPIBaseURL) async -> Bool {
+        await performAccountRecovery(baseURL: baseURL) {
+            try await self.coordinator.resumeAccountRecoveryWork(boundTo: baseURL)
+        }
+    }
+
+    @discardableResult
+    func completeAccountRecoveryCredentialHandoff(
+        baseURL: DayWeaveAPIBaseURL
+    ) async -> Bool {
+        guard !isRefreshingAccountRecovery else { return false }
+        let generation = accountRecoveryGeneration
+        do {
+            try await coordinator.completeAccountRecoveryCredentialHandoff(
+                boundTo: baseURL
+            )
+            guard accountRecoveryGeneration == generation else { return false }
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return true
+        } catch {
+            guard accountRecoveryGeneration == generation else { return false }
+            accountRecoveryErrorMessage = error.localizedDescription
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return false
+        }
+    }
+
+    func revealAccountRecoveryCode(baseURL: DayWeaveAPIBaseURL) async {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else { return }
+        let generation = accountRecoveryGeneration
+        accountRecoveryErrorMessage = nil
+        do {
+            let code = try await coordinator
+                .recoveryCodeAwaitingAcknowledgement(boundTo: baseURL)
+            guard accountRecoveryGeneration == generation else { return }
+            revealedAccountRecoveryCode = code
+        } catch {
+            guard accountRecoveryGeneration == generation else { return }
+            revealedAccountRecoveryCode = nil
+            accountRecoveryErrorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func acknowledgeAccountRecoveryCode(baseURL: DayWeaveAPIBaseURL) async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        isBusy = true
+        accountRecoveryErrorMessage = nil
+        defer {
+            isBusy = false
+            revealedAccountRecoveryCode = nil
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+        }
+        do {
+            try await coordinator.acknowledgeAccountRecoveryCode(boundTo: baseURL)
+            accountRecoveryNotice = "Recovery code acknowledgement saved."
+            accountRecoverySnapshot = nil
+            accountRecoverySnapshotIsStale = false
+            return true
+        } catch {
+            accountRecoveryErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func discardIncompatibleAccountRecoveryJournal() async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        isBusy = true
+        accountRecoveryErrorMessage = nil
+        defer { isBusy = false }
+        do {
+            try await coordinator.confirmDiscardIncompatibleAccountRecoveryJournal()
+            clearAccountRecoveryMemory()
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return true
+        } catch {
+            accountRecoveryErrorMessage = error.localizedDescription
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return false
+        }
+    }
+
+    @discardableResult
+    func discardPendingAccountRecoveryConsumption() async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        isBusy = true
+        accountRecoveryErrorMessage = nil
+        defer { isBusy = false }
+        do {
+            try await coordinator.confirmDiscardPendingAccountRecoveryConsumption()
+            clearAccountRecoveryMemory()
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return true
+        } catch {
+            accountRecoveryErrorMessage = error.localizedDescription
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return false
+        }
+    }
+
+    @discardableResult
+    func discardPendingAccountRecoveryIssue() async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        isBusy = true
+        accountRecoveryErrorMessage = nil
+        defer { isBusy = false }
+        do {
+            try await coordinator.confirmDiscardPendingAccountRecoveryIssue()
+            clearAccountRecoveryMemory()
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return true
+        } catch {
+            accountRecoveryErrorMessage = error.localizedDescription
+            accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+            return false
+        }
+    }
+
+    /// Clears only memory/UI state. The restart-safe Keychain journal remains
+    /// intact and can be resumed after unlock or returning to Settings.
+    func clearAccountRecoveryMemory() {
+        accountRecoveryGeneration &+= 1
+        recoveryPrivacyGeneration &+= 1
+        accountRecoverySnapshot = nil
+        isRefreshingAccountRecovery = false
+        accountRecoverySnapshotIsStale = false
+        accountRecoveryErrorMessage = nil
+        accountRecoveryNotice = nil
+        revealedAccountRecoveryCode = nil
+        accountRecoveryRequestConfigurationIdentifier = nil
+    }
+
+    func suspendForPrivacyBoundary() {
+        clearDeviceSessionInventory()
+        clearAccountRecoveryMemory()
+    }
+
     func prepareCurrentSessionRevocationApproval(
         baseURL: DayWeaveAPIBaseURL
     ) async -> DurableCurrentSessionRevocationApproval? {
@@ -4541,7 +6136,7 @@ final class DurableAuthSettingsModel: ObservableObject {
         baseURL: DayWeaveAPIBaseURL?,
         operation: () async throws -> Void
     ) async -> Bool {
-        guard !isBusy, !isManagingDeviceSessions else { return false }
+        guard !isBusy, !isManagingDeviceSessions, !isManagingAccountRecovery else { return false }
         isBusy = true
         errorMessage = nil
         defer {
@@ -4552,6 +6147,7 @@ final class DurableAuthSettingsModel: ObservableObject {
         do {
             try await operation()
             clearDeviceSessionInventory()
+            clearAccountRecoveryMemory()
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -4577,6 +6173,66 @@ final class DurableAuthSettingsModel: ObservableObject {
         if let inventory = deviceSessionInventory,
            !coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL) {
             clearDeviceSessionInventory()
+        }
+    }
+
+    private func performAccountRecovery(
+        baseURL: DayWeaveAPIBaseURL,
+        operation: () async throws -> Void
+    ) async -> Bool {
+        guard !isBusy, !isManagingDeviceSessions, !isRefreshingAccountRecovery else {
+            return false
+        }
+        accountRecoveryGeneration &+= 1
+        let generation = accountRecoveryGeneration
+        isBusy = true
+        accountRecoveryErrorMessage = nil
+        accountRecoveryNotice = nil
+        revealedAccountRecoveryCode = nil
+        defer {
+            isBusy = false
+            if accountRecoveryGeneration == generation {
+                presentation = coordinator.presentation(boundTo: baseURL)
+                accountRecoveryPresentation = coordinator.accountRecoveryPresentation()
+                clearDeviceSessionInventory()
+                accountRecoverySnapshot = nil
+                accountRecoverySnapshotIsStale = false
+            }
+        }
+        do {
+            try await operation()
+            // A privacy boundary invalidates the caller's authority to perform
+            // follow-up UI/configuration work even when the durable operation
+            // itself completed while the callback was suspended.
+            guard accountRecoveryGeneration == generation else { return false }
+            accountRecoveryNotice = "Account recovery state was updated securely."
+            return true
+        } catch {
+            guard accountRecoveryGeneration == generation else { return false }
+            accountRecoveryErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func invalidateAccountRecoverySnapshotIfNeeded(
+        boundTo baseURL: DayWeaveAPIBaseURL?
+    ) {
+        guard let baseURL else {
+            if accountRecoverySnapshot != nil
+                || accountRecoveryRequestConfigurationIdentifier != nil
+                || revealedAccountRecoveryCode != nil {
+                clearAccountRecoveryMemory()
+            }
+            return
+        }
+        if let requestConfiguration = accountRecoveryRequestConfigurationIdentifier,
+           requestConfiguration != baseURL.canonicalConfigurationIdentifier {
+            clearAccountRecoveryMemory()
+            return
+        }
+        if let snapshot = accountRecoverySnapshot,
+           !coordinator.isAccountRecoverySnapshotCurrent(snapshot, boundTo: baseURL) {
+            clearAccountRecoveryMemory()
         }
     }
 }

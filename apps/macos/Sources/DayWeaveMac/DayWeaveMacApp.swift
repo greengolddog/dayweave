@@ -430,7 +430,7 @@ struct DayWeaveMacApp: App {
     }
 
     private func deactivateServices() {
-        durableAuth.clearDeviceSessionInventory()
+        durableAuth.suspendForPrivacyBoundary()
         googleOutbound.setPrivacyAvailable(false)
         googleSchedulePublication.setPrivacyAvailable(false)
         serviceCoordinator.deactivate()
