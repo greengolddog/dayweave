@@ -74,9 +74,11 @@ internal class FakeDeviceAuthEnvelopeStore(initialState: StoredDeviceAuthState) 
     var failNextDestroy = false
     var leaveDestroyCleanupPending = false
     var successfulSync: Long? = null
+    var beforeRead: (() -> Unit)? = null
     var afterRead: ((StoredDeviceAuthEnvelope) -> Unit)? = null
 
     override fun read(): StoredDeviceAuthEnvelope {
+        beforeRead?.invoke()
         val result = envelope
         afterRead?.invoke(result)
         return result
@@ -232,6 +234,33 @@ internal class RecordingDeviceAuthTransport : DeviceAuthTransport {
         val call = RevokeCall(baseUrl, accessToken, sessionId)
         revokeCalls += call
         revokeHandler(call)
+    }
+}
+
+internal class RecordingDeviceSessionsTransport : DeviceSessionsTransport {
+    val listCalls = mutableListOf<AuthenticatedApiConfiguration>()
+    val revokeCalls = mutableListOf<Pair<AuthenticatedApiConfiguration, String>>()
+
+    var listHandler: suspend (AuthenticatedApiConfiguration) -> DeviceSessionListResponse = {
+        throw IOException("synthetic device-session list response not configured")
+    }
+    var revokeHandler: suspend (AuthenticatedApiConfiguration, String) -> Unit = { _, _ ->
+        throw IOException("synthetic device-session revoke response not configured")
+    }
+
+    override suspend fun listSessions(
+        configuration: AuthenticatedApiConfiguration,
+    ): DeviceSessionListResponse {
+        listCalls += configuration
+        return listHandler(configuration)
+    }
+
+    override suspend fun revokeSession(
+        configuration: AuthenticatedApiConfiguration,
+        sessionId: String,
+    ) {
+        revokeCalls += configuration to sessionId
+        revokeHandler(configuration, sessionId)
     }
 }
 

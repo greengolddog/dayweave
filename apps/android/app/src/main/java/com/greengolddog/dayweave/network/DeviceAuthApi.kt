@@ -227,20 +227,23 @@ internal class OkHttpDeviceAuthTransport(
     ) {
         validateExactDeviceToken(accessToken, DEVICE_ACCESS_TOKEN_PREFIX)
         requireUuid(sessionId)
-        val response = execute(
-            request = requestBuilder(baseUrl, "v1/auth/sessions/$sessionId", accessToken)
+        val response = executeCurrentSessionRevoke(
+            requestBuilder(baseUrl, "v1/auth/sessions/$sessionId", accessToken)
                 .delete()
                 .build(),
-            expectedStatuses = setOf(204),
         )
         response.use {
-            if (response.body.contentLength() > MAX_RESPONSE_CHARS) {
-                throw DeviceAuthApiException.InvalidResponse()
+            val body = try {
+                if (response.body.contentLength() > MAX_RESPONSE_CHARS) {
+                    throw DeviceAuthApiException.InvalidResponse()
+                }
+                response.body.charStream().use { reader ->
+                    reader.readBoundedDeviceAuthText()
+                }
+            } catch (_: DeviceAuthApiException.InvalidResponse) {
+                throw DeviceSessionDeleteOutcomeAmbiguousException()
             }
-            val body = response.body.charStream().use { reader ->
-                reader.readBoundedDeviceAuthText()
-            }
-            if (body.isNotEmpty()) throw DeviceAuthApiException.InvalidResponse()
+            if (body.isNotEmpty()) throw DeviceSessionDeleteOutcomeAmbiguousException()
         }
     }
 
@@ -274,6 +277,53 @@ internal class OkHttpDeviceAuthTransport(
             throw DeviceAuthApiException.InvalidResponse()
         }
         return response
+    }
+
+    /**
+     * Preserves whether a current-session DELETE is safe to retry/reconcile. Malformed success and
+     * retryable upstream responses are outcome-ambiguous after dispatch. Malformed authentication
+     * and deterministic client-error contracts are protocol failures and never prove retirement.
+     */
+    private suspend fun executeCurrentSessionRevoke(request: Request): Response {
+        val response = client.newCall(request).awaitDeviceAuthResponse()
+        when {
+            response.code == 204 -> {
+                if (!hasStrictNoStoreHeaders(response)) {
+                    response.close()
+                    throw DeviceSessionDeleteOutcomeAmbiguousException()
+                }
+                return response
+            }
+            response.code in RETRYABLE_MUTATION_STATUSES || response.code in 500..599 -> {
+                response.close()
+                throw DeviceAuthApiException.Unavailable()
+            }
+            response.code == 401 -> {
+                val definitive = isTrustedDeviceAuthUnauthorized(response)
+                response.close()
+                throw if (definitive) {
+                    DeviceAuthApiException.Authentication()
+                } else {
+                    DeviceAuthApiException.InvalidResponse()
+                }
+            }
+            response.code in DETERMINISTIC_MUTATION_FAILURE_STATUSES -> {
+                if (!hasStrictNoStoreHeaders(response) || !hasExactJsonMediaType(response)) {
+                    response.close()
+                    throw DeviceAuthApiException.InvalidResponse()
+                }
+                val failure = response.use(::decodeTrustedDeviceAuthError)
+                throw if (failure is DeviceAuthApiException.Unavailable) {
+                    DeviceAuthApiException.InvalidResponse()
+                } else {
+                    failure
+                }
+            }
+            else -> {
+                response.close()
+                throw DeviceAuthApiException.InvalidResponse()
+            }
+        }
     }
 
     private inline fun <reified T> decode(response: Response): T = response.use {
@@ -337,6 +387,8 @@ internal class OkHttpDeviceAuthTransport(
         const val MAX_RESPONSE_CHARS = 64 * 1024
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val ENROLLMENT_MAX_RESPONSE_WINDOW: Duration = Duration.ofMinutes(15)
+        val RETRYABLE_MUTATION_STATUSES = setOf(408, 425, 429)
+        val DETERMINISTIC_MUTATION_FAILURE_STATUSES = setOf(400, 403, 404, 409, 422)
     }
 }
 

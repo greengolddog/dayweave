@@ -326,8 +326,8 @@ class OkHttpDeviceAuthTransportTest {
         assertEquals("no-store", request.headers["Cache-Control"])
         assertEquals("no-cache", request.headers["Pragma"])
 
-        server.enqueue(strictNoContent().newBuilder().body("unexpected").build())
-        assertThrows(IOException::class.java) {
+        server.enqueue(MockResponse.Builder().code(204).build())
+        assertThrows(DeviceSessionDeleteOutcomeAmbiguousException::class.java) {
             runBlocking { transport.revokeSession(baseUrl(), access, SYNTHETIC_SESSION_ID) }
         }
 
@@ -336,6 +336,47 @@ class OkHttpDeviceAuthTransportTest {
             runBlocking { transport.revokeSession(baseUrl(), access, SYNTHETIC_SESSION_ID) }
         }
         assertEquals(404, missing.statusCode)
+    }
+
+    @Test
+    fun revokeKeepsMalformedUnauthorizedAndClientContractsDeterministic() = runBlocking {
+        val access = syntheticDeviceToken(DEVICE_ACCESS_TOKEN_PREFIX, 111)
+        server.enqueue(
+            strictJson(
+                401,
+                """{"error":{"code":"unauthorized","message":"synthetic"}}""",
+            ),
+        )
+        assertThrows(DeviceAuthApiException.InvalidResponse::class.java) {
+            runBlocking { transport.revokeSession(baseUrl(), access, SYNTHETIC_SESSION_ID) }
+        }
+
+        server.enqueue(strictJson(404, """{"error":{"code":"future","message":"synthetic"}}"""))
+        assertThrows(DeviceAuthApiException.InvalidResponse::class.java) {
+            runBlocking { transport.revokeSession(baseUrl(), access, SYNTHETIC_SESSION_ID) }
+        }
+
+        val requestsBeforePreflight = server.requestCount
+        assertThrows(DeviceAuthApiException.InvalidResponse::class.java) {
+            runBlocking { transport.revokeSession(baseUrl(), access, "not-a-session-id") }
+        }
+        assertEquals(requestsBeforePreflight, server.requestCount)
+        Unit
+    }
+
+    @Test
+    fun revokeTreatsRetryableResponseAsOutcomeAmbiguous() {
+        val access = syntheticDeviceToken(DEVICE_ACCESS_TOKEN_PREFIX, 112)
+        listOf(408, 425, 429, 500, 504).forEach { status ->
+            val response = MockResponse.Builder().code(status)
+            if (status == 408) {
+                response.addHeader("Retry-After", "1")
+            }
+            server.enqueue(response.build())
+            assertThrows(DeviceAuthApiException.Unavailable::class.java) {
+                runBlocking { transport.revokeSession(baseUrl(), access, SYNTHETIC_SESSION_ID) }
+            }
+        }
     }
 
     @Test

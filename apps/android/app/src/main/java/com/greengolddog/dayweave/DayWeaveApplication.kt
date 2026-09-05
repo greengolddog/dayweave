@@ -178,11 +178,13 @@ class DayWeaveApplication : Application() {
     }
 
     private val apiBindingOperationGate = ApiBindingOperationGate()
+    private val deviceSessionsTransport by lazy { OkHttpDeviceSessionsTransport() }
 
     internal val deviceAuthCoordinator: DurableDeviceAuthCoordinator by lazy {
         DurableDeviceAuthCoordinator(
             store = deviceAuthEnvelopeStore,
             transport = OkHttpDeviceAuthTransport(),
+            deviceSessionsTransport = deviceSessionsTransport,
             clientVersion = BuildConfig.VERSION_NAME,
             deviceLabel = listOf(Build.MANUFACTURER, Build.MODEL)
                 .map(String::trim)
@@ -301,7 +303,7 @@ class DayWeaveApplication : Application() {
     private val deviceSessionManagerDelegate = lazy {
         DeviceSessionManager(
             credentialStore = apiCredentialStore,
-            transport = OkHttpDeviceSessionsTransport(),
+            transport = deviceSessionsTransport,
             operationAllowed = privatePresentationAllowed::get,
         )
     }

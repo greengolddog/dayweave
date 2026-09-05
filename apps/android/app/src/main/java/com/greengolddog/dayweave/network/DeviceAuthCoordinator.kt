@@ -43,6 +43,20 @@ private sealed interface BindingDestroyOutcome {
     data class Destroyed(val result: DeviceAuthDestroyResult) : BindingDestroyOutcome
 }
 
+private sealed interface CurrentSessionDeleteOutcome {
+    data object Confirmed : CurrentSessionDeleteOutcome
+    data object DefinitiveUnauthorized : CurrentSessionDeleteOutcome
+    data class Reconcile(val originalFailure: DeviceAuthActionResult) :
+        CurrentSessionDeleteOutcome
+    data class Rejected(val failure: DeviceAuthActionResult) : CurrentSessionDeleteOutcome
+}
+
+private data class CurrentSessionRetirementIdentity(
+    val baseUrl: String,
+    val clientInstanceId: String,
+    val sessionId: String,
+)
+
 internal interface DeviceAuthBindingFence {
     /**
      * Must durably quarantine all API-bound cache before a new binding becomes usable. The
@@ -139,6 +153,7 @@ internal suspend fun AuthenticatedApiConfiguration.executeAuthenticatedCancellab
 internal class DurableDeviceAuthCoordinator(
     private val store: DeviceAuthEnvelopeStore,
     private val transport: DeviceAuthTransport,
+    private val deviceSessionsTransport: DeviceSessionsTransport = OkHttpDeviceSessionsTransport(),
     private val clientVersion: String,
     private val deviceLabel: String,
     private val bindingOperationGate: ApiBindingOperationGate = ApiBindingOperationGate(),
@@ -151,6 +166,8 @@ internal class DurableDeviceAuthCoordinator(
     private val stateMutex = Mutex()
     private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlightOperations = mutableMapOf<AuthOperationKey, Deferred<DeviceAuthActionResult>>()
+    private val inFlightRevocations =
+        mutableMapOf<AuthOperationKey, Deferred<CurrentSessionDeleteOutcome>>()
     // Keep only the redacted projection in the long-lived flow. Retaining the initial envelope
     // here would also retain its credential strings for the lifetime of the process.
     private val mutableUiState = MutableStateFlow(store.read().state.toUiState())
@@ -340,6 +357,11 @@ internal class DurableDeviceAuthCoordinator(
             refreshUi("No active device session is available to revoke.")
             return DeviceAuthActionResult.NOT_ALLOWED
         }
+        val retirementIdentity = CurrentSessionRetirementIdentity(
+            baseUrl = active.baseUrl,
+            clientInstanceId = active.clientInstanceId,
+            sessionId = active.session.id,
+        )
         if (shouldRefresh(active.session)) {
             val refreshed = rotateActiveLocked(envelope, active)
             if (refreshed != DeviceAuthActionResult.SUCCESS) {
@@ -351,94 +373,223 @@ internal class DurableDeviceAuthCoordinator(
                 refreshUi("Authentication changed during sign-out; no revoke request was sent.")
                 return DeviceAuthActionResult.STALE_STATE
             }
-        }
-        val firstRevoke = revokeActiveLocked(envelope, active)
-        if (firstRevoke == DeviceAuthActionResult.AUTH_REQUIRED) {
-            // A current-session DELETE gets one refresh and one retry with the same method, URL,
-            // and session id. A second 401 is never interpreted as successful revocation.
-            val refreshed = rotateActiveLocked(envelope, active)
-            if (refreshed != DeviceAuthActionResult.SUCCESS) {
-                refreshUi("Server revocation was not authenticated; local state was retained.")
-                return refreshed
-            }
-            envelope = store.read()
-            active = envelope.state as? StoredDeviceAuthState.Active ?: run {
-                refreshUi("Authentication changed before the revoke retry; newer state was retained.")
+            if (!active.matches(retirementIdentity)) {
+                refreshUi("Authentication changed during sign-out; no revoke request was sent.")
                 return DeviceAuthActionResult.STALE_STATE
             }
-            val retriedRevoke = revokeActiveLocked(envelope, active)
-            if (retriedRevoke == DeviceAuthActionResult.AUTH_REQUIRED) {
-                val rejectedEnvelope = store.read()
-                if (rejectedEnvelope != envelope || rejectedEnvelope.state != active) {
-                    refreshUi("The revoke rejection belonged to a stale credential; newer authentication was retained.")
-                    return DeviceAuthActionResult.STALE_STATE
+        }
+        val firstRevoke = revokeActiveLocked(envelope, active)
+        return when (firstRevoke) {
+            CurrentSessionDeleteOutcome.Confirmed -> finishCurrentSessionRetirement(
+                expected = envelope,
+                identity = retirementIdentity,
+                serverEvidence = "The server session was revoked",
+            )
+            CurrentSessionDeleteOutcome.DefinitiveUnauthorized -> {
+                // One trusted 401 can be an expired access lease. Rotate once and retry the exact
+                // session DELETE before treating authentication rejection as retirement proof.
+                val refreshed = rotateActiveLocked(envelope, active)
+                if (refreshed != DeviceAuthActionResult.SUCCESS) {
+                    val rejected = definitiveRefreshRejectionEnvelope(retirementIdentity)
+                    if (refreshed == DeviceAuthActionResult.AUTH_REQUIRED && rejected != null) {
+                        finishCurrentSessionRetirement(
+                            expected = rejected,
+                            identity = retirementIdentity,
+                            serverEvidence = "The server no longer accepts this device session",
+                        )
+                    } else {
+                        refreshUi(
+                            "Server revocation was not authenticated; local state was retained.",
+                        )
+                        refreshed
+                    }
+                } else {
+                    envelope = store.read()
+                    active = envelope.state as? StoredDeviceAuthState.Active ?: run {
+                        refreshUi(
+                            "Authentication changed before the revoke retry; newer state was retained.",
+                        )
+                        return DeviceAuthActionResult.STALE_STATE
+                    }
+                    if (!active.matches(retirementIdentity)) {
+                        refreshUi(
+                            "Authentication changed before the revoke retry; newer state was retained.",
+                        )
+                        return DeviceAuthActionResult.STALE_STATE
+                    }
+                    when (val retried = revokeActiveLocked(envelope, active)) {
+                        CurrentSessionDeleteOutcome.Confirmed -> finishCurrentSessionRetirement(
+                            expected = envelope,
+                            identity = retirementIdentity,
+                            serverEvidence = "The server session was revoked",
+                        )
+                        CurrentSessionDeleteOutcome.DefinitiveUnauthorized ->
+                            finishCurrentSessionRetirement(
+                                expected = envelope,
+                                identity = retirementIdentity,
+                                serverEvidence =
+                                    "The server rejected the exact refreshed device session",
+                            )
+                        is CurrentSessionDeleteOutcome.Reconcile ->
+                            reconcileCurrentSessionRetirement(retirementIdentity, retried)
+                        is CurrentSessionDeleteOutcome.Rejected -> {
+                            refreshUi(
+                                "Server revocation could not be confirmed; local state was retained.",
+                            )
+                            retried.failure
+                        }
+                    }
                 }
-                val quarantined = StoredDeviceAuthState.Reauth(
-                    baseUrl = active.baseUrl,
-                    clientInstanceId = active.clientInstanceId,
-                    previousSessionId = active.session.id,
-                    reason = REAUTH_SESSION_REVOKED,
-                )
-                if (!transition(rejectedEnvelope, quarantined)) {
-                    refreshUi("Authentication changed after the revoke rejection; newer state was retained.")
-                    return DeviceAuthActionResult.STALE_STATE
-                }
-                refreshUi(
-                    "The exact refreshed credential was rejected during revocation. Server revocation and local deletion were not reported as successful.",
-                )
-                return DeviceAuthActionResult.AUTH_REQUIRED
             }
-            if (retriedRevoke != DeviceAuthActionResult.SUCCESS) {
+            is CurrentSessionDeleteOutcome.Reconcile ->
+                reconcileCurrentSessionRetirement(retirementIdentity, firstRevoke)
+            is CurrentSessionDeleteOutcome.Rejected -> {
                 refreshUi("Server revocation could not be confirmed; local state was retained.")
-                return retriedRevoke
+                firstRevoke.failure
             }
-        } else if (firstRevoke != DeviceAuthActionResult.SUCCESS) {
-            refreshUi("Server revocation could not be confirmed; local state was retained.")
-            return firstRevoke
+        }
+    }
+
+    private suspend fun reconcileCurrentSessionRetirement(
+        identity: CurrentSessionRetirementIdentity,
+        deleteOutcome: CurrentSessionDeleteOutcome.Reconcile,
+    ): DeviceAuthActionResult {
+        val before = store.read()
+        val beforeActive = before.state as? StoredDeviceAuthState.Active
+        if (beforeActive == null || !beforeActive.matches(identity)) {
+            val rejected = definitiveRefreshRejectionEnvelope(identity)
+            if (rejected != null) {
+                return finishCurrentSessionRetirement(
+                    expected = rejected,
+                    identity = identity,
+                    serverEvidence = "The server no longer accepts this device session",
+                )
+            }
+            refreshUi("Authentication changed before revocation could be verified; local state was retained.")
+            return DeviceAuthActionResult.STALE_STATE
+        }
+        val configuration = authenticatedConfiguration()
+        if (configuration == null || configuration.configurationId != identity.sessionId) {
+            refreshUi("Revocation could not be verified; local state was retained.")
+            return deleteOutcome.originalFailure
+        }
+
+        val listed = try {
+            deviceSessionsTransport.listSessions(configuration)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: DeviceAuthenticationChangedException) {
+            refreshUi("Authentication changed while revocation was verified; newer state was retained.")
+            return DeviceAuthActionResult.STALE_STATE
+        } catch (_: DeviceAuthenticationRequiredException) {
+            val rejected = definitiveRefreshRejectionEnvelope(identity)
+            if (rejected != null) {
+                return finishCurrentSessionRetirement(
+                    expected = rejected,
+                    identity = identity,
+                    serverEvidence = "The server no longer accepts this device session",
+                )
+            }
+            refreshUi("Revocation could not be verified; local state was retained.")
+            return deleteOutcome.originalFailure
+        } catch (_: DeviceAuthApiException.Authentication) {
+            val rejected = definitiveRefreshRejectionEnvelope(identity)
+            if (rejected != null) {
+                return finishCurrentSessionRetirement(
+                    expected = rejected,
+                    identity = identity,
+                    serverEvidence = "The server no longer accepts this device session",
+                )
+            }
+            refreshUi("Revocation could not be verified; local state was retained.")
+            return deleteOutcome.originalFailure
+        } catch (_: Exception) {
+            refreshUi("Revocation outcome is unconfirmed; local state was retained for retry.")
+            return deleteOutcome.originalFailure
+        }
+
+        val after = store.read()
+        val afterActive = after.state as? StoredDeviceAuthState.Active
+        if (afterActive == null || !afterActive.matches(identity)) {
+            refreshUi("Authentication changed while revocation was verified; newer state was retained.")
+            return DeviceAuthActionResult.STALE_STATE
+        }
+        val currentRows = listed.sessions.filter { it.id == identity.sessionId }
+        val exactCurrentStillActive = currentRows.singleOrNull()?.let { row ->
+            row.clientKind == "android" && row.clientInstanceId == identity.clientInstanceId
+        } == true
+        if (exactCurrentStillActive) {
+            refreshUi("The server still reports this exact device session as active; local state was retained.")
+            return deleteOutcome.originalFailure
+        }
+        // A successful request authenticated by this session must list its exact current row.
+        // Absence or mismatched identity is an invalid response, not retirement proof.
+        refreshUi("The revocation verification response was invalid; local state was retained.")
+        return DeviceAuthActionResult.SERVER_REJECTED
+    }
+
+    private fun definitiveRefreshRejectionEnvelope(
+        identity: CurrentSessionRetirementIdentity,
+    ): StoredDeviceAuthEnvelope? = store.read().takeIf { envelope ->
+        val reauth = envelope.state as? StoredDeviceAuthState.Reauth
+        reauth != null && reauth.baseUrl == identity.baseUrl &&
+            reauth.clientInstanceId == identity.clientInstanceId &&
+            reauth.previousSessionId == identity.sessionId &&
+            reauth.reason == REAUTH_REFRESH_REJECTED
+    }
+
+    private suspend fun finishCurrentSessionRetirement(
+        expected: StoredDeviceAuthEnvelope,
+        identity: CurrentSessionRetirementIdentity,
+        serverEvidence: String,
+    ): DeviceAuthActionResult {
+        if (!expected.state.matches(identity)) {
+            refreshUi("Retirement proof did not match the current credential; local state was retained.")
+            return DeviceAuthActionResult.STALE_STATE
         }
         val destroyResult = try {
             bindingOperationGate.invalidateBeforeQuarantine {
-                if (store.read() != envelope) {
+                if (store.read() != expected) {
                     return@invalidateBeforeQuarantine BindingDestroyOutcome.Stale
                 }
                 if (
                     !bindingFence.beforeBindingChange(
-                        active.baseUrl,
-                        active.session.id,
+                        identity.baseUrl,
+                        identity.sessionId,
                         null,
                         null,
                     )
                 ) {
                     return@invalidateBeforeQuarantine BindingDestroyOutcome.FenceBlocked
                 }
-                if (store.read() != envelope) {
+                if (store.read() != expected) {
                     return@invalidateBeforeQuarantine BindingDestroyOutcome.Stale
                 }
-                BindingDestroyOutcome.Destroyed(store.destroy(envelope))
+                BindingDestroyOutcome.Destroyed(store.destroy(expected))
             }
         } catch (_: IllegalStateException) {
-            refreshUi("The server session was revoked, but local credential removal could not be confirmed.")
+            refreshUi("$serverEvidence, but local credential removal could not be confirmed.")
             return DeviceAuthActionResult.STORAGE_FAILURE
         }
         val destroyed = when (destroyResult) {
             BindingDestroyOutcome.FenceBlocked -> {
-                refreshUi("The server session was revoked, but encrypted cache quarantine failed; local state was retained.")
+                refreshUi("$serverEvidence, but encrypted cache quarantine failed; local state was retained.")
                 return DeviceAuthActionResult.CACHE_FENCE_BLOCKED
             }
             BindingDestroyOutcome.Stale -> {
-                refreshUi("The server session was revoked, but newer local authentication was retained.")
+                refreshUi("$serverEvidence, but newer local authentication was retained.")
                 return DeviceAuthActionResult.STALE_STATE
             }
             is BindingDestroyOutcome.Destroyed -> destroyResult.result
         }
         when (destroyed) {
             DeviceAuthDestroyResult.STALE -> {
-                refreshUi("The server session was revoked, but newer local authentication was retained.")
+                refreshUi("$serverEvidence, but newer local authentication was retained.")
                 return DeviceAuthActionResult.STALE_STATE
             }
             DeviceAuthDestroyResult.CREDENTIALS_DESTROYED_CLEANUP_PENDING -> {
                 mutableUiState.value = destroyCleanupPendingUiState(
-                    "The server session was revoked and credentials were removed. Obsolete Keystore cleanup is pending and will retry automatically.",
+                    "$serverEvidence and credentials were removed. Obsolete Keystore cleanup is pending and will retry automatically.",
                 )
                 return DeviceAuthActionResult.CLEANUP_PENDING
             }
@@ -446,9 +597,28 @@ internal class DurableDeviceAuthCoordinator(
         }
         val reset = store.read()
         mutableUiState.value = reset.state.toUiState(
-            overrideMessage = "This device session was revoked and local credentials were removed.",
+            overrideMessage = "$serverEvidence and local credentials were removed.",
         )
         return DeviceAuthActionResult.SUCCESS
+    }
+
+    private fun StoredDeviceAuthState.Active.matches(
+        identity: CurrentSessionRetirementIdentity,
+    ): Boolean = baseUrl == identity.baseUrl && clientInstanceId == identity.clientInstanceId &&
+        session.id == identity.sessionId && session.clientKind == "android"
+
+    private fun StoredDeviceAuthState.matches(
+        identity: CurrentSessionRetirementIdentity,
+    ): Boolean = when (this) {
+        is StoredDeviceAuthState.Active -> matches(identity)
+        is StoredDeviceAuthState.RefreshPending ->
+            baseUrl == identity.baseUrl && clientInstanceId == identity.clientInstanceId &&
+                session.id == identity.sessionId && session.clientKind == "android"
+        is StoredDeviceAuthState.Reauth ->
+            baseUrl == identity.baseUrl && clientInstanceId == identity.clientInstanceId &&
+                previousSessionId == identity.sessionId &&
+                reason == REAUTH_REFRESH_REJECTED
+        else -> false
     }
 
     suspend fun destroyLocalOnly(confirmed: Boolean): DeviceAuthActionResult {
@@ -957,7 +1127,7 @@ internal class DurableDeviceAuthCoordinator(
                     active.baseUrl,
                     active.clientInstanceId,
                     active.session.id,
-                    REAUTH_REFRESH_REJECTED,
+                    REAUTH_REFRESH_EXPIRED,
                 ),
             )
             return DeviceAuthActionResult.AUTH_REQUIRED
@@ -1120,27 +1290,43 @@ internal class DurableDeviceAuthCoordinator(
     private suspend fun revokeActiveLocked(
         expected: StoredDeviceAuthEnvelope,
         active: StoredDeviceAuthState.Active,
-    ): DeviceAuthActionResult {
-        if (expected.state != active) return DeviceAuthActionResult.STALE_STATE
-        return runSingleFlight(expected, AuthOperationType.REVOKE_SESSION) revoke@{
-            if (store.read() != expected) return@revoke DeviceAuthActionResult.STALE_STATE
+    ): CurrentSessionDeleteOutcome {
+        if (expected.state != active) {
+            return CurrentSessionDeleteOutcome.Rejected(DeviceAuthActionResult.STALE_STATE)
+        }
+        return runCurrentRevokeSingleFlight(expected) revoke@{
+            if (store.read() != expected) {
+                return@revoke CurrentSessionDeleteOutcome.Rejected(
+                    DeviceAuthActionResult.STALE_STATE,
+                )
+            }
             try {
                 transport.revokeSession(
                     active.baseUrl,
                     active.accessToken.value,
                     active.session.id,
                 )
-                DeviceAuthActionResult.SUCCESS
+                CurrentSessionDeleteOutcome.Confirmed
             } catch (error: CancellationException) {
                 throw error
             } catch (_: DeviceAuthApiException.Authentication) {
-                DeviceAuthActionResult.AUTH_REQUIRED
+                CurrentSessionDeleteOutcome.DefinitiveUnauthorized
+            } catch (_: DeviceSessionDeleteOutcomeAmbiguousException) {
+                CurrentSessionDeleteOutcome.Reconcile(DeviceAuthActionResult.SERVER_REJECTED)
             } catch (_: DeviceAuthApiException.Unavailable) {
-                DeviceAuthActionResult.NETWORK_FAILURE
+                CurrentSessionDeleteOutcome.Reconcile(DeviceAuthActionResult.NETWORK_FAILURE)
+            } catch (error: DeviceAuthApiException.Http) {
+                if (error.statusCode == 404) {
+                    CurrentSessionDeleteOutcome.Reconcile(DeviceAuthActionResult.SERVER_REJECTED)
+                } else {
+                    CurrentSessionDeleteOutcome.Rejected(DeviceAuthActionResult.SERVER_REJECTED)
+                }
+            } catch (_: DeviceAuthApiException.InvalidResponse) {
+                CurrentSessionDeleteOutcome.Rejected(DeviceAuthActionResult.SERVER_REJECTED)
             } catch (_: DeviceAuthApiException) {
-                DeviceAuthActionResult.SERVER_REJECTED
+                CurrentSessionDeleteOutcome.Rejected(DeviceAuthActionResult.SERVER_REJECTED)
             } catch (_: IOException) {
-                DeviceAuthActionResult.NETWORK_FAILURE
+                CurrentSessionDeleteOutcome.Reconcile(DeviceAuthActionResult.NETWORK_FAILURE)
             }
         }
     }
@@ -1344,6 +1530,34 @@ internal class DurableDeviceAuthCoordinator(
                         stateMutex.withLock {
                             if (inFlightOperations[key] === created) {
                                 inFlightOperations.remove(key)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        deferred.start()
+        return deferred.await()
+    }
+
+    private suspend fun runCurrentRevokeSingleFlight(
+        expected: StoredDeviceAuthEnvelope,
+        operation: suspend () -> CurrentSessionDeleteOutcome,
+    ): CurrentSessionDeleteOutcome {
+        val identity = expected.storageIdentity ?: return CurrentSessionDeleteOutcome.Rejected(
+            DeviceAuthActionResult.STORAGE_FAILURE,
+        )
+        val key = AuthOperationKey(AuthOperationType.REVOKE_SESSION, expected.revision, identity)
+        val deferred = stateMutex.withLock {
+            inFlightRevocations[key] ?: operationScope.async(start = CoroutineStart.LAZY) {
+                operation()
+            }.also { created ->
+                inFlightRevocations[key] = created
+                created.invokeOnCompletion {
+                    operationScope.launch {
+                        stateMutex.withLock {
+                            if (inFlightRevocations[key] === created) {
+                                inFlightRevocations.remove(key)
                             }
                         }
                     }

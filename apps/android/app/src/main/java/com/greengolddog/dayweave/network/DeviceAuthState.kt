@@ -491,11 +491,13 @@ private fun isBase64Url(character: Char): Boolean =
         character == '-' || character == '_'
 
 internal const val REAUTH_REFRESH_REJECTED = "refresh_rejected"
+internal const val REAUTH_REFRESH_EXPIRED = "refresh_expired"
 internal const val REAUTH_SESSION_REVOKED = "session_revoked"
 internal const val REAUTH_LOCAL_RECOVERY = "local_recovery_required"
 internal const val REAUTH_CONTRACT_REJECTED = "server_contract_rejected"
 private val REAUTH_REASONS = setOf(
     REAUTH_REFRESH_REJECTED,
+    REAUTH_REFRESH_EXPIRED,
     REAUTH_SESSION_REVOKED,
     REAUTH_LOCAL_RECOVERY,
     REAUTH_CONTRACT_REJECTED,

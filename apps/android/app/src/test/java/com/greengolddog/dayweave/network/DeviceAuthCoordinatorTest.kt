@@ -839,11 +839,20 @@ class DeviceAuthCoordinatorTest {
         val failedTransport = RecordingDeviceAuthTransport().apply {
             revokeHandler = { throw IOException("synthetic network failure") }
         }
+        val verifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = { DeviceSessionListResponse(listOf(active.session)) }
+        }
         assertEquals(
             DeviceAuthActionResult.NETWORK_FAILURE,
-            coordinator(failedStore, failedTransport).signOutRevokeFirst(),
+            coordinator(
+                failedStore,
+                failedTransport,
+                deviceSessionsTransport = verifier,
+            ).signOutRevokeFirst(),
         )
         assertEquals(active, failedStore.envelope.state)
+        assertEquals(1, verifier.listCalls.size)
+        assertEquals(active.session.id, verifier.listCalls.single().configurationId)
 
         val staleStore = FakeDeviceAuthEnvelopeStore(active)
         val replacement = active.copy(
@@ -859,6 +868,146 @@ class DeviceAuthCoordinatorTest {
         )
         assertEquals(replacement, staleStore.envelope.state)
         assertTrue(fence.calls.isEmpty())
+    }
+
+    @Test
+    fun malformedDeleteSuccessRelistsAndRetainsAnAuthoritativelyActiveSession() = runBlocking {
+        val active = syntheticActiveState(now)
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        val transport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw DeviceSessionDeleteOutcomeAmbiguousException() }
+        }
+        val verifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = { DeviceSessionListResponse(listOf(active.session)) }
+        }
+
+        assertEquals(
+            DeviceAuthActionResult.SERVER_REJECTED,
+            coordinator(
+                store,
+                transport,
+                deviceSessionsTransport = verifier,
+            ).signOutRevokeFirst(),
+        )
+
+        assertEquals(active, store.envelope.state)
+        assertEquals(1, verifier.listCalls.size)
+    }
+
+    @Test
+    fun ambiguousDeleteThenDefinitiveRefreshRejectionTearsDownThroughExactFence() = runBlocking {
+        val active = syntheticActiveState(now)
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        val transport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw IOException("synthetic response lost after dispatch") }
+        }
+        val verifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = {
+                store.forceState(
+                    StoredDeviceAuthState.Reauth(
+                        baseUrl = active.baseUrl,
+                        clientInstanceId = active.clientInstanceId,
+                        previousSessionId = active.session.id,
+                        reason = REAUTH_REFRESH_REJECTED,
+                    ),
+                )
+                throw DeviceAuthenticationRequiredException()
+            }
+        }
+        val fence = RecordingDeviceAuthFence()
+
+        assertEquals(
+            DeviceAuthActionResult.SUCCESS,
+            coordinator(
+                store,
+                transport,
+                fence = fence,
+                deviceSessionsTransport = verifier,
+            ).signOutRevokeFirst(),
+        )
+
+        assertTrue(store.envelope.state is StoredDeviceAuthState.Unconfigured)
+        assertEquals(
+            listOf(SYNTHETIC_BASE_URL, active.session.id, null, null),
+            fence.calls.single(),
+        )
+    }
+
+    @Test
+    fun invalidVerificationOrConcurrentReplacementNeverDeletesLocalState() = runBlocking {
+        val active = syntheticActiveState(now)
+        val mismatched = active.session.copy(
+            clientInstanceId = "33333333-3333-4333-8333-333333333333",
+        )
+        val invalidStore = FakeDeviceAuthEnvelopeStore(active)
+        val invalidTransport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw DeviceAuthApiException.Http(404) }
+        }
+        val invalidVerifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = { DeviceSessionListResponse(listOf(mismatched)) }
+        }
+        assertEquals(
+            DeviceAuthActionResult.SERVER_REJECTED,
+            coordinator(
+                invalidStore,
+                invalidTransport,
+                deviceSessionsTransport = invalidVerifier,
+            ).signOutRevokeFirst(),
+        )
+        assertEquals(active, invalidStore.envelope.state)
+
+        val concurrentStore = FakeDeviceAuthEnvelopeStore(active)
+        val replacement = syntheticActiveState(
+            now = now,
+            session = syntheticSession(
+                now = now,
+                id = "44444444-4444-4444-8444-444444444444",
+                clientInstanceId = active.clientInstanceId,
+            ),
+            accessMarker = 88,
+            refreshMarker = 89,
+        )
+        val concurrentVerifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = {
+                concurrentStore.forceState(replacement)
+                DeviceSessionListResponse(listOf(active.session))
+            }
+        }
+        val concurrentTransport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw IOException("synthetic response loss") }
+        }
+        assertEquals(
+            DeviceAuthActionResult.STALE_STATE,
+            coordinator(
+                concurrentStore,
+                concurrentTransport,
+                deviceSessionsTransport = concurrentVerifier,
+            ).signOutRevokeFirst(),
+        )
+        assertEquals(replacement, concurrentStore.envelope.state)
+    }
+
+    @Test
+    fun deterministicDeleteContractFailureDoesNotRelistOrDelete() = runBlocking {
+        val active = syntheticActiveState(now)
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        val transport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw DeviceAuthApiException.InvalidResponse() }
+        }
+        val verifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = { error("A deterministic failure must not be re-listed") }
+        }
+
+        assertEquals(
+            DeviceAuthActionResult.SERVER_REJECTED,
+            coordinator(
+                store,
+                transport,
+                deviceSessionsTransport = verifier,
+            ).signOutRevokeFirst(),
+        )
+        assertEquals(active, store.envelope.state)
+        assertTrue(verifier.listCalls.isEmpty())
     }
 
     @Test
@@ -918,7 +1067,99 @@ class DeviceAuthCoordinatorTest {
     }
 
     @Test
-    fun secondTrustedRevoke401QuarantinesOnlyExactRefreshedEnvelope() = runBlocking {
+    fun delete401ThenDefinitiveRefresh401TearsDownButLocalExpiryDoesNot() = runBlocking {
+        val active = syntheticActiveState(now)
+        val rejectedStore = FakeDeviceAuthEnvelopeStore(active)
+        val rejectedTransport = RecordingDeviceAuthTransport().apply {
+            revokeHandler = { throw DeviceAuthApiException.Authentication() }
+            refreshHandler = { throw DeviceAuthApiException.Authentication() }
+        }
+        val fence = RecordingDeviceAuthFence()
+
+        assertEquals(
+            DeviceAuthActionResult.SUCCESS,
+            coordinator(rejectedStore, rejectedTransport, fence = fence).signOutRevokeFirst(),
+        )
+        assertTrue(rejectedStore.envelope.state is StoredDeviceAuthState.Unconfigured)
+        assertEquals(1, rejectedTransport.revokeCalls.size)
+        assertEquals(1, rejectedTransport.refreshCalls.size)
+        assertEquals(1, fence.calls.size)
+
+        val expiredSession = syntheticSession(
+            now = now,
+            createdAt = now.minus(Duration.ofDays(31)),
+            issuedAt = now.minus(Duration.ofDays(31)),
+            lastSeenAt = now.minus(Duration.ofDays(1)),
+            accessExpiresAt = now.minus(Duration.ofDays(31)).plus(DEVICE_AUTH_ACCESS_TTL),
+            refreshIdleExpiresAt = now.minus(Duration.ofDays(1)),
+            absoluteExpiresAt = now.plus(Duration.ofDays(149)),
+        )
+        val expired = syntheticActiveState(now, session = expiredSession)
+        val expiredStore = FakeDeviceAuthEnvelopeStore(expired)
+        val expiredTransport = RecordingDeviceAuthTransport()
+
+        assertEquals(
+            DeviceAuthActionResult.AUTH_REQUIRED,
+            coordinator(expiredStore, expiredTransport).signOutRevokeFirst(),
+        )
+        val reauth = expiredStore.envelope.state as StoredDeviceAuthState.Reauth
+        assertEquals(REAUTH_REFRESH_EXPIRED, reauth.reason)
+        assertTrue(expiredTransport.revokeCalls.isEmpty())
+    }
+
+    @Test
+    fun proactiveRefreshCannotDispatchRevokeForAConcurrentReplacementSession() = runBlocking {
+        val expiringSession = syntheticSession(
+            now = now,
+            accessExpiresAt = now.plus(Duration.ofMinutes(1)),
+        )
+        val active = syntheticActiveState(now, session = expiringSession)
+        val replacement = syntheticActiveState(
+            now = now,
+            session = syntheticSession(
+                now = now,
+                id = "44444444-4444-4444-8444-444444444444",
+                clientInstanceId = active.clientInstanceId,
+            ),
+            accessMarker = 120,
+            refreshMarker = 121,
+        )
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        val transport = RecordingDeviceAuthTransport().apply {
+            refreshHandler = {
+                DeviceSessionMutationResponse(
+                    syntheticSession(
+                        now = now,
+                        id = active.session.id,
+                        clientInstanceId = active.clientInstanceId,
+                        revision = active.session.revision + 1,
+                        createdAt = Instant.parse(active.session.createdAt),
+                        absoluteExpiresAt = Instant.parse(active.session.absoluteExpiresAt),
+                    ),
+                    replayed = false,
+                )
+            }
+        }
+        store.beforeRead = replace@{
+            val refreshed = store.envelope.state as? StoredDeviceAuthState.Active
+                ?: return@replace
+            if (refreshed.session.revision == active.session.revision + 1) {
+                store.beforeRead = null
+                store.forceState(replacement)
+            }
+        }
+
+        assertEquals(
+            DeviceAuthActionResult.STALE_STATE,
+            coordinator(store, transport).signOutRevokeFirst(),
+        )
+        assertEquals(replacement, store.envelope.state)
+        assertEquals(1, transport.refreshCalls.size)
+        assertTrue(transport.revokeCalls.isEmpty())
+    }
+
+    @Test
+    fun secondTrustedRevoke401ProvesRetirementAndTearsDownExactRefreshedEnvelope() = runBlocking {
         val active = syntheticActiveState(now)
         val store = FakeDeviceAuthEnvelopeStore(active)
         val fence = RecordingDeviceAuthFence()
@@ -940,15 +1181,16 @@ class DeviceAuthCoordinatorTest {
         }
 
         assertEquals(
-            DeviceAuthActionResult.AUTH_REQUIRED,
+            DeviceAuthActionResult.SUCCESS,
             coordinator(store, transport, fence = fence).signOutRevokeFirst(),
         )
-        val reauth = store.envelope.state as StoredDeviceAuthState.Reauth
-        assertEquals(active.session.id, reauth.previousSessionId)
-        assertEquals(REAUTH_SESSION_REVOKED, reauth.reason)
+        assertTrue(store.envelope.state is StoredDeviceAuthState.Unconfigured)
         assertEquals(2, transport.revokeCalls.size)
         assertEquals(1, transport.refreshCalls.size)
-        assertTrue(fence.calls.isEmpty())
+        assertEquals(
+            listOf(SYNTHETIC_BASE_URL, active.session.id, null, null),
+            fence.calls.single(),
+        )
     }
 
     @Test
@@ -1030,12 +1272,20 @@ class DeviceAuthCoordinatorTest {
         val transport = RecordingDeviceAuthTransport().apply {
             revokeHandler = { throw DeviceAuthApiException.Http(404) }
         }
+        val verifier = RecordingDeviceSessionsTransport().apply {
+            listHandler = { DeviceSessionListResponse(listOf(active.session)) }
+        }
 
         assertEquals(
             DeviceAuthActionResult.SERVER_REJECTED,
-            coordinator(store, transport).signOutRevokeFirst(),
+            coordinator(
+                store,
+                transport,
+                deviceSessionsTransport = verifier,
+            ).signOutRevokeFirst(),
         )
         assertEquals(active, store.envelope.state)
+        assertEquals(1, verifier.listCalls.size)
     }
 
     @Test
@@ -1294,9 +1544,12 @@ class DeviceAuthCoordinatorTest {
         fence: DeviceAuthBindingFence = AllowDeviceAuthBindingChange,
         generator: DeviceCredentialGenerator = QueueDeviceCredentialGenerator(),
         gate: ApiBindingOperationGate = ApiBindingOperationGate(),
+        deviceSessionsTransport: RecordingDeviceSessionsTransport =
+            RecordingDeviceSessionsTransport(),
     ) = DurableDeviceAuthCoordinator(
         store = store,
         transport = transport,
+        deviceSessionsTransport = deviceSessionsTransport,
         clientVersion = SYNTHETIC_CLIENT_VERSION,
         deviceLabel = SYNTHETIC_DEVICE_LABEL,
         bindingOperationGate = gate,
