@@ -235,6 +235,47 @@ struct ExecutionSyncStoreTests {
         #expect(await unprovenTransport.receivedCommands().isEmpty)
     }
 
+    @Test("A newer durable schedule head revokes old block actions across offline restart")
+    func newerScheduleHintRevokesPublishedBlockActions() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let block = Self.block()
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()]
+        )
+        #expect(planner.currentPublishedScheduleProofAuthority?.revisionNumber == 1)
+        #expect(planner.canonicalScheduleBlockActionabilityIssue(block) == nil)
+
+        // Model an authenticated revision-2 SSE event followed by a failed
+        // current-resource fetch. Revision-1 blocks remain useful for display,
+        // but no publication-derived action may leave this device.
+        try planner.persistPublishedScheduleRevisionHint(2)
+        #expect(planner.publishedScheduleProof?.revisionNumber == 1)
+        #expect(planner.currentPublishedScheduleProofAuthority == nil)
+        #expect(!planner.canMutate(block))
+        #expect(planner.canonicalScheduleBlockActionabilityIssue(block) != nil)
+        let transport = Self.emptyReadTransport()
+        #expect(
+            await Self.controller(planner: planner, transport: transport).start(block.id)
+                == .invalidLocalState
+        )
+        #expect(await transport.receivedCommands().isEmpty)
+
+        let restored = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { Self.baseDate }
+        )
+        let restoredBlock = try #require(restored.blocks.first)
+        #expect(restored.publishedScheduleLatestHintRevision == 2)
+        #expect(restored.publishedScheduleProof?.revisionNumber == 1)
+        #expect(restored.currentPublishedScheduleProofAuthority == nil)
+        #expect(restored.canonicalScheduleBlockActionabilityIssue(restoredBlock) != nil)
+    }
+
     @Test("Start rejects a missing server session index instead of synthesizing zero")
     func startRejectsMissingSessionIndex() async throws {
         let context = try Self.persistenceContext()

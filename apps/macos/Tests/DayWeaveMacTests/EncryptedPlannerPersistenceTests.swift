@@ -1047,9 +1047,9 @@ private enum EncryptedPlannerPersistenceScenarios {
             "An unsubmitted schema 22 draft did not upgrade to the current request shape"
         )
         try require(
-            migrated.schemaVersion == 23
-                && PlannerSnapshot.currentSchemaVersion == 23,
-            "Rich authoring drafts are not protected by the schema 23 rollback fence"
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion
+                && PlannerSnapshot.currentSchemaVersion == 24,
+            "Rich authoring drafts are not protected by the current rollback fence"
         )
         try require(
             migratedDraft.durationKind == .exact
@@ -1061,19 +1061,19 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
         let rewritten = try requireValue(
             JSONSerialization.jsonObject(with: encoder.encode(migrated)) as? [String: Any],
-            "Migrated schema 23 fixture was not an object"
+            "Migrated current-schema fixture was not an object"
         )
         let rewrittenDraft = try requireValue(
             (rewritten["pendingCanonicalAuthoringMutations"] as? [[String: Any]])?
                 .first?["draft"] as? [String: Any],
-            "Migrated schema 23 fixture had no authoring draft"
+            "Migrated current-schema fixture had no authoring draft"
         )
         try require(
             rewrittenDraft["duration_kind"] as? String == "exact"
                 && rewrittenDraft["duration_min_seconds"] as? Int == 2_700
                 && rewrittenDraft["duration_max_seconds"] as? Int == 2_700
                 && rewrittenDraft["duration_source"] as? String == "user",
-            "Schema 23 rewrite did not durably persist rich duration metadata"
+            "Current-schema rewrite did not durably persist rich duration metadata"
         )
 
         var partialCurrentRoot = rewritten
@@ -1101,6 +1101,131 @@ private enum EncryptedPlannerPersistenceScenarios {
         try require(
             rejectedPartialCurrentShape,
             "Schema 23 draft silently normalized partial rich-duration metadata"
+        )
+    }
+
+    static func schemaTwentyThreeCannotAcquireOccurrenceMembershipAuthority() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let configurationIdentifier = "publication-membership-fixture"
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: configurationIdentifier,
+            generatedAt: now,
+            asOf: now,
+            horizonStart: now.addingTimeInterval(-3_600),
+            horizonEnd: now.addingTimeInterval(86_400),
+            timezoneName: "UTC"
+        )
+        let revisionID = UUID(uuidString: "a5000000-0000-4000-8000-000000000005")!
+        func proof(version: Int) -> DayWeavePublishedScheduleProof {
+            DayWeavePublishedScheduleProof(
+                version: version,
+                configurationIdentifier: configurationIdentifier,
+                revisionID: revisionID,
+                revision: "1:\(revisionID.uuidString.lowercased())",
+                revisionNumber: 1,
+                inputDigest: "sha256:\(String(repeating: "c", count: 64))",
+                asOf: now,
+                horizonStart: provenance.horizonStart,
+                horizonEnd: provenance.horizonEnd,
+                timezoneName: provenance.timezoneName,
+                publishedAt: now,
+                publishedBlocks: [],
+                publishedOccurrences: version == DayWeavePublishedScheduleProof.currentVersion
+                    ? [.init(
+                        plannerOccurrenceID: UUID(
+                            uuidString: "a6000000-0000-5000-8000-000000000006"
+                        )!,
+                        seriesItemID: UUID(
+                            uuidString: "a7000000-0000-4000-8000-000000000007"
+                        )!,
+                        state: "generated"
+                    )]
+                    : nil
+            )
+        }
+        func snapshot(
+            proof: DayWeavePublishedScheduleProof,
+            injectedHintRevision: UInt64? = nil
+        ) throws -> PlannerSnapshot {
+            PlannerSnapshot(
+                schemaVersion: 23,
+                savedAt: now,
+                destination: .today,
+                selectedBlockID: nil,
+                blocks: [],
+                suggestions: [],
+                assistantMessages: [],
+                lastScheduleMessage: "Published",
+                protectedFreeMinutes: 90,
+                scheduleProfile: try .legacyDefault(
+                    timezoneName: "UTC",
+                    protectedFreeMinutes: 90
+                ),
+                freezeHours: 2,
+                showCompleted: true,
+                canonicalItems: [],
+                canonicalConfigurationIdentifier: configurationIdentifier,
+                schedulePreviewProvenance: provenance,
+                publishedScheduleProof: proof,
+                publishedScheduleLatestHintRevision: injectedHintRevision
+            )
+        }
+
+        let legacyV2 = proof(version: 2)
+        let migratedV2 = try snapshot(proof: legacyV2).migratedToCurrentSchema()
+        try require(
+            migratedV2.publishedScheduleProof == legacyV2
+                && migratedV2.publishedScheduleProof?.currentOccurrenceAuthority == nil
+                && migratedV2.publishedScheduleLatestHintRevision
+                    == legacyV2.revisionNumber,
+            "Schema 23 did not preserve legacy block proof without granting occurrence authority"
+        )
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let injectedPlaintext = try encoder.encode(
+            try snapshot(
+                proof: proof(version: DayWeavePublishedScheduleProof.currentVersion),
+                injectedHintRevision: 99
+            )
+        )
+        let sealed = try AES.GCM.seal(
+            injectedPlaintext,
+            using: SymmetricKey(data: context.keyData),
+            authenticating: Data("DayWeave.PlannerSnapshot|1|AES.GCM.256".utf8)
+        )
+        let combined = try requireValue(
+            sealed.combined,
+            "Injected predecessor ciphertext was unavailable"
+        )
+        let envelope: [String: Any] = [
+            "magic": "DAYWEAVE-ENCRYPTED-SNAPSHOT",
+            "formatVersion": 1,
+            "cipher": "AES.GCM.256",
+            "sealedSnapshot": combined.base64EncodedString(),
+        ]
+        try JSONSerialization.data(withJSONObject: envelope).write(to: context.fileURL)
+
+        let migrated = try requireValue(
+            context.persistence.load(),
+            "Authenticated schema 23 fixture did not migrate"
+        )
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion
+                && migrated.publishedScheduleProof == nil
+                && migrated.publishedScheduleLatestHintRevision == 0,
+            "Schema 23 acquired injected v3 occurrence-membership authority"
+        )
+        let rewritten = try requireValue(
+            context.persistence.load(),
+            "Migrated occurrence-membership snapshot was not rewritten"
+        )
+        try require(
+            rewritten.publishedScheduleProof == nil
+                && rewritten.publishedScheduleLatestHintRevision == 0,
+            "Injected occurrence-membership authority survived encrypted rewrite"
         )
     }
 
@@ -2162,6 +2287,11 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
             .schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape()
     }
 
+    func testSchemaTwentyThreeCannotAcquireOccurrenceMembershipAuthority() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyThreeCannotAcquireOccurrenceMembershipAuthority()
+    }
+
     func testSchemaNineCanonicalAuthoringMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaNineAddsNoCanonicalAuthoringIntent()
     }
@@ -2307,6 +2437,12 @@ struct EncryptedPlannerPersistenceTests {
             .schemaTwentyTwoAuthoringDraftMigrationAddsRollbackFence()
         try EncryptedPlannerPersistenceScenarios
             .schemaTwentyTwoSubmittedAuthoringKeepsLegacyRequestShape()
+    }
+
+    @Test("Schema 23 cannot acquire v3 occurrence-membership authority")
+    func schemaTwentyThreeOccurrenceMembershipMigration() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .schemaTwentyThreeCannotAcquireOccurrenceMembershipAuthority()
     }
 
     @Test("Schema 9 migrates without inventing canonical authoring intent")

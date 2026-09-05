@@ -363,7 +363,8 @@ struct GoogleSchedulePublicationView: View {
                 Button("Prepare review") {
                     guard let accountID = selectedAccountID,
                           let collectionID = selectedCollectionID,
-                          let revisionID = planner.publishedScheduleProof?.revisionID else { return }
+                          let revisionID = planner.currentPublishedScheduleProofAuthority?
+                            .revisionID else { return }
                     Task {
                         _ = await publication.preparePreview(
                             accountID: accountID,
@@ -374,9 +375,9 @@ struct GoogleSchedulePublicationView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(
-                    selectedAccount == nil
+                        selectedAccount == nil
                         || selectedCalendar == nil
-                        || planner.publishedScheduleProof == nil
+                        || planner.currentPublishedScheduleProofAuthority == nil
                         || publication.status.isWorking
                         || google.isBusy
                 )

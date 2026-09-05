@@ -446,7 +446,7 @@ struct CanonicalItemInvalidationStoreTests {
         let blockID = UUID()
         let firstRevisionID = UUID()
         let recoveredRevisionID = UUID()
-        let scheduleStream = CanonicalCursorAheadScheduleStreamDouble(staleHint: 9)
+        let scheduleStream = CanonicalCursorAheadScheduleStreamDouble()
         let sync = Self.sync(
             planner: context.planner,
             token: token,
@@ -476,6 +476,7 @@ struct CanonicalItemInvalidationStoreTests {
         )
         #expect(await sync.bootstrapForegroundActivation())
         #expect(context.planner.publishedScheduleProof?.revisionNumber == 1)
+        try context.planner.persistPublishedScheduleRevisionHint(9)
 
         URLProtocolStub.storage.reset(key: token)
         URLProtocolStub.storage.enqueue(
@@ -491,7 +492,8 @@ struct CanonicalItemInvalidationStoreTests {
                 statusCode: 503,
                 body: Data(#"{"error":{"code":"offline","message":"retry"}}"#.utf8)
             ),
-            // Only this authoritative GET may replace the stale hint high-water.
+            // Only the GET following rejection of the exact revision-nine
+            // cursor may replace the stale high-water.
             .init(
                 statusCode: 200,
                 headers: Self.currentHeaders(
@@ -514,8 +516,156 @@ struct CanonicalItemInvalidationStoreTests {
         }
         sync.stopForegroundItemInvalidations()
 
-        #expect(await scheduleStream.resumeRevisions.prefix(2) == [1, 4])
+        #expect(await scheduleStream.resumeRevisions.prefix(2) == [9, 4])
         #expect(context.planner.publishedScheduleProof?.revisionID == recoveredRevisionID)
+    }
+
+    @Test("ordinary no-current cannot roll back a newer durable schedule hint")
+    func ordinaryScheduleAbsencePreservesHintHighWater() async throws {
+        let token = "schedule-ordinary-absence-high-water-token"
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let context = try Self.context(token: token, cursor: "cursor-before", now: now)
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID()
+        let blockID = UUID()
+        let revisionID = UUID()
+        let sync = Self.sync(
+            planner: context.planner,
+            token: token,
+            stream: CanonicalItemStreamDouble(hints: []),
+            scheduleStream: CanonicalScheduleStreamDouble(hints: []),
+            now: now
+        )
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    "{\"changes\":[{\"type\":\"upsert\",\"item\":\(Self.itemObject(id: itemID))}],\"next_cursor\":\"cursor-after\",\"has_more\":false}".utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                headers: Self.currentHeaders(revisionID: revisionID),
+                body: Data(Self.currentScheduleObject(
+                    itemID: itemID,
+                    blockID: blockID,
+                    revisionID: revisionID
+                ).utf8)
+            )
+        )
+        #expect(await sync.bootstrapForegroundActivation())
+        try context.planner.persistPublishedScheduleRevisionHint(9)
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"cursor-after","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 404,
+                headers: [
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store, max-age=0",
+                    "Pragma": "no-cache",
+                ],
+                body: Data(
+                    #"{"error":{"code":"not_found","message":"Published schedule was not found"}}"#.utf8
+                )
+            )
+        )
+
+        #expect(!(await sync.bootstrapForegroundActivation()))
+        #expect(context.planner.publishedScheduleProof?.revisionID == revisionID)
+        #expect(context.planner.publishedScheduleLatestHintRevision == 9)
+        let persisted = try #require(try context.persistence.load())
+        #expect(persisted.publishedScheduleProof?.revisionID == revisionID)
+        #expect(persisted.publishedScheduleLatestHintRevision == 9)
+    }
+
+    @Test("cursor-ahead authority durably accepts an exact no-current result")
+    func scheduleCursorAheadCanClearToNoCurrent() async throws {
+        let token = "schedule-cursor-ahead-absence-token"
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let context = try Self.context(token: token, cursor: "cursor-before", now: now)
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID()
+        let blockID = UUID()
+        let revisionID = UUID()
+        let scheduleStream = CanonicalCursorAheadScheduleStreamDouble()
+        let sync = Self.sync(
+            planner: context.planner,
+            token: token,
+            stream: CanonicalItemStreamDouble(hints: []),
+            scheduleStream: scheduleStream,
+            now: now
+        )
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    "{\"changes\":[{\"type\":\"upsert\",\"item\":\(Self.itemObject(id: itemID))}],\"next_cursor\":\"cursor-after\",\"has_more\":false}".utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                headers: Self.currentHeaders(revisionID: revisionID),
+                body: Data(Self.currentScheduleObject(
+                    itemID: itemID,
+                    blockID: blockID,
+                    revisionID: revisionID
+                ).utf8)
+            )
+        )
+        #expect(await sync.bootstrapForegroundActivation())
+        try context.planner.persistPublishedScheduleRevisionHint(9)
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"cursor-after","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 503,
+                body: Data(#"{"error":{"code":"offline","message":"retry"}}"#.utf8)
+            ),
+            .init(
+                statusCode: 404,
+                headers: [
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store, max-age=0",
+                    "Pragma": "no-cache",
+                ],
+                body: Data(
+                    #"{"error":{"code":"not_found","message":"Published schedule was not found"}}"#.utf8
+                )
+            )
+        )
+
+        sync.startForegroundItemInvalidations(every: .seconds(3_600))
+        try await Self.waitUntil {
+            context.planner.publishedScheduleLatestHintRevision == 0
+                && context.planner.publishedScheduleProof == nil
+        }
+        sync.stopForegroundItemInvalidations()
+
+        let persisted = try #require(try context.persistence.load())
+        #expect(persisted.publishedScheduleLatestHintRevision == 0)
+        #expect(persisted.publishedScheduleProof == nil)
+        #expect(await scheduleStream.resumeRevisions.first == 9)
     }
 
     @Test("activation catches up items before installing current and performs no write")
@@ -633,8 +783,8 @@ struct CanonicalItemInvalidationStoreTests {
         ])
     }
 
-    @Test("activation exact 404 atomically clears and never composes or publishes")
-    func activationExactAbsenceClearsReadOnly() async throws {
+    @Test("activation 404 cannot erase an installed nonzero schedule head")
+    func activationExactAbsencePreservesInstalledHead() async throws {
         let token = "schedule-activation-absence-token"
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let context = try Self.context(token: token, cursor: "cursor-before", now: now)
@@ -686,13 +836,16 @@ struct CanonicalItemInvalidationStoreTests {
             now: now
         )
         #expect(await sync.bootstrapForegroundActivation())
+        let priorBlocks = context.planner.blocks
+        let priorProof = context.planner.publishedScheduleProof
 
-        #expect(await sync.bootstrapForegroundActivation())
-        #expect(context.planner.blocks.isEmpty)
-        #expect(context.planner.schedulePreviewProvenance == nil)
-        #expect(context.planner.publishedScheduleProof == nil)
+        #expect(!(await sync.bootstrapForegroundActivation()))
+        #expect(context.planner.blocks == priorBlocks)
+        #expect(context.planner.publishedScheduleProof == priorProof)
+        #expect(context.planner.publishedScheduleLatestHintRevision == 1)
         let persisted = try #require(try context.persistence.load())
-        #expect(persisted.publishedScheduleProof == nil)
+        #expect(persisted.publishedScheduleProof == priorProof)
+        #expect(persisted.publishedScheduleLatestHintRevision == 1)
         #expect(URLProtocolStub.storage.requests(
             for: token,
             includingSchedulePublication: true
@@ -879,12 +1032,7 @@ private actor CanonicalScheduleStreamDouble: DayWeaveScheduleStreamTransport {
 private actor CanonicalCursorAheadScheduleStreamDouble:
     DayWeaveScheduleStreamTransport
 {
-    private let staleHint: UInt64
     private(set) var resumeRevisions: [UInt64] = []
-
-    init(staleHint: UInt64) {
-        self.staleHint = staleHint
-    }
 
     func consumeScheduleInvalidations(
         after revision: UInt64,
@@ -892,7 +1040,6 @@ private actor CanonicalCursorAheadScheduleStreamDouble:
     ) async throws -> DayWeaveScheduleStreamCompletion {
         resumeRevisions.append(revision)
         if resumeRevisions.count == 1 {
-            await receive(staleHint)
             return .cursorAhead(headRevision: 0)
         }
         try await Task.sleep(for: .seconds(3_600))

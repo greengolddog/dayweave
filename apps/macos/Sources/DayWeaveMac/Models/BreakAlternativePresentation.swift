@@ -99,8 +99,7 @@ enum BreakAlternativePolicy {
               planner.deferredExecutionPublicationSessionIDs.isEmpty,
               planner.canonicalPreviewFreshnessIssue == nil,
               let provenance = planner.schedulePreviewProvenance,
-              let proof = planner.publishedScheduleProof,
-              proof.configurationIdentifier == planner.canonicalConfigurationIdentifier,
+              let proof = planner.currentPublishedScheduleProofAuthority,
               proof.matches(provenance),
               proof.matchesPublishedPlan(planner.blocks),
               Set(planner.canonicalItems.map(\.id)).count

@@ -38,7 +38,8 @@ struct GoogleSchedulePublicationStoreTests {
 
         #expect(await store.approveAndEnqueue(confirmation))
         #expect(recovery.saved.map(\.stage) == [
-            .intent, .previewed, .approvalAttempted, .approved, .accepted, .accepted,
+            .intent, .previewed, .approvalAttempted, .approved, .approved,
+            .accepted, .accepted,
         ])
         let approved = try #require(recovery.saved.first { $0.stage == .approved })
         #expect(approved.approvalCapability == Self.capability)
@@ -137,6 +138,151 @@ struct GoogleSchedulePublicationStoreTests {
 
         store.setPrivacyAvailable(false)
         #expect(store.recoveryStage == nil)
+    }
+
+    @Test("newer published head revokes a preview before one-shot approval")
+    func newerPublishedHeadRevokesPreviewApproval() async throws {
+        let fixture = try Self.makeAuthoritativePlanner(
+            directoryPrefix: "DayWeaveScheduleGoogleStalePreview",
+            keyByte: 61
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let transport = TestGoogleSchedulePublicationTransport(
+            configurationIdentifier: Self.configuration,
+            preview: Self.preview,
+            approval: Self.approval,
+            acceptance: Self.acceptance,
+            status: Self.completedStatus
+        )
+        let store = GoogleSchedulePublicationStore(
+            recoveryStore: fixture.planner,
+            transportProvider: { transport },
+            privacyAvailable: true,
+            now: { Self.now }
+        )
+
+        #expect(await store.preparePreview(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            scheduleRevisionID: Self.scheduleRevisionID
+        ))
+        let confirmation = try #require(store.approvalConfirmation)
+        #expect(
+            try fixture.planner.loadGoogleSchedulePublicationRecoveryJournal()?.stage
+                == .previewed
+        )
+
+        try fixture.planner.persistPublishedScheduleRevisionHint(9)
+        #expect(!(await store.approveAndEnqueue(confirmation)))
+        #expect(await transport.approvalCallCount == 0)
+        #expect(await transport.enqueueCallCount == 0)
+        #expect(
+            try fixture.planner.loadGoogleSchedulePublicationRecoveryJournal()?.stage
+                == .previewed
+        )
+    }
+
+    @Test("newer published head blocks approved replay before provider I/O")
+    func newerPublishedHeadBlocksApprovedReplay() async throws {
+        let fixture = try Self.makeAuthoritativePlanner(
+            directoryPrefix: "DayWeaveScheduleGoogleStaleApproved",
+            keyByte: 62
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let intent = try GoogleSchedulePublicationRecoveryJournal(
+            operationGeneration: 1,
+            configurationIdentifier: Self.configuration,
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            expectedScheduleRevisionID: Self.scheduleRevisionID,
+            intentExpiresAt: Self.now.addingTimeInterval(35 * 60),
+            createdAt: Self.now
+        )
+        let previewed = try intent.recording(preview: Self.preview)
+        let attempted = try previewed.recordingApprovalAttempt()
+        let approved = try attempted.recording(approval: Self.approval)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(intent)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(previewed)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(attempted)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(approved)
+
+        let transport = TestGoogleSchedulePublicationTransport(
+            configurationIdentifier: Self.configuration,
+            preview: Self.preview,
+            approval: Self.approval,
+            acceptance: Self.acceptance,
+            status: Self.completedStatus
+        )
+        let store = GoogleSchedulePublicationStore(
+            recoveryStore: fixture.planner,
+            transportProvider: { transport },
+            privacyAvailable: true,
+            now: { Self.now }
+        )
+        #expect(store.recoveryStage == .approved)
+
+        try fixture.planner.persistPublishedScheduleRevisionHint(9)
+        #expect(!(await store.replayApprovedEnqueue()))
+        #expect(await transport.enqueueCallCount == 0)
+        #expect(
+            try fixture.planner.loadGoogleSchedulePublicationRecoveryJournal() == approved
+        )
+    }
+
+    @Test("a newer head during enqueue cannot erase the provider acceptance receipt")
+    func newerPublishedHeadDuringEnqueueRetainsAcceptanceReceipt() async throws {
+        let fixture = try Self.makeAuthoritativePlanner(
+            directoryPrefix: "DayWeaveScheduleGoogleInFlightHead",
+            keyByte: 63
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let intent = try GoogleSchedulePublicationRecoveryJournal(
+            operationGeneration: 1,
+            configurationIdentifier: Self.configuration,
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            expectedScheduleRevisionID: Self.scheduleRevisionID,
+            intentExpiresAt: Self.now.addingTimeInterval(35 * 60),
+            createdAt: Self.now
+        )
+        let previewed = try intent.recording(preview: Self.preview)
+        let attempted = try previewed.recordingApprovalAttempt()
+        let approved = try attempted.recording(approval: Self.approval)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(intent)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(previewed)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(attempted)
+        try fixture.planner.saveGoogleSchedulePublicationRecoveryJournal(approved)
+
+        let enqueueGate = TestGoogleSchedulePublicationEnqueueGate()
+        let transport = TestGoogleSchedulePublicationTransport(
+            configurationIdentifier: Self.configuration,
+            preview: Self.preview,
+            approval: Self.approval,
+            acceptance: Self.acceptance,
+            status: Self.completedStatus,
+            enqueueGate: enqueueGate
+        )
+        let store = GoogleSchedulePublicationStore(
+            recoveryStore: fixture.planner,
+            transportProvider: { transport },
+            privacyAvailable: true,
+            now: { Self.now }
+        )
+
+        let replay = Task { @MainActor in
+            await store.replayApprovedEnqueue()
+        }
+        await enqueueGate.waitUntilEntered()
+        try fixture.planner.persistPublishedScheduleRevisionHint(9)
+        await enqueueGate.release()
+
+        #expect(await replay.value)
+        #expect(await transport.enqueueCallCount == 1)
+        #expect(await transport.statusCallCount == 1)
+        let loaded = try fixture.planner.loadGoogleSchedulePublicationRecoveryJournal()
+        let retained = try #require(loaded)
+        #expect(retained.stage == .accepted)
+        #expect(retained.deliveryStatus?.state == .published)
     }
 
     @Test("journal decoding rejects unknown fields and reflection hides authority")
@@ -597,6 +743,60 @@ struct GoogleSchedulePublicationStoreTests {
         return try encoder.encode(snapshot)
     }
 
+    private static func makeAuthoritativePlanner(
+        directoryPrefix: String,
+        keyByte: UInt8
+    ) throws -> (planner: PlannerStore, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "\(directoryPrefix)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: try PlannerEncryptionKey(data: Data(repeating: keyByte, count: 32))
+        )
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: configuration,
+            generatedAt: now,
+            asOf: now,
+            horizonStart: now,
+            horizonEnd: now.addingTimeInterval(7 * 24 * 60 * 60),
+            timezoneName: "UTC"
+        )
+        let proof = DayWeavePublishedScheduleProof(
+            configurationIdentifier: configuration,
+            revisionID: scheduleRevisionID,
+            revision: "8:\(scheduleRevisionID.uuidString.lowercased())",
+            revisionNumber: 8,
+            inputDigest: "sha256:\(String(repeating: "b", count: 64))",
+            asOf: provenance.asOf,
+            horizonStart: provenance.horizonStart,
+            horizonEnd: provenance.horizonEnd,
+            timezoneName: provenance.timezoneName,
+            publishedAt: now,
+            publishedBlocks: []
+        )
+        let planner = PlannerStore(
+            canonicalConfigurationIdentifier: configuration,
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: proof,
+            previewValidatedForCurrentLaunch: true,
+            persistence: persistence,
+            restoreFromPersistence: false,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        planner.flushPersistence()
+        guard planner.persistenceError == nil else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.encryptedPersistenceRequired
+        }
+        return (planner, directory)
+    }
+
     private static func makeNearMaximumWirePreview() throws -> (
         preview: GoogleSchedulePublicationPreview,
         wireBytes: Int,
@@ -695,6 +895,38 @@ private final class TestGoogleSchedulePublicationRecoveryStore:
     }
 }
 
+private actor TestGoogleSchedulePublicationEnqueueGate {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
 private actor TestGoogleSchedulePublicationTransport: GoogleSchedulePublicationTransport {
     nonisolated let configurationIdentifier: String
     let preview: GoogleSchedulePublicationPreview
@@ -702,6 +934,7 @@ private actor TestGoogleSchedulePublicationTransport: GoogleSchedulePublicationT
     let acceptance: GoogleSchedulePublicationAccepted
     let status: GoogleSchedulePublicationStatus
     let approvalError: TestGoogleSchedulePublicationError?
+    let enqueueGate: TestGoogleSchedulePublicationEnqueueGate?
     private(set) var approvalCallCount = 0
     private(set) var enqueueCallCount = 0
     private(set) var statusCallCount = 0
@@ -712,7 +945,8 @@ private actor TestGoogleSchedulePublicationTransport: GoogleSchedulePublicationT
         approval: GoogleSchedulePublicationApproval,
         acceptance: GoogleSchedulePublicationAccepted,
         status: GoogleSchedulePublicationStatus,
-        approvalError: TestGoogleSchedulePublicationError? = nil
+        approvalError: TestGoogleSchedulePublicationError? = nil,
+        enqueueGate: TestGoogleSchedulePublicationEnqueueGate? = nil
     ) {
         self.configurationIdentifier = configurationIdentifier
         self.preview = preview
@@ -720,6 +954,7 @@ private actor TestGoogleSchedulePublicationTransport: GoogleSchedulePublicationT
         self.acceptance = acceptance
         self.status = status
         self.approvalError = approvalError
+        self.enqueueGate = enqueueGate
     }
 
     func previewGoogleSchedulePublication(
@@ -744,6 +979,7 @@ private actor TestGoogleSchedulePublicationTransport: GoogleSchedulePublicationT
         request: GoogleSchedulePublicationEnqueueRequest
     ) async throws -> GoogleSchedulePublicationAccepted {
         enqueueCallCount += 1
+        await enqueueGate?.enterAndWait()
         return acceptance
     }
 

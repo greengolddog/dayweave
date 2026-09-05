@@ -879,6 +879,156 @@ struct PlannerStoreTestingTests {
         }
     }
 
+    @Test("A durable schedule hint alone fences the canonical binding until reset")
+    func canonicalConfigurationHintOnlyBindingFence() throws {
+        let saved = "https://api.example.com/personal"
+        let replacement = "https://api.example.com/work"
+        let store = PlannerStore(
+            canonicalConfigurationIdentifier: saved,
+            publishedScheduleLatestHintRevision: 17,
+            restoreFromPersistence: false
+        )
+
+        #expect(throws: PlannerCanonicalConfigurationError.configurationMismatch) {
+            try store.prepareCanonicalReplicaRead(configurationIdentifier: replacement)
+        }
+        #expect(store.canonicalConfigurationIdentifier == saved)
+        #expect(store.publishedScheduleLatestHintRevision == 17)
+
+        store.resetCanonicalSyncState()
+        #expect(store.canonicalConfigurationIdentifier == nil)
+        #expect(store.publishedScheduleLatestHintRevision == 0)
+        try store.prepareCanonicalReplicaRead(configurationIdentifier: replacement)
+        #expect(store.canonicalConfigurationIdentifier == replacement)
+    }
+
+    @Test("Only an exact cursor-ahead fence clears a hint-only old epoch")
+    func exactScheduleAbsenceRequiresCursorAheadFence() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "DayWeaveHintOnlyAbsenceTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: try PlannerEncryptionKey(data: Data(repeating: 47, count: 32))
+        )
+        let configuration = "https://api.example.com/personal"
+        let store = PlannerStore(
+            canonicalConfigurationIdentifier: configuration,
+            publishedScheduleLatestHintRevision: 17,
+            persistence: persistence,
+            restoreFromPersistence: false
+        )
+        store.flushPersistence()
+        #expect(store.beginCanonicalSync())
+
+        #expect(throws: PlannerScheduleReplicaError.invalidPublication) {
+            try store.clearCurrentPublishedSchedule(
+                configurationIdentifier: configuration
+            )
+        }
+        #expect(store.publishedScheduleLatestHintRevision == 17)
+        #expect(try persistence.load()?.publishedScheduleLatestHintRevision == 17)
+
+        #expect(throws: PlannerScheduleReplicaError.invalidPublication) {
+            try store.clearCurrentPublishedSchedule(
+                configurationIdentifier: configuration,
+                revisionEpochResetFence: .init(
+                    configurationIdentifier: configuration,
+                    rejectedRevision: 16
+                )
+            )
+        }
+        #expect(throws: PlannerScheduleReplicaError.invalidPublication) {
+            try store.clearCurrentPublishedSchedule(
+                configurationIdentifier: configuration,
+                revisionEpochResetFence: .init(
+                    configurationIdentifier: "https://api.example.com/other",
+                    rejectedRevision: 17
+                )
+            )
+        }
+        try store.persistPublishedScheduleRevisionHint(18)
+        #expect(throws: PlannerScheduleReplicaError.invalidPublication) {
+            try store.clearCurrentPublishedSchedule(
+                configurationIdentifier: configuration,
+                revisionEpochResetFence: .init(
+                    configurationIdentifier: configuration,
+                    rejectedRevision: 17
+                )
+            )
+        }
+        try store.clearCurrentPublishedSchedule(
+            configurationIdentifier: configuration,
+            revisionEpochResetFence: .init(
+                configurationIdentifier: configuration,
+                rejectedRevision: 18
+            )
+        )
+        store.endCanonicalSync()
+
+        #expect(store.publishedScheduleLatestHintRevision == 0)
+        #expect(try persistence.load()?.publishedScheduleLatestHintRevision == 0)
+    }
+
+    @Test("a failed epoch clear preserves authority for an exact durable retry")
+    func failedEpochClearPreservesFenceForRetry() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "DayWeaveEpochClearRetryTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: try PlannerEncryptionKey(data: Data(repeating: 48, count: 32))
+        )
+        let configuration = "https://api.example.com/personal"
+        let fence = PlannerScheduleRevisionEpochResetFence(
+            configurationIdentifier: configuration,
+            rejectedRevision: 17
+        )
+        let seed = PlannerStore(
+            canonicalConfigurationIdentifier: configuration,
+            publishedScheduleLatestHintRevision: 17,
+            persistence: persistence,
+            restoreFromPersistence: false
+        )
+        seed.flushPersistence()
+        let stale = PlannerStore(persistence: persistence)
+        let racingWriter = PlannerStore(persistence: persistence)
+        racingWriter.flushPersistence()
+        #expect(stale.beginCanonicalSync())
+
+        #expect(throws: PlannerPersistenceError.concurrentModification) {
+            try stale.clearCurrentPublishedSchedule(
+                configurationIdentifier: configuration,
+                revisionEpochResetFence: fence
+            )
+        }
+        stale.endCanonicalSync()
+        #expect(stale.publishedScheduleLatestHintRevision == 17)
+
+        let recovered = PlannerStore(persistence: persistence)
+        #expect(recovered.publishedScheduleLatestHintRevision == 17)
+        #expect(recovered.beginCanonicalSync())
+        try recovered.clearCurrentPublishedSchedule(
+            configurationIdentifier: configuration,
+            revisionEpochResetFence: fence
+        )
+        recovered.endCanonicalSync()
+        #expect(recovered.publishedScheduleLatestHintRevision == 0)
+        #expect(try persistence.load()?.publishedScheduleLatestHintRevision == 0)
+    }
+
     @Test("Recurrence history retains only the newest bounded outcomes")
     func boundedRecurrenceHistory() {
         let itemID = UUID()

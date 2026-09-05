@@ -465,6 +465,563 @@ struct HabitModelPersistenceTests {
         }
     }
 
+    @Test("missed resolutions decode every frozen action and reject widened or mismatched shapes")
+    func missedResolutionContract() throws {
+        let base = """
+        {"occurrence_evidence_id":"bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb","habit_id":"aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa","source_planner_occurrence_id":"cccccccc-3333-5333-8333-cccccccccccc","revision":REPLACE_REVISION,"configured_policy":"REPLACE_POLICY","action":REPLACE_ACTION,"created_at":"2026-09-04T12:00:00.000000Z","updated_at":"REPLACE_UPDATED"}
+        """
+        func decode(
+            _ action: String,
+            revision: Int,
+            policy: String = "ask",
+            updated: String = "2026-09-04T12:30:00.000000Z"
+        ) throws -> DayWeaveHabitMissedResolution {
+            let json = base
+                .replacingOccurrences(of: "REPLACE_REVISION", with: String(revision))
+                .replacingOccurrences(of: "REPLACE_POLICY", with: policy)
+                .replacingOccurrences(of: "REPLACE_ACTION", with: action)
+                .replacingOccurrences(of: "REPLACE_UPDATED", with: updated)
+            return try Self.decoder().decode(
+                DayWeaveHabitMissedResolution.self,
+                from: Data(json.utf8)
+            )
+        }
+
+        let decision = try decode(#"{"type":"decision_required"}"#, revision: 1)
+        let skipped = try decode(#"{"type":"skip"}"#, revision: 2)
+        let carried = try decode(
+            #"{"type":"carry","window_start":"2026-09-04T12:30:00.000000Z","window_end":"2026-09-05T12:30:00.000000Z"}"#,
+            revision: 2
+        )
+        let reduced = try decode(
+            #"{"type":"reduce_frequency","suppressed_planner_occurrence_ids":["dddddddd-4444-5444-8444-dddddddddddd"]}"#,
+            revision: 2
+        )
+        let cancelled = try decode(
+            #"{"type":"cancelled","reason":"source_completed","resume_action":"carry"}"#,
+            revision: 2
+        )
+        #expect(decision.action.isDecisionRequired)
+        #expect(skipped.hasValidShape && carried.hasValidShape)
+        #expect(reduced.hasValidShape && cancelled.hasValidShape)
+        #expect(decision.canTransition(to: cancelled))
+
+        let skippedCancellation = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: skipped.occurrenceEvidenceID,
+            habitID: skipped.habitID,
+            sourcePlannerOccurrenceID: skipped.sourcePlannerOccurrenceID,
+            revision: 3,
+            configuredPolicy: .ask,
+            action: .cancelled(reason: .sourcePaused, resumeAction: .skip),
+            createdAt: skipped.createdAt,
+            updatedAt: skipped.updatedAt.addingTimeInterval(1)
+        )
+        let wrongSkippedCancellation = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: skipped.occurrenceEvidenceID,
+            habitID: skipped.habitID,
+            sourcePlannerOccurrenceID: skipped.sourcePlannerOccurrenceID,
+            revision: 3,
+            configuredPolicy: .ask,
+            action: .cancelled(reason: .sourcePaused, resumeAction: .carry),
+            createdAt: skipped.createdAt,
+            updatedAt: skipped.updatedAt.addingTimeInterval(1)
+        )
+        #expect(skipped.canTransition(to: skippedCancellation))
+        #expect(!skipped.canTransition(to: wrongSkippedCancellation))
+
+        let reprompted = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: carried.occurrenceEvidenceID,
+            habitID: carried.habitID,
+            sourcePlannerOccurrenceID: carried.sourcePlannerOccurrenceID,
+            revision: 3,
+            configuredPolicy: .ask,
+            action: .decisionRequired,
+            createdAt: carried.createdAt,
+            updatedAt: carried.updatedAt.addingTimeInterval(86_400)
+        )
+        #expect(carried.canTransition(to: reprompted))
+        let askRecarried = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: carried.occurrenceEvidenceID,
+            habitID: carried.habitID,
+            sourcePlannerOccurrenceID: carried.sourcePlannerOccurrenceID,
+            revision: 3,
+            configuredPolicy: .ask,
+            action: .carry(
+                windowStart: carried.updatedAt.addingTimeInterval(1),
+                windowEnd: carried.updatedAt.addingTimeInterval(3_601)
+            ),
+            createdAt: carried.createdAt,
+            updatedAt: carried.updatedAt.addingTimeInterval(1)
+        )
+        #expect(!carried.canTransition(to: askRecarried))
+
+        #expect(throws: (any Error).self) {
+            try decode(#"{"type":"skip","future":true}"#, revision: 2)
+        }
+        #expect(throws: (any Error).self) {
+            try decode(
+                #"{"type":"cancelled","reason":"source_paused","resume_action":"carry"}"#,
+                revision: 2,
+                policy: "skip"
+            )
+        }
+        #expect(throws: (any Error).self) {
+            try decode(
+                #"{"type":"carry","window_start":"2030-01-01T00:00:00.000000Z","window_end":"2030-01-02T00:00:00.000000Z"}"#,
+                revision: 2
+            )
+        }
+        #expect(throws: (any Error).self) {
+            try decode(
+                #"{"type":"reduce_frequency","suppressed_planner_occurrence_ids":["dddddddd-4444-4444-8444-dddddddddddd"]}"#,
+                revision: 2
+            )
+        }
+
+        let invalidReduction = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: reduced.occurrenceEvidenceID,
+            habitID: reduced.habitID,
+            sourcePlannerOccurrenceID: reduced.sourcePlannerOccurrenceID,
+            revision: reduced.revision,
+            configuredPolicy: reduced.configuredPolicy,
+            action: .reduceFrequency(suppressedPlannerOccurrenceIDs: [
+                UUID(uuidString: "dddddddd-4444-4444-8444-dddddddddddd")!,
+            ]),
+            createdAt: reduced.createdAt,
+            updatedAt: reduced.updatedAt
+        )
+        #expect(!invalidReduction.hasValidShape)
+        let context = try Context()
+        defer { context.remove() }
+        let invalidSnapshot = DayWeaveHabitClientSnapshot(
+            savedAt: reduced.updatedAt,
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "aGVhZDox",
+            deltaCaughtUp: true,
+            occurrences: [.init(
+                evidence: Self.occurrence(note: nil).evidence,
+                outcome: nil,
+                missedResolution: invalidReduction
+            )],
+            pauses: [],
+            analytics: [],
+            pendingMutations: []
+        )
+        #expect(!invalidSnapshot.hasValidShape)
+        #expect(throws: HabitPersistenceError.invalidSnapshot) {
+            try context.persistence().preflightSave(invalidSnapshot)
+        }
+    }
+
+    @Test("habit policy fingerprints match the server canonical vector")
+    func habitPolicyFingerprintContract() throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let item = try decoder.decode(DayWeaveCanonicalItem.self, from: Data(#"""
+        {
+          "id":"00112233-4455-6677-8899-aabbccddeeff","is_sensitive":false,
+          "kind":"habit","status":"scheduled","title":"Fingerprint vector","notes":null,
+          "timezone_name":"Europe/Paris","duration_kind":"range",
+          "duration_min_seconds":1200,"duration_seconds":2400,
+          "duration_max_seconds":3600,"duration_source":"user",
+          "deadline_kind":"none","deadline_at":null,"deadline_date":null,
+          "deadline_strength":null,"deadline_soft_weight":null,"earliest_start_at":null,
+          "recurrence":{"rrule":"FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=8","type":"custom"},
+          "flexible_constraints":{"habit_minimum_spacing_minutes":45,
+            "habit_missed_policy":"reduce_frequency",
+            "habit_target":{"amount":12,"unit":"reps"},
+            "preserves_streak_when_paused":false},
+          "split_policy":{"type":"splittable","minimum_chunk_seconds":600,
+            "maximum_chunk_seconds":1800},
+          "importance":50,"urgency":50,"parent_id":null,"sibling_order":0,
+          "has_own_effort":false,"blocked_reason_kind":null,"blocked_by_item_id":null,
+          "blocked_reason":null,"is_executable":true,"revision":7,
+          "created_at":"2026-09-04T10:00:00Z","updated_at":"2026-09-04T10:00:00Z",
+          "completed_at":null,"deleted_at":null
+        }
+        """#.utf8))
+
+        #expect(
+            item.habitPolicyFingerprint
+                == "sha256:4bfc50898f2b4f24cda17d040b21647e4d5ba5fe7fab7e7409024217c8249ebf"
+        )
+    }
+
+    @Test("missed review prompts require a current executable leaf and active source lifecycle")
+    func missedReviewEligibility() throws {
+        let habitID = UUID(uuidString: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")!
+        func item(
+            executable: Bool,
+            revision: UInt64 = 3,
+            title: String = "Private habit"
+        ) throws -> DayWeaveCanonicalItem {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            return try decoder.decode(DayWeaveCanonicalItem.self, from: Data("""
+            {"id":"\(habitID.uuidString.lowercased())","is_sensitive":false,
+            "kind":"habit","status":"scheduled","title":"\(title)","notes":null,
+            "timezone_name":"Europe/Paris","duration_seconds":3600,"deadline_at":null,
+            "earliest_start_at":null,"recurrence":{"type":"daily","times_per_day":1},
+            "flexible_constraints":{},"split_policy":{"type":"indivisible"},
+            "importance":50,"urgency":50,"parent_id":null,"sibling_order":0,
+            "is_executable":\(executable),"revision":\(revision),
+            "created_at":"2026-09-04T10:00:00Z","updated_at":"2026-09-04T10:00:00Z",
+            "completed_at":null,"deleted_at":null}
+            """.utf8))
+        }
+
+        let active = try item(executable: true)
+        #expect(
+            active.habitPolicyFingerprint
+                == "sha256:27ceb688ce161cdafc212a38e048744105d6cb22b79e7196d6f3327ff3c3af18"
+        )
+        let evidence = Self.evidence(
+            identity: .object([
+                "type": .string("calendar_day"),
+                "date": .string("2026-09-04"),
+                "bucket_ordinal": .number(.init(UInt64(0))),
+            ]),
+            policyFingerprint: try #require(active.habitPolicyFingerprint)
+        )
+        let resolution = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: evidence.id,
+            habitID: evidence.habitID,
+            sourcePlannerOccurrenceID: evidence.plannerOccurrenceID,
+            revision: 1,
+            configuredPolicy: .ask,
+            action: .decisionRequired,
+            createdAt: evidence.windowEnd,
+            updatedAt: evidence.windowEnd
+        )
+        let occurrence = DayWeaveHabitOccurrence(
+            evidence: evidence,
+            outcome: nil,
+            missedResolution: resolution
+        )
+        #expect(MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: active,
+            canonicalItems: [active],
+            pauses: []
+        ))
+
+        let harmlessEdit = try item(
+            executable: true,
+            revision: active.revision + 1,
+            title: "Renamed private habit"
+        )
+        #expect(MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: harmlessEdit,
+            canonicalItems: [harmlessEdit],
+            pauses: []
+        ))
+
+        var changedPolicy = active
+        changedPolicy.recurrence = .object([
+            "type": .string("daily"),
+            "times_per_day": .number(.init(UInt64(2))),
+        ])
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: changedPolicy,
+            canonicalItems: [changedPolicy],
+            pauses: []
+        ))
+
+        var terminalItem = active
+        terminalItem.status = .completed
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: terminalItem,
+            canonicalItems: [terminalItem],
+            pauses: []
+        ))
+        var blockedItem = active
+        blockedItem.status = .blocked
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: blockedItem,
+            canonicalItems: [blockedItem],
+            pauses: []
+        ))
+        var futureStatusItem = active
+        futureStatusItem.status = .unknown("future_status")
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: futureStatusItem,
+            canonicalItems: [futureStatusItem],
+            pauses: []
+        ))
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: try item(executable: false),
+            canonicalItems: [],
+            pauses: []
+        ))
+
+        var child = active
+        child.parentID = active.id
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: active,
+            canonicalItems: [active, child],
+            pauses: []
+        ))
+
+        let terminalOutcome = DayWeaveHabitOutcome(
+            revision: 1,
+            status: .completed,
+            progressBasisPoints: 10_000,
+            quantity: nil,
+            unit: nil,
+            actualSeconds: nil,
+            note: nil,
+            occurredAt: evidence.windowEnd,
+            updatedAt: evidence.windowEnd
+        )
+        #expect(!MissedHabitDecisionEligibility.allows(
+            .init(
+                evidence: evidence,
+                outcome: terminalOutcome,
+                missedResolution: resolution
+            ),
+            item: active,
+            canonicalItems: [active],
+            pauses: []
+        ))
+
+        let pause = DayWeaveHabitPause(
+            id: UUID(),
+            habitID: evidence.habitID,
+            revision: 1,
+            startedAt: evidence.windowStart,
+            endedAt: evidence.windowEnd,
+            preservesStreak: true,
+            createdAt: evidence.windowStart,
+            updatedAt: evidence.windowEnd
+        )
+        #expect(!MissedHabitDecisionEligibility.allows(
+            occurrence,
+            item: active,
+            canonicalItems: [active],
+            pauses: [pause]
+        ))
+
+        let targetEvidence = Self.evidence(
+            identity: .object([
+                "type": .string("calendar_day"),
+                "date": .string("2026-09-05"),
+                "bucket_ordinal": .number(.init(UInt64(0))),
+            ]),
+            id: UUID(uuidString: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbc")!,
+            plannerOccurrenceID: UUID(
+                uuidString: "cccccccc-3333-5333-8333-cccccccccccd"
+            )!,
+            nominalStart: Self.date("2026-09-05T12:00:00.123456Z"),
+            localDate: DayWeaveLocalDate("2026-09-05")!,
+            policyFingerprint: try #require(active.habitPolicyFingerprint)
+        )
+        let reduction = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: evidence.id,
+            habitID: evidence.habitID,
+            sourcePlannerOccurrenceID: evidence.plannerOccurrenceID,
+            revision: 2,
+            configuredPolicy: .ask,
+            action: .reduceFrequency(
+                suppressedPlannerOccurrenceIDs: [targetEvidence.plannerOccurrenceID]
+            ),
+            createdAt: evidence.windowEnd,
+            updatedAt: evidence.windowEnd
+        )
+        let targetDecision = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: targetEvidence.id,
+            habitID: targetEvidence.habitID,
+            sourcePlannerOccurrenceID: targetEvidence.plannerOccurrenceID,
+            revision: 1,
+            configuredPolicy: .ask,
+            action: .decisionRequired,
+            createdAt: targetEvidence.windowEnd,
+            updatedAt: targetEvidence.windowEnd
+        )
+        func checkpointOccurrence(
+            evidence: DayWeaveHabitOccurrenceEvidence,
+            outcome: DayWeaveHabitOutcome? = nil,
+            resolution: DayWeaveHabitMissedResolution?
+        ) -> HabitCompositionCheckpoint.Occurrence {
+            .init(
+                id: evidence.id,
+                habitID: evidence.habitID,
+                plannerOccurrenceID: evidence.plannerOccurrenceID,
+                sourceItemRevision: evidence.sourceItemRevision,
+                policyFingerprint: evidence.policyFingerprint,
+                nominalStart: evidence.nominalStart,
+                windowStart: evidence.windowStart,
+                windowEnd: evidence.windowEnd,
+                expectedDurationSeconds: evidence.expectedDurationSeconds,
+                outcome: outcome.map {
+                    .init(
+                        revision: $0.revision,
+                        status: $0.status,
+                        progressBasisPoints: $0.progressBasisPoints,
+                        occurredAt: $0.occurredAt
+                    )
+                },
+                missedResolution: resolution,
+                identity: evidence.identity,
+                nominalEnd: evidence.nominalEnd,
+                localDate: evidence.localDate
+            )
+        }
+        func decisionIDs(
+            sourceOutcome: DayWeaveHabitOutcome?,
+            includeTargetInPublication: Bool = true,
+            targetPublicationState: String = "generated",
+            proofVersion: Int = DayWeavePublishedScheduleProof.currentVersion,
+            latestHintRevision: UInt64 = 1
+        ) -> Set<UUID> {
+            let checkpoint = HabitCompositionCheckpoint(
+                configurationIdentifier: "test",
+                deltaCursor: "cursor",
+                deltaCaughtUp: true,
+                occurrences: [
+                    checkpointOccurrence(
+                        evidence: evidence,
+                        outcome: sourceOutcome,
+                        resolution: reduction
+                    ),
+                    checkpointOccurrence(
+                        evidence: targetEvidence,
+                        resolution: targetDecision
+                    ),
+                ],
+                pauses: [],
+                pendingMutationIDs: [],
+                hasActiveOperation: false,
+                operationGeneration: 1
+            )
+            let revisionID = UUID(uuidString: "dddddddd-4444-4444-8444-dddddddddddd")!
+            let membership = [
+                DayWeavePublishedScheduleOccurrenceProof(
+                    plannerOccurrenceID: evidence.plannerOccurrenceID,
+                    seriesItemID: active.id,
+                    state: "generated"
+                ),
+                includeTargetInPublication ? .init(
+                    plannerOccurrenceID: targetEvidence.plannerOccurrenceID,
+                    seriesItemID: active.id,
+                    state: targetPublicationState
+                ) : nil,
+            ]
+                .compactMap { $0 }
+                .sorted {
+                    $0.plannerOccurrenceID.uuidString
+                        < $1.plannerOccurrenceID.uuidString
+                }
+            let proof = DayWeavePublishedScheduleProof(
+                version: proofVersion,
+                configurationIdentifier: checkpoint.configurationIdentifier ?? "",
+                revisionID: revisionID,
+                revision: "1:\(revisionID.uuidString.lowercased())",
+                revisionNumber: 1,
+                inputDigest: "sha256:\(String(repeating: "a", count: 64))",
+                asOf: evidence.nominalStart,
+                horizonStart: evidence.windowStart.addingTimeInterval(-60),
+                horizonEnd: targetEvidence.windowEnd.addingTimeInterval(60),
+                timezoneName: "UTC",
+                publishedAt: evidence.nominalStart,
+                publishedBlocks: [],
+                publishedOccurrences: proofVersion
+                    == DayWeavePublishedScheduleProof.currentVersion ? membership : nil
+            )
+            return MissedHabitDecisionEligibility.effectiveDecisionIDs(
+                checkpoint: checkpoint,
+                canonicalItems: [active],
+                publishedScheduleProof: proof,
+                publishedScheduleLatestHintRevision: latestHintRevision
+            )
+        }
+        #expect(!decisionIDs(sourceOutcome: nil).contains(targetEvidence.id))
+        #expect(decisionIDs(sourceOutcome: terminalOutcome).contains(targetEvidence.id))
+        #expect(decisionIDs(
+            sourceOutcome: nil,
+            includeTargetInPublication: false
+        ).contains(targetEvidence.id))
+        #expect(decisionIDs(
+            sourceOutcome: nil,
+            targetPublicationState: "completed"
+        ).contains(targetEvidence.id))
+        #expect(!decisionIDs(
+            sourceOutcome: nil,
+            targetPublicationState: "skipped"
+        ).contains(targetEvidence.id))
+        #expect(decisionIDs(
+            sourceOutcome: nil,
+            proofVersion: 2
+        ).contains(targetEvidence.id))
+        #expect(decisionIDs(
+            sourceOutcome: nil,
+            latestHintRevision: 2
+        ).contains(targetEvidence.id))
+    }
+
+    @Test("encrypted missed-choice journals retain only server-authority inputs")
+    func encryptedMissedChoiceJournal() throws {
+        let context = try Context()
+        defer { context.remove() }
+        let occurrence = Self.occurrence(note: nil)
+        let createdAt = Self.date("2026-09-04T12:31:00.123456Z")
+        let resolution = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: occurrence.id,
+            habitID: occurrence.evidence.habitID,
+            sourcePlannerOccurrenceID: occurrence.evidence.plannerOccurrenceID,
+            revision: 1,
+            configuredPolicy: .ask,
+            action: .decisionRequired,
+            createdAt: createdAt,
+            updatedAt: createdAt
+        )
+        let authoritative = DayWeaveHabitOccurrence(
+            evidence: occurrence.evidence,
+            outcome: occurrence.outcome,
+            missedResolution: resolution
+        )
+        let operationID = UUID(uuidString: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee")!
+        let pending = DayWeavePendingHabitMutation.missedResolution(.init(
+            habitID: authoritative.evidence.habitID,
+            occurrenceID: authoritative.id,
+            idempotencyKey: "habit-missed-resolution:test",
+            command: .init(
+                operationID: operationID,
+                expectedRevision: 1,
+                action: .carry
+            ),
+            createdAt: createdAt,
+            conflictDetected: false
+        ))
+        let snapshot = DayWeaveHabitClientSnapshot(
+            savedAt: createdAt,
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "aGVhZDox",
+            deltaCaughtUp: true,
+            occurrences: [authoritative],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [pending]
+        )
+
+        _ = try context.persistence().save(snapshot, expectedRevision: .missing)
+        let restored = try #require(context.persistence().loadRevisioned().snapshot)
+        #expect(restored == snapshot)
+        guard case let .missedResolution(value) = try #require(restored.pendingMutations.first)
+        else {
+            Issue.record("Expected a missed-resolution journal")
+            return
+        }
+        #expect(value.command.action == .carry)
+        #expect(value.command.expectedRevision == 1)
+    }
+
     @Test("analytics partitions and rounded adherence must be self-consistent")
     func analyticsTotalsValidation() {
         let valid = DayWeaveHabitAnalyticsTotals(
@@ -689,6 +1246,121 @@ struct HabitModelPersistenceTests {
         #expect(restored.hasValidShape)
     }
 
+    @Test("schema-one terminal snapshots retain their cursor but require missed-resolution catch-up")
+    func schemaOneSnapshotRevokesDeltaAuthority() throws {
+        let snapshot = Self.snapshot(binding: "origin-a|auth=device-a", note: "private")
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: Self.encoder().encode(snapshot))
+                as? [String: Any]
+        )
+        object["schemaVersion"] = 1
+        let legacy = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+
+        let restored = try Self.decoder().decode(DayWeaveHabitClientSnapshot.self, from: legacy)
+
+        #expect(restored.schemaVersion == DayWeaveHabitClientSnapshot.currentSchemaVersion)
+        #expect(restored.deltaCursor == snapshot.deltaCursor)
+        #expect(!restored.deltaCaughtUp)
+        #expect(restored.hasValidShape)
+    }
+
+    @Test("authenticated schema-one snapshots cannot mint missed scheduling or replay authority")
+    func schemaOneSnapshotStripsInjectedMissedAuthority() throws {
+        let context = try Context()
+        defer { context.remove() }
+        let base = Self.occurrence(note: nil)
+        let resolutionTime = base.evidence.windowEnd
+        let resolution = DayWeaveHabitMissedResolution(
+            occurrenceEvidenceID: base.id,
+            habitID: base.evidence.habitID,
+            sourcePlannerOccurrenceID: base.evidence.plannerOccurrenceID,
+            revision: 1,
+            configuredPolicy: .ask,
+            action: .decisionRequired,
+            createdAt: resolutionTime,
+            updatedAt: resolutionTime
+        )
+        let occurrence = DayWeaveHabitOccurrence(
+            evidence: base.evidence,
+            outcome: base.outcome,
+            missedResolution: resolution
+        )
+        let reconcileOperationID = UUID(
+            uuidString: "11111111-aaaa-4aaa-8aaa-111111111111"
+        )!
+        let resolveOperationID = UUID(
+            uuidString: "22222222-bbbb-4bbb-8bbb-222222222222"
+        )!
+        let pauseOperationID = UUID(
+            uuidString: "33333333-cccc-4ccc-8ccc-333333333333"
+        )!
+        let pauseID = UUID(uuidString: "44444444-dddd-4ddd-8ddd-444444444444")!
+        let genuineLegacyMutation = DayWeavePendingHabitMutation.pauseStart(.init(
+            habitID: occurrence.evidence.habitID,
+            idempotencyKey: "habit-pause:legacy-test",
+            command: .init(
+                operationID: pauseOperationID,
+                pauseID: pauseID,
+                startedAt: resolutionTime
+            ),
+            createdAt: resolutionTime,
+            conflictDetected: false
+        ))
+        let injectedReconcile = DayWeavePendingHabitMutation.missedReconcile(.init(
+            idempotencyKey: "habit-missed-reconcile:injected-test",
+            command: .init(operationID: reconcileOperationID),
+            limit: 200,
+            createdAt: resolutionTime,
+            conflictDetected: false
+        ))
+        let injectedResolution = DayWeavePendingHabitMutation.missedResolution(.init(
+            habitID: occurrence.evidence.habitID,
+            occurrenceID: occurrence.id,
+            idempotencyKey: "habit-missed-resolution:injected-test",
+            command: .init(
+                operationID: resolveOperationID,
+                expectedRevision: resolution.revision,
+                action: .carry
+            ),
+            createdAt: resolutionTime,
+            conflictDetected: false
+        ))
+        let injected = DayWeaveHabitClientSnapshot(
+            savedAt: resolutionTime,
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "aGVhZDox",
+            deltaCaughtUp: true,
+            occurrences: [occurrence],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [
+                genuineLegacyMutation,
+                injectedReconcile,
+                injectedResolution,
+            ]
+        )
+        #expect(injected.hasValidShape)
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: Self.encoder().encode(injected))
+                as? [String: Any]
+        )
+        object["schemaVersion"] = 1
+        try Self.writeAuthenticatedSnapshot(
+            JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+            to: context.fileURL
+        )
+
+        let restored = try #require(context.persistence().loadRevisioned().snapshot)
+
+        #expect(restored.schemaVersion == DayWeaveHabitClientSnapshot.currentSchemaVersion)
+        #expect(restored.deltaCursor == injected.deltaCursor)
+        #expect(!restored.deltaCaughtUp)
+        #expect(restored.occurrences.count == 1)
+        #expect(restored.occurrences[0].missedResolution == nil)
+        #expect(restored.pendingMutations == [genuineLegacyMutation])
+        #expect(restored.hasValidShape)
+    }
+
     @Test("a terminal pagination verdict requires a durable cursor")
     func terminalDeltaRequiresCursor() {
         let invalid = DayWeaveHabitClientSnapshot(
@@ -885,7 +1557,8 @@ struct HabitModelPersistenceTests {
         localDate: DayWeaveLocalDate = DayWeaveLocalDate("2026-09-04")!,
         timezoneName: String = "Europe/Paris",
         expectedUnit: String = "pages",
-        expectedDurationSeconds: UInt64 = 3_600
+        expectedDurationSeconds: UInt64 = 3_600,
+        policyFingerprint: String = "sha256:\(String(repeating: "a", count: 64))"
     ) -> DayWeaveHabitOccurrenceEvidence {
         let resolvedEnd = nominalEnd ?? nominalStart.addingTimeInterval(3_600)
         return .init(
@@ -896,7 +1569,7 @@ struct HabitModelPersistenceTests {
                 uuidString: "dddddddd-4444-4444-8444-dddddddddddd"
             )!,
             sourceItemRevision: 3,
-            policyFingerprint: "sha256:\(String(repeating: "a", count: 64))",
+            policyFingerprint: policyFingerprint,
             identity: identity,
             nominalStart: nominalStart,
             nominalEnd: resolvedEnd,
@@ -1009,6 +1682,29 @@ struct HabitModelPersistenceTests {
             return date
         }
         return decoder
+    }
+
+    private static func writeAuthenticatedSnapshot(_ plaintext: Data, to fileURL: URL) throws {
+        let sealed = try AES.GCM.seal(
+            plaintext,
+            using: SymmetricKey(data: Data(repeating: 7, count: 32)),
+            authenticating: Data("DayWeave.HabitSnapshot|1|AES.GCM.256".utf8)
+        )
+        let combined = try #require(sealed.combined)
+        let envelope = try JSONSerialization.data(
+            withJSONObject: [
+                "cipher": "AES.GCM.256",
+                "magic": "DAYWEAVE-ENCRYPTED-HABITS",
+                "payload": combined.base64EncodedString(),
+                "version": 1,
+            ],
+            options: [.sortedKeys]
+        )
+        try envelope.write(to: fileURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o600))],
+            ofItemAtPath: fileURL.path
+        )
     }
 
     private static func date(_ text: String) -> Date {

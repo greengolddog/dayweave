@@ -6,6 +6,8 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
     case outcome(PendingOutcome)
     case pauseStart(PendingPauseStart)
     case pauseResume(PendingPauseResume)
+    case missedReconcile(PendingMissedReconcile)
+    case missedResolution(PendingMissedResolution)
 
     struct PendingOutcome: Codable, Equatable, Sendable {
         let habitID: UUID
@@ -33,27 +35,50 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
         var conflictDetected: Bool
     }
 
+    struct PendingMissedReconcile: Codable, Equatable, Sendable {
+        let idempotencyKey: String
+        let command: DayWeaveHabitMissedReconcileCommand
+        let limit: Int
+        let createdAt: Date
+        var conflictDetected: Bool
+    }
+
+    struct PendingMissedResolution: Codable, Equatable, Sendable {
+        let habitID: UUID
+        let occurrenceID: UUID
+        let idempotencyKey: String
+        let command: DayWeaveHabitMissedResolveCommand
+        let createdAt: Date
+        var conflictDetected: Bool
+    }
+
     var id: UUID {
         switch self {
         case let .outcome(value): value.command.operationID
         case let .pauseStart(value): value.command.operationID
         case let .pauseResume(value): value.command.operationID
+        case let .missedReconcile(value): value.command.operationID
+        case let .missedResolution(value): value.command.operationID
         }
     }
 
-    var habitID: UUID {
+    var habitID: UUID? {
         switch self {
         case let .outcome(value): value.habitID
         case let .pauseStart(value): value.habitID
         case let .pauseResume(value): value.habitID
+        case .missedReconcile: nil
+        case let .missedResolution(value): value.habitID
         }
     }
 
-    var targetID: UUID {
+    var targetID: UUID? {
         switch self {
         case let .outcome(value): value.occurrenceID
         case let .pauseStart(value): value.command.pauseID
         case let .pauseResume(value): value.pauseID
+        case .missedReconcile: nil
+        case let .missedResolution(value): value.occurrenceID
         }
     }
 
@@ -62,6 +87,8 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
         case let .outcome(value): value.idempotencyKey
         case let .pauseStart(value): value.idempotencyKey
         case let .pauseResume(value): value.idempotencyKey
+        case let .missedReconcile(value): value.idempotencyKey
+        case let .missedResolution(value): value.idempotencyKey
         }
     }
 
@@ -70,7 +97,14 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
         case let .outcome(value): value.conflictDetected
         case let .pauseStart(value): value.conflictDetected
         case let .pauseResume(value): value.conflictDetected
+        case let .missedReconcile(value): value.conflictDetected
+        case let .missedResolution(value): value.conflictDetected
         }
+    }
+
+    var canRequireUserConflictReview: Bool {
+        if case .missedReconcile = self { return false }
+        return true
     }
 
     func markingConflict() -> Self {
@@ -84,13 +118,19 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
         case var .pauseResume(value):
             value.conflictDetected = true
             return .pauseResume(value)
+        case var .missedReconcile(value):
+            value.conflictDetected = true
+            return .missedReconcile(value)
+        case var .missedResolution(value):
+            value.conflictDetected = true
+            return .missedResolution(value)
         }
     }
 
     var hasValidShape: Bool {
         let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
         guard id != nilID,
-              habitID != nilID,
+              habitID.map({ $0 != nilID }) ?? true,
               Self.isValidIdempotencyKey(idempotencyKey) else { return false }
         switch self {
         case let .outcome(value):
@@ -107,6 +147,18 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
                 && value.command.operationID == id
                 && value.command.hasValidShape
                 && value.createdAt.timeIntervalSinceReferenceDate.isFinite
+        case let .missedReconcile(value):
+            return value.command.operationID == id
+                && value.command.hasValidShape
+                && (1...200).contains(value.limit)
+                && value.createdAt.timeIntervalSinceReferenceDate.isFinite
+                && !value.conflictDetected
+        case let .missedResolution(value):
+            return value.habitID != nilID
+                && value.occurrenceID != nilID
+                && value.command.operationID == id
+                && value.command.hasValidShape
+                && value.createdAt.timeIntervalSinceReferenceDate.isFinite
         }
     }
 
@@ -119,7 +171,7 @@ enum DayWeavePendingHabitMutation: Codable, Equatable, Identifiable, Sendable {
 }
 
 struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
     static let maximumOccurrences = 20_000
     static let maximumPauses = 2_000
     static let maximumAnalytics = 2_000
@@ -184,7 +236,10 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
               deltaCursor.map(Self.isValidCursor) ?? true,
               !deltaCaughtUp || deltaCursor != nil,
               occurrences.allSatisfy({
-                  $0.evidence.hasValidShape && ($0.outcome?.hasValidShape ?? true)
+                  $0.evidence.hasValidShape
+                      && ($0.outcome?.hasValidShape ?? true)
+                      && ($0.missedResolution?.hasValidShape ?? true)
+                      && ($0.missedResolution?.belongs(to: $0.evidence) ?? true)
               }),
               pauses.allSatisfy(\.hasValidShape),
               analytics.allSatisfy(\.hasValidShape),
@@ -225,13 +280,22 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
     /// authoritative delta advances or removes its original target.
     private var hasValidPendingMutationRelations: Bool {
         let unresolved = pendingMutations.filter { !$0.conflictDetected }
-        let targets = unresolved.map { HabitMutationTarget(habitID: $0.habitID, id: $0.targetID) }
+        let targets = unresolved.compactMap { mutation -> HabitMutationTarget? in
+            guard let habitID = mutation.habitID, let targetID = mutation.targetID else { return nil }
+            return HabitMutationTarget(habitID: habitID, id: targetID)
+        }
         guard Set(targets).count == targets.count else { return false }
         let pauseHabits = unresolved.compactMap { mutation -> UUID? in
-            if case .outcome = mutation { return nil }
-            return mutation.habitID
+            switch mutation {
+            case .pauseStart, .pauseResume: return mutation.habitID
+            default: return nil
+            }
         }
         guard Set(pauseHabits).count == pauseHabits.count else { return false }
+        guard unresolved.count(where: {
+            if case .missedReconcile = $0 { return true }
+            return false
+        }) <= 1 else { return false }
 
         let occurrenceByID = Dictionary(uniqueKeysWithValues: occurrences.map { ($0.id, $0) })
         let pauseByID = Dictionary(uniqueKeysWithValues: pauses.map { ($0.id, $0) })
@@ -259,6 +323,16 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
                       pause.endedAt == nil,
                       pause.revision == value.command.expectedRevision,
                       value.command.endedAt > pause.startedAt else { return false }
+            case .missedReconcile:
+                break
+            case let .missedResolution(value):
+                guard let occurrence = occurrenceByID[value.occurrenceID],
+                      occurrence.evidence.habitID == value.habitID,
+                      let resolution = occurrence.missedResolution,
+                      resolution.action.isDecisionRequired,
+                      resolution.revision == value.command.expectedRevision else {
+                    return false
+                }
             }
         }
         return true
@@ -278,7 +352,8 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        let storedSchemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        schemaVersion = storedSchemaVersion == 1 ? Self.currentSchemaVersion : storedSchemaVersion
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         configurationIdentifier = try container.decodeIfPresent(
             String.self,
@@ -287,7 +362,14 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
         let decodedCursor = try container.decodeIfPresent(String.self, forKey: .deltaCursor)
         if container.contains(.deltaCaughtUp) {
             deltaCursor = decodedCursor
-            deltaCaughtUp = try container.decode(Bool.self, forKey: .deltaCaughtUp)
+            let decodedCaughtUp = try container.decode(Bool.self, forKey: .deltaCaughtUp)
+            // Schema 1 predates missed-resolution replication. Its terminal
+            // cursor cannot prove that coordinate was reconciled, so retain
+            // the incremental cursor but revoke composition authority until
+            // a new terminal delta page is durably committed.
+            deltaCaughtUp = storedSchemaVersion == Self.currentSchemaVersion
+                ? decodedCaughtUp
+                : false
         } else {
             // Legacy clients bounded occurrence history without retaining every
             // correction-safe completion anchor. Their tail cursor cannot
@@ -295,13 +377,43 @@ struct DayWeaveHabitClientSnapshot: Codable, Equatable, Sendable {
             deltaCursor = nil
             deltaCaughtUp = false
         }
-        occurrences = try container.decode([DayWeaveHabitOccurrence].self, forKey: .occurrences)
+        let decodedOccurrences = try container.decode(
+            [DayWeaveHabitOccurrence].self,
+            forKey: .occurrences
+        )
+        if storedSchemaVersion == 1 {
+            // Schema 1 could not create a missed-resolution projection. Strip a
+            // relabelled newer field before the migrated snapshot can regain
+            // composition authority after its next terminal delta page.
+            occurrences = decodedOccurrences.map { occurrence in
+                .init(
+                    evidence: occurrence.evidence,
+                    outcome: occurrence.outcome,
+                    missedResolution: nil
+                )
+            }
+        } else {
+            occurrences = decodedOccurrences
+        }
         pauses = try container.decode([DayWeaveHabitPause].self, forKey: .pauses)
         analytics = try container.decode([DayWeaveHabitAnalytics].self, forKey: .analytics)
-        pendingMutations = try container.decode(
+        let decodedPendingMutations = try container.decode(
             [DayWeavePendingHabitMutation].self,
             forKey: .pendingMutations
         )
+        if storedSchemaVersion == 1 {
+            // Likewise, the predecessor format cannot mint either of the new
+            // missed-occurrence replay authorities by carrying a future enum
+            // case under an old schema label. Preserve every genuine v1 write.
+            pendingMutations = decodedPendingMutations.filter { mutation in
+                switch mutation {
+                case .outcome, .pauseStart, .pauseResume: true
+                case .missedReconcile, .missedResolution: false
+                }
+            }
+        } else {
+            pendingMutations = decodedPendingMutations
+        }
     }
 
     private static func isValidBinding(_ value: String) -> Bool {

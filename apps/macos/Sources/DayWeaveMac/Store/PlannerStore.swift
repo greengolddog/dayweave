@@ -106,6 +106,21 @@ enum PlannerScheduleReplicaError: LocalizedError, Equatable, Sendable {
     }
 }
 
+/// One-use authority to lower the durable schedule revision after the server
+/// rejects that exact cursor as ahead of its current epoch. The credential
+/// binding and rejected high-water are checked again inside PlannerStore so a
+/// raced newer hint or configuration change cannot reuse an older 409.
+struct PlannerScheduleRevisionEpochResetFence: Equatable, Sendable {
+    let configurationIdentifier: String
+    let rejectedRevision: UInt64
+
+    var hasValidShape: Bool {
+        !configurationIdentifier.isEmpty
+            && rejectedRevision > 0
+            && rejectedRevision <= UInt64(Int64.max)
+    }
+}
+
 enum PlannerLocalCompositionError: LocalizedError, Equatable, Sendable {
     case encryptedPersistenceRequired
     case mutationFenceUnavailable
@@ -392,6 +407,12 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var publishedScheduleProof: DayWeavePublishedScheduleProof? {
         didSet { scheduleAutosave() }
     }
+    /// Durable monotonic evidence from the authenticated schedule stream.
+    /// A proof below this observed head cannot authorize missed-target
+    /// suppression, including after a failed refresh and offline relaunch.
+    @Published private(set) var publishedScheduleLatestHintRevision: UInt64 {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var onboardingFirstItemAnchor:
         DayWeaveOnboardingFirstItemAnchor? {
         didSet { scheduleAutosave() }
@@ -522,6 +543,7 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
+        publishedScheduleLatestHintRevision: UInt64? = nil,
         onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor? = nil,
         localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
@@ -605,6 +627,11 @@ final class PlannerStore: ObservableObject {
             ? publishedScheduleProof
             : restoredSnapshot?.publishedScheduleProof
         self.publishedScheduleProof = initialPublishedScheduleProof
+        self.publishedScheduleLatestHintRevision = restoredSnapshot?
+            .publishedScheduleLatestHintRevision
+            ?? publishedScheduleLatestHintRevision
+            ?? initialPublishedScheduleProof?.revisionNumber
+            ?? 0
         let initialOnboardingFirstItemAnchor = restoredSnapshot == nil
             ? onboardingFirstItemAnchor
             : restoredSnapshot?.onboardingFirstItemAnchor
@@ -631,12 +658,20 @@ final class PlannerStore: ObservableObject {
             : restoredSnapshot?.pendingSchedulePublication
         self.pendingSchedulePublication = initialPendingSchedulePublication
         if initialPublishedScheduleProof.map({ proof in
-            !proof.hasValidShape
-                || proof.configurationIdentifier
-                    != initialCanonicalConfigurationIdentifier
-                || initialSchedulePreviewProvenance.map(proof.matches) != true
-                || initialLocalScheduleCompositionProvenance != nil
-                || !proof.matchesPublishedPlan(initialBlocks)
+            guard proof.hasValidShape,
+                  proof.configurationIdentifier
+                    == initialCanonicalConfigurationIdentifier else { return true }
+            if let initialSchedulePreviewProvenance {
+                return initialLocalScheduleCompositionProvenance != nil
+                    || !proof.matches(initialSchedulePreviewProvenance)
+                    || !proof.matchesPublishedPlan(initialBlocks)
+            }
+            // A local composition replaces the rendered blocks, not the
+            // server's current occurrence-membership head. Only a v3 proof can
+            // survive that transition, and it grants no block authority while
+            // the server preview provenance is absent.
+            return initialLocalScheduleCompositionProvenance == nil
+                || !proof.hasCurrentOccurrenceMembershipSeal
         }) == true {
             restorationError = .snapshotDecodingFailed
         }
@@ -902,6 +937,13 @@ final class PlannerStore: ObservableObject {
         loadState == .ready
     }
 
+    /// A nil value means the encrypted planner snapshot is not trustworthy, so
+    /// another store must not evict occurrence authority using an empty move set.
+    var habitRetentionProtectedPlannerOccurrenceIDs: Set<UUID>? {
+        guard canPersistPlan else { return nil }
+        return Set(recurrenceOccurrenceMoves.map(\.occurrenceID))
+    }
+
     var canMutatePlan: Bool {
         canPersistPlan
             && !isCanonicalSyncLocked
@@ -1132,6 +1174,39 @@ final class PlannerStore: ObservableObject {
         isCanonicalPreviewValidatedForCurrentLaunch = false
     }
 
+    private func observePublishedScheduleRevisionHintInMemory(_ revision: UInt64) {
+        guard revision > 0, revision <= UInt64(Int64.max) else { return }
+        publishedScheduleLatestHintRevision = max(
+            publishedScheduleLatestHintRevision,
+            revision
+        )
+    }
+
+    /// Persists a newer authenticated schedule head before callers may treat
+    /// the hint as accepted. A failed encrypted CAS/write restores the prior
+    /// in-memory high-water, so neither the old proof nor an uncommitted hint
+    /// can accidentally become authoritative in this process.
+    func persistPublishedScheduleRevisionHint(_ revision: UInt64) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerScheduleReplicaError.encryptedPersistenceRequired
+        }
+        guard revision > 0, revision <= UInt64(Int64.max) else {
+            throw PlannerScheduleReplicaError.invalidPublication
+        }
+        guard revision > publishedScheduleLatestHintRevision else { return }
+        let priorRevision = publishedScheduleLatestHintRevision
+        observePublishedScheduleRevisionHintInMemory(revision)
+        flushPersistence()
+        if let persistenceError {
+            publishedScheduleLatestHintRevision = priorRevision
+            throw persistenceError
+        }
+    }
+
+    private func reconcilePublishedScheduleRevisionHead(_ revision: UInt64?) {
+        publishedScheduleLatestHintRevision = revision ?? 0
+    }
+
     func resetCanonicalSyncState() {
         guard canMutatePlan,
               !executionState.hasCredentialReplacementBlocker,
@@ -1165,6 +1240,7 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         publishedScheduleProof = nil
+        reconcilePublishedScheduleRevisionHead(nil)
         localScheduleCompositionProvenance = nil
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
@@ -1231,15 +1307,18 @@ final class PlannerStore: ObservableObject {
             guard provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
                 return "The visible preview is not bound to the active API configuration."
             }
+            if let proof = publishedScheduleProof,
+               proof.configurationIdentifier == canonicalConfigurationIdentifier,
+               proof.revisionNumber != publishedScheduleLatestHintRevision {
+                return "A newer published schedule is available. Sync it before changing canonical schedule blocks."
+            }
             generatedAt = provenance.generatedAt
             asOf = provenance.asOf
             horizonStart = provenance.horizonStart
             horizonEnd = provenance.horizonEnd
             timezoneName = provenance.timezoneName
-            requiresLocalProfileTimezone = publishedScheduleProof.map { proof in
-                proof.hasCurrentImmutablePlanSeal
-                    && proof.configurationIdentifier == canonicalConfigurationIdentifier
-                    && proof.matches(provenance)
+            requiresLocalProfileTimezone = currentPublishedScheduleProofAuthority.map { proof in
+                proof.matches(provenance)
                     && proof.matchesPublishedPlan(blocks)
             } != true
         } else {
@@ -1297,6 +1376,20 @@ final class PlannerStore: ObservableObject {
         }
     }
 
+    /// Publication-derived actions are valid only at the exact newest
+    /// authenticated head observed for this credential binding. A newer SSE
+    /// hint keeps the old blocks visible but revokes every action until the
+    /// authoritative current resource is durably installed.
+    var currentPublishedScheduleProofAuthority: DayWeavePublishedScheduleProof? {
+        guard let proof = publishedScheduleProof,
+              proof.hasCurrentImmutablePlanSeal,
+              proof.configurationIdentifier == canonicalConfigurationIdentifier,
+              proof.revisionNumber == publishedScheduleLatestHintRevision else {
+            return nil
+        }
+        return proof
+    }
+
     /// A proven immutable replica carries its own planning timezone. The local
     /// profile remains the input for the next composition, but cannot reinterpret
     /// the calendar day of the currently authoritative published plan.
@@ -1332,8 +1425,7 @@ final class PlannerStore: ObservableObject {
             return "Publish the deferred work's replacement placement before starting another session."
         }
         guard let provenance = schedulePreviewProvenance,
-              let proof = publishedScheduleProof,
-              proof.configurationIdentifier == canonicalConfigurationIdentifier,
+              let proof = currentPublishedScheduleProofAuthority,
               proof.matches(provenance),
               proof.matches(block) else {
             return "This block has no durable exact publication proof. Sync and publish the schedule again."
@@ -1373,11 +1465,10 @@ final class PlannerStore: ObservableObject {
         let loadedDayReference: Date
         if block.sourceItemID != nil {
             guard let provenance = schedulePreviewProvenance,
-                  let proof = publishedScheduleProof,
+                  let proof = currentPublishedScheduleProofAuthority,
                   block.syncOrigin == .canonicalPreview,
                   pendingSchedulePublication == nil,
                   deferredExecutionPublicationSessionIDs.isEmpty,
-                  proof.configurationIdentifier == canonicalConfigurationIdentifier,
                   proof.matches(provenance),
                   proof.matches(block),
                   proof.matchesPublishedPlan(blocks),
@@ -1420,6 +1511,7 @@ final class PlannerStore: ObservableObject {
             || !pendingPublicationDeferredSessionIDs.isEmpty
             || schedulePreviewProvenance != nil
             || publishedScheduleProof != nil
+            || publishedScheduleLatestHintRevision != 0
             || localScheduleCompositionProvenance != nil
             || pendingSchedulePublication != nil
             || pendingProposalApplicationMutation != nil
@@ -3043,6 +3135,7 @@ final class PlannerStore: ObservableObject {
             revision: response.revision,
             renderedBlocks: newBlocks
         ), publicationProof.hasCurrentImmutablePlanSeal,
+           publicationProof.revisionNumber >= publishedScheduleLatestHintRevision,
            publicationProof.matchesPublishedPlan(newBlocks) else {
             throw PlannerSchedulePublicationError.invalidJournal
         }
@@ -3050,6 +3143,8 @@ final class PlannerStore: ObservableObject {
         let priorSelection = selectedBlockID
         let priorProvenance = schedulePreviewProvenance
         let priorPublishedScheduleProof = publishedScheduleProof
+        let priorPublishedScheduleLatestHintRevision =
+            publishedScheduleLatestHintRevision
         let priorLocalProvenance = localScheduleCompositionProvenance
         let priorExecutionState = executionState
         let priorDeferredPublicationSessionIDs = deferredExecutionPublicationSessionIDs
@@ -3062,6 +3157,7 @@ final class PlannerStore: ObservableObject {
             provenance: publication.provenance
         )
         publishedScheduleProof = publicationProof
+        observePublishedScheduleRevisionHintInMemory(publicationProof.revisionNumber)
         reconcileOutstandingDeferredPublicationProof(
             authorizedSessionIDs: pendingPublicationDeferredSessionIDs
         )
@@ -3073,6 +3169,8 @@ final class PlannerStore: ObservableObject {
             selectedBlockID = priorSelection
             schedulePreviewProvenance = priorProvenance
             publishedScheduleProof = priorPublishedScheduleProof
+            publishedScheduleLatestHintRevision =
+                priorPublishedScheduleLatestHintRevision
             localScheduleCompositionProvenance = priorLocalProvenance
             executionState = priorExecutionState
             deferredExecutionPublicationSessionIDs = priorDeferredPublicationSessionIDs
@@ -3094,7 +3192,8 @@ final class PlannerStore: ObservableObject {
         _ publication: DayWeaveCurrentPublishedSchedule,
         blocks newBlocks: [ScheduleBlock],
         configurationIdentifier: String,
-        message: String
+        message: String,
+        revisionEpochResetFence: PlannerScheduleRevisionEpochResetFence? = nil
     ) throws {
         guard hasEncryptedPersistence, canPersistPlan else {
             throw PlannerScheduleReplicaError.encryptedPersistenceRequired
@@ -3122,6 +3221,11 @@ final class PlannerStore: ObservableObject {
             horizonEnd: publication.schedule.plan.horizonEnd,
             timezoneName: publication.revision.timezoneName
         )
+        let epochResetIsAuthorized = revisionEpochResetFence.map { fence in
+            fence.hasValidShape
+                && fence.configurationIdentifier == configurationIdentifier
+                && fence.rejectedRevision == publishedScheduleLatestHintRevision
+        } == true
         guard publication.schedule.sourceItemRevisions == currentRevisions,
               let proof = DayWeavePublishedScheduleProof(
                   current: publication,
@@ -3129,6 +3233,8 @@ final class PlannerStore: ObservableObject {
                   renderedBlocks: newBlocks
               ),
               proof.hasCurrentImmutablePlanSeal,
+              epochResetIsAuthorized
+                || proof.revisionNumber >= publishedScheduleLatestHintRevision,
               proof.matches(provenance),
               proof.matchesPublishedPlan(newBlocks) else {
             throw PlannerScheduleReplicaError.invalidPublication
@@ -3138,6 +3244,8 @@ final class PlannerStore: ObservableObject {
         let priorSelection = selectedBlockID
         let priorProvenance = schedulePreviewProvenance
         let priorProof = publishedScheduleProof
+        let priorPublishedScheduleLatestHintRevision =
+            publishedScheduleLatestHintRevision
         let priorLocalProvenance = localScheduleCompositionProvenance
         let priorExecutionState = executionState
         let priorDeferredSessionIDs = deferredExecutionPublicationSessionIDs
@@ -3149,6 +3257,7 @@ final class PlannerStore: ObservableObject {
             provenance: provenance
         )
         publishedScheduleProof = proof
+        reconcilePublishedScheduleRevisionHead(proof.revisionNumber)
         reconcileOutstandingDeferredPublicationProof(
             authorizedSessionIDs: deferredExecutionPublicationSessionIDs
         )
@@ -3158,6 +3267,8 @@ final class PlannerStore: ObservableObject {
             selectedBlockID = priorSelection
             schedulePreviewProvenance = priorProvenance
             publishedScheduleProof = priorProof
+            publishedScheduleLatestHintRevision =
+                priorPublishedScheduleLatestHintRevision
             localScheduleCompositionProvenance = priorLocalProvenance
             executionState = priorExecutionState
             deferredExecutionPublicationSessionIDs = priorDeferredSessionIDs
@@ -3172,7 +3283,8 @@ final class PlannerStore: ObservableObject {
     /// local-only captures or an on-device composition. Generic 404 responses
     /// never reach this method.
     func clearCurrentPublishedSchedule(
-        configurationIdentifier: String
+        configurationIdentifier: String,
+        revisionEpochResetFence: PlannerScheduleRevisionEpochResetFence? = nil
     ) throws {
         guard hasEncryptedPersistence, canPersistPlan else {
             throw PlannerScheduleReplicaError.encryptedPersistenceRequired
@@ -3186,12 +3298,27 @@ final class PlannerStore: ObservableObject {
         guard canonicalConfigurationIdentifier == configurationIdentifier else {
             throw PlannerScheduleReplicaError.configurationMismatch
         }
-        guard schedulePreviewProvenance != nil || publishedScheduleProof != nil else { return }
+        let epochResetIsAuthorized = revisionEpochResetFence.map { fence in
+            fence.hasValidShape
+                && fence.configurationIdentifier == configurationIdentifier
+                && fence.rejectedRevision == publishedScheduleLatestHintRevision
+        } == true
+        guard publishedScheduleLatestHintRevision == 0 || epochResetIsAuthorized else {
+            throw PlannerScheduleReplicaError.invalidPublication
+        }
+        // A failed current-schedule fetch can leave only an authenticated,
+        // durable SSE high-water. Absence may clear it only when the server
+        // first rejected that exact cursor as belonging to an older epoch.
+        guard schedulePreviewProvenance != nil
+                || publishedScheduleProof != nil
+                || publishedScheduleLatestHintRevision != 0 else { return }
 
         let priorBlocks = blocks
         let priorSelection = selectedBlockID
         let priorProvenance = schedulePreviewProvenance
         let priorProof = publishedScheduleProof
+        let priorPublishedScheduleLatestHintRevision =
+            publishedScheduleLatestHintRevision
         let priorMessage = lastScheduleMessage
 
         blocks.removeAll {
@@ -3199,6 +3326,7 @@ final class PlannerStore: ObservableObject {
         }
         schedulePreviewProvenance = nil
         publishedScheduleProof = nil
+        reconcilePublishedScheduleRevisionHead(nil)
         isCanonicalPreviewValidatedForCurrentLaunch = localScheduleCompositionProvenance != nil
         selectedBlockID = blocks.first(where: { $0.id == priorSelection })?.id ?? blocks.first?.id
         lastScheduleMessage = "No schedule is currently published on this workspace"
@@ -3208,6 +3336,8 @@ final class PlannerStore: ObservableObject {
             selectedBlockID = priorSelection
             schedulePreviewProvenance = priorProvenance
             publishedScheduleProof = priorProof
+            publishedScheduleLatestHintRevision =
+                priorPublishedScheduleLatestHintRevision
             lastScheduleMessage = priorMessage
             isCanonicalPreviewValidatedForCurrentLaunch = false
             throw persistenceError
@@ -3578,7 +3708,9 @@ final class PlannerStore: ObservableObject {
             blocks[index].syncOrigin = .localComposition
         }
         schedulePreviewProvenance = nil
-        publishedScheduleProof = nil
+        if publishedScheduleProof?.hasCurrentOccurrenceMembershipSeal != true {
+            publishedScheduleProof = nil
+        }
         localScheduleCompositionProvenance = provenance
         isCanonicalPreviewValidatedForCurrentLaunch = true
     }
@@ -3717,7 +3849,7 @@ final class PlannerStore: ObservableObject {
         onboardingFirstItemAnchor?.hasExactPublishedPlanProof(
             canonicalItems: canonicalItems,
             pendingAuthoringMutations: pendingCanonicalAuthoringMutations,
-            publishedScheduleProof: publishedScheduleProof
+            publishedScheduleProof: currentPublishedScheduleProofAuthority
         ) == true
     }
 
@@ -5055,6 +5187,7 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         publishedScheduleProof = nil
+        reconcilePublishedScheduleRevisionHead(nil)
         localScheduleCompositionProvenance = nil
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
@@ -6223,6 +6356,8 @@ final class PlannerStore: ObservableObject {
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
             publishedScheduleProof: publishedScheduleProof,
+            publishedScheduleLatestHintRevision:
+                publishedScheduleLatestHintRevision,
             onboardingFirstItemAnchor: onboardingFirstItemAnchor,
             localScheduleCompositionProvenance: localScheduleCompositionProvenance,
             pendingSchedulePublication: pendingSchedulePublication,
@@ -6512,18 +6647,32 @@ extension PlannerStore: GoogleSchedulePublicationRecoveryStoring {
               ) else {
             throw PlannerGoogleSchedulePublicationRecoveryError.journalConflict
         }
-        if googleSchedulePublicationRecoveryJournal == nil {
-            guard googleOutboundRecoveryJournal == nil,
-                  let proof = publishedScheduleProof,
-                  proof.hasCurrentImmutablePlanSeal,
+        let existing = googleSchedulePublicationRecoveryJournal
+        if existing == nil {
+            guard googleOutboundRecoveryJournal == nil else {
+                throw PlannerGoogleSchedulePublicationRecoveryError
+                    .currentPublishedScheduleRequired
+            }
+        }
+        // Preview, one-shot approval, and enqueue all derive authority from
+        // the exact schedule revision. A newer authenticated schedule head
+        // revokes those transitions even when their journal was opened before
+        // the hint arrived. Once provider I/O has started, however, its exact
+        // approved -> accepted receipt must be durably recorded even if a new
+        // head arrives in flight; accepted jobs may then be polled or cleaned up.
+        let isPostEnqueueAcceptanceReceipt = existing?.stage == .approved
+            && journal.stage == .accepted
+        if existing?.stage != .accepted && !isPostEnqueueAcceptanceReceipt {
+            guard let proof = currentPublishedScheduleProofAuthority,
                   proof.revisionID == journal.expectedScheduleRevisionID,
-                  proof.configurationIdentifier == journal.configurationIdentifier,
+                  proof.configurationIdentifier
+                    == journal.configurationIdentifier,
                   proof.matchesPublishedPlan(blocks) else {
                 throw PlannerGoogleSchedulePublicationRecoveryError
                     .currentPublishedScheduleRequired
             }
         }
-        guard googleSchedulePublicationRecoveryJournal != journal else { return }
+        guard existing != journal else { return }
 
         let previous = googleSchedulePublicationRecoveryJournal
         googleSchedulePublicationRecoveryJournal = journal

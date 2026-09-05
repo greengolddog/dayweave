@@ -86,7 +86,7 @@ struct HabitAPIClientTests {
             URLProtocolStub.storage.enqueue(
                 key: Self.token,
                 Self.response(Data(
-                    "{\"occurrences\":[{\"evidence\":\(evidence),\"outcome\":null}],\"next_cursor\":null,\"has_more\":false}"
+                    "{\"occurrences\":[{\"evidence\":\(evidence),\"outcome\":null,\"missed_resolution\":null}],\"next_cursor\":null,\"has_more\":false}"
                         .utf8
                 ))
             )
@@ -175,6 +175,57 @@ struct HabitAPIClientTests {
         #expect(value.id == Self.occurrenceID)
     }
 
+    @Test("authenticated occurrence responses require the nullable missed-resolution member")
+    func requiredMissedResolutionMember() async {
+        let missing = Self.occurrence(
+            outcome: "null",
+            includesMissedResolution: false
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            Self.response(Data(
+                "{\"occurrences\":[\(missing)],\"next_cursor\":null,\"has_more\":false}"
+                    .utf8
+            )),
+            Self.response(
+                Data("{\"occurrence\":\(missing),\"replayed\":false}".utf8),
+                replayed: false
+            ),
+            Self.response(Data(
+                "{\"changes\":[{\"type\":\"occurrence_upsert\",\"occurrence\":\(missing)}],\"next_cursor\":\"aGVhZDox\",\"has_more\":false}"
+                    .utf8
+            ))
+        )
+        let client = makeClient()
+
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            try await client.habitOccurrences(
+                habitID: Self.habitID,
+                startDate: DayWeaveLocalDate("2026-09-01")!,
+                endDate: DayWeaveLocalDate("2026-09-07")!,
+                cursor: nil,
+                limit: 100
+            )
+        }
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            try await client.putHabitOutcome(
+                habitID: Self.habitID,
+                occurrenceID: Self.occurrenceID,
+                command: .init(
+                    operationID: UUID(uuidString: "12121212-1212-4212-8212-121212121212")!,
+                    expectedRevision: 0,
+                    outcome: .completed(
+                        occurredAt: Self.date("2026-09-04T12:30:00.000000Z")
+                    )
+                ),
+                idempotencyKey: "habit-operation:missing-missed-resolution"
+            )
+        }
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            try await client.habitDelta(cursor: nil, limit: 100)
+        }
+    }
+
     @Test("response echo accepts the exact transmitted microsecond for a finer in-memory Date")
     func submicrosecondOutcomeEcho() async throws {
         let occurredAt = Date(timeIntervalSince1970: 1_788_527_800.123_456_7)
@@ -252,6 +303,103 @@ struct HabitAPIClientTests {
             "/gateway/v1/habits/\(Self.habitID.uuidString.lowercased())/pauses",
             "/gateway/v1/habits/\(Self.habitID.uuidString.lowercased())/pauses/\(pauseID.uuidString.lowercased())/resume",
         ])
+    }
+
+    @Test("missed reconciliation is bounded, idempotent, and accepts only server-derived actions")
+    func missedReconcileContract() async throws {
+        let operationID = UUID(uuidString: "abababab-1111-4111-8111-abababababab")!
+        let resolution = Self.missedResolution(
+            action: #"{"type":"carry","window_start":"2026-09-04T12:30:00.000000Z","window_end":"2026-09-05T12:30:00.000000Z"}"#
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            Self.response(
+                Data("{\"resolutions\":[\(resolution)],\"has_more\":false,\"replayed\":false}".utf8),
+                replayed: false
+            )
+        )
+
+        let response = try await makeClient().reconcileMissedHabitOccurrences(
+            command: .init(operationID: operationID),
+            limit: 17,
+            idempotencyKey: "habit-missed-reconcile:test"
+        )
+
+        #expect(response.resolutions.count == 1)
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.token).first)
+        #expect(request.method == "POST")
+        #expect(request.url.path == "/gateway/v1/habits/missed/reconcile")
+        #expect(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems == [.init(name: "limit", value: "17")])
+        #expect(request.headers["Idempotency-Key"] == "habit-missed-reconcile:test")
+        #expect(request.jsonBody?["operation_id"] as? String == operationID.uuidString)
+    }
+
+    @Test("missed decisions send no caller window or target and accept matching race cancellation")
+    func missedResolutionContract() async throws {
+        let carryOperationID = UUID(uuidString: "abababab-2222-4222-8222-abababababab")!
+        let reduceOperationID = UUID(uuidString: "abababab-3333-4333-8333-abababababab")!
+        let carry = Self.missedResolution(
+            action: #"{"type":"carry","window_start":"2026-09-04T12:30:00.000000Z","window_end":"2026-09-05T12:30:00.000000Z"}"#
+        )
+        let cancelled = Self.missedResolution(
+            action: #"{"type":"cancelled","reason":"source_completed","resume_action":"reduce_frequency"}"#
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            Self.response(Data("{\"resolution\":\(carry),\"replayed\":false}".utf8), replayed: false),
+            Self.response(Data("{\"resolution\":\(cancelled),\"replayed\":false}".utf8), replayed: false)
+        )
+        let client = makeClient()
+
+        _ = try await client.resolveMissedHabitOccurrence(
+            habitID: Self.habitID,
+            occurrenceID: Self.occurrenceID,
+            command: .init(operationID: carryOperationID, expectedRevision: 1, action: .carry),
+            idempotencyKey: "habit-missed-resolution:carry"
+        )
+        _ = try await client.resolveMissedHabitOccurrence(
+            habitID: Self.habitID,
+            occurrenceID: Self.occurrenceID,
+            command: .init(
+                operationID: reduceOperationID,
+                expectedRevision: 1,
+                action: .reduceFrequency
+            ),
+            idempotencyKey: "habit-missed-resolution:reduce"
+        )
+
+        let requests = URLProtocolStub.storage.requests(for: Self.token)
+        #expect(requests.map(\.url.path) == [
+            "/gateway/v1/habits/\(Self.habitID.uuidString.lowercased())/occurrences/\(Self.occurrenceID.uuidString.lowercased())/missed-resolution",
+            "/gateway/v1/habits/\(Self.habitID.uuidString.lowercased())/occurrences/\(Self.occurrenceID.uuidString.lowercased())/missed-resolution",
+        ])
+        for request in requests {
+            let body = try #require(request.jsonBody)
+            #expect(body["carry_window_start"] == nil)
+            #expect(body["suppressed_planner_occurrence_ids"] == nil)
+            #expect(Set(body.keys) == ["operation_id", "expected_revision", "action"])
+        }
+    }
+
+    @Test("a cancelled missed decision must retain the selected action family")
+    func mismatchedMissedCancellation() async {
+        let cancelled = Self.missedResolution(
+            action: #"{"type":"cancelled","reason":"source_paused","resume_action":"carry"}"#
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            Self.response(Data("{\"resolution\":\(cancelled),\"replayed\":false}".utf8), replayed: false)
+        )
+
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            try await makeClient().resolveMissedHabitOccurrence(
+                habitID: Self.habitID,
+                occurrenceID: Self.occurrenceID,
+                command: .init(operationID: UUID(), expectedRevision: 1, action: .skip),
+                idempotencyKey: "habit-missed-resolution:mismatch"
+            )
+        }
     }
 
     @Test("analytics unwraps deterministic totals and supportive fact codes")
@@ -383,8 +531,18 @@ struct HabitAPIClientTests {
         Data("{\"occurrences\":[\(occurrence(outcome: "null"))],\"next_cursor\":null,\"has_more\":false}".utf8)
     }
 
-    private static func occurrence(outcome: String) -> String {
-        "{\"evidence\":\(evidence),\"outcome\":\(outcome)}"
+    private static func occurrence(
+        outcome: String,
+        includesMissedResolution: Bool = true
+    ) -> String {
+        let missedResolution = includesMissedResolution ? ",\"missed_resolution\":null" : ""
+        return "{\"evidence\":\(evidence),\"outcome\":\(outcome)\(missedResolution)}"
+    }
+
+    private static func missedResolution(action: String) -> String {
+        """
+        {"occurrence_evidence_id":"\(occurrenceID.uuidString.lowercased())","habit_id":"\(habitID.uuidString.lowercased())","source_planner_occurrence_id":"\(plannerOccurrenceID.uuidString.lowercased())","revision":2,"configured_policy":"ask","action":\(action),"created_at":"2026-09-04T12:00:00.000000Z","updated_at":"2026-09-04T12:30:00.000000Z"}
+        """
     }
 
     private static let evidence = """

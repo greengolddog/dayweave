@@ -67,6 +67,71 @@ struct HabitSyncStoreTests {
         #expect(disk.occurrences.first?.outcome?.note == "felt steady")
     }
 
+    @Test("an outcome acknowledgement merges an independently advanced missed decision")
+    func outcomeResponseMergesAdvancedMissedCoordinate() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            outcomeMode: .advancedMissed
+        )
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .success)
+
+        let partial = DayWeaveHabitOutcomeInput(
+            status: .partial,
+            progressBasisPoints: 5_000,
+            occurredAt: Self.now
+        )
+        #expect(await store.record(partial, for: decision) == .success)
+        #expect(store.pendingMutations.isEmpty)
+        #expect(store.occurrences.first?.outcome?.progressBasisPoints == 5_000)
+        guard case .carry = store.occurrences.first?.missedResolution?.action else {
+            Issue.record("Expected the independently advanced missed coordinate")
+            return
+        }
+        #expect(store.occurrences.first?.missedResolution?.revision == 2)
+        #expect(try context.persistence.loadRevisioned().snapshot?
+            .occurrences.first?.missedResolution?.revision == 2)
+    }
+
+    @Test("an invalid missed coordinate in an outcome acknowledgement keeps the journal")
+    func outcomeResponseRejectsDivergentMissedCoordinate() async throws {
+        for mode in [HabitTransportStub.OutcomeMode.divergentMissed,
+                     HabitTransportStub.OutcomeMode.unreachableMissed] {
+            let context = try Context()
+            defer { context.remove() }
+            let decision = Self.occurrence(missedResolution: Self.missedResolution())
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [.init(
+                    changes: [.occurrenceUpsert(decision)],
+                    nextCursor: "cursor-one",
+                    hasMore: false
+                )],
+                outcomeMode: mode
+            )
+            let store = makeStore(context: context, transport: transport)
+            #expect(await store.activate() == .success)
+
+            let partial = DayWeaveHabitOutcomeInput(
+                status: .partial,
+                progressBasisPoints: 5_000,
+                occurredAt: Self.now
+            )
+            #expect(await store.record(partial, for: decision) == .protocolFailure)
+            #expect(store.pendingMutations.count == 1)
+            #expect(store.occurrences.first?.outcome == nil)
+            #expect(store.occurrences.first?.missedResolution == decision.missedResolution)
+        }
+    }
+
     @Test("ambiguous network loss survives process death and replays the same operation")
     func processDeathReplay() async throws {
         let context = try Context()
@@ -124,6 +189,360 @@ struct HabitSyncStoreTests {
         #expect(try context.persistence.loadRevisioned().snapshot?.pendingMutations.first?.conflictDetected == true)
         #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == false)
         #expect(store.status.phase == .attentionRequired)
+    }
+
+    @Test("missed reconciliation is encrypted before transport and replays after process death")
+    func missedReconcileProcessDeathReplay() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let persistedBeforeTransport = LockedFlag()
+        let firstTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            missedReconcileMode: .offline,
+            beforeMissedReconcile: {
+                let pending = try? context.persistence.loadRevisioned().snapshot?.pendingMutations
+                persistedBeforeTransport.set(pending?.contains(where: {
+                    if case .missedReconcile = $0 { return true }
+                    return false
+                }) == true)
+            }
+        )
+        let first = makeStore(context: context, transport: firstTransport)
+
+        #expect(await first.activate() == .offline)
+        #expect(persistedBeforeTransport.value)
+        let queued = try #require(context.persistence.loadRevisioned().snapshot?
+            .pendingMutations.first)
+        guard case let .missedReconcile(saved) = queued else {
+            Issue.record("Expected a durable missed-reconcile request")
+            return
+        }
+
+        let secondTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(changes: [], nextCursor: "cursor-reconciled", hasMore: false)],
+            missedReconcileMode: .replayed
+        )
+        let second = makeStore(context: context, transport: secondTransport)
+        #expect(await second.activate() == .success)
+        let replay = try #require(await secondTransport.missedReconcileRequests().first)
+        #expect(replay.command == saved.command)
+        #expect(replay.limit == saved.limit)
+        #expect(replay.idempotencyKey == saved.idempotencyKey)
+        #expect(second.pendingMutations.isEmpty)
+    }
+
+    @Test("an expired no-op reconcile journal rotates while delta authority stays revoked")
+    func expiredMissedReconcileJournalRotates() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let expiredID = UUID(uuidString: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee")!
+        let expired = DayWeavePendingHabitMutation.missedReconcile(.init(
+            idempotencyKey: "habit-missed-reconcile:expired",
+            command: .init(operationID: expiredID),
+            limit: 200,
+            createdAt: Self.now.addingTimeInterval(
+                -HabitSyncStore.missedReconcileJournalLease - 1
+            ),
+            conflictDetected: false
+        ))
+        _ = try context.persistence.save(.init(
+            savedAt: Self.now,
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "cursor-one",
+            deltaCaughtUp: true,
+            occurrences: [],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [expired]
+        ), expectedRevision: .missing)
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            missedReconcileMode: .offline
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .offline)
+        let requests = await transport.missedReconcileRequests()
+        #expect(requests.count == 1)
+        #expect(requests.first?.command.operationID != expiredID)
+        let disk = try #require(context.persistence.loadRevisioned().snapshot)
+        #expect(!disk.deltaCaughtUp)
+        #expect(disk.pendingMutations.count == 1)
+        guard case let .missedReconcile(replacement) =
+                try #require(disk.pendingMutations.first) else {
+            Issue.record("Expected a fresh reconcile lease")
+            return
+        }
+        #expect(replacement.command.operationID != expiredID)
+        #expect(replacement.createdAt == Self.now)
+    }
+
+    @Test("an expired automatic reconcile journal cannot pin an obsolete API binding")
+    func expiredMissedReconcileJournalDoesNotPinBinding() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let expiredID = UUID(uuidString: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee")!
+        let expired = DayWeavePendingHabitMutation.missedReconcile(.init(
+            idempotencyKey: "habit-missed-reconcile:expired-binding",
+            command: .init(operationID: expiredID),
+            limit: 200,
+            createdAt: Self.now.addingTimeInterval(
+                -HabitSyncStore.missedReconcileJournalLease - 1
+            ),
+            conflictDetected: false
+        ))
+        _ = try context.persistence.save(.init(
+            savedAt: Self.now,
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaCursor: "cursor-private",
+            deltaCaughtUp: true,
+            occurrences: [Self.occurrence(note: "old connection")],
+            pauses: [],
+            analytics: [],
+            pendingMutations: [expired]
+        ), expectedRevision: .missing)
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-b|auth=device-b",
+            missedReconcileMode: .offline
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .offline)
+        #expect(store.occurrences.isEmpty)
+        let request = try #require(await transport.missedReconcileRequests().first)
+        #expect(request.command.operationID != expiredID)
+        let disk = try #require(context.persistence.loadRevisioned().snapshot)
+        #expect(disk.configurationIdentifier == "origin-b|auth=device-b")
+        #expect(disk.deltaCursor == nil)
+        #expect(!disk.deltaCaughtUp)
+        guard case let .missedReconcile(replacement) =
+                try #require(disk.pendingMutations.first) else {
+            Issue.record("Expected a fresh reconcile lease for the new binding")
+            return
+        }
+        #expect(replacement.command.operationID == request.command.operationID)
+    }
+
+    @Test("a missed choice is durable before transport and installs only the derived response")
+    func missedChoiceMutationFence() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let persistedBeforeTransport = LockedFlag()
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            beforeMissedResolution: {
+                let pending = try? context.persistence.loadRevisioned().snapshot?.pendingMutations
+                persistedBeforeTransport.set(pending?.contains(where: {
+                    if case .missedResolution = $0 { return true }
+                    return false
+                }) == true)
+            }
+        )
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .success)
+
+        #expect(await store.resolveMissed(decision, action: .carry) == .success)
+        #expect(persistedBeforeTransport.value)
+        guard case let .carry(windowStart, windowEnd) = try #require(
+            store.occurrences.first?.missedResolution?.action
+        ) else {
+            Issue.record("Expected the server-derived carry window")
+            return
+        }
+        #expect(windowStart == Self.now)
+        #expect(windowEnd == Self.now.addingTimeInterval(86_400))
+        #expect(store.pendingMutations.isEmpty)
+    }
+
+    @Test("a successful missed choice stays non-authoritative until terminal delta catch-up")
+    func missedChoiceRequiresDeltaCatchUp() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let firstTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            deltaFailureAtCall: 1
+        )
+        let first = makeStore(context: context, transport: firstTransport)
+        #expect(await first.activate() == .success)
+
+        #expect(await first.resolveMissed(decision, action: .carry) == .offline)
+        #expect(first.pendingMutations.isEmpty)
+        guard case .carry = first.occurrences.first?.missedResolution?.action else {
+            Issue.record("Expected the durable server response before delta failure")
+            return
+        }
+        let incomplete = try #require(context.persistence.loadRevisioned().snapshot)
+        #expect(!incomplete.deltaCaughtUp)
+        #expect(!first.habitCompositionCheckpoint.deltaCaughtUp)
+
+        let carried = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .carry(
+                windowStart: Self.now,
+                windowEnd: Self.now.addingTimeInterval(86_400)
+            ),
+            revision: 2,
+            updatedAt: Self.now
+        ))
+        let secondTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(carried)],
+                nextCursor: "cursor-two",
+                hasMore: false
+            )]
+        )
+        let second = makeStore(context: context, transport: secondTransport)
+        #expect(await second.activate() == .success)
+        #expect(second.habitCompositionCheckpoint.deltaCaughtUp)
+        #expect(second.occurrences.first == carried)
+    }
+
+    @Test("an ambiguous missed choice replays the exact operation after process death")
+    func missedChoiceProcessDeathReplay() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let firstTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            missedResolutionMode: .offline
+        )
+        let first = makeStore(context: context, transport: firstTransport)
+        #expect(await first.activate() == .success)
+        #expect(await first.resolveMissed(decision, action: .skip) == .offline)
+        let queued = try #require(context.persistence.loadRevisioned().snapshot?
+            .pendingMutations.first)
+
+        let secondTransport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(changes: [], nextCursor: "cursor-two", hasMore: false)],
+            missedResolutionMode: .replayed
+        )
+        let second = makeStore(context: context, transport: secondTransport)
+        #expect(await second.activate() == .success)
+        let replay = try #require(await secondTransport.missedResolutionRequests().first)
+        #expect(replay.command.operationID == queued.id)
+        #expect(replay.idempotencyKey == queued.idempotencyKey)
+        #expect(second.occurrences.first?.missedResolution?.action == .skip)
+        #expect(second.pendingMutations.isEmpty)
+    }
+
+    @Test("a missed-choice conflict remains encrypted for explicit review")
+    func missedChoiceConflictRemainsDurable() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            missedResolutionMode: .conflict
+        )
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .success)
+
+        #expect(await store.resolveMissed(decision, action: .reduceFrequency) == .conflict)
+        #expect(store.pendingMutations.first?.conflictDetected == true)
+        #expect(try context.persistence.loadRevisioned().snapshot?
+            .pendingMutations.first?.conflictDetected == true)
+        #expect(store.occurrences.first?.missedResolution?.action.isDecisionRequired == true)
+    }
+
+    @Test("a direct missed choice accepts a matching server race cancellation")
+    func missedChoiceRaceCancellation() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let decision = Self.occurrence(missedResolution: Self.missedResolution())
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [.init(
+                changes: [.occurrenceUpsert(decision)],
+                nextCursor: "cursor-one",
+                hasMore: false
+            )],
+            missedResolutionMode: .cancelled
+        )
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .success)
+
+        #expect(await store.resolveMissed(decision, action: .carry) == .success)
+        guard case let .cancelled(reason, resumeAction) = try #require(
+            store.occurrences.first?.missedResolution?.action
+        ) else {
+            Issue.record("Expected a durable race cancellation")
+            return
+        }
+        #expect(reason == .sourceCompleted)
+        #expect(resumeAction == .carry)
+    }
+
+    @Test("terminal outcome or overlapping pause blocks a stale missed decision locally")
+    func staleMissedChoiceIsNotJournaled() async throws {
+        do {
+            let context = try Context()
+            defer { context.remove() }
+            let decision = Self.occurrence(
+                completed: true,
+                missedResolution: Self.missedResolution()
+            )
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [.init(
+                    changes: [.occurrenceUpsert(decision)],
+                    nextCursor: "cursor-one",
+                    hasMore: false
+                )]
+            )
+            let store = makeStore(context: context, transport: transport)
+            #expect(await store.activate() == .success)
+            #expect(await store.resolveMissed(decision, action: .skip) == .conflict)
+            #expect(store.pendingMutations.isEmpty)
+            #expect(await transport.missedResolutionRequests().isEmpty)
+        }
+
+        do {
+            let context = try Context()
+            defer { context.remove() }
+            let decision = Self.occurrence(missedResolution: Self.missedResolution())
+            let pause = Self.pause(
+                id: UUID(),
+                startedAt: decision.evidence.windowStart,
+                endedAt: decision.evidence.windowEnd
+            )
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [.init(
+                    changes: [.occurrenceUpsert(decision), .pauseUpsert(pause)],
+                    nextCursor: "cursor-one",
+                    hasMore: false
+                )]
+            )
+            let store = makeStore(context: context, transport: transport)
+            #expect(await store.activate() == .success)
+            #expect(await store.resolveMissed(decision, action: .carry) == .conflict)
+            #expect(store.pendingMutations.isEmpty)
+            #expect(await transport.missedResolutionRequests().isEmpty)
+        }
     }
 
     @Test("discarding a reviewed conflict stays incomplete until a terminal delta commits")
@@ -719,6 +1138,105 @@ struct HabitSyncStoreTests {
         #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == false)
     }
 
+    @Test("a genesis delta replay validates identity before ignoring an older open pause")
+    func deltaValidatesStalePauseIdentityBeforeIgnoring() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let pauseID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let startedAt = Self.now.addingTimeInterval(-3_600)
+        let closed = Self.pause(
+            id: pauseID,
+            startedAt: startedAt,
+            endedAt: Self.now,
+            revision: 2
+        )
+        let staleOpen = Self.pause(id: pauseID, startedAt: startedAt, revision: 1)
+        let changedIdentity = Self.pause(
+            id: pauseID,
+            habitID: UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!,
+            startedAt: startedAt,
+            revision: 1
+        )
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(changes: [.pauseUpsert(closed)], nextCursor: "cursor-one", hasMore: false),
+                .init(
+                    changes: [.pauseUpsert(staleOpen), .pauseUpsert(closed)],
+                    nextCursor: "cursor-two",
+                    hasMore: false
+                ),
+                .init(
+                    changes: [.pauseUpsert(changedIdentity)],
+                    nextCursor: "cursor-three",
+                    hasMore: false
+                ),
+            ]
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .success)
+        #expect(await store.sync() == .success)
+        #expect(store.pauses == [closed])
+        #expect(store.habitCompositionCheckpoint.deltaCursor == "cursor-two")
+        #expect(store.habitCompositionCheckpoint.deltaCaughtUp)
+
+        #expect(await store.sync() == .protocolFailure)
+        #expect(store.pauses == [closed])
+        let durable = try #require(context.persistence.loadRevisioned().snapshot)
+        #expect(durable.deltaCursor == "cursor-two")
+        #expect(!durable.deltaCaughtUp)
+    }
+
+    @Test("a higher pause revision cannot reopen or move a closed pause")
+    func deltaRejectsChangedClosedPauseEnd() async throws {
+        let pauseID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let startedAt = Self.now.addingTimeInterval(-3_600)
+        let closed = Self.pause(
+            id: pauseID,
+            startedAt: startedAt,
+            endedAt: Self.now,
+            revision: 2
+        )
+        let invalidRevisions = [
+            Self.pause(id: pauseID, startedAt: startedAt, revision: 3),
+            Self.pause(
+                id: pauseID,
+                startedAt: startedAt,
+                endedAt: Self.now.addingTimeInterval(60),
+                revision: 3
+            ),
+        ]
+
+        for invalid in invalidRevisions {
+            let context = try Context()
+            defer { context.remove() }
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [
+                    .init(
+                        changes: [.pauseUpsert(closed)],
+                        nextCursor: "cursor-one",
+                        hasMore: false
+                    ),
+                    .init(
+                        changes: [.pauseUpsert(invalid)],
+                        nextCursor: "cursor-two",
+                        hasMore: false
+                    ),
+                ]
+            )
+            let store = makeStore(context: context, transport: transport)
+
+            #expect(await store.activate() == .success)
+            #expect(await store.sync() == .protocolFailure)
+            #expect(store.pauses == [closed])
+            let durable = try #require(context.persistence.loadRevisioned().snapshot)
+            #expect(durable.deltaCursor == "cursor-one")
+            #expect(!durable.deltaCaughtUp)
+        }
+    }
+
     @Test("an intermediate delta cursor stays incomplete across failure and process death")
     func intermediateDeltaCursorResumesFailClosed() async throws {
         let context = try Context()
@@ -780,7 +1298,7 @@ struct HabitSyncStoreTests {
         #expect(await store.sync() == .localStorageFailure)
         #expect(forcedCASConflict.value)
         #expect(!store.habitCompositionCheckpoint.deltaCaughtUp)
-        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == true)
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == false)
     }
 
     @Test("a mismatched outcome acknowledgement cannot clear its encrypted journal")
@@ -887,6 +1405,253 @@ struct HabitSyncStoreTests {
         #expect(store.canonicalOccurrence(for: olderCanonicalBlock) == nil)
     }
 
+    @Test("delta accepts a valid missed-resolution revision jump from a compact projection")
+    func missedResolutionRevisionJump() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let first = Self.occurrence(missedResolution: Self.missedResolution())
+        let jumped = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .skip,
+            revision: 4,
+            updatedAt: Self.now
+        ))
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(changes: [.occurrenceUpsert(first)], nextCursor: "cursor-one", hasMore: false),
+                .init(changes: [.occurrenceUpsert(jumped)], nextCursor: "cursor-two", hasMore: false),
+            ]
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .success)
+        #expect(await store.sync() == .success)
+        #expect(store.occurrences.first?.missedResolution?.revision == 4)
+    }
+
+    @Test("compacted missed revisions require an action reachable in the exact revision gap")
+    func missedResolutionRevisionJumpUsesExactDistance() async throws {
+        func run(
+            first: DayWeaveHabitOccurrence,
+            jumped: DayWeaveHabitOccurrence
+        ) async throws -> HabitSyncOutcome {
+            let context = try Context()
+            defer { context.remove() }
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [
+                    .init(
+                        changes: [.occurrenceUpsert(first)],
+                        nextCursor: "cursor-one",
+                        hasMore: false
+                    ),
+                    .init(
+                        changes: [.occurrenceUpsert(jumped)],
+                        nextCursor: "cursor-two",
+                        hasMore: false
+                    ),
+                ]
+            )
+            let store = makeStore(context: context, transport: transport)
+            #expect(await store.activate() == .success)
+            return await store.sync()
+        }
+
+        let skipped = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .skip,
+            revision: 2
+        ))
+        let evenSkip = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .skip,
+            revision: 4,
+            updatedAt: Self.now
+        ))
+        #expect(try await run(first: skipped, jumped: evenSkip) == .success)
+
+        let oddSkip = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .skip,
+            revision: 5,
+            updatedAt: Self.now
+        ))
+        #expect(try await run(first: skipped, jumped: oddSkip) == .protocolFailure)
+
+        let carryAction = DayWeaveHabitMissedResolutionAction.carry(
+            windowStart: Self.now,
+            windowEnd: Self.now.addingTimeInterval(86_400)
+        )
+        let carried = Self.occurrence(missedResolution: Self.missedResolution(
+            action: carryAction,
+            revision: 2,
+            updatedAt: Self.now
+        ))
+        let cycledCarry = Self.occurrence(missedResolution: Self.missedResolution(
+            action: carryAction,
+            revision: 4,
+            updatedAt: Self.now
+        ))
+        #expect(try await run(first: carried, jumped: cycledCarry) == .success)
+    }
+
+    @Test("delta rejects a revision jump to an unreachable missed-resolution family")
+    func missedResolutionRevisionJumpRequiresReachableAction() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let skipped = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .skip,
+            revision: 2
+        ))
+        let impossibleReprompt = Self.occurrence(missedResolution: Self.missedResolution(
+            action: .decisionRequired,
+            revision: 4,
+            updatedAt: Self.now
+        ))
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(changes: [.occurrenceUpsert(skipped)], nextCursor: "cursor-one", hasMore: false),
+                .init(
+                    changes: [.occurrenceUpsert(impossibleReprompt)],
+                    nextCursor: "cursor-two",
+                    hasMore: false
+                ),
+            ]
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .success)
+        #expect(await store.sync() == .protocolFailure)
+        #expect(store.occurrences.first == skipped)
+        #expect(!store.habitCompositionCheckpoint.deltaCaughtUp)
+    }
+
+    @Test("delta merges crossed outcome and missed-resolution coordinates independently")
+    func crossedHabitCoordinatesMergeIndependently() async throws {
+        let context = try Context()
+        defer { context.remove() }
+        let prior = Self.occurrence(
+            note: "private partial",
+            missedResolution: Self.missedResolution(
+                action: .skip,
+                revision: 4,
+                updatedAt: Self.now
+            )
+        )
+        let advancedOutcome = DayWeaveHabitOutcome(
+            revision: 2,
+            status: .partial,
+            progressBasisPoints: 5_000,
+            quantity: 10,
+            unit: "pages",
+            actualSeconds: 1_200,
+            note: "private correction",
+            occurredAt: Self.now,
+            updatedAt: Self.now
+        )
+        let crossed = DayWeaveHabitOccurrence(
+            evidence: prior.evidence,
+            outcome: advancedOutcome,
+            missedResolution: Self.missedResolution(
+                action: .skip,
+                revision: 3,
+                updatedAt: Self.now.addingTimeInterval(-1)
+            )
+        )
+        let transport = HabitTransportStub(
+            configurationIdentifier: "origin-a|auth=device-a",
+            deltaPages: [
+                .init(changes: [.occurrenceUpsert(prior)], nextCursor: "cursor-one", hasMore: false),
+                .init(changes: [.occurrenceUpsert(crossed)], nextCursor: "cursor-two", hasMore: false),
+            ]
+        )
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .success)
+        #expect(await store.sync() == .success)
+        let merged = try #require(store.occurrences.first)
+        #expect(merged.outcome == advancedOutcome)
+        #expect(merged.missedResolution == prior.missedResolution)
+        #expect(store.habitCompositionCheckpoint.deltaCaughtUp)
+    }
+
+    @Test("a stale missed coordinate must retain its immutable identity and timestamp ordering")
+    func staleMissedCoordinateStillValidatesAuthority() async throws {
+        let priorResolution = Self.missedResolution(
+            action: .skip,
+            revision: 4,
+            updatedAt: Self.now
+        )
+        let prior = Self.occurrence(
+            note: "private partial",
+            missedResolution: priorResolution
+        )
+        let advancedOutcome = DayWeaveHabitOutcome(
+            revision: 2,
+            status: .partial,
+            progressBasisPoints: 5_000,
+            quantity: 10,
+            unit: "pages",
+            actualSeconds: 1_200,
+            note: "private correction",
+            occurredAt: Self.now,
+            updatedAt: Self.now
+        )
+        let invalidStaleCoordinates = [
+            DayWeaveHabitMissedResolution(
+                occurrenceEvidenceID: priorResolution.occurrenceEvidenceID,
+                habitID: priorResolution.habitID,
+                sourcePlannerOccurrenceID: priorResolution.sourcePlannerOccurrenceID,
+                revision: 3,
+                configuredPolicy: .skip,
+                action: .skip,
+                createdAt: priorResolution.createdAt,
+                updatedAt: priorResolution.updatedAt.addingTimeInterval(-1)
+            ),
+            DayWeaveHabitMissedResolution(
+                occurrenceEvidenceID: priorResolution.occurrenceEvidenceID,
+                habitID: priorResolution.habitID,
+                sourcePlannerOccurrenceID: priorResolution.sourcePlannerOccurrenceID,
+                revision: 3,
+                configuredPolicy: priorResolution.configuredPolicy,
+                action: .skip,
+                createdAt: priorResolution.createdAt,
+                updatedAt: priorResolution.updatedAt.addingTimeInterval(1)
+            ),
+        ]
+
+        for invalidResolution in invalidStaleCoordinates {
+            let context = try Context()
+            defer { context.remove() }
+            let incoming = DayWeaveHabitOccurrence(
+                evidence: prior.evidence,
+                outcome: advancedOutcome,
+                missedResolution: invalidResolution
+            )
+            let transport = HabitTransportStub(
+                configurationIdentifier: "origin-a|auth=device-a",
+                deltaPages: [
+                    .init(
+                        changes: [.occurrenceUpsert(prior)],
+                        nextCursor: "cursor-one",
+                        hasMore: false
+                    ),
+                    .init(
+                        changes: [.occurrenceUpsert(incoming)],
+                        nextCursor: "cursor-two",
+                        hasMore: false
+                    ),
+                ]
+            )
+            let store = makeStore(context: context, transport: transport)
+
+            #expect(await store.activate() == .success)
+            #expect(await store.sync() == .protocolFailure)
+            #expect(store.occurrences == [prior])
+            let durable = try #require(context.persistence.loadRevisioned().snapshot)
+            #expect(durable.deltaCursor == "cursor-one")
+            #expect(!durable.deltaCaughtUp)
+        }
+    }
+
     @Test("retention never evicts rows referenced by durable habit journals")
     func retentionProtectsOutboxTargets() throws {
         let oldest = Self.occurrence(
@@ -956,6 +1721,405 @@ struct HabitSyncStoreTests {
             limit: 1
         )
         #expect(retainedPauses == [referencedPause])
+    }
+
+    @Test("closed pauses protecting retained schedule authority survive pause retention")
+    func retentionProtectsClosedMissedLifecyclePauses() throws {
+        let occurrence = Self.occurrence()
+        let protectedPause = Self.pause(
+            id: UUID(),
+            startedAt: Self.now.addingTimeInterval(-3_600),
+            endedAt: Self.now.addingTimeInterval(1_800)
+        )
+        let firstNewer = Self.pause(
+            id: UUID(),
+            habitID: UUID(),
+            startedAt: Self.now.addingTimeInterval(10 * 86_400),
+            endedAt: Self.now.addingTimeInterval(10 * 86_400 + 3_600)
+        )
+        let secondNewer = Self.pause(
+            id: UUID(),
+            habitID: UUID(),
+            startedAt: Self.now.addingTimeInterval(20 * 86_400),
+            endedAt: Self.now.addingTimeInterval(20 * 86_400 + 3_600)
+        )
+
+        let retained = try HabitSyncStore.retainedPauses(
+            [protectedPause, firstNewer, secondNewer],
+            pendingMutations: [],
+            protectedOccurrences: [occurrence],
+            limit: 2
+        )
+
+        #expect(retained.contains(where: { $0.id == protectedPause.id }))
+        #expect(retained.contains(where: { $0.id == secondNewer.id }))
+    }
+
+    @Test("overlapping pauses fail before retention can hide the conflict")
+    func retentionRejectsOverlappingPausesBeforePruning() {
+        let first = Self.pause(
+            id: UUID(),
+            startedAt: Self.now.addingTimeInterval(-7_200),
+            endedAt: Self.now.addingTimeInterval(-1_800)
+        )
+        let overlapping = Self.pause(
+            id: UUID(),
+            startedAt: Self.now.addingTimeInterval(-3_600),
+            endedAt: Self.now
+        )
+        let unrelated = Self.pause(
+            id: UUID(),
+            habitID: UUID(),
+            startedAt: Self.now.addingTimeInterval(3_600),
+            endedAt: Self.now.addingTimeInterval(7_200)
+        )
+
+        #expect(throws: (any Error).self) {
+            try HabitSyncStore.retainedPauses(
+                [first, overlapping, unrelated],
+                pendingMutations: [],
+                limit: 2
+            )
+        }
+    }
+
+    @Test("retention evicts terminal missed history while preserving active missed effects")
+    func retentionBoundsMissedHistory() throws {
+        func resolving(
+            _ occurrence: DayWeaveHabitOccurrence,
+            policy: DayWeaveHabitMissedPolicy,
+            revision: UInt64,
+            action: DayWeaveHabitMissedResolutionAction
+        ) -> DayWeaveHabitOccurrence {
+            .init(
+                evidence: occurrence.evidence,
+                outcome: occurrence.outcome,
+                missedResolution: .init(
+                    occurrenceEvidenceID: occurrence.id,
+                    habitID: occurrence.evidence.habitID,
+                    sourcePlannerOccurrenceID: occurrence.evidence.plannerOccurrenceID,
+                    revision: revision,
+                    configuredPolicy: policy,
+                    action: action,
+                    createdAt: occurrence.evidence.windowEnd,
+                    updatedAt: max(occurrence.evidence.windowEnd, Self.now)
+                )
+            )
+        }
+
+        let terminalHistory = (10...19).map { age in
+            let occurrence = Self.occurrence(
+                plannerID: UUID(),
+                ledgerID: UUID(),
+                nominalStart: Self.now.addingTimeInterval(-Double(age) * 86_400)
+            )
+            return resolving(occurrence, policy: .skip, revision: 1, action: .skip)
+        }
+        let carriedBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-9 * 86_400)
+        )
+        let carried = resolving(
+            carriedBase,
+            policy: .carry,
+            revision: 1,
+            action: .carry(
+                windowStart: Self.now.addingTimeInterval(3_600),
+                windowEnd: Self.now.addingTimeInterval(7_200)
+            )
+        )
+        let promptBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-8 * 86_400)
+        )
+        let prompt = resolving(
+            promptBase,
+            policy: .ask,
+            revision: 1,
+            action: .decisionRequired
+        )
+        let reductionTarget = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(86_400)
+        )
+        let reductionBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-7 * 86_400)
+        )
+        let reduction = resolving(
+            reductionBase,
+            policy: .reduceFrequency,
+            revision: 2,
+            action: .reduceFrequency(
+                suppressedPlannerOccurrenceIDs: [reductionTarget.evidence.plannerOccurrenceID]
+            )
+        )
+
+        let retained = try HabitSyncStore.retainedOccurrences(
+            terminalHistory + [carried, prompt, reduction, reductionTarget],
+            pendingMutations: [],
+            referenceDate: Self.now,
+            limit: 4
+        )
+        #expect(Set(retained.map(\.id)) == [
+            carried.id,
+            prompt.id,
+            reduction.id,
+            reductionTarget.id,
+        ])
+
+        let movedSkip = terminalHistory.last!
+        let moveProtected = try HabitSyncStore.retainedOccurrences(
+            terminalHistory + [carried, prompt, reduction, reductionTarget],
+            pendingMutations: [],
+            protectedPlannerOccurrenceIDs: [movedSkip.evidence.plannerOccurrenceID],
+            referenceDate: Self.now,
+            limit: 5
+        )
+        #expect(moveProtected.contains(where: { $0.id == movedSkip.id }))
+        #expect(Set(moveProtected.map(\.id)).isSuperset(of: [
+            carried.id,
+            prompt.id,
+            reduction.id,
+            reductionTarget.id,
+        ]))
+        #expect(throws: (any Error).self) {
+            try HabitSyncStore.retainedOccurrences(
+                [terminalHistory[0], terminalHistory[1]],
+                pendingMutations: [],
+                protectedPlannerOccurrenceIDs: [
+                    terminalHistory[0].evidence.plannerOccurrenceID,
+                    terminalHistory[1].evidence.plannerOccurrenceID,
+                ],
+                referenceDate: Self.now,
+                limit: 1
+            )
+        }
+    }
+
+    @Test("retention preserves the full upstream reduction dependency chain")
+    func retentionPreservesTransitiveReductionDependencies() throws {
+        func reducing(
+            _ occurrence: DayWeaveHabitOccurrence,
+            target: DayWeaveHabitOccurrence
+        ) -> DayWeaveHabitOccurrence {
+            .init(
+                evidence: occurrence.evidence,
+                outcome: occurrence.outcome,
+                missedResolution: .init(
+                    occurrenceEvidenceID: occurrence.id,
+                    habitID: occurrence.evidence.habitID,
+                    sourcePlannerOccurrenceID: occurrence.evidence.plannerOccurrenceID,
+                    revision: 1,
+                    configuredPolicy: .reduceFrequency,
+                    action: .reduceFrequency(
+                        suppressedPlannerOccurrenceIDs: [
+                            target.evidence.plannerOccurrenceID,
+                        ]
+                    ),
+                    createdAt: occurrence.evidence.windowEnd,
+                    updatedAt: occurrence.evidence.windowEnd
+                )
+            )
+        }
+
+        let target = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(86_400)
+        )
+        let middleBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-10 * 86_400)
+        )
+        let middle = reducing(middleBase, target: target)
+        let upstreamBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-20 * 86_400)
+        )
+        let upstream = reducing(upstreamBase, target: middle)
+        let newerHistory = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-2 * 86_400)
+        )
+
+        let retained = try HabitSyncStore.retainedOccurrences(
+            [upstream, middle, newerHistory, target],
+            pendingMutations: [],
+            referenceDate: Self.now,
+            limit: 3
+        )
+
+        #expect(Set(retained.map(\.id)) == [upstream.id, middle.id, target.id])
+        #expect(throws: (any Error).self) {
+            try HabitSyncStore.retainedOccurrences(
+                [upstream, middle, newerHistory, target],
+                pendingMutations: [],
+                referenceDate: Self.now,
+                limit: 2
+            )
+        }
+    }
+
+    @Test("retention keeps recent carry destinations and durable reduction sources")
+    func retentionKeepsMissedSchedulingBridges() throws {
+        let carryBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-20 * 86_400)
+        )
+        let carryStart = Self.now.addingTimeInterval(-12 * 3_600)
+        let carried = DayWeaveHabitOccurrence(
+            evidence: carryBase.evidence,
+            outcome: nil,
+            missedResolution: .init(
+                occurrenceEvidenceID: carryBase.id,
+                habitID: carryBase.evidence.habitID,
+                sourcePlannerOccurrenceID: carryBase.evidence.plannerOccurrenceID,
+                revision: 1,
+                configuredPolicy: .carry,
+                action: .carry(
+                    windowStart: carryStart,
+                    windowEnd: Self.now.addingTimeInterval(-3_600)
+                ),
+                createdAt: carryBase.evidence.windowEnd,
+                updatedAt: carryStart
+            )
+        )
+        let missingTargetBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-30 * 86_400)
+        )
+        let missingTargetSource = DayWeaveHabitOccurrence(
+            evidence: missingTargetBase.evidence,
+            outcome: nil,
+            missedResolution: .init(
+                occurrenceEvidenceID: missingTargetBase.id,
+                habitID: missingTargetBase.evidence.habitID,
+                sourcePlannerOccurrenceID: missingTargetBase.evidence.plannerOccurrenceID,
+                revision: 1,
+                configuredPolicy: .reduceFrequency,
+                action: .reduceFrequency(
+                    suppressedPlannerOccurrenceIDs: [Self.versionFiveUUID(UUID())]
+                ),
+                createdAt: missingTargetBase.evidence.windowEnd,
+                updatedAt: Self.now.addingTimeInterval(-3_600)
+            )
+        )
+        let ordinary = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-2 * 86_400)
+        )
+
+        let retained = try HabitSyncStore.retainedOccurrences(
+            [missingTargetSource, carried, ordinary],
+            pendingMutations: [],
+            referenceDate: Self.now,
+            limit: 2
+        )
+
+        #expect(Set(retained.map(\.id)) == [missingTargetSource.id, carried.id])
+
+        let expiredBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-500 * 86_400)
+        )
+        let expiredBridge = DayWeaveHabitOccurrence(
+            evidence: expiredBase.evidence,
+            outcome: nil,
+            missedResolution: .init(
+                occurrenceEvidenceID: expiredBase.id,
+                habitID: expiredBase.evidence.habitID,
+                sourcePlannerOccurrenceID: expiredBase.evidence.plannerOccurrenceID,
+                revision: 1,
+                configuredPolicy: .reduceFrequency,
+                action: .reduceFrequency(
+                    suppressedPlannerOccurrenceIDs: [Self.versionFiveUUID(UUID())]
+                ),
+                createdAt: expiredBase.evidence.windowEnd,
+                updatedAt: Self.now.addingTimeInterval(-367 * 86_400)
+            )
+        )
+        let recentHistory = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-3 * 86_400)
+        )
+        let historicalResult = try HabitSyncStore.retainedOccurrences(
+            [expiredBridge, recentHistory, ordinary],
+            pendingMutations: [],
+            referenceDate: Self.now,
+            limit: 2
+        )
+        #expect(historicalResult.contains(where: { $0.id == expiredBridge.id }))
+    }
+
+    @Test("retention rejects duplicate planner identities without trapping")
+    func retentionRejectsDuplicatePlannerIdentity() {
+        let plannerID = UUID()
+        let first = Self.occurrence(plannerID: plannerID, ledgerID: UUID())
+        let second = Self.occurrence(plannerID: plannerID, ledgerID: UUID())
+
+        #expect(throws: (any Error).self) {
+            try HabitSyncStore.retainedOccurrences(
+                [first, second],
+                pendingMutations: [],
+                referenceDate: Self.now,
+                limit: 1
+            )
+        }
+    }
+
+    @Test("the 20k cache ceiling cannot evict a moved occurrence's missed skip")
+    func retentionProtectsMovedMissedSkipAtProductionLimit() throws {
+        let skippedBase = Self.occurrence(
+            plannerID: UUID(),
+            ledgerID: UUID(),
+            nominalStart: Self.now.addingTimeInterval(-30_000 * 86_400)
+        )
+        let skipped = DayWeaveHabitOccurrence(
+            evidence: skippedBase.evidence,
+            outcome: nil,
+            missedResolution: .init(
+                occurrenceEvidenceID: skippedBase.id,
+                habitID: skippedBase.evidence.habitID,
+                sourcePlannerOccurrenceID: skippedBase.evidence.plannerOccurrenceID,
+                revision: 1,
+                configuredPolicy: .skip,
+                action: .skip,
+                createdAt: skippedBase.evidence.windowEnd,
+                updatedAt: Self.now
+            )
+        )
+        let history = (0..<DayWeaveHabitClientSnapshot.maximumOccurrences).map { offset in
+            Self.occurrence(
+                plannerID: UUID(),
+                ledgerID: UUID(),
+                nominalStart: Self.now.addingTimeInterval(
+                    -Double(DayWeaveHabitClientSnapshot.maximumOccurrences - offset + 10) * 86_400
+                )
+            )
+        }
+
+        let retained = try HabitSyncStore.retainedOccurrences(
+            [skipped] + history,
+            pendingMutations: [],
+            protectedPlannerOccurrenceIDs: [skipped.evidence.plannerOccurrenceID],
+            referenceDate: Self.now
+        )
+
+        #expect(retained.count == DayWeaveHabitClientSnapshot.maximumOccurrences)
+        #expect(retained.contains(where: { $0.id == skipped.id }))
     }
 
     @Test("retention reserves current rows and every correction-safe completion anchor")
@@ -1079,7 +2243,8 @@ struct HabitSyncStoreTests {
         ledgerID: UUID = ledgerOccurrenceID,
         nominalStart: Date = date("2026-09-04T12:00:00.000000Z"),
         sourceItemRevision: UInt64 = 3,
-        completed: Bool = false
+        completed: Bool = false,
+        missedResolution: DayWeaveHabitMissedResolution? = nil
     ) -> DayWeaveHabitOccurrence {
         let outcome: DayWeaveHabitOutcome?
         if completed {
@@ -1135,7 +2300,27 @@ struct HabitSyncStoreTests {
                 expectedQuantity: 20,
                 expectedUnit: "pages"
             ),
-            outcome: outcome
+            outcome: outcome,
+            missedResolution: missedResolution
+        )
+    }
+
+    nonisolated fileprivate static func missedResolution(
+        action: DayWeaveHabitMissedResolutionAction = .decisionRequired,
+        revision: UInt64 = 1,
+        updatedAt: Date? = nil,
+        policy: DayWeaveHabitMissedPolicy = .ask
+    ) -> DayWeaveHabitMissedResolution {
+        let createdAt = now.addingTimeInterval(-3_600)
+        return .init(
+            occurrenceEvidenceID: ledgerOccurrenceID,
+            habitID: habitID,
+            sourcePlannerOccurrenceID: plannerOccurrenceID,
+            revision: revision,
+            configuredPolicy: policy,
+            action: action,
+            createdAt: createdAt,
+            updatedAt: updatedAt ?? createdAt
         )
     }
 
@@ -1265,7 +2450,24 @@ private final class HabitStreamConnectionSelection {
 }
 
 private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Sendable {
-    enum OutcomeMode: Equatable, Sendable { case success, replayed, offline, conflict, mismatched }
+    enum OutcomeMode: Equatable, Sendable {
+        case success
+        case replayed
+        case offline
+        case conflict
+        case mismatched
+        case advancedMissed
+        case divergentMissed
+        case unreachableMissed
+    }
+    enum MissedReconcileMode: Equatable, Sendable { case success, replayed, offline }
+    enum MissedResolutionMode: Equatable, Sendable {
+        case success
+        case replayed
+        case offline
+        case conflict
+        case cancelled
+    }
     enum PauseResponseMode: Equatable, Sendable {
         case success
         case mismatchedStart
@@ -1278,10 +2480,24 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
         let idempotencyKey: String
     }
 
+    struct MissedReconcileRequest: Sendable {
+        let command: DayWeaveHabitMissedReconcileCommand
+        let limit: Int
+        let idempotencyKey: String
+    }
+
+    struct MissedResolutionRequest: Sendable {
+        let occurrenceID: UUID
+        let command: DayWeaveHabitMissedResolveCommand
+        let idempotencyKey: String
+    }
+
     final class State: @unchecked Sendable {
         private let lock = NSLock()
         var pages: [DayWeaveHabitDeltaPage]
         var requests: [OutcomeRequest] = []
+        var missedReconcileRequests: [MissedReconcileRequest] = []
+        var missedResolutionRequests: [MissedResolutionRequest] = []
         var cursors: [String?] = []
         var analyticIDs: [UUID] = []
 
@@ -1302,8 +2518,20 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
         }
 
         func add(_ request: OutcomeRequest) { lock.withLock { requests.append(request) } }
+        func add(_ request: MissedReconcileRequest) {
+            lock.withLock { missedReconcileRequests.append(request) }
+        }
+        func add(_ request: MissedResolutionRequest) {
+            lock.withLock { missedResolutionRequests.append(request) }
+        }
         func addAnalytics(_ id: UUID) { lock.withLock { analyticIDs.append(id) } }
         func outcomeRequests() -> [OutcomeRequest] { lock.withLock { requests } }
+        func reconcileRequests() -> [MissedReconcileRequest] {
+            lock.withLock { missedReconcileRequests }
+        }
+        func resolutionRequests() -> [MissedResolutionRequest] {
+            lock.withLock { missedResolutionRequests }
+        }
         func deltaCursors() -> [String?] { lock.withLock { cursors } }
         func analyticsIDs() -> [UUID] { lock.withLock { analyticIDs } }
     }
@@ -1311,7 +2539,11 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
     nonisolated let configurationIdentifier: String
     private let state: State
     private let outcomeMode: OutcomeMode
+    private let missedReconcileMode: MissedReconcileMode
+    private let missedResolutionMode: MissedResolutionMode
     private let beforeOutcome: @Sendable () -> Void
+    private let beforeMissedReconcile: @Sendable () -> Void
+    private let beforeMissedResolution: @Sendable () -> Void
     private let analyticsValue: DayWeaveHabitAnalytics?
     private let pauseOffline: Bool
     private let pauseResponseMode: PauseResponseMode
@@ -1322,22 +2554,30 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
         configurationIdentifier: String,
         deltaPages: [DayWeaveHabitDeltaPage] = [],
         outcomeMode: OutcomeMode = .success,
+        missedReconcileMode: MissedReconcileMode = .success,
+        missedResolutionMode: MissedResolutionMode = .success,
         analytics: DayWeaveHabitAnalytics? = nil,
         pauseOffline: Bool = false,
         pauseResponseMode: PauseResponseMode = .success,
         deltaFailureAtCall: Int? = nil,
         beforeDelta: @escaping @Sendable (String?) async -> Void = { _ in },
-        beforeOutcome: @escaping @Sendable () -> Void = {}
+        beforeOutcome: @escaping @Sendable () -> Void = {},
+        beforeMissedReconcile: @escaping @Sendable () -> Void = {},
+        beforeMissedResolution: @escaping @Sendable () -> Void = {}
     ) {
         self.configurationIdentifier = configurationIdentifier
         state = .init(pages: deltaPages)
         self.outcomeMode = outcomeMode
+        self.missedReconcileMode = missedReconcileMode
+        self.missedResolutionMode = missedResolutionMode
         analyticsValue = analytics
         self.pauseOffline = pauseOffline
         self.pauseResponseMode = pauseResponseMode
         self.deltaFailureAtCall = deltaFailureAtCall
         self.beforeDelta = beforeDelta
         self.beforeOutcome = beforeOutcome
+        self.beforeMissedReconcile = beforeMissedReconcile
+        self.beforeMissedResolution = beforeMissedResolution
     }
 
     func habitOccurrences(
@@ -1372,7 +2612,8 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
                 message: "habit revision conflict",
                 requestID: nil
             )
-        case .success, .replayed, .mismatched:
+        case .success, .replayed, .mismatched, .advancedMissed, .divergentMissed,
+             .unreachableMissed:
             let base = HabitSyncStoreTests.occurrence()
             let receivedInput = outcomeMode == .mismatched
                 ? DayWeaveHabitOutcomeInput.skipped(occurredAt: command.outcome.occurredAt)
@@ -1388,9 +2629,104 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
                 occurredAt: receivedInput.occurredAt,
                 updatedAt: HabitSyncStoreTests.now
             )
+            let missedResolution: DayWeaveHabitMissedResolution? = switch outcomeMode {
+            case .advancedMissed:
+                HabitSyncStoreTests.missedResolution(
+                    action: .carry(
+                        windowStart: HabitSyncStoreTests.now,
+                        windowEnd: HabitSyncStoreTests.now.addingTimeInterval(86_400)
+                    ),
+                    revision: 2,
+                    updatedAt: HabitSyncStoreTests.now
+                )
+            case .divergentMissed:
+                HabitSyncStoreTests.missedResolution(action: .skip)
+            case .unreachableMissed:
+                HabitSyncStoreTests.missedResolution(
+                    action: .decisionRequired,
+                    revision: 2,
+                    updatedAt: HabitSyncStoreTests.now
+                )
+            default:
+                nil
+            }
             return .init(
-                occurrence: .init(evidence: base.evidence, outcome: outcome),
+                occurrence: .init(
+                    evidence: base.evidence,
+                    outcome: outcome,
+                    missedResolution: missedResolution
+                ),
                 replayed: outcomeMode == .replayed
+            )
+        }
+    }
+
+    func reconcileMissedHabitOccurrences(
+        command: DayWeaveHabitMissedReconcileCommand,
+        limit: Int,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedReconcileResponse {
+        state.add(.init(command: command, limit: limit, idempotencyKey: idempotencyKey))
+        beforeMissedReconcile()
+        if missedReconcileMode == .offline {
+            throw DayWeaveAPIError.transport(.networkConnectionLost)
+        }
+        return .init(
+            resolutions: [],
+            hasMore: false,
+            replayed: missedReconcileMode == .replayed
+        )
+    }
+
+    func resolveMissedHabitOccurrence(
+        habitID: UUID,
+        occurrenceID: UUID,
+        command: DayWeaveHabitMissedResolveCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedResolutionMutationResponse {
+        state.add(.init(
+            occurrenceID: occurrenceID,
+            command: command,
+            idempotencyKey: idempotencyKey
+        ))
+        beforeMissedResolution()
+        switch missedResolutionMode {
+        case .offline:
+            throw DayWeaveAPIError.transport(.networkConnectionLost)
+        case .conflict:
+            throw DayWeaveAPIError.server(
+                statusCode: 409,
+                code: "conflict",
+                message: "missed resolution changed",
+                requestID: nil
+            )
+        case .success, .replayed, .cancelled:
+            let action: DayWeaveHabitMissedResolutionAction
+            if missedResolutionMode == .cancelled {
+                action = .cancelled(
+                    reason: .sourceCompleted,
+                    resumeAction: Self.resumeAction(for: command.action)
+                )
+            } else {
+                switch command.action {
+                case .skip:
+                    action = .skip
+                case .carry:
+                    action = .carry(
+                        windowStart: HabitSyncStoreTests.now,
+                        windowEnd: HabitSyncStoreTests.now.addingTimeInterval(86_400)
+                    )
+                case .reduceFrequency:
+                    action = .reductionPending
+                }
+            }
+            return .init(
+                resolution: HabitSyncStoreTests.missedResolution(
+                    action: action,
+                    revision: command.expectedRevision + 1,
+                    updatedAt: HabitSyncStoreTests.now
+                ),
+                replayed: missedResolutionMode == .replayed
             )
         }
     }
@@ -1457,8 +2793,24 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
     }
 
     func outcomeRequests() async -> [OutcomeRequest] { state.outcomeRequests() }
+    func missedReconcileRequests() async -> [MissedReconcileRequest] {
+        state.reconcileRequests()
+    }
+    func missedResolutionRequests() async -> [MissedResolutionRequest] {
+        state.resolutionRequests()
+    }
     func deltaCursors() async -> [String?] { state.deltaCursors() }
     func analyticsHabitIDs() async -> [UUID] { state.analyticsIDs() }
+
+    private static func resumeAction(
+        for action: DayWeaveHabitMissedExplicitAction
+    ) -> DayWeaveHabitMissedResumeAction {
+        switch action {
+        case .skip: .skip
+        case .carry: .carry
+        case .reduceFrequency: .reduceFrequency
+        }
+    }
 }
 
 private final class HabitStreamTransportStub: DayWeaveHabitStreamTransport, @unchecked Sendable {

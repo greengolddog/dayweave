@@ -729,6 +729,19 @@ protocol DayWeaveHabitTransport: Sendable {
         idempotencyKey: String
     ) async throws -> DayWeaveHabitOccurrenceMutationResponse
 
+    func reconcileMissedHabitOccurrences(
+        command: DayWeaveHabitMissedReconcileCommand,
+        limit: Int,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedReconcileResponse
+
+    func resolveMissedHabitOccurrence(
+        habitID: UUID,
+        occurrenceID: UUID,
+        command: DayWeaveHabitMissedResolveCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedResolutionMutationResponse
+
     func startHabitPause(
         habitID: UUID,
         command: DayWeaveHabitPauseStartCommand,
@@ -2734,6 +2747,66 @@ struct DayWeaveAPIClient: Sendable {
         return response
     }
 
+    func reconcileMissedHabitOccurrences(
+        command: DayWeaveHabitMissedReconcileCommand,
+        limit: Int = 200,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedReconcileResponse {
+        guard command.hasValidShape,
+              (1...200).contains(limit),
+              Self.isValidHabitIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let response: DayWeaveHabitMissedReconcileResponse = try await send(
+            method: "POST",
+            pathComponents: ["v1", "habits", "missed", "reconcile"],
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(command),
+            requiredStatusCode: 200
+        )
+        guard response.resolutions.count <= limit else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return response
+    }
+
+    func resolveMissedHabitOccurrence(
+        habitID: UUID,
+        occurrenceID: UUID,
+        command: DayWeaveHabitMissedResolveCommand,
+        idempotencyKey: String
+    ) async throws -> DayWeaveHabitMissedResolutionMutationResponse {
+        guard habitID != Self.nilUUID,
+              occurrenceID != Self.nilUUID,
+              command.expectedRevision < UInt64.max,
+              command.hasValidShape,
+              Self.isValidHabitIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let response: DayWeaveHabitMissedResolutionMutationResponse = try await send(
+            method: "PUT",
+            pathComponents: [
+                "v1", "habits", habitID.uuidString.lowercased(), "occurrences",
+                occurrenceID.uuidString.lowercased(), "missed-resolution",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(command),
+            requiredStatusCode: 200
+        )
+        guard response.resolution.habitID == habitID,
+              response.resolution.occurrenceEvidenceID == occurrenceID,
+              response.resolution.revision == command.expectedRevision + 1,
+              response.resolution.configuredPolicy == .ask,
+              Self.missedResolutionAction(
+                  response.resolution.action,
+                  satisfies: command.action
+              ) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return response
+    }
+
     func startHabitPause(
         habitID: UUID,
         command: DayWeaveHabitPauseStartCommand,
@@ -2898,6 +2971,26 @@ struct DayWeaveAPIClient: Sendable {
             && left.actualSeconds == right.actualSeconds
             && left.note == right.note
             && hasSameHabitInstant(left.occurredAt, right.occurredAt)
+    }
+
+    private static func missedResolutionAction(
+        _ received: DayWeaveHabitMissedResolutionAction,
+        satisfies requested: DayWeaveHabitMissedExplicitAction
+    ) -> Bool {
+        switch (requested, received) {
+        case (.skip, .skip), (.carry, .carry):
+            return true
+        case (.reduceFrequency, .reduceFrequency), (.reduceFrequency, .reductionPending):
+            return true
+        case let (.skip, .cancelled(_, resumeAction)):
+            return resumeAction == .skip
+        case let (.carry, .cancelled(_, resumeAction)):
+            return resumeAction == .carry
+        case let (.reduceFrequency, .cancelled(_, resumeAction)):
+            return resumeAction == .reduceFrequency
+        default:
+            return false
+        }
     }
 
     func previewSchedule(
@@ -3262,7 +3355,10 @@ struct DayWeaveAPIClient: Sendable {
         }
 
         let isMutation = method == "PUT"
-            || (method == "POST" && pathComponents.contains("pauses"))
+            || (method == "POST" && (
+                pathComponents.contains("pauses")
+                    || pathComponents == ["v1", "habits", "missed", "reconcile"]
+            ))
         guard isMutation else { return replayHeader == nil }
         guard let replayHeader = replayHeader?.lowercased(),
               replayHeader == "true" || replayHeader == "false",
@@ -4552,6 +4648,7 @@ struct DayWeaveAPIClient: Sendable {
 
     private func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
+        decoder.userInfo[.dayWeaveRequiresHabitMissedResolution] = true
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
             let value = try container.decode(String.self)

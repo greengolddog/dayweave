@@ -84,7 +84,12 @@ struct DayWeaveMacApp: App {
             journal: store
         )
         _proposalApplications = StateObject(wrappedValue: proposalApplications)
-        let habitSync = HabitSyncStore(authCoordinator: authCoordinator)
+        let habitSync = HabitSyncStore(
+            authCoordinator: authCoordinator,
+            protectedPlannerOccurrenceIDs: {
+                store.habitRetentionProtectedPlannerOccurrenceIDs
+            }
+        )
         _habitSync = StateObject(wrappedValue: habitSync)
         let canonicalSync = CanonicalSyncStore(
             planner: store,

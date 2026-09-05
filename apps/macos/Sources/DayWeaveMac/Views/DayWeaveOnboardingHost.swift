@@ -347,8 +347,7 @@ struct DayWeaveOnboardingHost: View {
               let firstItem = firstPlanningCanonicalItem,
               firstItem.revision == anchoredRevision,
               let provenance = store.schedulePreviewProvenance,
-              let proof = store.publishedScheduleProof,
-              proof.hasCurrentImmutablePlanSeal,
+              let proof = store.currentPublishedScheduleProofAuthority,
               proof.matches(provenance),
               proof.matchesPublishedPlan(store.blocks),
               proof.configurationIdentifier

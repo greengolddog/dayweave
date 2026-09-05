@@ -108,10 +108,12 @@ final class CanonicalSyncStore: ObservableObject {
     private var foregroundScheduleStreamUnavailableForActivation = false
     private var foregroundScheduleImmediateAttempts = 0
     private var foregroundScheduleRefreshInProgress = false
-    /// Set only after the server proves the SSE cursor is ahead. It remains
-    /// pending across an overlapping drain or transient GET and is cleared
-    /// only by a successful authoritative current-schedule response.
-    private var foregroundScheduleHintResetPending = false
+    /// Created only after the server rejects the exact durable SSE cursor as
+    /// ahead. It remains pending across an overlapping drain or transient GET
+    /// and is consumed only by a durable current-schedule installation for the
+    /// same binding while that rejected revision is still the local high-water.
+    private var foregroundScheduleEpochResetFence:
+        PlannerScheduleRevisionEpochResetFence?
 
     init(
         planner: PlannerStore,
@@ -260,7 +262,7 @@ final class CanonicalSyncStore: ObservableObject {
         foregroundScheduleStreamUnavailableForActivation = false
         foregroundScheduleImmediateAttempts = 0
         foregroundScheduleRefreshInProgress = false
-        foregroundScheduleHintResetPending = false
+        foregroundScheduleEpochResetFence = nil
     }
 
     private func startForegroundItemStreamIfReady() {
@@ -569,13 +571,14 @@ final class CanonicalSyncStore: ObservableObject {
                     retrySeconds = 1
                     reconnectDelaySeconds = 1
                 case .cursorAhead:
-                    // The numeric head is diagnostic only. An ordinary GET is
-                    // required before changing or lowering durable state.
-                    foregroundScheduleHintResetPending = true
-                    _ = await refreshForegroundSchedule(
-                        generation: generation,
-                        resetHintHighWater: true
+                    // The numeric server head is diagnostic only. The exact
+                    // rejected request cursor is bound into a one-use fence;
+                    // only a subsequent current GET may lower durable state.
+                    foregroundScheduleEpochResetFence = .init(
+                        configurationIdentifier: client.configurationIdentifier,
+                        rejectedRevision: durableRevision
                     )
+                    _ = await refreshForegroundSchedule(generation: generation)
                     retrySeconds = 1
                     reconnectDelaySeconds = 1
                 }
@@ -613,6 +616,14 @@ final class CanonicalSyncStore: ObservableObject {
             configurationIdentifier: configurationIdentifier
         )
         guard revision > durable else { return }
+        do {
+            try planner.persistPublishedScheduleRevisionHint(revision)
+        } catch {
+            // The hint is not accepted until its high-water is encrypted. The
+            // planner already failed closed on a save error, and a later
+            // activation/reload can safely retry from durable state.
+            return
+        }
         foregroundScheduleLatestHintRevision = max(
             foregroundScheduleLatestHintRevision,
             revision
@@ -640,7 +651,7 @@ final class CanonicalSyncStore: ObservableObject {
                 return
             }
             let target = foregroundScheduleLatestHintRevision
-            let durable = durablePublishedScheduleRevision(
+            let durable = installedPublishedScheduleRevision(
                 configurationIdentifier: configurationIdentifier
             )
             if durable >= target {
@@ -666,10 +677,7 @@ final class CanonicalSyncStore: ObservableObject {
         _ = await refreshForegroundSchedule(generation: generation)
     }
 
-    private func refreshForegroundSchedule(
-        generation: UInt64,
-        resetHintHighWater: Bool = false
-    ) async -> Bool {
+    private func refreshForegroundSchedule(generation: UInt64) async -> Bool {
         guard foregroundItemIsCurrent(generation),
               !foregroundScheduleRefreshInProgress,
               !hasPendingScheduleReplicaWrites,
@@ -687,6 +695,11 @@ final class CanonicalSyncStore: ObservableObject {
               planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
               configurationSupportsScheduleReplica(client.configurationIdentifier),
               canonicalClientIsCurrent(client) else { return false }
+        let epochResetFence = foregroundScheduleEpochResetFence.flatMap { fence in
+            fence.configurationIdentifier == client.configurationIdentifier
+                ? fence
+                : nil
+        }
         do {
             var current = try await client.currentPublishedSchedule()
             guard foregroundItemIsCurrent(generation),
@@ -695,13 +708,14 @@ final class CanonicalSyncStore: ObservableObject {
                   !hasPendingScheduleReplicaWrites else { return false }
             guard let initialCurrent = current else {
                 try planner.clearCurrentPublishedSchedule(
-                    configurationIdentifier: client.configurationIdentifier
+                    configurationIdentifier: client.configurationIdentifier,
+                    revisionEpochResetFence: epochResetFence
                 )
                 lastPreview = nil
                 foregroundScheduleReconciledRevision = 0
-                if resetHintHighWater || foregroundScheduleHintResetPending {
+                if epochResetFence != nil {
                     foregroundScheduleLatestHintRevision = 0
-                    foregroundScheduleHintResetPending = false
+                    foregroundScheduleEpochResetFence = nil
                 }
                 return true
             }
@@ -724,13 +738,14 @@ final class CanonicalSyncStore: ObservableObject {
                       !hasPendingScheduleReplicaWrites else { return false }
                 guard let current else {
                     try planner.clearCurrentPublishedSchedule(
-                        configurationIdentifier: client.configurationIdentifier
+                        configurationIdentifier: client.configurationIdentifier,
+                        revisionEpochResetFence: epochResetFence
                     )
                     lastPreview = nil
                     foregroundScheduleReconciledRevision = 0
-                    if resetHintHighWater || foregroundScheduleHintResetPending {
+                    if epochResetFence != nil {
                         foregroundScheduleLatestHintRevision = 0
-                        foregroundScheduleHintResetPending = false
+                        foregroundScheduleEpochResetFence = nil
                     }
                     return true
                 }
@@ -744,14 +759,15 @@ final class CanonicalSyncStore: ObservableObject {
                 current,
                 blocks: rendered,
                 configurationIdentifier: client.configurationIdentifier,
-                message: message
+                message: message,
+                revisionEpochResetFence: epochResetFence
             )
             clearTransientLocalComposition()
             lastPreview = current.schedule
             foregroundScheduleReconciledRevision = current.revision.revisionNumber
-            if resetHintHighWater || foregroundScheduleHintResetPending {
+            if epochResetFence != nil {
                 foregroundScheduleLatestHintRevision = current.revision.revisionNumber
-                foregroundScheduleHintResetPending = false
+                foregroundScheduleEpochResetFence = nil
             }
             return true
         } catch {
@@ -813,6 +829,20 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     private func durablePublishedScheduleRevision(
+        configurationIdentifier: String
+    ) -> UInt64 {
+        guard planner.canonicalConfigurationIdentifier == configurationIdentifier else {
+            return 0
+        }
+        return max(
+            installedPublishedScheduleRevision(
+                configurationIdentifier: configurationIdentifier
+            ),
+            planner.publishedScheduleLatestHintRevision
+        )
+    }
+
+    private func installedPublishedScheduleRevision(
         configurationIdentifier: String
     ) -> UInt64 {
         guard let proof = planner.publishedScheduleProof,
@@ -954,6 +984,9 @@ final class CanonicalSyncStore: ObservableObject {
                 deferredExecutionPublicationSessionIDs:
                     planner.deferredExecutionPublicationSessionIDs,
                 blocks: planner.blocks,
+                publishedScheduleProof: planner.publishedScheduleProof,
+                publishedScheduleLatestHintRevision:
+                    planner.publishedScheduleLatestHintRevision,
                 scheduleProfile: planner.scheduleProfile,
                 freezeHours: planner.freezeHours,
                 timezoneName: planningTimezone,
@@ -1635,8 +1668,10 @@ final class CanonicalSyncStore: ObservableObject {
             }
 
             // Only the transport's exact authenticated, non-cacheable typed 404
-            // reaches this branch. It may clear obsolete authority, but it does
-            // not authorize an activation-time write: without an expected-head
+            // reaches this branch. It may clear obsolete authority only when
+            // no nonzero durable SSE high-water exists; lowering an old epoch
+            // requires the separately scoped cursor-ahead fence. It does not
+            // authorize an activation-time write: without an expected-head
             // publish precondition, another device could publish between this
             // read and our POST. Onboarding and explicit sync remain the paths
             // that deliberately compose and publish.
@@ -3326,6 +3361,7 @@ final class CanonicalSyncStore: ObservableObject {
         let end = expandedProfile.horizonEnd
         let activeItems = planner.canonicalItems.filter { $0.deletedAt == nil }
         let activeItemIDs = Set(activeItems.map(\.id))
+        let activeParentIDs = Set(activeItems.compactMap(\.parentID))
         let activeHabitIDs = Set(activeItems.filter { $0.kind == .habit }.map(\.id))
         let authoritativeHabitIDs = habitCheckpoint == nil ? Set<UUID>() : activeHabitIDs
         let currentItemByID = Dictionary(
@@ -3360,11 +3396,101 @@ final class CanonicalSyncStore: ObservableObject {
             .compactMap { occurrenceID, outcomes in
                 outcomes.map(\.occurredAt).max().map { (occurrenceID, $0) }
             }
-        let authoritativeOccurrences = (habitCheckpoint?.occurrences ?? []).filter { occurrence in
+        let checkpointOccurrences = habitCheckpoint?.occurrences ?? []
+        let checkpointPauses = habitCheckpoint?.pauses ?? []
+        func hasBaseMissedResolutionLifecycle(
+            _ occurrence: HabitCompositionCheckpoint.Occurrence
+        ) -> Bool {
+            guard let resolution = occurrence.missedResolution,
+                  let item = currentItemByID[occurrence.habitID],
+                  item.kind == .habit,
+                  item.isExecutable,
+                  !activeParentIDs.contains(item.id),
+                  item.recurrence != nil,
+                  item.status.allowsMissedHabitScheduling,
+                  occurrence.sourceItemRevision <= item.revision,
+                  item.habitPolicyFingerprint == occurrence.policyFingerprint,
+                  occurrence.outcome?.status.endsMissedResolutionLifecycle != true else {
+                return false
+            }
+            let window = resolution.action.sourceLifecycleWindow(
+                fallbackStart: occurrence.windowStart,
+                fallbackEnd: occurrence.windowEnd
+            )
+            return !checkpointPauses.contains { pause in
+                pause.habitID == occurrence.habitID
+                    && pause.startedAt < window.end
+                    && (pause.endedAt ?? .distantFuture) > window.start
+            }
+        }
+        let occurrenceByPlannerID = Dictionary(
+            uniqueKeysWithValues: checkpointOccurrences.map {
+                ($0.plannerOccurrenceID, $0)
+            }
+        )
+        let publishedOccurrenceAuthority: DayWeavePublishedScheduleOccurrenceAuthority?
+        if let proof = planner.publishedScheduleProof,
+           proof.configurationIdentifier == planner.canonicalConfigurationIdentifier,
+           proof.revisionNumber == planner.publishedScheduleLatestHintRevision {
+            publishedOccurrenceAuthority = proof.currentOccurrenceAuthority
+        } else {
+            publishedOccurrenceAuthority = nil
+        }
+        func isEligibleMissedReductionTarget(
+            _ targetID: UUID,
+            for source: HabitCompositionCheckpoint.Occurrence
+        ) -> Bool {
+            guard let target = occurrenceByPlannerID[targetID],
+                  target.habitID == source.habitID,
+                  let item = currentItemByID[target.habitID],
+                  target.sourceItemRevision <= item.revision,
+                  item.habitPolicyFingerprint == target.policyFingerprint,
+                  target.outcome.map({ $0.status == .unresolved }) ?? true,
+                  let publishedOccurrenceAuthority,
+                  publishedOccurrenceAuthority.authorizesMissedReductionTarget(
+                      plannerOccurrenceID: target.plannerOccurrenceID,
+                      seriesItemID: target.habitID,
+                      windowStart: target.windowStart,
+                      windowEnd: target.windowEnd
+                  ) else {
+                return false
+            }
+            return !checkpointPauses.contains { pause in
+                pause.habitID == target.habitID
+                    && pause.startedAt < target.windowEnd
+                    && (pause.endedAt ?? .distantFuture) > target.windowStart
+            }
+        }
+        let effectiveMissed = effectiveHabitMissedProjection(
+            occurrences: checkpointOccurrences,
+            sourceIsActive: hasBaseMissedResolutionLifecycle,
+            reductionTargetIsEligible: { source, target in
+                isEligibleMissedReductionTarget(target.plannerOccurrenceID, for: source)
+            }
+        )
+        func activeMissedAction(
+            _ occurrence: HabitCompositionCheckpoint.Occurrence
+        ) -> DayWeaveHabitMissedResolutionAction? {
+            effectiveMissed.actionsByEvidenceID[occurrence.id]
+        }
+        let authoritativeOccurrences = checkpointOccurrences.filter { occurrence in
             guard authoritativeHabitIDs.contains(occurrence.habitID),
                   let revision = currentRevisionByItem[occurrence.habitID],
                   occurrence.sourceItemRevision <= revision else { return false }
-            return (occurrence.windowStart < end && occurrence.windowEnd > start)
+            let sourceIsRelevant = occurrence.windowStart < end && occurrence.windowEnd > start
+            let missedActionIsRelevant: Bool
+            switch activeMissedAction(occurrence) {
+            case let .carry(windowStart, windowEnd):
+                missedActionIsRelevant = windowStart < end && windowEnd > start
+            case let .reduceFrequency(ids):
+                missedActionIsRelevant = ids.contains(
+                    where: effectiveMissed.suppressedPlannerOccurrenceIDs.contains
+                )
+            default:
+                missedActionIsRelevant = false
+            }
+            return sourceIsRelevant
+                || missedActionIsRelevant
                 || movedOccurrenceIDsInHorizon.contains(occurrence.plannerOccurrenceID)
         }
         let authoritativeCompletions: [(UUID, Date)] = authoritativeOccurrences.compactMap {
@@ -3410,11 +3536,70 @@ final class CanonicalSyncStore: ObservableObject {
             result, entry in
             result[entry.key.uuidString.lowercased()] = .string(format(entry.value))
         }
+        func canProjectMissedCarry(
+            _ occurrence: HabitCompositionCheckpoint.Occurrence
+        ) -> Bool {
+            guard case let .carry(windowStart, windowEnd)? = activeMissedAction(occurrence),
+                  start <= windowStart,
+                  windowEnd <= end,
+                  let identity = occurrence.identity,
+                  occurrence.nominalEnd != nil,
+                  occurrence.localDate != nil,
+                  let identityData = try? JSONEncoder().encode(identity),
+                  let recurrenceIdentity = try? JSONDecoder().decode(
+                      RecurrenceOccurrenceIdentity.self,
+                      from: identityData
+                  ),
+                  recurrenceIdentity.stableOrdinal != nil,
+                  let item = currentItemByID[occurrence.habitID],
+                  recurrenceIdentity.isCompatible(with: item.recurrence) else { return false }
+            return true
+        }
+        func missedResolutionSkipsSource(
+            _ occurrence: HabitCompositionCheckpoint.Occurrence
+        ) -> Bool {
+            guard let action = activeMissedAction(occurrence) else { return false }
+            switch action {
+            case .skip:
+                return true
+            case .carry:
+                return occurrence.windowStart < end
+                    && occurrence.windowEnd > start
+                    && !canProjectMissedCarry(occurrence)
+            default:
+                return false
+            }
+        }
+        let authoritativeSkippedOccurrenceIDs = authoritativeOccurrences.reduce(
+            into: Set<UUID>()
+        ) { skipped, occurrence in
+            if occurrence.outcome?.status == .skipped
+                || missedResolutionSkipsSource(occurrence) {
+                skipped.insert(occurrence.plannerOccurrenceID)
+            }
+            if case let .reduceFrequency(ids)? = activeMissedAction(occurrence) {
+                skipped.formUnion(ids.filter {
+                    effectiveMissed.suppressedPlannerOccurrenceIDs.contains($0)
+                })
+            }
+        }
+        let authoritativeCarryOccurrenceIDs = Set(authoritativeOccurrences.compactMap {
+            occurrence -> UUID? in
+            guard case .carry? = activeMissedAction(occurrence) else { return nil }
+            return occurrence.plannerOccurrenceID
+        })
+        // A server-owned skip, reduction, or carry is the sole recurrence
+        // exception authority for its occurrence. A locally stored move may
+        // predate or postdate that lifecycle row, but must never resurrect or
+        // replace it; this mirrors the server composition merge.
+        let authoritativeExceptionOwnedOccurrenceIDs =
+            authoritativeSkippedOccurrenceIDs.union(authoritativeCarryOccurrenceIDs)
         let partialProgress = try authoritativeOccurrences.reduce(
             into: [String: JSONValue]()
         ) { result, occurrence in
             guard let outcome = occurrence.outcome,
                   outcome.status == .partial,
+                  !authoritativeSkippedOccurrenceIDs.contains(occurrence.plannerOccurrenceID),
                   let expectedSeconds = occurrence.expectedDurationSeconds else { return }
             let rounded = expectedSeconds.addingReportingOverflow(59)
             guard !rounded.overflow, rounded.partialValue / 60 > 0 else {
@@ -3453,9 +3638,18 @@ final class CanonicalSyncStore: ObservableObject {
             }
         let authoritativeSkipExceptions: [ExceptionRecord] = authoritativeOccurrences.compactMap {
             occurrence in
-            guard let outcome = occurrence.outcome, outcome.status == .skipped else { return nil }
+            let outcomeSkipped = occurrence.outcome?.status == .skipped
+            // If a carry cannot be represented faithfully in this compose
+            // request, suppress the source while the server retains the
+            // durable carry decision. This prevents the old slot returning.
+            let missedSkipped = missedResolutionSkipsSource(occurrence)
+            guard outcomeSkipped || missedSkipped else { return nil }
             return ExceptionRecord(
-                occurredAt: outcome.occurredAt,
+                occurredAt: max(
+                    outcomeSkipped ? occurrence.outcome?.occurredAt ?? .distantPast : .distantPast,
+                    missedSkipped
+                        ? occurrence.missedResolution?.updatedAt ?? .distantPast : .distantPast
+                ),
                 occurrenceID: occurrence.plannerOccurrenceID,
                 value: .object([
                     "item_id": .string(occurrence.habitID.uuidString.lowercased()),
@@ -3467,8 +3661,43 @@ final class CanonicalSyncStore: ObservableObject {
                 ])
             )
         }
-        let skipExceptions = ordinarySkipExceptions + authoritativeSkipExceptions
-        let pauseRecords: [PauseRecord] = (habitCheckpoint?.pauses ?? [])
+        let missedReductionExceptions: [ExceptionRecord] = authoritativeOccurrences.flatMap {
+            occurrence -> [ExceptionRecord] in
+            guard let resolution = occurrence.missedResolution,
+                  case let .reduceFrequency(ids)? = activeMissedAction(occurrence) else { return [] }
+            return ids.compactMap { occurrenceID in
+                guard effectiveMissed.suppressedPlannerOccurrenceIDs.contains(occurrenceID) else {
+                    return nil
+                }
+                return ExceptionRecord(
+                    occurredAt: resolution.updatedAt,
+                    occurrenceID: occurrenceID,
+                    value: .object([
+                        "item_id": .string(occurrence.habitID.uuidString.lowercased()),
+                        "selector": .object([
+                            "type": .string("occurrence"),
+                            "id": .string(occurrenceID.uuidString.lowercased()),
+                        ]),
+                        "action": .object(["type": .string("skip")]),
+                    ])
+                )
+            }
+        }
+        let skipExceptions = (ordinarySkipExceptions
+            + authoritativeSkipExceptions
+            + missedReductionExceptions)
+            .sorted {
+                if $0.occurredAt != $1.occurredAt { return $0.occurredAt > $1.occurredAt }
+                return $0.occurrenceID.uuidString < $1.occurrenceID.uuidString
+            }
+            .reduce(into: [UUID: ExceptionRecord]()) { values, exception in
+                if values[exception.occurrenceID] == nil {
+                    values[exception.occurrenceID] = exception
+                }
+            }
+            .values
+            .map { $0 }
+        let pauseRecords: [PauseRecord] = checkpointPauses
             .compactMap { pause in
                 guard authoritativeHabitIDs.contains(pause.habitID) else { return nil }
                 let clippedStart = max(pause.startedAt, start)
@@ -3491,6 +3720,7 @@ final class CanonicalSyncStore: ObservableObject {
                 ])
         }
         let moveExceptions = storedMoves
+            .filter { !authoritativeExceptionOwnedOccurrenceIDs.contains($0.occurrenceID) }
             .map { move in
                 let source = move.source!
                 return ExceptionRecord(
@@ -3518,11 +3748,55 @@ final class CanonicalSyncStore: ObservableObject {
                     ])
                 )
             }
+        let missedMoveExceptions: [ExceptionRecord] = authoritativeOccurrences.compactMap {
+            occurrence in
+            guard let resolution = occurrence.missedResolution,
+                  case let .carry(windowStart, windowEnd)? = activeMissedAction(occurrence),
+                  start <= windowStart,
+                  windowEnd <= end,
+                  let identity = occurrence.identity,
+                  let nominalEnd = occurrence.nominalEnd,
+                  let localDate = occurrence.localDate,
+                  let identityData = try? JSONEncoder().encode(identity),
+                  let recurrenceIdentity = try? JSONDecoder().decode(
+                      RecurrenceOccurrenceIdentity.self,
+                      from: identityData
+                  ),
+                  let ordinal = recurrenceIdentity.stableOrdinal,
+                  let item = currentItemByID[occurrence.habitID],
+                  item.habitPolicyFingerprint == occurrence.policyFingerprint,
+                  recurrenceIdentity.isCompatible(with: item.recurrence) else { return nil }
+            return ExceptionRecord(
+                occurredAt: resolution.updatedAt,
+                occurrenceID: occurrence.plannerOccurrenceID,
+                value: .object([
+                    "item_id": .string(occurrence.habitID.uuidString.lowercased()),
+                    "selector": .object([
+                        "type": .string("occurrence"),
+                        "id": .string(occurrence.plannerOccurrenceID.uuidString.lowercased()),
+                    ]),
+                    "action": .object([
+                        "type": .string("move"),
+                        "start": .string(format(windowStart)),
+                        "end": .string(format(windowEnd)),
+                        "source": .object([
+                            "item_revision": .number(.init(item.revision)),
+                            "identity": identity,
+                            "nominal_start": .string(format(occurrence.nominalStart)),
+                            "nominal_end": .string(format(nominalEnd)),
+                            "local_date": .string(localDate.rawValue),
+                            "ordinal": .number(.init(UInt64(ordinal))),
+                        ]),
+                    ]),
+                ])
+            )
+        }
         guard completedOccurrenceIDs.count + completionAnchors.count + partialProgress.count
-            + recurrencePauses.count + skipExceptions.count + moveExceptions.count <= 9_000 else {
+            + recurrencePauses.count + skipExceptions.count + moveExceptions.count
+            + missedMoveExceptions.count <= 9_000 else {
             throw CanonicalSyncError.recurrenceContextCapacity
         }
-        let recurrenceExceptions = (skipExceptions + moveExceptions)
+        let recurrenceExceptions = (skipExceptions + moveExceptions + missedMoveExceptions)
             .sorted {
                 if $0.occurredAt != $1.occurredAt {
                     return $0.occurredAt > $1.occurredAt
@@ -4046,6 +4320,8 @@ private struct LocalCompositionMutationFence: Sendable {
     let recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]
     let deferredExecutionPublicationSessionIDs: Set<UUID>
     let blocks: [ScheduleBlock]
+    let publishedScheduleProof: DayWeavePublishedScheduleProof?
+    let publishedScheduleLatestHintRevision: UInt64
     let scheduleProfile: ScheduleProfile
     let freezeHours: Int
     let timezoneName: String
@@ -4066,6 +4342,9 @@ private struct LocalCompositionMutationFence: Sendable {
             && deferredExecutionPublicationSessionIDs
                 == planner.deferredExecutionPublicationSessionIDs
             && blocks == planner.blocks
+            && publishedScheduleProof == planner.publishedScheduleProof
+            && publishedScheduleLatestHintRevision
+                == planner.publishedScheduleLatestHintRevision
             && scheduleProfile == planner.scheduleProfile
             && freezeHours == planner.freezeHours
             && timezoneName == currentTimezoneName

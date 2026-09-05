@@ -83,7 +83,7 @@ struct ScheduleProfileTests {
         }
     }
 
-    @Test("v2 publication proof seals item and external static fields across restart")
+    @Test("v3 publication proof seals blocks and occurrence membership across restart")
     func publicationProofPersistenceAndMigration() throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
@@ -165,6 +165,7 @@ struct ScheduleProfileTests {
         )
         #expect(proof.hasValidShape)
         #expect(proof.hasCurrentImmutablePlanSeal)
+        #expect(proof.hasCurrentOccurrenceMembershipSeal)
         #expect(proof.matchesPublishedPlan([block, externalBlock]))
         func snapshot(blocks: [ScheduleBlock]) throws -> PlannerSnapshot {
             PlannerSnapshot(
@@ -189,6 +190,48 @@ struct ScheduleProfileTests {
             )
         }
         let current = try snapshot(blocks: [block, externalBlock])
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var missingMembershipObject = try #require(
+            JSONSerialization.jsonObject(with: encoder.encode(current)) as? [String: Any]
+        )
+        var missingMembershipProof = try #require(
+            missingMembershipObject["publishedScheduleProof"] as? [String: Any]
+        )
+        #expect(
+            missingMembershipProof.removeValue(forKey: "publishedOccurrences") != nil
+        )
+        missingMembershipObject["publishedScheduleProof"] = missingMembershipProof
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] =
+            PlannerSnapshot.currentSchemaVersion
+        #expect(throws: (any Error).self) {
+            _ = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: missingMembershipObject)
+            ).migratedToCurrentSchema()
+        }
+
+        let legacyV2Proof = DayWeavePublishedScheduleProof(
+            version: 2,
+            configurationIdentifier: proof.configurationIdentifier,
+            revisionID: proof.revisionID,
+            revision: proof.revision,
+            revisionNumber: proof.revisionNumber,
+            inputDigest: proof.inputDigest,
+            asOf: proof.asOf,
+            horizonStart: proof.horizonStart,
+            horizonEnd: proof.horizonEnd,
+            timezoneName: proof.timezoneName,
+            publishedAt: proof.publishedAt,
+            publishedBlocks: proof.publishedBlocks
+        )
+        #expect(legacyV2Proof.hasValidShape)
+        #expect(legacyV2Proof.hasCurrentImmutablePlanSeal)
+        #expect(!legacyV2Proof.hasCurrentOccurrenceMembershipSeal)
+        #expect(legacyV2Proof.currentOccurrenceAuthority == nil)
 
         try context.persistence.save(current)
         let restored = try #require(try context.persistence.load())

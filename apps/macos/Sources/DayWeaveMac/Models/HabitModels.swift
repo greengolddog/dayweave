@@ -1,5 +1,13 @@
 import Foundation
 
+extension CodingUserInfoKey {
+    /// Authenticated API decoders require the nullable missed-resolution member
+    /// so an older or malformed occurrence cannot silently erase that authority.
+    static let dayWeaveRequiresHabitMissedResolution = CodingUserInfoKey(
+        rawValue: "com.greengolddog.dayweave.requires-habit-missed-resolution"
+    )!
+}
+
 private struct DayWeaveAnyCodingKey: CodingKey, Hashable {
     let stringValue: String
     let intValue: Int?
@@ -142,6 +150,13 @@ enum DayWeaveHabitOutcomeStatus: String, Codable, CaseIterable, Sendable {
         case .completed: "checkmark.circle.fill"
         case .skipped: "forward.circle"
         }
+    }
+
+    /// Completed and explicitly skipped outcomes make any concurrently cached
+    /// missed-resolution coordinate inert. The two server ledgers advance
+    /// independently, so clients must not wait for a matching cancellation row.
+    var endsMissedResolutionLifecycle: Bool {
+        self == .completed || self == .skipped
     }
 }
 
@@ -733,6 +748,413 @@ private enum DayWeaveHabitRecurrenceIdentity: Decodable, Sendable {
     }
 }
 
+enum DayWeaveHabitMissedPolicy: String, Codable, CaseIterable, Sendable {
+    case skip
+    case carry
+    case reduceFrequency = "reduce_frequency"
+    case ask
+}
+
+enum DayWeaveHabitMissedExplicitAction: String, Codable, CaseIterable, Sendable {
+    case skip
+    case carry
+    case reduceFrequency = "reduce_frequency"
+}
+
+enum DayWeaveHabitMissedCancellationReason: String, Codable, CaseIterable, Sendable {
+    case sourceCompleted = "source_completed"
+    case sourceSkipped = "source_skipped"
+    case sourcePaused = "source_paused"
+    case sourceObsolete = "source_obsolete"
+}
+
+enum DayWeaveHabitMissedResumeAction: String, Codable, CaseIterable, Hashable, Sendable {
+    case decisionRequired = "decision_required"
+    case skip
+    case carry
+    case reduceFrequency = "reduce_frequency"
+}
+
+/// A server-derived scheduling decision for an overdue habit occurrence.
+/// Carry windows and reduction targets are intentionally output-only.
+enum DayWeaveHabitMissedResolutionAction: Codable, Equatable, Sendable {
+    case decisionRequired
+    case reductionPending
+    case cancelled(
+        reason: DayWeaveHabitMissedCancellationReason,
+        resumeAction: DayWeaveHabitMissedResumeAction
+    )
+    case skip
+    case carry(windowStart: Date, windowEnd: Date)
+    case reduceFrequency(suppressedPlannerOccurrenceIDs: [UUID])
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case windowStart = "window_start"
+        case windowEnd = "window_end"
+        case suppressedPlannerOccurrenceIDs = "suppressed_planner_occurrence_ids"
+        case reason
+        case resumeAction = "resume_action"
+    }
+
+    private enum Kind: String, Codable {
+        case decisionRequired = "decision_required"
+        case reductionPending = "reduction_pending"
+        case cancelled
+        case skip
+        case carry
+        case reduceFrequency = "reduce_frequency"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(Kind.self, forKey: .type)
+        switch kind {
+        case .decisionRequired:
+            try requireExactHabitKeys(from: decoder, required: ["type"])
+            self = .decisionRequired
+        case .reductionPending:
+            try requireExactHabitKeys(from: decoder, required: ["type"])
+            self = .reductionPending
+        case .cancelled:
+            try requireExactHabitKeys(
+                from: decoder,
+                required: ["type", "reason", "resume_action"]
+            )
+            self = .cancelled(
+                reason: try container.decode(
+                    DayWeaveHabitMissedCancellationReason.self,
+                    forKey: .reason
+                ),
+                resumeAction: try container.decode(
+                    DayWeaveHabitMissedResumeAction.self,
+                    forKey: .resumeAction
+                )
+            )
+        case .skip:
+            try requireExactHabitKeys(from: decoder, required: ["type"])
+            self = .skip
+        case .carry:
+            try requireExactHabitKeys(
+                from: decoder,
+                required: ["type", "window_start", "window_end"]
+            )
+            let start = try container.decode(Date.self, forKey: .windowStart)
+            let end = try container.decode(Date.self, forKey: .windowEnd)
+            guard Self.isValidCarryWindow(start: start, end: end) else {
+                throw Self.invalid(decoder)
+            }
+            self = .carry(windowStart: start, windowEnd: end)
+        case .reduceFrequency:
+            try requireExactHabitKeys(
+                from: decoder,
+                required: ["type", "suppressed_planner_occurrence_ids"]
+            )
+            let ids = try container.decode([UUID].self, forKey: .suppressedPlannerOccurrenceIDs)
+            guard Self.hasValidReductionTargets(ids) else { throw Self.invalid(decoder) }
+            self = .reduceFrequency(suppressedPlannerOccurrenceIDs: ids)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .decisionRequired:
+            try container.encode(Kind.decisionRequired, forKey: .type)
+        case .reductionPending:
+            try container.encode(Kind.reductionPending, forKey: .type)
+        case let .cancelled(reason, resumeAction):
+            try container.encode(Kind.cancelled, forKey: .type)
+            try container.encode(reason, forKey: .reason)
+            try container.encode(resumeAction, forKey: .resumeAction)
+        case .skip:
+            try container.encode(Kind.skip, forKey: .type)
+        case let .carry(windowStart, windowEnd):
+            try container.encode(Kind.carry, forKey: .type)
+            try container.encode(windowStart, forKey: .windowStart)
+            try container.encode(windowEnd, forKey: .windowEnd)
+        case let .reduceFrequency(ids):
+            try container.encode(Kind.reduceFrequency, forKey: .type)
+            try container.encode(ids, forKey: .suppressedPlannerOccurrenceIDs)
+        }
+    }
+
+    var isDecisionRequired: Bool {
+        if case .decisionRequired = self { return true }
+        return false
+    }
+
+    func sourceLifecycleWindow(
+        fallbackStart: Date,
+        fallbackEnd: Date
+    ) -> (start: Date, end: Date) {
+        if case let .carry(windowStart, windowEnd) = self {
+            return (windowStart, windowEnd)
+        }
+        return (fallbackStart, fallbackEnd)
+    }
+
+    fileprivate static func isValidCarryWindow(start: Date, end: Date) -> Bool {
+        DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(start)
+            && DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(end)
+            && end > start
+            && end.timeIntervalSince(start) <= 366 * 24 * 60 * 60
+    }
+
+    fileprivate static func hasValidReductionTargets(_ ids: [UUID]) -> Bool {
+        ids.count == 1
+            && ids[0] != nilID
+            && dayWeaveIsRFC4122VersionFiveUUID(ids[0])
+    }
+
+    private static func invalid(_ decoder: any Decoder) -> DecodingError {
+        .dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Invalid missed-habit resolution action"
+            )
+        )
+    }
+
+    private static let nilID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
+}
+
+struct DayWeaveHabitMissedResolution: Codable, Equatable, Sendable {
+    let occurrenceEvidenceID: UUID
+    let habitID: UUID
+    let sourcePlannerOccurrenceID: UUID
+    let revision: UInt64
+    let configuredPolicy: DayWeaveHabitMissedPolicy
+    let action: DayWeaveHabitMissedResolutionAction
+    let createdAt: Date
+    let updatedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case occurrenceEvidenceID = "occurrence_evidence_id"
+        case habitID = "habit_id"
+        case sourcePlannerOccurrenceID = "source_planner_occurrence_id"
+        case revision
+        case configuredPolicy = "configured_policy"
+        case action
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(
+        occurrenceEvidenceID: UUID,
+        habitID: UUID,
+        sourcePlannerOccurrenceID: UUID,
+        revision: UInt64,
+        configuredPolicy: DayWeaveHabitMissedPolicy,
+        action: DayWeaveHabitMissedResolutionAction,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.occurrenceEvidenceID = occurrenceEvidenceID
+        self.habitID = habitID
+        self.sourcePlannerOccurrenceID = sourcePlannerOccurrenceID
+        self.revision = revision
+        self.configuredPolicy = configuredPolicy
+        self.action = action
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactHabitKeys(from: decoder, required: [
+            "occurrence_evidence_id", "habit_id", "source_planner_occurrence_id",
+            "revision", "configured_policy", "action", "created_at", "updated_at",
+        ])
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        occurrenceEvidenceID = try container.decode(UUID.self, forKey: .occurrenceEvidenceID)
+        habitID = try container.decode(UUID.self, forKey: .habitID)
+        sourcePlannerOccurrenceID = try container.decode(
+            UUID.self,
+            forKey: .sourcePlannerOccurrenceID
+        )
+        revision = try container.decode(UInt64.self, forKey: .revision)
+        configuredPolicy = try container.decode(
+            DayWeaveHabitMissedPolicy.self,
+            forKey: .configuredPolicy
+        )
+        action = try container.decode(DayWeaveHabitMissedResolutionAction.self, forKey: .action)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        guard hasValidShape else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Invalid missed-habit resolution")
+            )
+        }
+    }
+
+    var hasValidShape: Bool {
+        let nilID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        guard occurrenceEvidenceID != nilID,
+              habitID != nilID,
+              sourcePlannerOccurrenceID != nilID,
+              revision > 0,
+              DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(createdAt),
+              DayWeaveHabitOccurrenceEvidence.isValidEvidenceDate(updatedAt),
+              updatedAt >= createdAt else { return false }
+        switch (configuredPolicy, action, revision) {
+        case (.ask, .decisionRequired, 1...),
+             (.ask, .skip, 2...),
+             (.ask, .reductionPending, 2...),
+             (.skip, .skip, 1...),
+             (.reduceFrequency, .reductionPending, 1...):
+            return true
+        case let (.ask, .carry(windowStart, windowEnd), 2...),
+             let (.carry, .carry(windowStart, windowEnd), 1...):
+            return DayWeaveHabitMissedResolutionAction.isValidCarryWindow(
+                start: windowStart,
+                end: windowEnd
+            ) && Self.sameInstant(windowStart, updatedAt)
+        case let (.ask, .reduceFrequency(ids), 2...):
+            return validReductionTargets(ids)
+        case let (.reduceFrequency, .reduceFrequency(ids), 1...):
+            return validReductionTargets(ids)
+        case (.ask, .cancelled, 2...):
+            return true
+        case let (.skip, .cancelled(_, resumeAction), 2...):
+            return resumeAction == .skip
+        case let (.carry, .cancelled(_, resumeAction), 2...):
+            return resumeAction == .carry
+        case let (.reduceFrequency, .cancelled(_, resumeAction), 2...):
+            return resumeAction == .reduceFrequency
+        default:
+            return false
+        }
+    }
+
+    func belongs(to evidence: DayWeaveHabitOccurrenceEvidence) -> Bool {
+        occurrenceEvidenceID == evidence.id
+            && habitID == evidence.habitID
+            && sourcePlannerOccurrenceID == evidence.plannerOccurrenceID
+    }
+
+    func canTransition(to next: Self) -> Bool {
+        guard next.hasValidShape,
+              occurrenceEvidenceID == next.occurrenceEvidenceID,
+              habitID == next.habitID,
+              sourcePlannerOccurrenceID == next.sourcePlannerOccurrenceID,
+              configuredPolicy == next.configuredPolicy,
+              Self.sameInstant(createdAt, next.createdAt),
+              revision.addingReportingOverflow(1) == (next.revision, false),
+              next.updatedAt >= updatedAt else { return false }
+        switch (action, next.action) {
+        case (.decisionRequired, .skip),
+             (.decisionRequired, .carry),
+             (.decisionRequired, .reductionPending),
+             (.decisionRequired, .reduceFrequency),
+             (.decisionRequired, .cancelled),
+             (.carry, .decisionRequired):
+            return configuredPolicy == .ask
+        case (.reductionPending, .reduceFrequency),
+             (.reduceFrequency, .reductionPending):
+            return true
+        case (.carry, .carry):
+            return configuredPolicy == .carry
+        case let (.skip, .cancelled(_, resumeAction)):
+            return resumeAction == .skip
+        case let (.carry, .cancelled(_, resumeAction)):
+            return resumeAction == .carry
+        case let (.reductionPending, .cancelled(_, resumeAction)),
+             let (.reduceFrequency, .cancelled(_, resumeAction)):
+            return resumeAction == .reduceFrequency
+        case let (.cancelled(_, resumeAction), nextAction):
+            switch (resumeAction, nextAction) {
+            case (.decisionRequired, .decisionRequired),
+                 (.skip, .skip),
+                 (.carry, .carry),
+                 (.reduceFrequency, .reductionPending),
+                 (.reduceFrequency, .reduceFrequency):
+                return true
+            default:
+                return false
+            }
+        default:
+            return false
+        }
+    }
+
+    private func validReductionTargets(_ ids: [UUID]) -> Bool {
+        DayWeaveHabitMissedResolutionAction.hasValidReductionTargets(ids)
+            && ids[0] != sourcePlannerOccurrenceID
+    }
+
+    private static func sameInstant(_ left: Date, _ right: Date) -> Bool {
+        dayWeavePostgresEpochMicroseconds(left) == dayWeavePostgresEpochMicroseconds(right)
+    }
+}
+
+struct DayWeaveHabitMissedReconcileCommand: Codable, Equatable, Sendable {
+    let operationID: UUID
+
+    private enum CodingKeys: String, CodingKey { case operationID = "operation_id" }
+
+    init(operationID: UUID) { self.operationID = operationID }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactHabitKeys(from: decoder, required: ["operation_id"])
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        operationID = try container.decode(UUID.self, forKey: .operationID)
+        guard hasValidShape else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Invalid missed-habit reconcile command")
+            )
+        }
+    }
+
+    var hasValidShape: Bool {
+        operationID != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    }
+}
+
+struct DayWeaveHabitMissedResolveCommand: Codable, Equatable, Sendable {
+    let operationID: UUID
+    let expectedRevision: UInt64
+    let action: DayWeaveHabitMissedExplicitAction
+
+    private enum CodingKeys: String, CodingKey {
+        case operationID = "operation_id"
+        case expectedRevision = "expected_revision"
+        case action
+    }
+
+    init(
+        operationID: UUID,
+        expectedRevision: UInt64,
+        action: DayWeaveHabitMissedExplicitAction
+    ) {
+        self.operationID = operationID
+        self.expectedRevision = expectedRevision
+        self.action = action
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactHabitKeys(
+            from: decoder,
+            required: ["operation_id", "expected_revision", "action"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        operationID = try container.decode(UUID.self, forKey: .operationID)
+        expectedRevision = try container.decode(UInt64.self, forKey: .expectedRevision)
+        action = try container.decode(DayWeaveHabitMissedExplicitAction.self, forKey: .action)
+        guard hasValidShape else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Invalid missed-habit resolve command")
+            )
+        }
+    }
+
+    var hasValidShape: Bool {
+        operationID != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            && expectedRevision > 0
+    }
+}
+
 struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
     let id: UUID
     let habitID: UUID
@@ -940,24 +1362,48 @@ struct DayWeaveHabitOccurrenceEvidence: Codable, Equatable, Sendable {
 struct DayWeaveHabitOccurrence: Codable, Equatable, Identifiable, Sendable {
     let evidence: DayWeaveHabitOccurrenceEvidence
     let outcome: DayWeaveHabitOutcome?
+    let missedResolution: DayWeaveHabitMissedResolution?
 
     var id: UUID { evidence.id }
 
     private enum CodingKeys: String, CodingKey {
         case evidence
         case outcome
+        case missedResolution = "missed_resolution"
     }
 
-    init(evidence: DayWeaveHabitOccurrenceEvidence, outcome: DayWeaveHabitOutcome?) {
+    init(
+        evidence: DayWeaveHabitOccurrenceEvidence,
+        outcome: DayWeaveHabitOutcome?,
+        missedResolution: DayWeaveHabitMissedResolution? = nil
+    ) {
         self.evidence = evidence
         self.outcome = outcome
+        self.missedResolution = missedResolution
     }
 
     init(from decoder: any Decoder) throws {
-        try requireExactHabitKeys(from: decoder, required: ["evidence", "outcome"])
+        let requiresMissedResolution =
+            decoder.userInfo[.dayWeaveRequiresHabitMissedResolution] as? Bool == true
+        try requireExactHabitKeys(
+            from: decoder,
+            required: requiresMissedResolution
+                ? ["evidence", "outcome", "missed_resolution"]
+                : ["evidence", "outcome"],
+            optional: requiresMissedResolution ? [] : ["missed_resolution"]
+        )
         let container = try decoder.container(keyedBy: CodingKeys.self)
         evidence = try container.decode(DayWeaveHabitOccurrenceEvidence.self, forKey: .evidence)
         outcome = try container.decodeIfPresent(DayWeaveHabitOutcome.self, forKey: .outcome)
+        missedResolution = try container.decodeIfPresent(
+            DayWeaveHabitMissedResolution.self,
+            forKey: .missedResolution
+        )
+        guard missedResolution?.belongs(to: evidence) ?? true else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Missed resolution does not belong to occurrence evidence")
+            )
+        }
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -965,6 +1411,7 @@ struct DayWeaveHabitOccurrence: Codable, Equatable, Identifiable, Sendable {
         try container.encode(evidence, forKey: .evidence)
         try container.encodeIfPresent(outcome, forKey: .outcome)
         if outcome == nil { try container.encodeNil(forKey: .outcome) }
+        try container.encodeIfPresent(missedResolution, forKey: .missedResolution)
     }
 }
 
@@ -1052,6 +1499,25 @@ struct DayWeaveHabitPause: Codable, Equatable, Identifiable, Sendable {
             && createdAt.timeIntervalSinceReferenceDate.isFinite
             && updatedAt.timeIntervalSinceReferenceDate.isFinite
             && updatedAt >= createdAt
+    }
+}
+
+extension DayWeaveHabitOccurrence {
+    /// Whether a missed decision can still affect its source occurrence.
+    /// Outcome and pause state are separate monotonic coordinates and may be
+    /// newer than the missed-resolution row until the next reconciliation.
+    func hasActiveMissedResolutionLifecycle(pauses: [DayWeaveHabitPause]) -> Bool {
+        guard let resolution = missedResolution,
+              outcome?.status.endsMissedResolutionLifecycle != true else { return false }
+        let window = resolution.action.sourceLifecycleWindow(
+            fallbackStart: evidence.windowStart,
+            fallbackEnd: evidence.windowEnd
+        )
+        return !pauses.contains { pause in
+            pause.habitID == evidence.habitID
+                && pause.startedAt < window.end
+                && (pause.endedAt ?? .distantFuture) > window.start
+        }
     }
 }
 
@@ -1201,6 +1667,71 @@ struct DayWeaveHabitOccurrenceMutationResponse: Codable, Equatable, Sendable {
         try requireExactHabitKeys(from: decoder, required: ["occurrence", "replayed"])
         let container = try decoder.container(keyedBy: CodingKeys.self)
         occurrence = try container.decode(DayWeaveHabitOccurrence.self, forKey: .occurrence)
+        replayed = try container.decode(Bool.self, forKey: .replayed)
+    }
+}
+
+struct DayWeaveHabitMissedReconcileResponse: Codable, Equatable, Sendable {
+    let resolutions: [DayWeaveHabitMissedResolution]
+    let hasMore: Bool
+    let replayed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case resolutions
+        case hasMore = "has_more"
+        case replayed
+    }
+
+    init(
+        resolutions: [DayWeaveHabitMissedResolution],
+        hasMore: Bool,
+        replayed: Bool
+    ) {
+        self.resolutions = resolutions
+        self.hasMore = hasMore
+        self.replayed = replayed
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactHabitKeys(
+            from: decoder,
+            required: ["resolutions", "has_more", "replayed"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        resolutions = try container.decode(
+            [DayWeaveHabitMissedResolution].self,
+            forKey: .resolutions
+        )
+        hasMore = try container.decode(Bool.self, forKey: .hasMore)
+        replayed = try container.decode(Bool.self, forKey: .replayed)
+        guard resolutions.count <= 200,
+              Set(resolutions.map(\.occurrenceEvidenceID)).count == resolutions.count,
+              !hasMore || !resolutions.isEmpty else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Invalid missed-habit reconcile response")
+            )
+        }
+    }
+}
+
+struct DayWeaveHabitMissedResolutionMutationResponse: Codable, Equatable, Sendable {
+    let resolution: DayWeaveHabitMissedResolution
+    let replayed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case resolution
+        case replayed
+    }
+
+    init(resolution: DayWeaveHabitMissedResolution, replayed: Bool) {
+        self.resolution = resolution
+        self.replayed = replayed
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactHabitKeys(from: decoder, required: ["resolution", "replayed"])
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        resolution = try container.decode(DayWeaveHabitMissedResolution.self, forKey: .resolution)
         replayed = try container.decode(Bool.self, forKey: .replayed)
     }
 }

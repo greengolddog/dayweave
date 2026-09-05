@@ -91,6 +91,15 @@ enum DayWeaveCanonicalItemStatus: Codable, Equatable, Hashable, Sendable {
         var container = encoder.singleValueContainer()
         try container.encode(wireValue)
     }
+
+    var allowsMissedHabitScheduling: Bool {
+        switch self {
+        case .inbox, .planned, .scheduled, .inProgress, .paused:
+            true
+        case .blocked, .completed, .skipped, .cancelled, .unknown:
+            false
+        }
+    }
 }
 
 enum DayWeaveDurationKind: Codable, Equatable, Sendable {
@@ -451,7 +460,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             in: container
         )
         let persistedExactDeadline: String?
-        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
+        if snapshotSchemaVersion.map({ $0 >= 22 }) == true {
             persistedExactDeadline = try container.decodeIfPresent(
                 String.self,
                 forKey: .retainedCanonicalDeadlineAt
@@ -506,7 +515,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
                 )
             }
             usesExplicitStructuralWireShape = hasCompleteStructuralWireShape
-        } else if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
+        } else if snapshotSchemaVersion.map({ $0 >= 22 }) == true {
             guard hasCompleteStructuralWireShape,
                   container.contains(.hasExplicitStructuralMetadata) else {
                 throw DecodingError.dataCorruptedError(
@@ -630,7 +639,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             && blockedByItemID == nil
             && blockedReason == nil
             && status != .blocked
-        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
+        if snapshotSchemaVersion.map({ $0 >= 22 }) == true {
             hasExplicitStructuralMetadata = try container.decode(
                 Bool.self,
                 forKey: .hasExplicitStructuralMetadata
@@ -639,7 +648,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             hasExplicitStructuralMetadata = usesExplicitStructuralWireShape
                 && !typedValuesAreLegacyEquivalent
         }
-        if snapshotSchemaVersion == 22 || snapshotSchemaVersion == 23 {
+        if snapshotSchemaVersion.map({ $0 >= 22 }) == true {
             guard hasExplicitStructuralMetadata || typedValuesAreLegacyEquivalent else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .hasExplicitStructuralMetadata,
@@ -1400,6 +1409,78 @@ enum DayWeaveItemDeltaChange: Decodable, Equatable, Sendable {
     }
 }
 
+extension DayWeaveCanonicalItem {
+    /// Matches the server's `dayweave-habit-policy/1` digest. Missed-habit
+    /// decisions bind to recurrence-affecting policy rather than the whole
+    /// item revision, so harmless edits such as title or priority changes do
+    /// not make a durable decision disappear.
+    var habitPolicyFingerprint: String? {
+        guard kind == .habit, let recurrence else { return nil }
+
+        let durationKindValue: String
+        switch durationKind {
+        case .unknown, .exact, .range:
+            durationKindValue = durationKind.wireValue
+        case .unsupported:
+            return nil
+        }
+        let durationSourceValue: JSONValue
+        switch durationSource {
+        case nil:
+            durationSourceValue = .null
+        case .user?, .assistant?, .learned?, .imported?:
+            durationSourceValue = .string(durationSource!.wireValue)
+        case .unsupported?:
+            return nil
+        }
+
+        let splitAllowed: Bool
+        let splitMinimum: JSONValue
+        let splitMaximum: JSONValue
+        switch splitPolicy {
+        case .indivisible:
+            splitAllowed = false
+            splitMinimum = .null
+            splitMaximum = .null
+        case let .splittable(minimum, maximum):
+            splitAllowed = true
+            splitMinimum = .number(.init(UInt64(minimum)))
+            splitMaximum = .number(.init(UInt64(maximum)))
+        case .unknown:
+            return nil
+        }
+
+        func optionalNumber(_ value: UInt32?) -> JSONValue {
+            value.map { .number(.init(UInt64($0))) } ?? .null
+        }
+        let policy = JSONValue.object([
+            "schema": .string("dayweave-habit-policy/1"),
+            "habit_id": .string(id.uuidString.lowercased()),
+            "timezone_name": .string(timezoneName),
+            "recurrence": recurrence,
+            "constraints": flexibleConstraints,
+            "duration": .object([
+                "kind": .string(durationKindValue),
+                "seconds": optionalNumber(durationSeconds),
+                "minimum_seconds": optionalNumber(durationMinimumSeconds),
+                "maximum_seconds": optionalNumber(durationMaximumSeconds),
+                "source": durationSourceValue,
+            ]),
+            "split": .object([
+                "allowed": .bool(splitAllowed),
+                "minimum_seconds": splitMinimum,
+                "maximum_seconds": splitMaximum,
+            ]),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let bytes = try? encoder.encode(policy) else { return nil }
+        return "sha256:" + SHA256.hash(data: bytes).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+}
+
 private extension DayWeaveCanonicalItem {
     var retainedByteEstimate: Int {
         var total = 512
@@ -2035,12 +2116,74 @@ struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable membership for a recurrence occurrence in an exact published
+/// schedule revision. This deliberately does not depend on rendered blocks:
+/// a generated occurrence may be unscheduled and a skipped occurrence has no
+/// block, but both states are relevant when replaying an already-bound missed
+/// reduction edge.
+struct DayWeavePublishedScheduleOccurrenceProof: Codable, Equatable, Sendable {
+    let plannerOccurrenceID: UUID
+    let seriesItemID: UUID
+    let state: String
+
+    init(_ occurrence: DayWeaveSchedulePreview.Plan.Occurrence) {
+        plannerOccurrenceID = occurrence.id
+        seriesItemID = occurrence.seriesItemID
+        state = occurrence.state
+    }
+
+    init(
+        plannerOccurrenceID: UUID,
+        seriesItemID: UUID,
+        state: String
+    ) {
+        self.plannerOccurrenceID = plannerOccurrenceID
+        self.seriesItemID = seriesItemID
+        self.state = state
+    }
+
+    var hasValidShape: Bool {
+        dayWeaveIsRFC4122VersionFiveUUID(plannerOccurrenceID)
+            && !seriesItemID.isDayWeavePublicationNil
+            && ["generated", "completed", "paused", "skipped"].contains(state)
+    }
+}
+
+struct DayWeavePublishedScheduleOccurrenceAuthority: Sendable {
+    let horizonStart: Date
+    let horizonEnd: Date
+    let membershipByPlannerOccurrenceID:
+        [UUID: DayWeavePublishedScheduleOccurrenceProof]
+
+    func authorizesMissedReductionTarget(
+        plannerOccurrenceID: UUID,
+        seriesItemID: UUID,
+        windowStart: Date,
+        windowEnd: Date
+    ) -> Bool {
+        guard windowStart.timeIntervalSinceReferenceDate.isFinite,
+              windowEnd.timeIntervalSinceReferenceDate.isFinite,
+              windowStart < windowEnd else { return false }
+        // Match the server's effective-edge rule: a current publication only
+        // constrains occurrence windows that it covers in full. Historical
+        // edges outside that horizon remain meaningful and prevent a later
+        // source in the chain from cascading its own reduction.
+        guard horizonStart <= windowStart, horizonEnd >= windowEnd else {
+            return true
+        }
+        guard let membership = membershipByPlannerOccurrenceID[plannerOccurrenceID],
+              membership.seriesItemID == seriesItemID else { return false }
+        return membership.state == "generated" || membership.state == "skipped"
+    }
+}
+
 /// Durable positive evidence for the exact schedule installed after a
 /// validated, non-replayed publication response. The server receipt does not
 /// carry the compose `as_of` value or local API binding, so both are retained
 /// beside it instead of being inferred again after a restart.
 struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
-    static let currentVersion = 2
+    static let currentVersion = 3
+    static let maximumPublishedOccurrences = 200_000
 
     let version: Int
     let configurationIdentifier: String
@@ -2054,6 +2197,48 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
     let timezoneName: String
     let publishedAt: Date
     let publishedBlocks: [DayWeavePublishedScheduleBlockProof]
+    /// Nil only for legacy v1/v2 proofs. Version 3 always carries the exact,
+    /// sorted occurrence membership returned with the published schedule.
+    let publishedOccurrences: [DayWeavePublishedScheduleOccurrenceProof]?
+
+    private enum CodingKeys: String, CodingKey {
+        case version, configurationIdentifier, revisionID, revision, revisionNumber
+        case inputDigest, asOf, horizonStart, horizonEnd, timezoneName, publishedAt
+        case publishedBlocks, publishedOccurrences
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        configurationIdentifier = try container.decode(
+            String.self,
+            forKey: .configurationIdentifier
+        )
+        revisionID = try container.decode(UUID.self, forKey: .revisionID)
+        revision = try container.decode(String.self, forKey: .revision)
+        revisionNumber = try container.decode(UInt64.self, forKey: .revisionNumber)
+        inputDigest = try container.decode(String.self, forKey: .inputDigest)
+        asOf = try container.decode(Date.self, forKey: .asOf)
+        horizonStart = try container.decode(Date.self, forKey: .horizonStart)
+        horizonEnd = try container.decode(Date.self, forKey: .horizonEnd)
+        timezoneName = try container.decode(String.self, forKey: .timezoneName)
+        publishedAt = try container.decode(Date.self, forKey: .publishedAt)
+        publishedBlocks = try container.decode(
+            [DayWeavePublishedScheduleBlockProof].self,
+            forKey: .publishedBlocks
+        )
+        if version == Self.currentVersion {
+            publishedOccurrences = try container.decode(
+                [DayWeavePublishedScheduleOccurrenceProof].self,
+                forKey: .publishedOccurrences
+            )
+        } else {
+            publishedOccurrences = try container.decodeIfPresent(
+                [DayWeavePublishedScheduleOccurrenceProof].self,
+                forKey: .publishedOccurrences
+            )
+        }
+    }
 
     init?(
         publication: PendingSchedulePublication,
@@ -2065,6 +2250,11 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
         let publishedBlocks = renderedBlocks.compactMap {
             DayWeavePublishedScheduleBlockProof(block: $0)
         }.sorted { $0.id.uuidString < $1.id.uuidString }
+        let publishedOccurrences = Self.sortedOccurrenceProofs(
+            publication.preview.plan.occurrences.map(
+                DayWeavePublishedScheduleOccurrenceProof.init
+            )
+        )
         self.init(
             configurationIdentifier: publication.configurationIdentifier,
             revisionID: revision.id,
@@ -2076,7 +2266,8 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
             horizonEnd: revision.horizonEnd,
             timezoneName: revision.timezoneName,
             publishedAt: revision.publishedAt,
-            publishedBlocks: publishedBlocks
+            publishedBlocks: publishedBlocks,
+            publishedOccurrences: publishedOccurrences
         )
         guard renderedBlocks.count == publication.preview.plan.blocks.count,
               publishedBlocks.count == renderedBlocks.count,
@@ -2104,6 +2295,11 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
         let blocks = renderedBlocks.compactMap {
             DayWeavePublishedScheduleBlockProof(block: $0)
         }.sorted { $0.id.uuidString < $1.id.uuidString }
+        let publishedOccurrences = Self.sortedOccurrenceProofs(
+            schedule.plan.occurrences.map(
+                DayWeavePublishedScheduleOccurrenceProof.init
+            )
+        )
         self.init(
             configurationIdentifier: configurationIdentifier,
             revisionID: revision.id,
@@ -2115,7 +2311,8 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
             horizonEnd: revision.horizonEnd,
             timezoneName: revision.timezoneName,
             publishedAt: revision.publishedAt,
-            publishedBlocks: blocks
+            publishedBlocks: blocks,
+            publishedOccurrences: publishedOccurrences
         )
         guard renderedBlocks.count == schedule.plan.blocks.count,
               blocks.count == renderedBlocks.count,
@@ -2137,7 +2334,8 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
         horizonEnd: Date,
         timezoneName: String,
         publishedAt: Date,
-        publishedBlocks: [DayWeavePublishedScheduleBlockProof]
+        publishedBlocks: [DayWeavePublishedScheduleBlockProof],
+        publishedOccurrences: [DayWeavePublishedScheduleOccurrenceProof]? = nil
     ) {
         self.version = version
         self.configurationIdentifier = configurationIdentifier
@@ -2151,18 +2349,32 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
         self.timezoneName = timezoneName
         self.publishedAt = publishedAt
         self.publishedBlocks = publishedBlocks
+        self.publishedOccurrences = version == Self.currentVersion
+            ? (publishedOccurrences ?? [])
+            : publishedOccurrences
     }
 
     var hasValidShape: Bool {
         let digestPrefix = "sha256:"
         let digest = inputDigest.dropFirst(digestPrefix.count)
         let expectedRevision = "\(revisionNumber):\(revisionID.uuidString.lowercased())"
-        let proofVersionIsValid = version == 1 || version == Self.currentVersion
-        let blocksHaveValidVersion = version == Self.currentVersion
+        let proofVersionIsValid = (1...Self.currentVersion).contains(version)
+        let blocksHaveValidVersion = version >= 2
             ? publishedBlocks.allSatisfy(\.hasCurrentImmutableSeal)
             : publishedBlocks.allSatisfy {
                 $0.hasValidShape && $0.immutableBlockDigest == nil
             }
+        let occurrenceMembershipHasValidVersion: Bool
+        if version == Self.currentVersion, let publishedOccurrences {
+            occurrenceMembershipHasValidVersion =
+                publishedOccurrences.count <= Self.maximumPublishedOccurrences
+                && publishedOccurrences.allSatisfy(\.hasValidShape)
+                && Set(publishedOccurrences.map(\.plannerOccurrenceID)).count
+                    == publishedOccurrences.count
+                && publishedOccurrences == Self.sortedOccurrenceProofs(publishedOccurrences)
+        } else {
+            occurrenceMembershipHasValidVersion = publishedOccurrences == nil
+        }
         return proofVersionIsValid
             && !configurationIdentifier.isEmpty
             && configurationIdentifier.utf8.count <= 4_096
@@ -2193,13 +2405,41 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
                     && horizonStart < $0.end
             }
             && Set(publishedBlocks.map(\.id)).count == publishedBlocks.count
+            && occurrenceMembershipHasValidVersion
     }
 
-    /// Only a version-2 proof seals the complete publication-static rendered
-    /// plan. Version 1 remains decodable so an upgrade can retain encrypted
-    /// canonical data, but it grants no presentation or execution authority.
+    /// Versions 2 and 3 seal the complete publication-static rendered plan.
+    /// Version 1 remains decodable so an upgrade can retain encrypted canonical
+    /// data, but it grants no presentation or execution authority.
     var hasCurrentImmutablePlanSeal: Bool {
+        version >= 2 && version <= Self.currentVersion && hasValidShape
+    }
+
+    /// Only v3 binds the full non-rendered occurrence membership. Older proofs
+    /// remain valid for their original block authority but cannot suppress a
+    /// missed decision until the current publication is fetched again.
+    var hasCurrentOccurrenceMembershipSeal: Bool {
         version == Self.currentVersion && hasValidShape
+    }
+
+    var currentOccurrenceAuthority: DayWeavePublishedScheduleOccurrenceAuthority? {
+        guard hasCurrentOccurrenceMembershipSeal, let publishedOccurrences else {
+            return nil
+        }
+        var membershipByPlannerOccurrenceID:
+            [UUID: DayWeavePublishedScheduleOccurrenceProof] = [:]
+        membershipByPlannerOccurrenceID.reserveCapacity(publishedOccurrences.count)
+        for occurrence in publishedOccurrences {
+            guard membershipByPlannerOccurrenceID.updateValue(
+                occurrence,
+                forKey: occurrence.plannerOccurrenceID
+            ) == nil else { return nil }
+        }
+        return .init(
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            membershipByPlannerOccurrenceID: membershipByPlannerOccurrenceID
+        )
     }
 
     func matches(_ provenance: SchedulePreviewProvenance) -> Bool {
@@ -2254,8 +2494,24 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
             horizonEnd: horizonEnd,
             timezoneName: timezoneName,
             publishedAt: publishedAt,
-            publishedBlocks: publishedBlocks
+            publishedBlocks: publishedBlocks,
+            publishedOccurrences: publishedOccurrences
         )
+    }
+
+    private static func sortedOccurrenceProofs(
+        _ occurrences: [DayWeavePublishedScheduleOccurrenceProof]
+    ) -> [DayWeavePublishedScheduleOccurrenceProof] {
+        occurrences.sorted {
+            if $0.plannerOccurrenceID != $1.plannerOccurrenceID {
+                return $0.plannerOccurrenceID.uuidString
+                    < $1.plannerOccurrenceID.uuidString
+            }
+            if $0.seriesItemID != $1.seriesItemID {
+                return $0.seriesItemID.uuidString < $1.seriesItemID.uuidString
+            }
+            return $0.state < $1.state
+        }
     }
 
     private func sameInstant(_ left: Date, _ right: Date) -> Bool {

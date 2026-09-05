@@ -21,11 +21,48 @@ struct HabitCompositionCheckpoint: Equatable, Sendable {
         let habitID: UUID
         let plannerOccurrenceID: UUID
         let sourceItemRevision: UInt64
+        let policyFingerprint: String?
         let nominalStart: Date
         let windowStart: Date
         let windowEnd: Date
         let expectedDurationSeconds: UInt64?
         let outcome: Outcome?
+        let missedResolution: DayWeaveHabitMissedResolution?
+        let identity: JSONValue?
+        let nominalEnd: Date?
+        let localDate: DayWeaveLocalDate?
+
+        init(
+            id: UUID,
+            habitID: UUID,
+            plannerOccurrenceID: UUID,
+            sourceItemRevision: UInt64,
+            policyFingerprint: String? = nil,
+            nominalStart: Date,
+            windowStart: Date,
+            windowEnd: Date,
+            expectedDurationSeconds: UInt64?,
+            outcome: Outcome?,
+            missedResolution: DayWeaveHabitMissedResolution? = nil,
+            identity: JSONValue? = nil,
+            nominalEnd: Date? = nil,
+            localDate: DayWeaveLocalDate? = nil
+        ) {
+            self.id = id
+            self.habitID = habitID
+            self.plannerOccurrenceID = plannerOccurrenceID
+            self.sourceItemRevision = sourceItemRevision
+            self.policyFingerprint = policyFingerprint
+            self.nominalStart = nominalStart
+            self.windowStart = windowStart
+            self.windowEnd = windowEnd
+            self.expectedDurationSeconds = expectedDurationSeconds
+            self.outcome = outcome
+            self.missedResolution = missedResolution
+            self.identity = identity
+            self.nominalEnd = nominalEnd
+            self.localDate = localDate
+        }
     }
 
     struct Outcome: Codable, Equatable, Sendable {
@@ -97,6 +134,72 @@ struct HabitCompositionCheckpoint: Equatable, Sendable {
     }
 }
 
+struct EffectiveHabitMissedProjection {
+    let actionsByEvidenceID: [UUID: DayWeaveHabitMissedResolutionAction]
+    let suppressedPlannerOccurrenceIDs: Set<UUID>
+}
+
+/// Resolves the server's forward reduction graph without allowing a suppressed source to cascade.
+func effectiveHabitMissedProjection(
+    occurrences: [HabitCompositionCheckpoint.Occurrence],
+    sourceIsActive: (HabitCompositionCheckpoint.Occurrence) -> Bool,
+    reductionTargetIsEligible: (
+        HabitCompositionCheckpoint.Occurrence,
+        HabitCompositionCheckpoint.Occurrence
+    ) -> Bool
+) -> EffectiveHabitMissedProjection {
+    typealias Occurrence = HabitCompositionCheckpoint.Occurrence
+    func ordinal(_ occurrence: Occurrence) -> UInt32? {
+        guard let identity = occurrence.identity,
+              let data = try? JSONEncoder().encode(identity),
+              let decoded = try? JSONDecoder().decode(
+                  RecurrenceOccurrenceIdentity.self,
+                  from: data
+              ) else { return nil }
+        return decoded.stableOrdinal
+    }
+    func orderedBefore(_ left: Occurrence, _ right: Occurrence) -> Bool {
+        if left.nominalStart != right.nominalStart {
+            return left.nominalStart < right.nominalStart
+        }
+        let leftOrdinal = ordinal(left) ?? .max
+        let rightOrdinal = ordinal(right) ?? .max
+        if leftOrdinal != rightOrdinal { return leftOrdinal < rightOrdinal }
+        return left.plannerOccurrenceID.uuidString < right.plannerOccurrenceID.uuidString
+    }
+    let plannerGroups = Dictionary(grouping: occurrences, by: \.plannerOccurrenceID)
+    let candidates = occurrences.compactMap { occurrence -> (
+        Occurrence,
+        DayWeaveHabitMissedResolutionAction
+    )? in
+        guard ordinal(occurrence) != nil,
+              sourceIsActive(occurrence),
+              let action = occurrence.missedResolution?.action else { return nil }
+        if case .cancelled = action { return nil }
+        return (occurrence, action)
+    }.sorted { orderedBefore($0.0, $1.0) }
+
+    var actions: [UUID: DayWeaveHabitMissedResolutionAction] = [:]
+    var suppressed: Set<UUID> = []
+    for (source, action) in candidates {
+        guard !suppressed.contains(source.plannerOccurrenceID) else { continue }
+        actions[source.id] = action
+        guard case let .reduceFrequency(ids) = action else { continue }
+        for targetID in ids {
+            guard let targets = plannerGroups[targetID], targets.count == 1,
+                  let target = targets.first,
+                  target.habitID == source.habitID,
+                  orderedBefore(source, target),
+                  reductionTargetIsEligible(source, target) else { continue }
+            suppressed.insert(targetID)
+        }
+    }
+    return .init(
+        actionsByEvidenceID: actions,
+        suppressedPlannerOccurrenceIDs: suppressed
+    )
+}
+
 @MainActor
 protocol HabitCompositionCheckpointProviding: AnyObject {
     var habitCompositionCheckpoint: HabitCompositionCheckpoint { get }
@@ -161,6 +264,7 @@ private enum HabitSyncControllerError: Error, LocalizedError {
     case authoritativeOccurrenceChanged
     case pendingMutationExists
     case pauseUnavailable
+    case plannerAuthorityUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -172,6 +276,7 @@ private enum HabitSyncControllerError: Error, LocalizedError {
         case .authoritativeOccurrenceChanged: "This occurrence changed while it was open. Review its current progress before saving."
         case .pendingMutationExists: "This habit already has a saved update waiting to sync."
         case .pauseUnavailable: "The habit pause changed. Refresh before trying again."
+        case .plannerAuthorityUnavailable: "Encrypted schedule moves are unavailable. Habit authority was preserved without advancing sync."
         }
     }
 }
@@ -182,7 +287,13 @@ private enum HabitSyncControllerError: Error, LocalizedError {
 @MainActor
 final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProviding {
     static let maximumDeltaPagesPerSync = 1_000
+    static let maximumMissedReconcilePagesPerSync = 1_000
     static let maximumImmediateStreamDrains = 2
+    /// Empty automatic reconcile responses have a bounded server replay
+    /// lease. Rotate an unresolved client journal well before that lease can
+    /// expire; changed responses remain permanently replayable, and delta is
+    /// kept non-authoritative until the replacement scan completes.
+    static let missedReconcileJournalLease: TimeInterval = 12 * 60 * 60
 
     @Published private(set) var occurrences: [DayWeaveHabitOccurrence] = []
     @Published private(set) var pauses: [DayWeaveHabitPause] = []
@@ -199,6 +310,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
     private let streamSleep: @Sendable (Duration) async throws -> Void
+    private let protectedPlannerOccurrenceIDs: @MainActor @Sendable () -> Set<UUID>?
     private var snapshot: DayWeaveHabitClientSnapshot?
     private var persistenceRevision = HabitPersistenceRevision.missing
     private var operationID: UUID?
@@ -226,6 +338,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         persistence: EncryptedHabitPersistence? = try? .applicationDefault(),
+        protectedPlannerOccurrenceIDs: @escaping @MainActor @Sendable () -> Set<UUID>? = { [] },
         now: @escaping @Sendable () -> Date = Date.init,
         makeUUID: @escaping @Sendable () -> UUID = UUID.init,
         streamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
@@ -236,6 +349,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         self.now = now
         self.makeUUID = makeUUID
         self.streamSleep = streamSleep
+        self.protectedPlannerOccurrenceIDs = protectedPlannerOccurrenceIDs
         connectionProvider = {
             guard let configuredURL = configurationStore.loadBaseURL() else {
                 throw HabitSyncControllerError.notConfigured
@@ -272,6 +386,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
     init(
         persistence: EncryptedHabitPersistence?,
         connectionProvider: @escaping @MainActor @Sendable () throws -> DayWeaveHabitConnection,
+        protectedPlannerOccurrenceIDs: @escaping @MainActor @Sendable () -> Set<UUID>? = { [] },
         now: @escaping @Sendable () -> Date = Date.init,
         makeUUID: @escaping @Sendable () -> UUID = UUID.init,
         streamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
@@ -283,6 +398,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         self.now = now
         self.makeUUID = makeUUID
         self.streamSleep = streamSleep
+        self.protectedPlannerOccurrenceIDs = protectedPlannerOccurrenceIDs
     }
 
     var hasPendingConflict: Bool { pendingMutations.contains(where: \.conflictDetected) }
@@ -299,6 +415,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                     habitID: occurrence.evidence.habitID,
                     plannerOccurrenceID: occurrence.evidence.plannerOccurrenceID,
                     sourceItemRevision: occurrence.evidence.sourceItemRevision,
+                    policyFingerprint: occurrence.evidence.policyFingerprint,
                     nominalStart: occurrence.evidence.nominalStart,
                     windowStart: occurrence.evidence.windowStart,
                     windowEnd: occurrence.evidence.windowEnd,
@@ -310,7 +427,11 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                             progressBasisPoints: $0.progressBasisPoints,
                             occurredAt: $0.occurredAt
                         )
-                    }
+                    },
+                    missedResolution: occurrence.missedResolution,
+                    identity: occurrence.evidence.identity,
+                    nominalEnd: occurrence.evidence.nominalEnd,
+                    localDate: occurrence.evidence.localDate
                 )
             },
             pauses: (snapshot?.pauses ?? []).map {
@@ -358,15 +479,18 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
 
     func pendingMutation(forOccurrenceID occurrenceID: UUID) -> DayWeavePendingHabitMutation? {
         pendingMutations.first { mutation in
-            guard case let .outcome(value) = mutation else { return false }
-            return value.occurrenceID == occurrenceID
+            switch mutation {
+            case let .outcome(value): return value.occurrenceID == occurrenceID
+            case let .missedResolution(value): return value.occurrenceID == occurrenceID
+            default: return false
+            }
         }
     }
 
     func pendingPauseMutation(forHabitID habitID: UUID) -> DayWeavePendingHabitMutation? {
         pendingMutations.first { mutation in
             switch mutation {
-            case .outcome:
+            case .outcome, .missedReconcile, .missedResolution:
                 return false
             case let .pauseStart(value):
                 return value.habitID == habitID
@@ -394,7 +518,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
 
             if let storedBinding = restored.configurationIdentifier,
                storedBinding != connection.configurationIdentifier,
-               !restored.pendingMutations.isEmpty {
+               restored.pendingMutations.contains(where: mutationRequiresOriginalBinding) {
                 clearInMemoryPrivateData()
                 install(nil)
                 lastSyncedAt = nil
@@ -421,7 +545,9 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                 ))
             }
 
+            try fenceDeltaWhilePendingMutationsExist()
             try await replayPendingMutations(using: connection, operation: operation)
+            try await reconcileMissedOccurrences(using: connection, operation: operation)
             try await reconcileDelta(using: connection, operation: operation)
             lastSyncedAt = now()
             status = .init(
@@ -448,7 +574,9 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             guard snapshot?.configurationIdentifier == connection.configurationIdentifier else {
                 throw HabitSyncControllerError.configurationChanged
             }
+            try fenceDeltaWhilePendingMutationsExist()
             try await replayPendingMutations(using: connection, operation: operation)
+            try await reconcileMissedOccurrences(using: connection, operation: operation)
             try await reconcileDelta(using: connection, operation: operation)
             lastSyncedAt = now()
             status = .init(
@@ -512,6 +640,45 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             idempotencyKey: "habit-occurrence:\(operation.uuidString.lowercased())",
             command: command,
             createdAt: createdAt,
+            conflictDetected: false
+        ))
+        return await enqueueAndExecute(pending)
+    }
+
+    func resolveMissed(
+        _ occurrence: DayWeaveHabitOccurrence,
+        action: DayWeaveHabitMissedExplicitAction
+    ) async -> HabitSyncOutcome {
+        guard operationID == nil else { return .unexpectedFailure }
+        guard pendingMutation(forOccurrenceID: occurrence.id) == nil else {
+            status = .init(
+                phase: .attentionRequired,
+                message: HabitSyncControllerError.pendingMutationExists.localizedDescription
+            )
+            return .conflict
+        }
+        guard occurrences.first(where: { $0.id == occurrence.id }) == occurrence,
+              let resolution = occurrence.missedResolution,
+              resolution.configuredPolicy == .ask,
+              resolution.action.isDecisionRequired,
+              occurrence.hasActiveMissedResolutionLifecycle(pauses: pauses) else {
+            status = .init(
+                phase: .attentionRequired,
+                message: "This missed-habit choice changed. Review the current server version."
+            )
+            return .conflict
+        }
+        let operation = makeUUID()
+        let pending = DayWeavePendingHabitMutation.missedResolution(.init(
+            habitID: occurrence.evidence.habitID,
+            occurrenceID: occurrence.id,
+            idempotencyKey: "habit-missed-resolution:\(operation.uuidString.lowercased())",
+            command: .init(
+                operationID: operation,
+                expectedRevision: resolution.revision,
+                action: action
+            ),
+            createdAt: now(),
             conflictDetected: false
         ))
         return await enqueueAndExecute(pending)
@@ -939,11 +1106,13 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             }
             candidate = replacing(
                 candidate,
+                deltaCaughtUp: false,
                 analytics: candidate.analytics.filter { $0.habitID != pending.habitID },
                 pendingMutations: candidate.pendingMutations + [pending]
             )
             try persist(candidate)
             try await execute(pending, using: connection, operation: operation)
+            try await reconcileDelta(using: connection, operation: operation)
             status = .init(phase: .online, message: "Habit progress saved and synced.")
             return .success
         } catch {
@@ -965,18 +1134,71 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         using connection: DayWeaveHabitConnection,
         operation: UUID
     ) async throws {
+        try rotateExpiredMissedReconcileJournal()
         let queued = snapshot?.pendingMutations ?? []
         for pending in queued where !pending.conflictDetected {
             do {
                 try await execute(pending, using: connection, operation: operation)
             } catch {
-                guard isConflict(error) else { throw error }
+                guard isConflict(error), pending.canRequireUserConflictReview else { throw error }
                 // A conflict discovered while replaying after process death
                 // needs the same durable review marker as an immediate write.
                 // Keep processing the delta so the user can compare against
                 // the authoritative current occurrence or pause.
                 try markPendingConflict(pending.id)
             }
+        }
+    }
+
+    private func rotateExpiredMissedReconcileJournal() throws {
+        guard let current = snapshot else { throw HabitSyncControllerError.protocolFailure }
+        let cutoff = now().addingTimeInterval(-Self.missedReconcileJournalLease)
+        let retained = current.pendingMutations.filter { mutation in
+            guard case let .missedReconcile(value) = mutation else { return true }
+            return value.createdAt > cutoff
+        }
+        guard retained.count != current.pendingMutations.count else { return }
+        try persist(replacing(
+            current,
+            deltaCaughtUp: false,
+            pendingMutations: retained
+        ))
+    }
+
+    private func mutationRequiresOriginalBinding(
+        _ mutation: DayWeavePendingHabitMutation
+    ) -> Bool {
+        guard case let .missedReconcile(value) = mutation else { return true }
+        let cutoff = now().addingTimeInterval(-Self.missedReconcileJournalLease)
+        return value.createdAt > cutoff
+    }
+
+    private func reconcileMissedOccurrences(
+        using connection: DayWeaveHabitConnection,
+        operation: UUID
+    ) async throws {
+        var pages = 0
+        while true {
+            guard pages < Self.maximumMissedReconcilePagesPerSync,
+                  let current = snapshot else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            let requestID = makeUUID()
+            let pending = DayWeavePendingHabitMutation.missedReconcile(.init(
+                idempotencyKey: "habit-missed-reconcile:\(requestID.uuidString.lowercased())",
+                command: .init(operationID: requestID),
+                limit: 200,
+                createdAt: now(),
+                conflictDetected: false
+            ))
+            try persist(replacing(
+                current,
+                deltaCaughtUp: false,
+                pendingMutations: current.pendingMutations + [pending]
+            ))
+            let hasMore = try await execute(pending, using: connection, operation: operation)
+            pages += 1
+            if !hasMore { return }
         }
     }
 
@@ -994,11 +1216,19 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         ))
     }
 
+    private func fenceDeltaWhilePendingMutationsExist() throws {
+        guard let current = snapshot,
+              current.deltaCaughtUp,
+              !current.pendingMutations.isEmpty else { return }
+        try persist(replacing(current, deltaCaughtUp: false))
+    }
+
+    @discardableResult
     private func execute(
         _ pending: DayWeavePendingHabitMutation,
         using connection: DayWeaveHabitConnection,
         operation: UUID
-    ) async throws {
+    ) async throws -> Bool {
         switch pending {
         case let .outcome(value):
             guard let prior = snapshot?.occurrences.first(where: {
@@ -1023,7 +1253,13 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                   received.input == value.command.outcome else {
                 throw HabitSyncControllerError.protocolFailure
             }
-            try commitMutation(pending.id, occurrence: response.occurrence, pause: nil)
+            // Outcome and missed-resolution revisions are independent server
+            // coordinates. Another device may advance the latter while this
+            // request is in flight; validate and merge that coordinate rather
+            // than requiring the response to echo our cached projection.
+            let merged = try Self.mergedOccurrence(prior, incoming: response.occurrence)
+            try commitMutation(pending.id, occurrence: merged, pause: nil)
+            return false
         case let .pauseStart(value):
             let response = try await connection.transport.startHabitPause(
                 habitID: value.habitID,
@@ -1041,6 +1277,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                 throw HabitSyncControllerError.protocolFailure
             }
             try commitMutation(pending.id, occurrence: nil, pause: response.pause)
+            return false
         case let .pauseResume(value):
             guard let prior = snapshot?.pauses.first(where: { $0.id == value.pauseID }),
                   prior.habitID == value.habitID,
@@ -1067,13 +1304,70 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                 throw HabitSyncControllerError.protocolFailure
             }
             try commitMutation(pending.id, occurrence: nil, pause: response.pause)
+            return false
+        case let .missedReconcile(value):
+            let response = try await connection.transport.reconcileMissedHabitOccurrences(
+                command: value.command,
+                limit: value.limit,
+                idempotencyKey: value.idempotencyKey
+            )
+            try assertCurrent(operation: operation, connection: connection)
+            guard response.resolutions.count <= value.limit else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            try commitMutation(
+                pending.id,
+                occurrence: nil,
+                pause: nil,
+                missedResolutions: response.resolutions
+            )
+            return response.hasMore
+        case let .missedResolution(value):
+            guard let prior = snapshot?.occurrences.first(where: {
+                $0.id == value.occurrenceID
+            }),
+                prior.evidence.habitID == value.habitID,
+                let priorResolution = prior.missedResolution,
+                priorResolution.action.isDecisionRequired,
+                priorResolution.revision == value.command.expectedRevision else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            let response = try await connection.transport.resolveMissedHabitOccurrence(
+                habitID: value.habitID,
+                occurrenceID: value.occurrenceID,
+                command: value.command,
+                idempotencyKey: value.idempotencyKey
+            )
+            try assertCurrent(operation: operation, connection: connection)
+            let resolution = response.resolution
+            let nextRevision = value.command.expectedRevision.addingReportingOverflow(1)
+            guard !nextRevision.overflow,
+                  resolution.belongs(to: prior.evidence),
+                  resolution.revision == nextRevision.partialValue,
+                  resolution.configuredPolicy == .ask,
+                  Self.sameMissedResolutionIdentity(priorResolution, resolution),
+                  priorResolution.canTransition(to: resolution),
+                  Self.missedResolutionAction(
+                      resolution.action,
+                      satisfies: value.command.action
+                  ) else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            try commitMutation(
+                pending.id,
+                occurrence: nil,
+                pause: nil,
+                missedResolutions: [resolution]
+            )
+            return false
         }
     }
 
     private func commitMutation(
         _ operationID: UUID,
         occurrence: DayWeaveHabitOccurrence?,
-        pause: DayWeaveHabitPause?
+        pause: DayWeaveHabitPause?,
+        missedResolutions: [DayWeaveHabitMissedResolution] = []
     ) throws {
         guard var candidate = snapshot,
               candidate.pendingMutations.contains(where: { $0.id == operationID }) else {
@@ -1081,20 +1375,40 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         }
         var occurrenceIndex = Dictionary(uniqueKeysWithValues: candidate.occurrences.map { ($0.id, $0) })
         if let occurrence { occurrenceIndex[occurrence.id] = occurrence }
+        for resolution in missedResolutions {
+            guard let prior = occurrenceIndex[resolution.occurrenceEvidenceID] else { continue }
+            guard resolution.belongs(to: prior.evidence) else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            occurrenceIndex[prior.id] = .init(
+                evidence: prior.evidence,
+                outcome: prior.outcome,
+                missedResolution: try Self.mergedMissedResolution(
+                    prior.missedResolution,
+                    incoming: resolution
+                )
+            )
+        }
         var pauseIndex = Dictionary(uniqueKeysWithValues: candidate.pauses.map { ($0.id, $0) })
         if let pause { pauseIndex[pause.id] = pause }
         let remainingMutations = candidate.pendingMutations.filter { $0.id != operationID }
         let retentionDate = now()
+        guard let protectedPlannerOccurrenceIDs = protectedPlannerOccurrenceIDs() else {
+            throw HabitSyncControllerError.plannerAuthorityUnavailable
+        }
+        let retainedOccurrences = try Self.retainedOccurrences(
+            Array(occurrenceIndex.values),
+            pendingMutations: remainingMutations,
+            protectedPlannerOccurrenceIDs: protectedPlannerOccurrenceIDs,
+            referenceDate: retentionDate
+        )
         candidate = replacing(
             candidate,
-            occurrences: try Self.retainedOccurrences(
-                Array(occurrenceIndex.values),
-                pendingMutations: remainingMutations,
-                referenceDate: retentionDate
-            ),
+            occurrences: retainedOccurrences,
             pauses: try Self.retainedPauses(
                 Array(pauseIndex.values),
-                pendingMutations: remainingMutations
+                pendingMutations: remainingMutations,
+                protectedOccurrences: retainedOccurrences
             ),
             pendingMutations: remainingMutations
         )
@@ -1132,21 +1446,29 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                 switch change {
                 case let .occurrenceUpsert(value):
                     if let prior = occurrenceIndex[value.id] {
-                        let priorRevision = prior.outcome?.revision ?? 0
-                        let nextRevision = value.outcome?.revision ?? 0
-                        guard value.evidence == prior.evidence,
-                              nextRevision > priorRevision || value == prior else {
-                            throw HabitSyncControllerError.protocolFailure
-                        }
+                        occurrenceIndex[value.id] = try Self.mergedOccurrence(
+                            prior,
+                            incoming: value
+                        )
+                    } else {
+                        occurrenceIndex[value.id] = value
                     }
-                    occurrenceIndex[value.id] = value
                 case let .pauseUpsert(value):
                     if let prior = pauseIndex[value.id] {
                         guard value.habitID == prior.habitID,
                               value.startedAt == prior.startedAt,
                               value.createdAt == prior.createdAt,
-                              value.preservesStreak == prior.preservesStreak,
-                              value.revision > prior.revision || value == prior else {
+                              value.preservesStreak == prior.preservesStreak else {
+                            throw HabitSyncControllerError.protocolFailure
+                        }
+                        if value.revision < prior.revision { continue }
+                        if value.revision == prior.revision {
+                            guard value == prior else {
+                                throw HabitSyncControllerError.protocolFailure
+                            }
+                            continue
+                        }
+                        guard prior.endedAt == nil || value.endedAt == prior.endedAt else {
                             throw HabitSyncControllerError.protocolFailure
                         }
                     }
@@ -1165,18 +1487,25 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             let terminalCaughtUp = !page.hasMore && coversInFlightObservations
             let candidate: DayWeaveHabitClientSnapshot
             do {
+                guard let protectedPlannerOccurrenceIDs = protectedPlannerOccurrenceIDs() else {
+                    throw HabitSyncControllerError.plannerAuthorityUnavailable
+                }
+                let retentionDate = now()
+                let retainedOccurrences = try Self.retainedOccurrences(
+                    Array(occurrenceIndex.values),
+                    pendingMutations: current.pendingMutations,
+                    protectedPlannerOccurrenceIDs: protectedPlannerOccurrenceIDs,
+                    referenceDate: retentionDate
+                )
                 candidate = replacing(
                     current,
                     deltaCursor: page.nextCursor,
                     deltaCaughtUp: terminalCaughtUp,
-                    occurrences: try Self.retainedOccurrences(
-                        Array(occurrenceIndex.values),
-                        pendingMutations: current.pendingMutations,
-                        referenceDate: now()
-                    ),
+                    occurrences: retainedOccurrences,
                     pauses: try Self.retainedPauses(
                         Array(pauseIndex.values),
-                        pendingMutations: current.pendingMutations
+                        pendingMutations: current.pendingMutations,
+                        protectedOccurrences: retainedOccurrences
                     )
                 )
             } catch {
@@ -1292,6 +1621,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
     static func retainedOccurrences(
         _ values: [DayWeaveHabitOccurrence],
         pendingMutations: [DayWeavePendingHabitMutation],
+        protectedPlannerOccurrenceIDs: Set<UUID> = [],
         referenceDate: Date = Date(),
         limit: Int = DayWeaveHabitClientSnapshot.maximumOccurrences
     ) throws -> [DayWeaveHabitOccurrence] {
@@ -1302,20 +1632,24 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             }
             return $0.evidence.nominalStart < $1.evidence.nominalStart
         }
+        guard Set(ordered.map(\.id)).count == ordered.count,
+              Set(ordered.map(\.evidence.plannerOccurrenceID)).count == ordered.count else {
+            throw HabitSyncControllerError.protocolFailure
+        }
         guard ordered.count > limit else {
             return ordered
         }
-        let mandatoryIDs = Set(pendingMutations.compactMap { mutation -> UUID? in
-            guard case let .outcome(value) = mutation else { return nil }
-            return value.occurrenceID
+        let journalIDs = Set(pendingMutations.compactMap { mutation -> UUID? in
+            switch mutation {
+            case let .outcome(value): return value.occurrenceID
+            case let .missedResolution(value): return value.occurrenceID
+            default: return nil
+            }
         })
-        var retained: [UUID: DayWeaveHabitOccurrence] = [:]
-        for value in ordered.reversed() where mandatoryIDs.contains(value.id) {
-            retained[value.id] = value
-        }
-        guard retained.count <= limit else {
-            throw HabitSyncControllerError.protocolFailure
-        }
+        let plannerMoveProtectedIDs = Set(ordered.compactMap { occurrence in
+            protectedPlannerOccurrenceIDs.contains(occurrence.evidence.plannerOccurrenceID)
+                ? occurrence.id : nil
+        })
         // Protect the complete scheduling neighborhood before allocating any
         // capacity to historical completion anchors. Without this reservation,
         // one old completion from many deleted habits can crowd every current
@@ -1326,26 +1660,71 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             $0.evidence.windowEnd > compositionStart
                 && $0.evidence.windowStart < compositionEnd
         }
-        // Every completed occurrence remains an authoritative fallback anchor.
-        // A later completion can be corrected to partial/skipped, at which
-        // point an older completion becomes the streak anchor again. Until the
-        // wire contract provides a compact correction-safe anchor, no completed
-        // row may be evicted silently.
+        let occurrenceByPlannerID = Dictionary(
+            uniqueKeysWithValues: ordered.map { ($0.evidence.plannerOccurrenceID, $0) }
+        )
+        var activeMissedIDs = Set<UUID>()
+        var reductionSourcesByTarget: [UUID: [DayWeaveHabitOccurrence]] = [:]
+        for occurrence in ordered {
+            guard let resolution = occurrence.missedResolution else { continue }
+            if case let .reduceFrequency(targetPlannerIDs) = resolution.action {
+                // A terminal target can later be corrected to unresolved
+                // without replaying its upstream source. Preserve every
+                // physical reduction edge, including split-page sources, so
+                // pruning cannot change graph precedence after restart.
+                activeMissedIDs.insert(occurrence.id)
+                for targetPlannerID in targetPlannerIDs {
+                    reductionSourcesByTarget[targetPlannerID, default: []].append(occurrence)
+                    if let target = occurrenceByPlannerID[targetPlannerID],
+                       target.evidence.habitID == occurrence.evidence.habitID {
+                        activeMissedIDs.insert(target.id)
+                    }
+                }
+                continue
+            }
+            guard occurrence.outcome?.status.endsMissedResolutionLifecycle != true else { continue }
+            switch resolution.action {
+            case .decisionRequired, .reductionPending:
+                activeMissedIDs.insert(occurrence.id)
+            case let .carry(windowStart, windowEnd)
+                where windowStart < compositionEnd && windowEnd > compositionStart:
+                activeMissedIDs.insert(occurrence.id)
+            case .cancelled, .skip, .carry, .reduceFrequency:
+                break
+            }
+        }
         let completedRows = ordered.filter { $0.outcome?.status == .completed }
-        let requiredIDs = mandatoryIDs
+        var mandatoryIDs = journalIDs
+            .union(activeMissedIDs)
+            .union(plannerMoveProtectedIDs)
             .union(compositionRows.map(\.id))
             .union(completedRows.map(\.id))
-        guard requiredIDs.count <= limit else {
+        let occurrenceByID = Dictionary(uniqueKeysWithValues: ordered.map { ($0.id, $0) })
+        var plannerIDsToVisit = mandatoryIDs.compactMap {
+            occurrenceByID[$0]?.evidence.plannerOccurrenceID
+        }
+        var visitedPlannerIDs = Set<UUID>()
+        while let targetPlannerID = plannerIDsToVisit.popLast() {
+            guard visitedPlannerIDs.insert(targetPlannerID).inserted else { continue }
+            for source in reductionSourcesByTarget[targetPlannerID, default: []]
+                where source.evidence.habitID
+                    == occurrenceByPlannerID[targetPlannerID]?.evidence.habitID {
+                if mandatoryIDs.insert(source.id).inserted {
+                    plannerIDsToVisit.append(source.evidence.plannerOccurrenceID)
+                }
+            }
+        }
+        var retained: [UUID: DayWeaveHabitOccurrence] = [:]
+        for value in ordered.reversed() where mandatoryIDs.contains(value.id) {
+            retained[value.id] = value
+        }
+        guard retained.count <= limit else {
             throw HabitSyncControllerError.protocolFailure
         }
-        for value in compositionRows.reversed() {
-            retained[value.id] = value
-        }
-        for value in completedRows.sorted(by: {
-            ($0.outcome?.occurredAt ?? .distantPast) > ($1.outcome?.occurredAt ?? .distantPast)
-        }) {
-            retained[value.id] = value
-        }
+        // Every completed occurrence remains an authoritative fallback anchor.
+        // The transitive closure above also preserves any unresolved reducer
+        // whose target is required. Otherwise evicting A from A -> B -> C can
+        // make B spuriously effective after restart and suppress C.
         for value in ordered.reversed()
             where retained.count < limit {
             retained[value.id] = value
@@ -1364,6 +1743,7 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
     static func retainedPauses(
         _ values: [DayWeaveHabitPause],
         pendingMutations: [DayWeavePendingHabitMutation],
+        protectedOccurrences: [DayWeaveHabitOccurrence] = [],
         limit: Int = DayWeaveHabitClientSnapshot.maximumPauses
     ) throws -> [DayWeaveHabitPause] {
         guard limit >= 0 else { throw HabitSyncControllerError.protocolFailure }
@@ -1371,11 +1751,65 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             if $0.startedAt == $1.startedAt { return $0.id.uuidString < $1.id.uuidString }
             return $0.startedAt < $1.startedAt
         }
+        guard Set(ordered.map(\.id)).count == ordered.count else {
+            throw HabitSyncControllerError.protocolFailure
+        }
+        for habitPauses in Dictionary(grouping: ordered, by: \.habitID).values {
+            guard habitPauses.filter({ $0.endedAt == nil }).count <= 1 else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            for (previous, next) in zip(habitPauses, habitPauses.dropFirst()) {
+                guard let previousEnd = previous.endedAt,
+                      previousEnd <= next.startedAt else {
+                    throw HabitSyncControllerError.protocolFailure
+                }
+            }
+        }
         guard ordered.count > limit else { return ordered }
+        let occurrenceGroups = Dictionary(
+            grouping: protectedOccurrences,
+            by: \.evidence.plannerOccurrenceID
+        )
+        var protectedWindows: [(habitID: UUID, start: Date, end: Date)] = []
+        for occurrence in protectedOccurrences {
+            protectedWindows.append((
+                habitID: occurrence.evidence.habitID,
+                start: occurrence.evidence.windowStart,
+                end: occurrence.evidence.windowEnd
+            ))
+            guard let action = occurrence.missedResolution?.action else { continue }
+            if case let .carry(windowStart, windowEnd) = action {
+                protectedWindows.append((
+                    habitID: occurrence.evidence.habitID,
+                    start: windowStart,
+                    end: windowEnd
+                ))
+            }
+            guard case let .reduceFrequency(targetPlannerIDs) = action else { continue }
+            for targetPlannerID in targetPlannerIDs {
+                guard let targets = occurrenceGroups[targetPlannerID], targets.count == 1,
+                      let target = targets.first,
+                      target.evidence.habitID == occurrence.evidence.habitID else { continue }
+                protectedWindows.append((
+                    habitID: target.evidence.habitID,
+                    start: target.evidence.windowStart,
+                    end: target.evidence.windowEnd
+                ))
+            }
+        }
+        let lifecyclePauseIDs = ordered.compactMap { pause -> UUID? in
+            protectedWindows.contains { window in
+                pause.habitID == window.habitID
+                    && pause.startedAt < window.end
+                    && (pause.endedAt.map { $0 > window.start } ?? true)
+            } ? pause.id : nil
+        }
         let mandatoryIDs = Set(pendingMutations.compactMap { mutation -> UUID? in
             guard case let .pauseResume(value) = mutation else { return nil }
             return value.pauseID
-        }).union(ordered.compactMap { $0.endedAt == nil ? $0.id : nil })
+        })
+            .union(ordered.compactMap { $0.endedAt == nil ? $0.id : nil })
+            .union(lifecyclePauseIDs)
         guard mandatoryIDs.count <= limit else {
             throw HabitSyncControllerError.protocolFailure
         }
@@ -1412,6 +1846,187 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         return false
     }
 
+    private static func mergedOccurrence(
+        _ prior: DayWeaveHabitOccurrence,
+        incoming: DayWeaveHabitOccurrence
+    ) throws -> DayWeaveHabitOccurrence {
+        guard prior.evidence == incoming.evidence else {
+            throw HabitSyncControllerError.protocolFailure
+        }
+        return .init(
+            evidence: prior.evidence,
+            outcome: try mergedOutcome(prior.outcome, incoming: incoming.outcome),
+            missedResolution: try mergedMissedResolution(
+                prior.missedResolution,
+                incoming: incoming.missedResolution
+            )
+        )
+    }
+
+    private static func mergedOutcome(
+        _ prior: DayWeaveHabitOutcome?,
+        incoming: DayWeaveHabitOutcome?
+    ) throws -> DayWeaveHabitOutcome? {
+        switch (prior, incoming) {
+        case (nil, let incoming):
+            return incoming
+        case (let prior, nil):
+            return prior
+        case let (.some(prior), .some(incoming)):
+            if incoming.revision == prior.revision {
+                guard incoming == prior else { throw HabitSyncControllerError.protocolFailure }
+                return prior
+            }
+            return incoming.revision > prior.revision ? incoming : prior
+        }
+    }
+
+    private static func mergedMissedResolution(
+        _ prior: DayWeaveHabitMissedResolution?,
+        incoming: DayWeaveHabitMissedResolution?
+    ) throws -> DayWeaveHabitMissedResolution? {
+        switch (prior, incoming) {
+        case (nil, let incoming):
+            return incoming
+        case (let prior, nil):
+            return prior
+        case let (.some(prior), .some(incoming)):
+            guard sameMissedResolutionIdentity(prior, incoming) else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            if incoming.revision == prior.revision {
+                guard incoming == prior else { throw HabitSyncControllerError.protocolFailure }
+                return prior
+            }
+            guard incoming.revision > prior.revision else {
+                guard incoming.updatedAt <= prior.updatedAt else {
+                    throw HabitSyncControllerError.protocolFailure
+                }
+                return prior
+            }
+            guard incoming.updatedAt >= prior.updatedAt,
+                  isReachableMissedResolutionAction(from: prior, to: incoming) else {
+                throw HabitSyncControllerError.protocolFailure
+            }
+            return incoming
+        }
+    }
+
+    private enum MissedResolutionState: Hashable {
+        case decisionRequired
+        case reductionPending
+        case cancelled(DayWeaveHabitMissedResumeAction)
+        case skip
+        case carry
+        case reduceFrequency
+
+        init(_ action: DayWeaveHabitMissedResolutionAction) {
+            switch action {
+            case .decisionRequired: self = .decisionRequired
+            case .reductionPending: self = .reductionPending
+            case let .cancelled(_, resumeAction): self = .cancelled(resumeAction)
+            case .skip: self = .skip
+            case .carry: self = .carry
+            case .reduceFrequency: self = .reduceFrequency
+            }
+        }
+    }
+
+    private static func isReachableMissedResolutionAction(
+        from prior: DayWeaveHabitMissedResolution,
+        to incoming: DayWeaveHabitMissedResolution
+    ) -> Bool {
+        guard incoming.revision > prior.revision else { return false }
+        let revisionDistance = incoming.revision - prior.revision
+        if revisionDistance == 1 {
+            return prior.canTransition(to: incoming)
+        }
+        let target = MissedResolutionState(incoming.action)
+        var frontier: Set<MissedResolutionState> = [MissedResolutionState(prior.action)]
+        var step: UInt64 = 0
+        var seen: [Set<MissedResolutionState>: UInt64] = [:]
+        while step < revisionDistance {
+            if let cycleStart = seen[frontier] {
+                let cycleLength = step - cycleStart
+                let remaining = revisionDistance - step
+                let completeCycles = remaining / cycleLength
+                if completeCycles > 0 {
+                    step += completeCycles * cycleLength
+                    continue
+                }
+            } else {
+                seen[frontier] = step
+            }
+            frontier = Set(frontier.flatMap {
+                nextMissedResolutionStates(after: $0, policy: prior.configuredPolicy)
+            })
+            step += 1
+            if frontier.isEmpty { return false }
+        }
+        return frontier.contains(target)
+    }
+
+    private static func nextMissedResolutionStates(
+        after state: MissedResolutionState,
+        policy: DayWeaveHabitMissedPolicy
+    ) -> Set<MissedResolutionState> {
+        switch state {
+        case .decisionRequired:
+            guard policy == .ask else { return [] }
+            return [
+                .skip, .carry, .reductionPending, .reduceFrequency,
+                .cancelled(.decisionRequired), .cancelled(.skip),
+                .cancelled(.carry), .cancelled(.reduceFrequency),
+            ]
+        case .reductionPending, .reduceFrequency:
+            return [.reductionPending, .reduceFrequency, .cancelled(.reduceFrequency)]
+        case .skip:
+            return [.cancelled(.skip)]
+        case .carry:
+            if policy == .ask { return [.decisionRequired, .cancelled(.carry)] }
+            return policy == .carry ? [.carry, .cancelled(.carry)] : []
+        case let .cancelled(resumeAction):
+            return switch resumeAction {
+            case .decisionRequired: [.decisionRequired]
+            case .skip: [.skip]
+            case .carry: [.carry]
+            case .reduceFrequency: [.reductionPending, .reduceFrequency]
+            }
+        }
+    }
+
+    private static func sameMissedResolutionIdentity(
+        _ left: DayWeaveHabitMissedResolution,
+        _ right: DayWeaveHabitMissedResolution
+    ) -> Bool {
+        left.occurrenceEvidenceID == right.occurrenceEvidenceID
+            && left.habitID == right.habitID
+            && left.sourcePlannerOccurrenceID == right.sourcePlannerOccurrenceID
+            && left.configuredPolicy == right.configuredPolicy
+            && dayWeavePostgresEpochMicroseconds(left.createdAt)
+                == dayWeavePostgresEpochMicroseconds(right.createdAt)
+    }
+
+    private static func missedResolutionAction(
+        _ received: DayWeaveHabitMissedResolutionAction,
+        satisfies requested: DayWeaveHabitMissedExplicitAction
+    ) -> Bool {
+        switch (requested, received) {
+        case (.skip, .skip), (.carry, .carry):
+            return true
+        case (.reduceFrequency, .reduceFrequency), (.reduceFrequency, .reductionPending):
+            return true
+        case let (.skip, .cancelled(_, resumeAction)):
+            return resumeAction == .skip
+        case let (.carry, .cancelled(_, resumeAction)):
+            return resumeAction == .carry
+        case let (.reduceFrequency, .cancelled(_, resumeAction)):
+            return resumeAction == .reduceFrequency
+        default:
+            return false
+        }
+    }
+
     private func handle(_ error: any Error) -> HabitSyncOutcome {
         let outcome: HabitSyncOutcome
         let phase: HabitSyncPhase
@@ -1438,6 +2053,10 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             outcome = .protocolFailure
             phase = .failed
             message = "Habit sync stopped because the server response could not be trusted."
+        case HabitSyncControllerError.plannerAuthorityUnavailable:
+            outcome = .localStorageFailure
+            phase = .failed
+            message = HabitSyncControllerError.plannerAuthorityUnavailable.localizedDescription
         case is HabitPersistenceError:
             outcome = .localStorageFailure
             phase = .failed

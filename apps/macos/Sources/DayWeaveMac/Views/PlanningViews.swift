@@ -286,6 +286,101 @@ private struct HabitOutcomeEditorPresentation: Identifiable {
     var id: UUID { occurrence.id }
 }
 
+enum MissedHabitDecisionEligibility {
+    static func allows(
+        _ occurrence: DayWeaveHabitOccurrence,
+        item: DayWeaveCanonicalItem?,
+        canonicalItems: [DayWeaveCanonicalItem],
+        pauses: [DayWeaveHabitPause]
+    ) -> Bool {
+        guard let item else { return false }
+        let hasActiveChildren = canonicalItems.contains {
+            $0.deletedAt == nil && $0.parentID == item.id
+        }
+        return item.deletedAt == nil
+            && item.kind == .habit
+            && item.isExecutable
+            && !hasActiveChildren
+            && item.status.allowsMissedHabitScheduling
+            && item.habitPolicyFingerprint == occurrence.evidence.policyFingerprint
+            && occurrence.missedResolution?.action.isDecisionRequired == true
+            && occurrence.hasActiveMissedResolutionLifecycle(pauses: pauses)
+    }
+
+    static func effectiveDecisionIDs(
+        checkpoint: HabitCompositionCheckpoint,
+        canonicalItems: [DayWeaveCanonicalItem],
+        publishedScheduleProof: DayWeavePublishedScheduleProof?,
+        publishedScheduleLatestHintRevision: UInt64
+    ) -> Set<UUID> {
+        let itemsByID = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        let pauses = checkpoint.pauses
+        let publishedOccurrenceAuthority: DayWeavePublishedScheduleOccurrenceAuthority?
+        if let publishedScheduleProof,
+           publishedScheduleProof.configurationIdentifier
+            == checkpoint.configurationIdentifier,
+           publishedScheduleProof.revisionNumber
+            == publishedScheduleLatestHintRevision {
+            publishedOccurrenceAuthority = publishedScheduleProof.currentOccurrenceAuthority
+        } else {
+            publishedOccurrenceAuthority = nil
+        }
+        func sourceIsActive(_ occurrence: HabitCompositionCheckpoint.Occurrence) -> Bool {
+            guard let item = itemsByID[occurrence.habitID],
+                  item.deletedAt == nil,
+                  item.kind == .habit,
+                  item.isExecutable,
+                  item.recurrence != nil,
+                  item.status.allowsMissedHabitScheduling,
+                  occurrence.sourceItemRevision <= item.revision,
+                  item.habitPolicyFingerprint == occurrence.policyFingerprint,
+                  occurrence.outcome?.status.endsMissedResolutionLifecycle != true,
+                  let resolution = occurrence.missedResolution else { return false }
+            let hasActiveChildren = canonicalItems.contains {
+                $0.deletedAt == nil && $0.parentID == item.id
+            }
+            guard !hasActiveChildren else { return false }
+            let window = resolution.action.sourceLifecycleWindow(
+                fallbackStart: occurrence.windowStart,
+                fallbackEnd: occurrence.windowEnd
+            )
+            return !pauses.contains { pause in
+                pause.habitID == occurrence.habitID
+                    && pause.startedAt < window.end
+                    && (pause.endedAt ?? .distantFuture) > window.start
+            }
+        }
+        let projection = effectiveHabitMissedProjection(
+            occurrences: checkpoint.occurrences,
+            sourceIsActive: sourceIsActive,
+            reductionTargetIsEligible: { source, target in
+                guard target.habitID == source.habitID,
+                      let item = itemsByID[target.habitID],
+                      target.sourceItemRevision <= item.revision,
+                      item.habitPolicyFingerprint == target.policyFingerprint,
+                      target.outcome.map({ $0.status == .unresolved }) ?? true,
+                      let publishedOccurrenceAuthority,
+                      publishedOccurrenceAuthority.authorizesMissedReductionTarget(
+                          plannerOccurrenceID: target.plannerOccurrenceID,
+                          seriesItemID: target.habitID,
+                          windowStart: target.windowStart,
+                          windowEnd: target.windowEnd
+                      ) else {
+                    return false
+                }
+                return !pauses.contains { pause in
+                    pause.habitID == target.habitID
+                        && pause.startedAt < target.windowEnd
+                        && (pause.endedAt ?? .distantFuture) > target.windowStart
+                }
+            }
+        )
+        return Set(projection.actionsByEvidenceID.compactMap { id, action in
+            action.isDecisionRequired ? id : nil
+        })
+    }
+}
+
 struct HabitsDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var habitSync: HabitSyncStore
@@ -319,6 +414,24 @@ struct HabitsDestinationView: View {
             + localFallback.count(where: { $0.status == .completed })
     }
 
+    private var missedDecisions: [DayWeaveHabitOccurrence] {
+        let effectiveDecisionIDs = MissedHabitDecisionEligibility.effectiveDecisionIDs(
+            checkpoint: habitSync.habitCompositionCheckpoint,
+            canonicalItems: store.canonicalItems,
+            publishedScheduleProof: store.publishedScheduleProof,
+            publishedScheduleLatestHintRevision:
+                store.publishedScheduleLatestHintRevision
+        )
+        return habitSync.occurrences
+            .filter { effectiveDecisionIDs.contains($0.id) }
+            .sorted {
+                if $0.evidence.windowEnd == $1.evidence.windowEnd {
+                    return $0.id.uuidString < $1.id.uuidString
+                }
+                return $0.evidence.windowEnd < $1.evidence.windowEnd
+            }
+    }
+
     var body: some View {
         DestinationScroll(
             title: "Habits",
@@ -327,7 +440,7 @@ struct HabitsDestinationView: View {
             SummaryStrip(metrics: [
                 ("\(canonicalRows.count + localFallback.count)", "today", "repeat"),
                 ("\(completedCount)", "completed", "checkmark.circle"),
-                ("\(canonicalRows.count(where: { habitSync.openPause(for: $0.occurrence.evidence.habitID) != nil }))", "paused", "pause.circle"),
+                ("\(missedDecisions.count)", "to review", "arrow.triangle.branch"),
             ])
 
             HabitSyncStatusBanner(status: habitSync.status) {
@@ -362,7 +475,36 @@ struct HabitsDestinationView: View {
                 .accessibilityIdentifier("habits.conflicts")
             }
 
-            if habits.isEmpty {
+
+            if !missedDecisions.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("Choose what happens next", systemImage: "heart.text.square")
+                            .font(.headline)
+                        Text("These habit windows passed without a final result. Nothing is erased—pick the most helpful next step.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(missedDecisions) { occurrence in
+                        let item = store.canonicalItem(id: occurrence.evidence.habitID)
+                        MissedHabitDecisionCard(
+                            occurrence: occurrence,
+                            title: item?.title ?? "Habit",
+                            isSensitive: item.map {
+                                store.canonicalItemRequiresSensitivePresentation(
+                                    itemID: $0.id
+                                )
+                            } ?? true
+                        )
+                    }
+                }
+                .padding(16)
+                .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("habits.missed-review")
+            }
+
+            if habits.isEmpty && missedDecisions.isEmpty {
                 DestinationEmpty(title: "No habit occurrences", symbol: "repeat.circle", action: "Add habit") {
                     store.isQuickAddPresented = true
                 }
@@ -446,7 +588,89 @@ struct HabitsDestinationView: View {
             "Pause request"
         case .pauseResume:
             "Resume request"
+        case .missedReconcile:
+            "Missed-habit refresh"
+        case .missedResolution:
+            "Missed-habit choice"
         }
+    }
+}
+
+private struct MissedHabitDecisionCard: View {
+    @EnvironmentObject private var habitSync: HabitSyncStore
+    let occurrence: DayWeaveHabitOccurrence
+    let title: String
+    let isSensitive: Bool
+
+    private var pending: DayWeavePendingHabitMutation? {
+        habitSync.pendingMutation(forOccurrenceID: occurrence.id)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.headline)
+                    Text("Scheduled for \(occurrence.evidence.localDate.rawValue)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Label("Needs your choice", systemImage: "questionmark.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+
+            if let pending {
+                Label(
+                    pending.conflictDetected
+                        ? "A newer decision is available. Use the server version, then choose again if needed."
+                        : "Your choice is encrypted on this Mac and will sync when the connection returns.",
+                    systemImage: pending.conflictDetected
+                        ? "exclamationmark.triangle.fill" : "lock.icloud"
+                )
+                .font(.caption)
+                .foregroundStyle(pending.conflictDetected ? .orange : .secondary)
+            }
+
+            if occurrence.missedResolution?.action.isDecisionRequired == true,
+               occurrence.hasActiveMissedResolutionLifecycle(pauses: habitSync.pauses) {
+                HStack(spacing: 8) {
+                    Button {
+                        resolve(.skip)
+                    } label: {
+                        Label("Skip", systemImage: "forward.end")
+                    }
+                    .accessibilityIdentifier("habit.missed.skip.\(occurrence.id.uuidString.lowercased())")
+
+                    Button {
+                        resolve(.carry)
+                    } label: {
+                        Label("Will do later", systemImage: "arrow.right.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("habit.missed.carry.\(occurrence.id.uuidString.lowercased())")
+
+                    Button {
+                        resolve(.reduceFrequency)
+                    } label: {
+                        Label("Reduce upcoming frequency", systemImage: "arrow.down.right")
+                    }
+                    .accessibilityIdentifier("habit.missed.reduce.\(occurrence.id.uuidString.lowercased())")
+                }
+                .controlSize(.small)
+                .disabled(pending != nil || habitSync.status.isBusy)
+            }
+        }
+        .padding(13)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .privacySensitive(isSensitive)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("habit.missed.card.\(occurrence.id.uuidString.lowercased())")
+    }
+
+    private func resolve(_ action: DayWeaveHabitMissedExplicitAction) {
+        Task { _ = await habitSync.resolveMissed(occurrence, action: action) }
     }
 }
 
@@ -548,6 +772,11 @@ private struct CanonicalHabitOccurrenceCard: View {
                     .foregroundStyle(.secondary)
             }
 
+
+            if let resolution = occurrence.missedResolution {
+                HabitMissedResolutionLine(resolution: resolution)
+            }
+
             if let pending {
                 HStack {
                     Label(
@@ -639,6 +868,64 @@ private struct CanonicalHabitOccurrenceCard: View {
         case .partial: .blue
         case .skipped: .orange
         case .unresolved, nil: .secondary
+        }
+    }
+}
+
+private struct HabitMissedResolutionLine: View {
+    let resolution: DayWeaveHabitMissedResolution
+
+    var body: some View {
+        Label(message, systemImage: symbol)
+            .font(.caption)
+            .foregroundStyle(color)
+            .accessibilityIdentifier(
+                "habit.missed.status.\(resolution.occurrenceEvidenceID.uuidString.lowercased())"
+            )
+    }
+
+    private var message: String {
+        switch resolution.action {
+        case .decisionRequired:
+            "This window passed. Choose a supportive next step in the review section."
+        case .reductionPending:
+            "DayWeave will reduce the next safe occurrence after it is published."
+        case let .cancelled(reason, _):
+            cancellationMessage(reason)
+        case .skip:
+            "This missed window stays skipped; any recorded effort remains in your history."
+        case let .carry(_, windowEnd):
+            "Moved into a new window ending \(windowEnd.formatted(date: .abbreviated, time: .shortened))."
+        case .reduceFrequency:
+            "One upcoming occurrence was removed to make the routine more manageable."
+        }
+    }
+
+    private var symbol: String {
+        switch resolution.action {
+        case .decisionRequired: "questionmark.circle"
+        case .reductionPending: "hourglass"
+        case .cancelled: "pause.circle"
+        case .skip: "forward.end"
+        case .carry: "arrow.right.circle"
+        case .reduceFrequency: "arrow.down.right"
+        }
+    }
+
+    private var color: Color {
+        resolution.action.isDecisionRequired ? .orange : .secondary
+    }
+
+    private func cancellationMessage(_ reason: DayWeaveHabitMissedCancellationReason) -> String {
+        switch reason {
+        case .sourceCompleted:
+            "No schedule change is active because this occurrence was completed."
+        case .sourceSkipped:
+            "No extra schedule change is active because this occurrence was already skipped."
+        case .sourcePaused:
+            "This schedule change is paused while the habit is paused."
+        case .sourceObsolete:
+            "This schedule change is inactive because the original occurrence changed."
         }
     }
 }

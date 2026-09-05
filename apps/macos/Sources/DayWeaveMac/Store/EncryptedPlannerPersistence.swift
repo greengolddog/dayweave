@@ -443,10 +443,14 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Version 23 adds rich duration fields to locally authored drafts; the
     /// schema fence keeps older binaries from collapsing a range back to an
     /// exact duration when they rewrite an otherwise familiar v1 journal.
+    /// Version 24 adds exact current-publication occurrence membership and a
+    /// binding-scoped durable schedule-head high-water. Its outer fence
+    /// prevents a relabeled predecessor snapshot from injecting missed-target
+    /// suppression authority that no schema-23 writer knew.
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 23
+    static let currentSchemaVersion = 24
 
     let schemaVersion: Int
     let savedAt: Date
@@ -482,6 +486,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
     let publishedScheduleProof: DayWeavePublishedScheduleProof?
+    /// Highest authenticated publication revision observed for the active
+    /// canonical binding. Optional only so schemas through 23 can decode
+    /// before migration; every schema-24 snapshot contains a bounded value.
+    let publishedScheduleLatestHintRevision: UInt64?
     let onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor?
     let localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
     let pendingSchedulePublication: PendingSchedulePublication?
@@ -523,6 +531,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
+        publishedScheduleLatestHintRevision: UInt64? = nil,
         onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor? = nil,
         localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
@@ -573,6 +582,15 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
         self.publishedScheduleProof = publishedScheduleProof
+        if let publishedScheduleLatestHintRevision {
+            self.publishedScheduleLatestHintRevision =
+                publishedScheduleLatestHintRevision
+        } else if schemaVersion == Self.currentSchemaVersion {
+            self.publishedScheduleLatestHintRevision =
+                publishedScheduleProof?.revisionNumber ?? 0
+        } else {
+            self.publishedScheduleLatestHintRevision = nil
+        }
         self.onboardingFirstItemAnchor = onboardingFirstItemAnchor
         self.localScheduleCompositionProvenance = localScheduleCompositionProvenance
         self.pendingSchedulePublication = pendingSchedulePublication
@@ -587,6 +605,13 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     }
 
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
+        // Nested proof v3 is new authority in outer schema 24. Every older
+        // snapshot must ignore an injected v3 proof before reconstruction;
+        // legitimate predecessor writers emitted only v1/v2 here.
+        let publishedScheduleProof = schemaVersion < Self.currentSchemaVersion
+            && self.publishedScheduleProof.map({ $0.version >= 3 }) == true
+            ? nil
+            : self.publishedScheduleProof
         switch schemaVersion {
         case Self.currentSchemaVersion:
             let pendingTypedSuggestions = suggestions.filter { suggestion in
@@ -632,6 +657,12 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   let executionState,
                   pendingCanonicalSensitivityMutations != nil,
                   let recurrenceOccurrenceMoves,
+                  let publishedScheduleLatestHintRevision,
+                  publishedScheduleLatestHintRevision <= UInt64(Int64.max),
+                  canonicalConfigurationIdentifier != nil
+                    || publishedScheduleLatestHintRevision == 0,
+                  (publishedScheduleProof?.revisionNumber ?? 0)
+                    <= publishedScheduleLatestHintRevision,
                   let deferredExecutionPublicationSessionIDs,
                   let pendingPublicationDeferredSessionIDs,
                   RecurrenceOccurrenceMove.collectionIsValid(
@@ -702,24 +733,29 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   localScheduleCompositionProvenance != nil
                     || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
                   (publishedScheduleProof.map { proof in
-                      proof.hasValidShape
-                          && proof.configurationIdentifier
-                              == canonicalConfigurationIdentifier
-                          && schedulePreviewProvenance.map(proof.matches) == true
-                          && localScheduleCompositionProvenance == nil
-                          && proof.matchesPublishedPlan(blocks)
+                      guard proof.hasValidShape,
+                            proof.configurationIdentifier
+                              == canonicalConfigurationIdentifier else { return false }
+                      if let schedulePreviewProvenance {
+                          return localScheduleCompositionProvenance == nil
+                              && proof.matches(schedulePreviewProvenance)
+                              && proof.matchesPublishedPlan(blocks)
+                      }
+                      return localScheduleCompositionProvenance != nil
+                          && proof.hasCurrentOccurrenceMembershipSeal
                   } ?? true) else {
                 throw .snapshotDecodingFailed
             }
             return self
-        case 21, 22:
+        case 21, 22, 23:
             // Canonical structural metadata was previously nested or implicit,
             // while unknown-field retention could forward-capture the complete
             // server wire shape. The schema-aware item decoder either infers a
             // zero-key legacy row or preserves a complete captured shape (and
             // rejects partial shapes). Schema 22 also predates rich fields in
-            // authoring drafts. Rewriting makes both upgrades durable and
-            // establishes the rollback fence before a ranged draft is saved.
+            // authoring drafts, while schema 23 predates occurrence-membership
+            // publication authority. Rewriting makes the upgrades durable and
+            // establishes each rollback fence before newer authority is saved.
             return try PlannerSnapshot(
                 savedAt: savedAt,
                 destination: destination,

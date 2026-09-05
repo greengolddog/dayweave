@@ -1043,6 +1043,10 @@ final class GoogleSchedulePublicationStore: ObservableObject {
               request.isValid else {
             throw GoogleSchedulePublicationWorkflowError.invalidRecoveryJournal
         }
+        // Revalidate the exact published head immediately before consequential
+        // provider I/O. Saving an equal approved journal performs no write,
+        // but PlannerStore still enforces its durable schedule-head fence.
+        try recoveryStore.saveGoogleSchedulePublicationRecoveryJournal(journal)
         status = .enqueueing
         let response = try await operation.transport.enqueueGoogleSchedulePublication(
             accountID: journal.accountID,
