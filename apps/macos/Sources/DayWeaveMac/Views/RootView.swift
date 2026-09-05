@@ -6708,6 +6708,7 @@ struct SettingsView: View {
     @State private var dayWeaveBearerToken = ""
     @State private var dayWeaveEnrollmentCode = ""
     @State private var isCanonicalResetConfirmationPresented = false
+    @State private var isCurrentSessionRevokeConfirmationPresented = false
     @State private var isLocalOnlyForgetConfirmationPresented = false
     @State private var apiSettingsError: String?
     @State private var scheduleProfileBaseline: ScheduleProfile?
@@ -6843,7 +6844,7 @@ struct SettingsView: View {
             Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
                     .textContentType(.URL)
-                    .disabled(durableAuth.isBusy)
+                    .disabled(durableAuth.isBusy || durableAuth.isManagingDeviceSessions)
                 SecureField(
                     durableAuth.presentation.phase == .active
                         ? "Revoke current session before replacement"
@@ -6854,12 +6855,20 @@ struct SettingsView: View {
                                 : "Bootstrap bearer")),
                     text: $dayWeaveBearerToken
                 )
-                .disabled(durableAuth.isBusy || !authReplacementControlsEnabled)
+                .disabled(
+                    durableAuth.isBusy
+                        || durableAuth.isManagingDeviceSessions
+                        || !authReplacementControlsEnabled
+                )
                 SecureField(
                     "One-time enrollment code (dw_en1_…)",
                     text: $dayWeaveEnrollmentCode
                 )
-                .disabled(durableAuth.isBusy || !authReplacementControlsEnabled)
+                .disabled(
+                    durableAuth.isBusy
+                        || durableAuth.isManagingDeviceSessions
+                        || !authReplacementControlsEnabled
+                )
                 HStack {
                     Button("Use one-time enrollment code") {
                         consumeOneTimeEnrollmentCode()
@@ -6870,6 +6879,7 @@ struct SettingsView: View {
                                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             || !durableAuth.presentation.canConsumeEnrollmentCode
                             || durableAuth.isBusy
+                            || durableAuth.isManagingDeviceSessions
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
@@ -6897,6 +6907,7 @@ struct SettingsView: View {
                             || executionSync.isSyncing
                             || canonicalSync.isSyncing
                             || durableAuth.isBusy
+                            || durableAuth.isManagingDeviceSessions
                             || (!authReplacementControlsEnabled
                                 && !dayWeaveBearerToken.isEmpty)
                             || !store.canMutatePlan
@@ -6906,9 +6917,10 @@ struct SettingsView: View {
                     )
 
                     if durableAuth.presentation.canForget || suggestionSync.tokenConfigured {
-                        if durableAuth.presentation.canRevokeRemotely {
-                            Button("Revoke this Mac & sign out", role: .destructive) {
-                                revokeAndRemoveAuthentication()
+                        if durableAuth.presentation.canRevokeRemotely,
+                           durableAuth.shouldOfferCurrentSessionRevokeFallback {
+                            Button("Revoke this Mac & sign out…", role: .destructive) {
+                                isCurrentSessionRevokeConfirmationPresented = true
                             }
                             .disabled(
                                 suggestionSync.isRefreshing
@@ -6916,9 +6928,13 @@ struct SettingsView: View {
                                     || executionSync.isSyncing
                                     || canonicalSync.isSyncing
                                     || durableAuth.isBusy
+                                    || durableAuth.isManagingDeviceSessions
                                     || !store.canMutatePlan
                                     || executionSync.credentialReplacementIsBlocked
                                     || googleCredentialTransitionIsBlocked
+                            )
+                            .accessibilityIdentifier(
+                                "settings.active-devices.current-fallback"
                             )
                         }
                         Button("Forget only on this Mac…", role: .destructive) {
@@ -6930,6 +6946,7 @@ struct SettingsView: View {
                                 || executionSync.isSyncing
                                 || canonicalSync.isSyncing
                                 || durableAuth.isBusy
+                                || durableAuth.isManagingDeviceSessions
                                 || !store.canMutatePlan
                                 || executionSync.credentialReplacementIsBlocked
                                 || googleCredentialTransitionIsBlocked
@@ -6963,6 +6980,7 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         durableAuth.isBusy
+                            || durableAuth.isManagingDeviceSessions
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
@@ -7042,6 +7060,23 @@ struct SettingsView: View {
                         || googleSchedulePublication.hasSavedPublication
                 )
             }
+            DeviceSessionSettingsView(
+                durableAuth: durableAuth,
+                baseURLString: dayWeaveAPIBaseURL,
+                currentSessionRevocationDisabled:
+                    suggestionSync.isRefreshing
+                        || !suggestionSync.activeProposalIDs.isEmpty
+                        || executionSync.isSyncing
+                        || canonicalSync.isSyncing
+                        || durableAuth.isBusy
+                        || durableAuth.isManagingDeviceSessions
+                        || !store.canMutatePlan
+                        || executionSync.credentialReplacementIsBlocked
+                        || googleCredentialTransitionIsBlocked,
+                onRevokeCurrentSession: { inventory in
+                    revokeAndRemoveAuthentication(approvedFrom: inventory)
+                }
+            )
             Section("Local data") {
                 LabeledContent(
                     "Planner storage",
@@ -7081,6 +7116,17 @@ struct SettingsView: View {
             }
         } message: {
             Text("This removes cached canonical items, preview blocks, recurrence history, and pending/conflicted canonical edits from this Mac. It does not change the server or locally authored captures.")
+        }
+        .confirmationDialog(
+            "Revoke this Mac and sign out?",
+            isPresented: $isCurrentSessionRevokeConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Revoke & Sign Out", role: .destructive) {
+                revokeAndRemoveAuthentication()
+            }
+        } message: {
+            Text("DayWeave will revoke this Mac on the server, then remove its local Keychain credentials. Pending protected work must be reconciled first.")
         }
         .confirmationDialog(
             "Forget authentication only on this Mac?",
@@ -7394,7 +7440,9 @@ struct SettingsView: View {
         }
     }
 
-    private func revokeAndRemoveAuthentication() {
+    private func revokeAndRemoveAuthentication(
+        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot? = nil
+    ) {
         apiSettingsError = nil
         guard allowGoogleCredentialTransition() else { return }
         let baseURL: DayWeaveAPIBaseURL
@@ -7409,7 +7457,10 @@ struct SettingsView: View {
             defer { googleIntegration.endCredentialTransition() }
             do {
                 try await executionSync.prepareForCredentialReplacement()
-                guard await durableAuth.revokeAndForget(baseURL: baseURL) else {
+                guard await durableAuth.revokeAndForget(
+                    baseURL: baseURL,
+                    approvedFrom: expectedInventory
+                ) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
                 }

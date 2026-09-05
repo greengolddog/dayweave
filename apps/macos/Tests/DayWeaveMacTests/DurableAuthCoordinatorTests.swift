@@ -1356,6 +1356,129 @@ struct DurableAuthCoordinatorTests {
         #expect(record.stateAtSend == initial)
     }
 
+    @Test("approved current sign-out cannot cross a session replacement")
+    func approvedCurrentSessionRevokeIsExactlyFenced() async throws {
+        let first = makeActive(issuedAt: instant, accessMarker: 254, refreshMarker: 255)
+        let initial = envelope(active: first, revision: 5)
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [.inventory([first.session])]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let approval = try await coordinator.listDeviceSessions(boundTo: baseURL)
+
+        let replacement = makeActive(
+            issuedAt: instant.addingTimeInterval(30),
+            accessMarker: 1,
+            refreshMarker: 2,
+            sessionID: UUID(uuidString: "45454545-4545-4545-8545-454545454545")!,
+            clientInstanceID: first.session.clientInstanceID
+        )
+        let replacementEnvelope = envelope(active: replacement, revision: 6)
+        state.forceReplace(replacementEnvelope)
+        do {
+            try await coordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedFrom: approval
+            )
+            Issue.record("A reviewed current session crossed a replacement")
+        } catch {
+            #expect(error as? DurableAuthError == .concurrentStateChange)
+        }
+        #expect(await transport.records().map(\.method) == ["GET"])
+        #expect(state.loadEnvelope() == replacementEnvelope)
+    }
+
+    @Test("approved current sign-out re-lists after 401 before its exact retry")
+    func approvedCurrentSessionRevokeUnauthorizedRecovery() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 3, refreshMarker: 4)
+        let initial = envelope(active: active, revision: 7)
+        let refreshedIssuedAt = instant.addingTimeInterval(60)
+        let refreshedCurrent = makeRefreshedInventorySession(
+            previous: active.session,
+            issuedAt: refreshedIssuedAt
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session]),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+                .session(
+                    issuedAt: refreshedIssuedAt,
+                    statusCode: 200,
+                    replayed: false
+                ),
+                .inventory([refreshedCurrent]),
+                .noContent,
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [5, 6]),
+            now: { refreshedIssuedAt }
+        )
+        let approval = try await coordinator.listDeviceSessions(boundTo: baseURL)
+
+        try await coordinator.revokeAndForget(
+            boundTo: baseURL,
+            approvedFrom: approval
+        )
+        #expect(state.loadEnvelope() == nil)
+        #expect(await transport.records().map(\.method) == [
+            "GET", "DELETE", "POST", "GET", "DELETE",
+        ])
+    }
+
+    @Test("approved current sign-out resolves a lost success from definitive rejection")
+    func approvedCurrentSessionRevokeLostResponseRecovery() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 7, refreshMarker: 8)
+        let state = TestDurableAuthStateStore(
+            initial: envelope(active: active, revision: 9)
+        )
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session]),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [9, 10]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let approval = try await coordinator.listDeviceSessions(boundTo: baseURL)
+
+        try await coordinator.revokeAndForget(
+            boundTo: baseURL,
+            approvedFrom: approval
+        )
+        #expect(state.loadEnvelope() == nil)
+        #expect(await transport.records().map(\.method) == ["GET", "DELETE", "POST"])
+    }
+
     @Test("failed remote revoke retains state; stale success cannot delete newer CAS state")
     func revokeFailureAndStaleCASRetention() async throws {
         let active = makeActive(issuedAt: instant, accessMarker: 83, refreshMarker: 84)
@@ -1497,6 +1620,456 @@ struct DurableAuthCoordinatorTests {
             Issue.record("An arbitrary revoke 401 destroyed the refreshed lease")
             return
         }
+    }
+
+    @Test("device inventory is strict, current-aware, and revision fenced")
+    func deviceSessionInventoryContractAndFence() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 236, refreshMarker: 237)
+        let initial = envelope(active: active, revision: 170)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "cccccccc-cccc-4ccc-8ccc-cccccccccccc")!,
+            clientKind: "android",
+            label: "Travel phone",
+            lastSeenAt: instant.addingTimeInterval(-30),
+            contractVersion: 1
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [.inventory([active.session, remote])]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+
+        let inventory = try await coordinator.listDeviceSessions(boundTo: baseURL)
+        #expect(inventory.currentSessionID == active.session.id)
+        #expect(inventory.sessions == [active.session, remote])
+        #expect(inventory.sessionsWithCurrentFirst.first?.id == active.session.id)
+        #expect(coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL))
+        #expect(state.loadEnvelope() == initial)
+
+        let request = try #require(await transport.records().first)
+        #expect(request.method == "GET")
+        #expect(request.path.hasSuffix("/v1/auth/sessions"))
+        #expect(request.body == nil)
+        #expect(request.headers["Accept"] == "application/json")
+        #expect(request.headers["Cache-Control"] == "no-store")
+        #expect(request.headers["Pragma"] == "no-cache")
+
+        state.forceReplace(.init(
+            revision: initial.revision + 1,
+            origin: initial.origin,
+            clientInstanceID: initial.clientInstanceID,
+            state: initial.state
+        ))
+        #expect(!coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL))
+        do {
+            _ = try await coordinator.revokeRemoteDeviceSession(
+                remote.id,
+                approvedFrom: inventory,
+                boundTo: baseURL
+            )
+            Issue.record("A stale inventory approval crossed an envelope revision")
+        } catch {
+            #expect(error as? DurableAuthError == .concurrentStateChange)
+        }
+        #expect(await transport.records().count == 1)
+    }
+
+    @Test("device inventory performs one trusted 401 refresh and exact retry")
+    func deviceSessionInventoryUnauthorizedRecovery() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 244, refreshMarker: 245)
+        let initial = envelope(active: active, revision: 174)
+        let refreshedIssuedAt = instant.addingTimeInterval(60)
+        let refreshedSession = makeRefreshedInventorySession(
+            previous: active.session,
+            issuedAt: refreshedIssuedAt
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+                .session(
+                    issuedAt: refreshedIssuedAt,
+                    statusCode: 200,
+                    replayed: false
+                ),
+                .inventory([refreshedSession]),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [246, 247]),
+            now: { refreshedIssuedAt }
+        )
+
+        let inventory = try await coordinator.listDeviceSessions(boundTo: baseURL)
+        #expect(inventory.sessions == [refreshedSession])
+        #expect(inventory.currentSessionID == active.session.id)
+        #expect(coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL))
+        let records = await transport.records()
+        #expect(records.map(\.method) == ["GET", "POST", "GET"])
+        #expect(records[0].authorization == "Bearer \(active.credentials.accessToken)")
+        #expect(records[1].authorization == "Bearer \(active.credentials.refreshToken)")
+        #expect(records[2].authorization != records[0].authorization)
+        guard case let .active(refreshed)? = state.loadEnvelope()?.state else {
+            Issue.record("Expected refreshed active credentials")
+            return
+        }
+        #expect(refreshed.session == refreshedSession)
+    }
+
+    @Test("device inventory rejects duplicate keys and widened or malformed rows")
+    func deviceSessionInventoryRejectsMalformedResponses() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 238, refreshMarker: 239)
+        let validBody = inventoryResponseBody([active.session])
+        let arrayBody = inventorySessionArrayBody([active.session])
+        let duplicateRoot = Data(
+            "{\"sessions\":[],\"sessions\":\(String(decoding: arrayBody, as: UTF8.self))}"
+                .utf8
+        )
+        let uppercaseUUID = Data(
+            String(decoding: validBody, as: UTF8.self)
+                .replacingOccurrences(
+                    of: active.session.id.uuidString.lowercased(),
+                    with: active.session.id.uuidString.uppercased()
+                )
+                .utf8
+        )
+        let unknownKind = Data(
+            String(decoding: validBody, as: UTF8.self)
+                .replacingOccurrences(
+                    of: "\"client_kind\":\"macos\"",
+                    with: "\"client_kind\":\"linux\""
+                )
+                .utf8
+        )
+        var widenedObject = try #require(
+            JSONSerialization.jsonObject(with: validBody) as? [String: Any]
+        )
+        var widenedRows = try #require(widenedObject["sessions"] as? [[String: Any]])
+        widenedRows[0]["unexpected"] = true
+        widenedObject["sessions"] = widenedRows
+        let widened = try JSONSerialization.data(
+            withJSONObject: widenedObject,
+            options: [.sortedKeys]
+        )
+        let validObject = try #require(
+            JSONSerialization.jsonObject(with: validBody) as? [String: Any]
+        )
+        let validRows = try #require(validObject["sessions"] as? [[String: Any]])
+        var duplicateScopeRow = validRows[0]
+        var duplicateScopes = try #require(duplicateScopeRow["scopes"] as? [String])
+        duplicateScopes.append(try #require(duplicateScopes.first))
+        duplicateScopeRow["scopes"] = duplicateScopes
+        let duplicateScope = try JSONSerialization.data(
+            withJSONObject: ["sessions": [duplicateScopeRow]],
+            options: [.sortedKeys]
+        )
+        var futureVersionRow = validRows[0]
+        futureVersionRow["client_contract_version"] = 3
+        let futureVersion = try JSONSerialization.data(
+            withJSONObject: ["sessions": [futureVersionRow]],
+            options: [.sortedKeys]
+        )
+        var invalidTimestampRow = validRows[0]
+        invalidTimestampRow["absolute_expires_at"] = invalidTimestampRow["created_at"]
+        let invalidTimestamp = try JSONSerialization.data(
+            withJSONObject: ["sessions": [invalidTimestampRow]],
+            options: [.sortedKeys]
+        )
+        let newerRemote = makeInventorySession(
+            id: UUID(uuidString: "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd")!,
+            clientKind: "android",
+            label: "Out-of-order phone",
+            lastSeenAt: instant.addingTimeInterval(30)
+        )
+        let outOfOrder = inventoryResponseBody([active.session, newerRemote])
+        let excessiveCount = inventoryResponseBody(
+            Array(repeating: active.session, count: DurableAuthCoordinator.maximumDeviceSessionCount + 1)
+        )
+
+        for body in [
+            duplicateRoot, uppercaseUUID, unknownKind, widened, duplicateScope,
+            futureVersion, invalidTimestamp, outOfOrder, excessiveCount,
+        ] {
+            let initial = envelope(active: active, revision: 171)
+            let state = TestDurableAuthStateStore(initial: initial)
+            let transport = TestDurableAuthTransport(
+                stateStore: state,
+                plans: [.response(statusCode: 200, headers: trustedJSONHeaders, body: body)]
+            )
+            let coordinator = makeCoordinator(
+                state: state,
+                transport: transport,
+                generator: TestDurableCredentialGenerator(),
+                now: { instant.addingTimeInterval(60) }
+            )
+            do {
+                _ = try await coordinator.listDeviceSessions(boundTo: baseURL)
+                Issue.record("Malformed session inventory was accepted")
+            } catch {
+                #expect(error as? DurableAuthError == .invalidResponse)
+            }
+            #expect(state.loadEnvelope() == initial)
+        }
+    }
+
+    @Test("remote revoke never targets or mutates this Mac and always re-lists")
+    func remoteDeviceSessionRevokeIsSeparatedFromCurrentSignOut() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 240, refreshMarker: 241)
+        let initial = envelope(active: active, revision: 172)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "dddddddd-dddd-4ddd-8ddd-dddddddddddd")!,
+            clientKind: "android",
+            label: "Work phone",
+            lastSeenAt: instant.addingTimeInterval(-30)
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session, remote]),
+                .noContent,
+                .inventory([active.session]),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+
+        let approval = try await coordinator.listDeviceSessions(boundTo: baseURL)
+        let result = try await coordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: approval,
+            boundTo: baseURL
+        )
+        #expect(result.disposition == .revoked)
+        #expect(result.inventory.sessions == [active.session])
+        #expect(state.loadEnvelope() == initial)
+        let records = await transport.records()
+        #expect(records.map(\.method) == ["GET", "DELETE", "GET"])
+        #expect(records[1].path.hasSuffix("/v1/auth/sessions/\(remote.id.uuidString.lowercased())"))
+
+        let guardedTransport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [.inventory([active.session])]
+        )
+        let guardedCoordinator = makeCoordinator(
+            state: state,
+            transport: guardedTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let currentApproval = try await guardedCoordinator.listDeviceSessions(boundTo: baseURL)
+        do {
+            _ = try await guardedCoordinator.revokeRemoteDeviceSession(
+                active.session.id,
+                approvedFrom: currentApproval,
+                boundTo: baseURL
+            )
+            Issue.record("The remote-only path targeted this Mac")
+        } catch {
+            #expect(
+                error as? DurableDeviceSessionManagementError
+                    == .currentSessionRequiresSignOut
+            )
+        }
+        #expect(await guardedTransport.records().map(\.method) == ["GET"])
+        #expect(state.loadEnvelope() == initial)
+    }
+
+    @Test("remote revoke refreshes, re-lists approval, and retries only the same target")
+    func remoteDeviceSessionRevokeUnauthorizedRecovery() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 250, refreshMarker: 251)
+        let initial = envelope(active: active, revision: 175)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "dededede-dede-4ede-8ede-dededededede")!,
+            clientKind: "android",
+            label: "Tablet",
+            lastSeenAt: instant.addingTimeInterval(-30)
+        )
+        let refreshedIssuedAt = instant.addingTimeInterval(60)
+        let refreshedCurrent = makeRefreshedInventorySession(
+            previous: active.session,
+            issuedAt: refreshedIssuedAt
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session, remote]),
+                .response(
+                    statusCode: 401,
+                    headers: trustedUnauthorizedHeaders,
+                    body: trustedUnauthorizedBody
+                ),
+                .session(
+                    issuedAt: refreshedIssuedAt,
+                    statusCode: 200,
+                    replayed: false
+                ),
+                .inventory([refreshedCurrent, remote]),
+                .noContent,
+                .inventory([refreshedCurrent]),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [252, 253]),
+            now: { refreshedIssuedAt }
+        )
+
+        let approval = try await coordinator.listDeviceSessions(boundTo: baseURL)
+        let result = try await coordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: approval,
+            boundTo: baseURL
+        )
+        #expect(result.disposition == .revoked)
+        #expect(result.inventory.sessions == [refreshedCurrent])
+        #expect(await transport.records().map(\.method) == [
+            "GET", "DELETE", "POST", "GET", "DELETE", "GET",
+        ])
+        guard case let .active(refreshed)? = state.loadEnvelope()?.state else {
+            Issue.record("Expected the refreshed current session to remain local")
+            return
+        }
+        #expect(refreshed.session == refreshedCurrent)
+    }
+
+    @Test("404 and ambiguous remote revoke outcomes are reconciled by a strict list")
+    func remoteDeviceSessionRevokeReconciliation() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 242, refreshMarker: 243)
+        let initial = envelope(active: active, revision: 173)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")!,
+            clientKind: "android",
+            label: "Old phone",
+            lastSeenAt: instant.addingTimeInterval(-30)
+        )
+
+        let absentState = TestDurableAuthStateStore(initial: initial)
+        let absentTransport = TestDurableAuthTransport(
+            stateStore: absentState,
+            plans: [
+                .inventory([active.session, remote]),
+                .response(
+                    statusCode: 404,
+                    headers: trustedJSONHeaders,
+                    body: trustedNotFoundBody
+                ),
+                .inventory([active.session]),
+            ]
+        )
+        let absentCoordinator = makeCoordinator(
+            state: absentState,
+            transport: absentTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let absentApproval = try await absentCoordinator.listDeviceSessions(boundTo: baseURL)
+        let absent = try await absentCoordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: absentApproval,
+            boundTo: baseURL
+        )
+        #expect(absent.disposition == .alreadyAbsent)
+        #expect(absentState.loadEnvelope() == initial)
+
+        let ambiguousState = TestDurableAuthStateStore(initial: initial)
+        let ambiguousTransport = TestDurableAuthTransport(
+            stateStore: ambiguousState,
+            plans: [
+                .inventory([active.session, remote]),
+                .failure(.transport(.timedOut)),
+                .inventory([active.session]),
+            ]
+        )
+        let ambiguousCoordinator = makeCoordinator(
+            state: ambiguousState,
+            transport: ambiguousTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let ambiguousApproval = try await ambiguousCoordinator.listDeviceSessions(
+            boundTo: baseURL
+        )
+        let reconciled = try await ambiguousCoordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: ambiguousApproval,
+            boundTo: baseURL
+        )
+        #expect(reconciled.disposition == .revokedAfterReconciliation)
+        #expect(ambiguousState.loadEnvelope() == initial)
+
+        let retainedState = TestDurableAuthStateStore(initial: initial)
+        let retainedTransport = TestDurableAuthTransport(
+            stateStore: retainedState,
+            plans: [
+                .inventory([active.session, remote]),
+                .failure(.transport(.timedOut)),
+                .inventory([active.session, remote]),
+            ]
+        )
+        let retainedCoordinator = makeCoordinator(
+            state: retainedState,
+            transport: retainedTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let retainedApproval = try await retainedCoordinator.listDeviceSessions(
+            boundTo: baseURL
+        )
+        let retained = try await retainedCoordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: retainedApproval,
+            boundTo: baseURL
+        )
+        #expect(retained.disposition == .stillActive)
+        #expect(retained.inventory.sessions.contains { $0.id == remote.id })
+        #expect(retainedState.loadEnvelope() == initial)
+
+        let malformedState = TestDurableAuthStateStore(initial: initial)
+        let malformedTransport = TestDurableAuthTransport(
+            stateStore: malformedState,
+            plans: [
+                .inventory([active.session, remote]),
+                .response(statusCode: 204, headers: [:], body: Data()),
+                .inventory([active.session]),
+            ]
+        )
+        let malformedCoordinator = makeCoordinator(
+            state: malformedState,
+            transport: malformedTransport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let malformedApproval = try await malformedCoordinator.listDeviceSessions(
+            boundTo: baseURL
+        )
+        let malformedReconciled = try await malformedCoordinator.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: malformedApproval,
+            boundTo: baseURL
+        )
+        #expect(malformedReconciled.disposition == .revokedAfterReconciliation)
+        #expect(await malformedTransport.records().map(\.method) == ["GET", "DELETE", "GET"])
+        #expect(malformedState.loadEnvelope() == initial)
     }
 
     @Test("confirmed local-only destruction is separate and leaves a no-secret tombstone")
@@ -3131,6 +3704,213 @@ struct DurableAuthCoordinatorTests {
         }
     }
 
+    @Test("settings inventory is memory-only, stale offline, and clears on binding revision")
+    @MainActor
+    func settingsDeviceSessionInventoryLifecycle() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 248, refreshMarker: 249)
+        let initial = envelope(active: active, revision: 180)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "12121212-1212-4212-8212-121212121212")!,
+            clientKind: "android",
+            label: "Pocket phone",
+            lastSeenAt: instant.addingTimeInterval(-30)
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session, remote]),
+                .failure(.transport(.notConnectedToInternet)),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let model = DurableAuthSettingsModel(
+            coordinator: coordinator,
+            configurationStore: TestSuggestionConfigurationStore(
+                baseURL: baseURL.url.absoluteString
+            ),
+            descriptor: descriptor
+        )
+
+        #expect(await model.refreshDeviceSessions(baseURL: baseURL))
+        #expect(model.deviceSessionInventory?.sessions.count == 2)
+        #expect(!model.deviceSessionInventoryIsStale)
+        #expect(!model.shouldOfferCurrentSessionRevokeFallback)
+        #expect(!(await model.refreshDeviceSessions(baseURL: baseURL)))
+        #expect(model.deviceSessionInventory?.sessions.count == 2)
+        #expect(model.deviceSessionInventoryIsStale)
+        #expect(model.shouldOfferCurrentSessionRevokeFallback)
+        #expect(model.deviceSessionErrorMessage?.contains("offline") == true)
+        let staleApproval = try #require(model.deviceSessionInventory)
+        #expect(!(await model.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: staleApproval,
+            baseURL: baseURL
+        )))
+        #expect(model.deviceSessionErrorMessage?.contains("Refresh Active Devices") == true)
+        #expect(await transport.records().map(\.method) == ["GET", "GET"])
+
+        state.forceReplace(.init(
+            revision: initial.revision + 1,
+            origin: initial.origin,
+            clientInstanceID: initial.clientInstanceID,
+            state: initial.state
+        ))
+        model.reload(boundTo: baseURL)
+        #expect(model.deviceSessionInventory == nil)
+        #expect(model.deviceSessionErrorMessage == nil)
+    }
+
+    @Test("active-device mutation authority comes only from the exact current row")
+    @MainActor
+    func settingsDeviceSessionWriteScopeIsCurrentRowBound() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 11, refreshMarker: 12)
+        let initial = envelope(active: active, revision: 181)
+        let readOnlyCurrent = replacingScopes(
+            of: active.session,
+            with: active.session.scopes.filter { $0 != .authSessionsWrite }
+        )
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "13131313-1313-4313-8313-131313131313")!,
+            clientKind: "android",
+            label: "Writable target",
+            lastSeenAt: instant.addingTimeInterval(-30)
+        )
+        #expect(remote.scopes.contains(.authSessionsWrite))
+
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([readOnlyCurrent, remote]),
+                .failure(.transport(.notConnectedToInternet)),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let model = DurableAuthSettingsModel(
+            coordinator: coordinator,
+            configurationStore: TestSuggestionConfigurationStore(
+                baseURL: baseURL.url.absoluteString
+            ),
+            descriptor: descriptor
+        )
+
+        #expect(model.shouldOfferCurrentSessionRevokeFallback)
+        #expect(await model.refreshDeviceSessions(baseURL: baseURL))
+        let approval = try #require(model.deviceSessionInventory)
+        #expect(approval.currentSession == readOnlyCurrent)
+        #expect(!approval.currentSessionCanWriteAuthSessions)
+        #expect(model.deviceSessionInventoryIsReadOnly)
+        #expect(!model.canMutateDeviceSessionsFromInventory)
+        #expect(model.deviceSessionReadOnlyMessage?.contains("does not have permission") == true)
+        #expect(!model.shouldOfferCurrentSessionRevokeFallback)
+
+        do {
+            _ = try await coordinator.revokeRemoteDeviceSession(
+                remote.id,
+                approvedFrom: approval,
+                boundTo: baseURL
+            )
+            Issue.record("A writable target row granted authority to a read-only current row")
+        } catch {
+            #expect(
+                error as? DurableDeviceSessionManagementError
+                    == .currentSessionIsReadOnly
+            )
+        }
+        do {
+            try await coordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedFrom: approval
+            )
+            Issue.record("A reviewed read-only current row was remotely signed out")
+        } catch {
+            #expect(
+                error as? DurableDeviceSessionManagementError
+                    == .currentSessionIsReadOnly
+            )
+        }
+        #expect(!(await model.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: approval,
+            baseURL: baseURL
+        )))
+        #expect(!(await model.revokeAndForget(
+            baseURL: baseURL,
+            approvedFrom: approval
+        )))
+        #expect(model.deviceSessionErrorMessage?.contains("does not have permission") == true)
+        #expect(model.errorMessage?.contains("does not have permission") == true)
+        #expect(!(await model.refreshDeviceSessions(baseURL: baseURL)))
+        #expect(model.deviceSessionInventoryIsStale)
+        #expect(model.deviceSessionInventoryIsReadOnly)
+        #expect(!model.shouldOfferCurrentSessionRevokeFallback)
+        #expect(await transport.records().map(\.method) == ["GET", "GET"])
+        #expect(state.loadEnvelope() == initial)
+    }
+
+    @Test("a target row does not need session-write scope when the current row has it")
+    @MainActor
+    func settingsDeviceSessionWriteScopeDoesNotComeFromTarget() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 13, refreshMarker: 14)
+        let initial = envelope(active: active, revision: 182)
+        let remote = makeInventorySession(
+            id: UUID(uuidString: "14141414-1414-4414-8414-141414141414")!,
+            clientKind: "android",
+            label: "Read-only target",
+            lastSeenAt: instant.addingTimeInterval(-30),
+            scopes: descriptor.scopes.filter { $0 != .authSessionsWrite }
+        )
+        let state = TestDurableAuthStateStore(initial: initial)
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .inventory([active.session, remote]),
+                .noContent,
+                .inventory([active.session]),
+            ]
+        )
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(),
+            now: { instant.addingTimeInterval(60) }
+        )
+        let model = DurableAuthSettingsModel(
+            coordinator: coordinator,
+            configurationStore: TestSuggestionConfigurationStore(
+                baseURL: baseURL.url.absoluteString
+            ),
+            descriptor: descriptor
+        )
+
+        #expect(await model.refreshDeviceSessions(baseURL: baseURL))
+        let approval = try #require(model.deviceSessionInventory)
+        #expect(approval.currentSessionCanWriteAuthSessions)
+        #expect(!remote.scopes.contains(.authSessionsWrite))
+        #expect(!model.deviceSessionInventoryIsReadOnly)
+        #expect(model.canMutateDeviceSessionsFromInventory)
+        #expect(model.deviceSessionReadOnlyMessage == nil)
+        #expect(!model.shouldOfferCurrentSessionRevokeFallback)
+        #expect(await model.revokeRemoteDeviceSession(
+            remote.id,
+            approvedFrom: approval,
+            baseURL: baseURL
+        ))
+        #expect(await transport.records().map(\.method) == ["GET", "DELETE", "GET"])
+        #expect(state.loadEnvelope() == initial)
+    }
+
     @Test("settings presentation freezes during auth and invalidates stale URL affordances")
     @MainActor
     func settingsPresentationIsBoundToCapturedURL() async throws {
@@ -3309,6 +4089,94 @@ struct DurableAuthCoordinatorTests {
         )
     }
 
+    private func makeInventorySession(
+        id: UUID,
+        clientKind: String,
+        label: String,
+        lastSeenAt: Date,
+        contractVersion: Int = DurableAuthClientDescriptor.contractVersion,
+        scopes explicitScopes: [DayWeaveAuthScope]? = nil
+    ) -> DurableDeviceSessionMetadata {
+        let issuedAt = instant.addingTimeInterval(-120)
+        let scopes = explicitScopes ?? (contractVersion == 1
+            ? descriptor.scopes.filter { $0 != .schedulePublish }
+            : descriptor.scopes)
+        return .init(
+            id: id,
+            clientInstanceID: UUID(uuidString: "ffffffff-ffff-4fff-8fff-ffffffffffff")!,
+            clientKind: clientKind,
+            deviceLabel: label,
+            scopes: scopes,
+            clientContractVersion: contractVersion,
+            clientVersion: "2.0-test",
+            clientCapabilities: descriptor.clientCapabilities,
+            createdAt: instant.addingTimeInterval(-3_600),
+            lastSeenAt: lastSeenAt,
+            credentialIssuedAt: issuedAt,
+            accessExpiresAt: issuedAt.addingTimeInterval(
+                DurableAuthCoordinator.accessLifetime
+            ),
+            refreshIdleExpiresAt: issuedAt.addingTimeInterval(
+                DurableAuthCoordinator.refreshIdleLifetime
+            ),
+            absoluteExpiresAt: instant.addingTimeInterval(-3_600)
+                .addingTimeInterval(DurableAuthCoordinator.absoluteLifetime),
+            revision: 3
+        )
+    }
+
+    private func makeRefreshedInventorySession(
+        previous: DurableDeviceSessionMetadata,
+        issuedAt: Date
+    ) -> DurableDeviceSessionMetadata {
+        .init(
+            id: previous.id,
+            clientInstanceID: previous.clientInstanceID,
+            clientKind: previous.clientKind,
+            deviceLabel: previous.deviceLabel,
+            scopes: previous.scopes,
+            clientContractVersion: previous.clientContractVersion,
+            clientVersion: previous.clientVersion,
+            clientCapabilities: previous.clientCapabilities,
+            createdAt: previous.createdAt,
+            lastSeenAt: max(previous.lastSeenAt, issuedAt),
+            credentialIssuedAt: issuedAt,
+            accessExpiresAt: min(
+                issuedAt.addingTimeInterval(DurableAuthCoordinator.accessLifetime),
+                previous.absoluteExpiresAt
+            ),
+            refreshIdleExpiresAt: min(
+                issuedAt.addingTimeInterval(DurableAuthCoordinator.refreshIdleLifetime),
+                previous.absoluteExpiresAt
+            ),
+            absoluteExpiresAt: previous.absoluteExpiresAt,
+            revision: previous.revision + 1
+        )
+    }
+
+    private func replacingScopes(
+        of session: DurableDeviceSessionMetadata,
+        with scopes: [DayWeaveAuthScope]
+    ) -> DurableDeviceSessionMetadata {
+        .init(
+            id: session.id,
+            clientInstanceID: session.clientInstanceID,
+            clientKind: session.clientKind,
+            deviceLabel: session.deviceLabel,
+            scopes: scopes,
+            clientContractVersion: session.clientContractVersion,
+            clientVersion: session.clientVersion,
+            clientCapabilities: session.clientCapabilities,
+            createdAt: session.createdAt,
+            lastSeenAt: session.lastSeenAt,
+            credentialIssuedAt: session.credentialIssuedAt,
+            accessExpiresAt: session.accessExpiresAt,
+            refreshIdleExpiresAt: session.refreshIdleExpiresAt,
+            absoluteExpiresAt: session.absoluteExpiresAt,
+            revision: session.revision
+        )
+    }
+
     private func makeEnrollmentPending(
         enrollmentMarker: UInt8,
         accessMarker: UInt8,
@@ -3475,6 +4343,44 @@ private let trustedUnauthorizedBody = Data(
     #"{"error":{"code":"unauthorized","message":"A valid bearer token is required"}}"#.utf8
 )
 
+private let trustedJSONHeaders = [
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+    "Content-Type": "application/json; charset=utf-8",
+]
+
+private let trustedNotFoundBody = Data(
+    #"{"error":{"code":"not_found","message":"Device session was not found"}}"#.utf8
+)
+
+private func inventorySessionArrayBody(
+    _ sessions: [DurableDeviceSessionMetadata]
+) -> Data {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    let objects = sessions.map { session -> [String: Any] in
+        var object = try! JSONSerialization.jsonObject(
+            with: encoder.encode(session)
+        ) as! [String: Any]
+        object["id"] = session.id.uuidString.lowercased()
+        object["client_instance_id"] = session.clientInstanceID.uuidString.lowercased()
+        return object
+    }
+    return try! JSONSerialization.data(withJSONObject: objects, options: [.sortedKeys])
+}
+
+private func inventoryResponseBody(
+    _ sessions: [DurableDeviceSessionMetadata]
+) -> Data {
+    let objects = try! JSONSerialization.jsonObject(
+        with: inventorySessionArrayBody(sessions)
+    )
+    return try! JSONSerialization.data(
+        withJSONObject: ["sessions": objects],
+        options: [.sortedKeys]
+    )
+}
+
 private final class TestDurableAuthStateStore: DurableAuthStateStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var envelope: DurableAuthEnvelope?
@@ -3578,6 +4484,7 @@ private actor TestDurableAuthTransport: DurableAuthHTTPTransport {
             serverClientInstanceID: UUID? = nil,
             extraTopLevelKey: Bool = false
         )
+        case inventory([DurableDeviceSessionMetadata], statusCode: Int = 200)
         case noContent
         case noContentAndReplaceState(DurableAuthEnvelope)
         case raw(statusCode: Int, body: Data)
@@ -3670,6 +4577,12 @@ private actor TestDurableAuthTransport: DurableAuthHTTPTransport {
             var object: [String: Any] = ["session": sessionObject, "replayed": replayed]
             if extraTopLevelKey { object["unexpected"] = true }
             return response(statusCode: statusCode, object: object)
+        case let .inventory(sessions, statusCode):
+            return .init(
+                statusCode: statusCode,
+                headers: Self.jsonHeaders,
+                body: inventoryResponseBody(sessions)
+            )
         case .noContent:
             return noContentResponse()
         case let .noContentAndReplaceState(replacement):

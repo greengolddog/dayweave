@@ -278,6 +278,61 @@ struct DurableDeviceSessionMetadata: Codable, Equatable, Sendable {
     }
 }
 
+struct DurableDeviceSessionInventoryFence: Equatable, Sendable {
+    let configurationIdentifier: String
+    let originIdentifier: String
+    let authorizationBindingIdentifier: String
+    let envelopeRevision: UInt64
+    let currentSessionID: UUID?
+    let clientInstanceID: UUID?
+}
+
+struct DurableDeviceSessionInventorySnapshot: Equatable, Sendable {
+    let sessions: [DurableDeviceSessionMetadata]
+    let currentSessionID: UUID?
+    let fetchedAt: Date
+    fileprivate let fence: DurableDeviceSessionInventoryFence
+
+    var currentSession: DurableDeviceSessionMetadata? {
+        guard let currentSessionID else { return nil }
+        return sessions.first(where: { $0.id == currentSessionID })
+    }
+
+    /// Session-management authority belongs to the credential making the
+    /// request. Never infer it from the row being revoked.
+    var currentSessionCanWriteAuthSessions: Bool {
+        currentSession?.scopes.contains(.authSessionsWrite) == true
+    }
+
+    var sessionsWithCurrentFirst: [DurableDeviceSessionMetadata] {
+        sessions.sorted { left, right in
+            let leftIsCurrent = left.id == currentSessionID
+            let rightIsCurrent = right.id == currentSessionID
+            if leftIsCurrent != rightIsCurrent { return leftIsCurrent }
+            if left.lastSeenAt != right.lastSeenAt {
+                return left.lastSeenAt > right.lastSeenAt
+            }
+            return left.id.uuidString.lowercased() < right.id.uuidString.lowercased()
+        }
+    }
+}
+
+enum DurableRemoteSessionRevocationDisposition: Equatable, Sendable {
+    case revoked
+    case alreadyAbsent
+    case revokedAfterReconciliation
+    case stillActive
+}
+
+struct DurableRemoteSessionRevocationResult: Equatable, Sendable {
+    let inventory: DurableDeviceSessionInventorySnapshot
+    let disposition: DurableRemoteSessionRevocationDisposition
+}
+
+private struct DeviceSessionListResponse: Decodable {
+    let sessions: [DurableDeviceSessionMetadata]
+}
+
 struct DurableAuthCredentialPair: Codable, Equatable, Sendable {
     let accessToken: String
     let refreshToken: String
@@ -1148,6 +1203,9 @@ enum DayWeaveAuthResponseContract {
         }
         guard body.count <= maximumErrorBytes else { throw DurableAuthError.invalidResponse }
         try validateNoStore(headers: headers, requiresJSON: true)
+        guard StrictJSONObjectKeyScanner.hasUniqueKeys(in: body) else {
+            throw DurableAuthError.invalidResponse
+        }
         if statusCode == 401, headers["www-authenticate"] != bearerChallenge {
             throw DurableAuthError.invalidResponse
         }
@@ -1342,6 +1400,25 @@ extension DurableAuthError: LocalizedError {
     }
 }
 
+enum DurableDeviceSessionManagementError: Error, Equatable, Sendable {
+    case currentSessionRequiresSignOut
+    case currentSessionIsReadOnly
+    case remoteRevocationVerificationRequired
+}
+
+extension DurableDeviceSessionManagementError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .currentSessionRequiresSignOut:
+            "This is the current Mac session. Use Revoke & Sign Out so local credentials are removed only after server revocation succeeds."
+        case .currentSessionIsReadOnly:
+            "This session can review active devices, but it does not have permission to revoke sessions."
+        case .remoteRevocationVerificationRequired:
+            "The active-device list could not be verified after the revocation attempt. Refresh the list before trying again."
+        }
+    }
+}
+
 struct DurableAuthorization: Equatable, Sendable {
     let bearerToken: String
     let bindingIdentifier: String
@@ -1399,6 +1476,25 @@ actor DurableAuthCoordinator {
     static let accessLifetime: TimeInterval = 15 * 60
     static let refreshIdleLifetime: TimeInterval = 30 * 24 * 60 * 60
     static let absoluteLifetime: TimeInterval = 180 * 24 * 60 * 60
+    static let maximumDeviceSessionCount = 16
+
+    private struct SessionManagementAuthorization {
+        var authorization: DurableAuthorization
+        var fence: DurableDeviceSessionInventoryFence
+        var recoveredFromUnauthorized = false
+    }
+
+    private struct SessionRevocationApproval {
+        let sessionID: UUID
+        let inventory: DurableDeviceSessionInventorySnapshot
+        let expectsCurrentSession: Bool
+    }
+
+    private enum RemoteSessionDeleteEvidence: Equatable {
+        case revoked
+        case alreadyAbsent
+        case ambiguous
+    }
 
     nonisolated let stateStore: any DurableAuthStateStoring
     nonisolated let legacyStore: any BearerTokenStoring
@@ -1887,6 +1983,118 @@ actor DurableAuthCoordinator {
         }
     }
 
+    nonisolated func isDeviceSessionInventoryCurrent(
+        _ snapshot: DurableDeviceSessionInventorySnapshot,
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) -> Bool {
+        do {
+            guard let envelope = try stateStore.loadEnvelope() else { return false }
+            return try Self.deviceSessionInventoryFence(
+                envelope: envelope,
+                baseURL: baseURL
+            ) == snapshot.fence
+        } catch {
+            return false
+        }
+    }
+
+    func listDeviceSessions(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableDeviceSessionInventorySnapshot {
+        var context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        return try await fetchDeviceSessionInventory(
+            boundTo: baseURL,
+            context: &context
+        )
+    }
+
+    /// Revokes only a different device. The current session is deliberately
+    /// excluded so this path can never destroy or orphan this Mac's local
+    /// credential envelope. A 404 or an outcome-ambiguous response is resolved
+    /// by a fresh authoritative list before an outcome is reported.
+    func revokeRemoteDeviceSession(
+        _ sessionID: UUID,
+        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot,
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) async throws -> DurableRemoteSessionRevocationResult {
+        guard isDeviceSessionInventoryCurrent(expectedInventory, boundTo: baseURL) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        var context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        try requireSessionRevocationApproval(
+            .init(
+                sessionID: sessionID,
+                inventory: expectedInventory,
+                expectsCurrentSession: false
+            ),
+            context: context,
+            baseURL: baseURL
+        )
+
+        let response: DurableAuthHTTPResponse
+        do {
+            response = try await sendSessionManagementRequest(
+                method: "DELETE",
+                path: ["v1", "auth", "sessions", sessionID.uuidString.lowercased()],
+                baseURL: baseURL,
+                context: &context,
+                revocationApproval: .init(
+                    sessionID: sessionID,
+                    inventory: expectedInventory,
+                    expectsCurrentSession: false
+                )
+            )
+        } catch let error as DurableAuthError where Self.isAmbiguousRemoteMutation(error) {
+            return try await reconcileRemoteSessionRevocation(
+                sessionID,
+                evidence: .ambiguous,
+                baseURL: baseURL,
+                context: &context
+            )
+        }
+
+        let evidence: RemoteSessionDeleteEvidence
+        switch response.statusCode {
+        case 204:
+            if (try? validateNoStore(response, requiresJSON: false)) != nil,
+               response.body.isEmpty {
+                evidence = .revoked
+            } else {
+                evidence = .ambiguous
+            }
+        case 404:
+            if (try? DayWeaveAuthResponseContract.validateDeterministicError(
+                statusCode: response.statusCode,
+                headers: response.headers,
+                body: response.body
+            )) != nil {
+                evidence = .alreadyAbsent
+            } else {
+                evidence = .ambiguous
+            }
+        default:
+            if Self.isRetryableStatus(response.statusCode) {
+                evidence = .ambiguous
+            } else if Self.isDeterministicClientError(response.statusCode),
+                      (try? DayWeaveAuthResponseContract.validateDeterministicError(
+                          statusCode: response.statusCode,
+                          headers: response.headers,
+                          body: response.body
+                      )) != nil {
+                throw DurableAuthError.invalidResponse
+            } else {
+                evidence = .ambiguous
+            }
+        }
+
+        return try await reconcileRemoteSessionRevocation(
+            sessionID,
+            evidence: evidence,
+            baseURL: baseURL,
+            context: &context
+        )
+    }
+
     func recoverFromUnauthorized(
         rejectedBearer: String,
         boundTo baseURL: DayWeaveAPIBaseURL
@@ -1960,7 +2168,17 @@ actor DurableAuthCoordinator {
         )
     }
 
-    func revokeAndForget(boundTo baseURL: DayWeaveAPIBaseURL) async throws {
+    func revokeAndForget(
+        boundTo baseURL: DayWeaveAPIBaseURL,
+        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot? = nil
+    ) async throws {
+        if let expectedInventory {
+            try await revokeApprovedCurrentSession(
+                boundTo: baseURL,
+                approvedFrom: expectedInventory
+            )
+            return
+        }
         var authorization = try await authorization(boundTo: baseURL)
         guard authorization.isDurable else {
             throw DurableAuthError.remoteRevocationUnavailable
@@ -2010,13 +2228,201 @@ actor DurableAuthCoordinator {
                 throw DurableAuthError.reauthenticationRequired
             }
         }
-        guard response.statusCode == 204 else { throw try mapFailure(response) }
-        try validateNoStore(response, requiresJSON: false)
-        guard response.body.isEmpty, let expected else {
+        if response.statusCode == 404 {
+            _ = try DayWeaveAuthResponseContract.validateDeterministicError(
+                statusCode: response.statusCode,
+                headers: response.headers,
+                body: response.body
+            )
+        } else {
+            guard response.statusCode == 204 else { throw try mapFailure(response) }
+            try validateNoStore(response, requiresJSON: false)
+            guard response.body.isEmpty else { throw DurableAuthError.invalidResponse }
+        }
+        guard let expected else {
             throw DurableAuthError.invalidResponse
         }
         // Clear any obsolete pre-envelope copy first. If this fails, retain
         // the authoritative envelope even though the server has revoked it.
+        try removeLegacyDuplicate()
+        guard try stateStore.compareAndSwap(expected: expected, replacement: nil) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func revokeApprovedCurrentSession(
+        boundTo baseURL: DayWeaveAPIBaseURL,
+        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot
+    ) async throws {
+        guard isDeviceSessionInventoryCurrent(expectedInventory, boundTo: baseURL),
+              let sessionID = expectedInventory.currentSessionID else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        var context = try await makeSessionManagementAuthorization(boundTo: baseURL)
+        guard context.authorization.isDurable else {
+            throw DurableAuthError.remoteRevocationUnavailable
+        }
+        let approval = SessionRevocationApproval(
+            sessionID: sessionID,
+            inventory: expectedInventory,
+            expectsCurrentSession: true
+        )
+        try requireSessionRevocationApproval(
+            approval,
+            context: context,
+            baseURL: baseURL
+        )
+
+        let response: DurableAuthHTTPResponse
+        do {
+            response = try await sendSessionManagementRequest(
+                method: "DELETE",
+                path: ["v1", "auth", "sessions", sessionID.uuidString.lowercased()],
+                baseURL: baseURL,
+                context: &context,
+                revocationApproval: approval
+            )
+        } catch let error as DurableAuthError {
+            if error == .reauthenticationRequired {
+                try clearLocallyAfterCurrentSessionBecameUnusable(
+                    sessionID,
+                    baseURL: baseURL
+                )
+                return
+            }
+            guard Self.isAmbiguousRemoteMutation(error) else { throw error }
+            try await reconcileApprovedCurrentSessionRevocation(
+                sessionID,
+                after: error,
+                baseURL: baseURL,
+                context: &context
+            )
+            return
+        }
+
+        switch response.statusCode {
+        case 204:
+            guard (try? validateNoStore(response, requiresJSON: false)) != nil,
+                  response.body.isEmpty else {
+                try await reconcileApprovedCurrentSessionRevocation(
+                    sessionID,
+                    after: .invalidResponse,
+                    baseURL: baseURL,
+                    context: &context
+                )
+                return
+            }
+        case 404:
+            guard (try? DayWeaveAuthResponseContract.validateDeterministicError(
+                statusCode: response.statusCode,
+                headers: response.headers,
+                body: response.body
+            )) != nil else {
+                try await reconcileApprovedCurrentSessionRevocation(
+                    sessionID,
+                    after: .invalidResponse,
+                    baseURL: baseURL,
+                    context: &context
+                )
+                return
+            }
+        default:
+            if Self.isRetryableStatus(response.statusCode) {
+                try await reconcileApprovedCurrentSessionRevocation(
+                    sessionID,
+                    after: .retryableServer(statusCode: response.statusCode),
+                    baseURL: baseURL,
+                    context: &context
+                )
+                return
+            }
+            if Self.isDeterministicClientError(response.statusCode),
+               (try? DayWeaveAuthResponseContract.validateDeterministicError(
+                   statusCode: response.statusCode,
+                   headers: response.headers,
+                   body: response.body
+               )) != nil {
+                throw DurableAuthError.invalidResponse
+            }
+            try await reconcileApprovedCurrentSessionRevocation(
+                sessionID,
+                after: .invalidResponse,
+                baseURL: baseURL,
+                context: &context
+            )
+            return
+        }
+
+        try clearApprovedCurrentSessionLocally(
+            sessionID,
+            context: context,
+            baseURL: baseURL
+        )
+    }
+
+    private func reconcileApprovedCurrentSessionRevocation(
+        _ sessionID: UUID,
+        after failure: DurableAuthError,
+        baseURL: DayWeaveAPIBaseURL,
+        context: inout SessionManagementAuthorization
+    ) async throws {
+        let inventory: DurableDeviceSessionInventorySnapshot
+        do {
+            inventory = try await fetchDeviceSessionInventory(
+                boundTo: baseURL,
+                context: &context
+            )
+        } catch let error as DurableAuthError {
+            if error == .reauthenticationRequired {
+                try clearLocallyAfterCurrentSessionBecameUnusable(
+                    sessionID,
+                    baseURL: baseURL
+                )
+                return
+            }
+            if Self.isAmbiguousRemoteMutation(error) {
+                throw DurableDeviceSessionManagementError.remoteRevocationVerificationRequired
+            }
+            throw error
+        }
+        guard inventory.currentSessionID == sessionID,
+              inventory.sessions.contains(where: { $0.id == sessionID }) else {
+            throw DurableAuthError.invalidResponse
+        }
+        throw failure
+    }
+
+    private func clearApprovedCurrentSessionLocally(
+        _ sessionID: UUID,
+        context: SessionManagementAuthorization,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        guard context.fence.currentSessionID == sessionID,
+              let expected = try loadState() else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        try removeLegacyDuplicate()
+        guard try stateStore.compareAndSwap(expected: expected, replacement: nil) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func clearLocallyAfterCurrentSessionBecameUnusable(
+        _ sessionID: UUID,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        guard let expected = try loadState(),
+              expected.origin == baseURL.credentialOriginIdentifier,
+              Self.sessionID(in: expected.state) == sessionID else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        switch expected.state {
+        case .active, .refreshPending, .reauthenticationRequired:
+            break
+        case .legacy, .enrollmentCreationPending, .enrollmentPending, .incompatible:
+            throw DurableAuthError.concurrentStateChange
+        }
         try removeLegacyDuplicate()
         guard try stateStore.compareAndSwap(expected: expected, replacement: nil) else {
             throw DurableAuthError.concurrentStateChange
@@ -2763,6 +3169,296 @@ actor DurableAuthCoordinator {
         return id
     }
 
+    private func makeSessionManagementAuthorization(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) async throws -> SessionManagementAuthorization {
+        let authorization = try await authorization(boundTo: baseURL)
+        guard let envelope = try loadState() else { throw DurableAuthError.notConfigured }
+        let fence = try Self.deviceSessionInventoryFence(
+            envelope: envelope,
+            baseURL: baseURL
+        )
+        guard fence.authorizationBindingIdentifier == authorization.bindingIdentifier,
+              Self.authorizationBearer(in: envelope.state) == authorization.bearerToken else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        return .init(authorization: authorization, fence: fence)
+    }
+
+    private static func deviceSessionInventoryFence(
+        envelope: DurableAuthEnvelope,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws -> DurableDeviceSessionInventoryFence {
+        guard envelope.origin == baseURL.credentialOriginIdentifier else {
+            throw DurableAuthError.originMismatch
+        }
+        let binding: String
+        let currentSessionID: UUID?
+        switch envelope.state {
+        case let .legacy(legacy):
+            binding = legacyBinding(token: legacy.bearerToken)
+            currentSessionID = nil
+        case let .active(active):
+            binding = deviceBinding(session: active.session)
+            currentSessionID = active.session.id
+        case let .refreshPending(pending):
+            guard pending.refreshRequest.isBound(
+                to: baseURL,
+                bearer: pending.previous.credentials.refreshToken
+            ) else { throw DurableAuthError.originMismatch }
+            binding = deviceBinding(session: pending.previous.session)
+            currentSessionID = pending.previous.session.id
+        case .enrollmentCreationPending, .enrollmentPending:
+            throw DurableAuthError.enrollmentRequired
+        case .reauthenticationRequired:
+            throw DurableAuthError.reauthenticationRequired
+        case .incompatible:
+            throw DurableAuthError.incompatibleState
+        }
+        return .init(
+            configurationIdentifier: baseURL.canonicalConfigurationIdentifier,
+            originIdentifier: baseURL.credentialOriginIdentifier,
+            authorizationBindingIdentifier: binding,
+            envelopeRevision: envelope.revision,
+            currentSessionID: currentSessionID,
+            clientInstanceID: envelope.clientInstanceID
+        )
+    }
+
+    private static func authorizationBearer(in state: DurableAuthState) -> String? {
+        switch state {
+        case let .legacy(legacy): legacy.bearerToken
+        case let .active(active): active.credentials.accessToken
+        case let .refreshPending(pending): pending.previous.credentials.accessToken
+        case .enrollmentCreationPending, .enrollmentPending,
+             .reauthenticationRequired, .incompatible:
+            nil
+        }
+    }
+
+    private func requireCurrentSessionManagementFence(
+        _ context: SessionManagementAuthorization,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        guard let envelope = try loadState(),
+              try Self.deviceSessionInventoryFence(
+                  envelope: envelope,
+                  baseURL: baseURL
+              ) == context.fence,
+              Self.authorizationBearer(in: envelope.state)
+                == context.authorization.bearerToken else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func requireSessionRevocationApproval(
+        _ approval: SessionRevocationApproval,
+        context: SessionManagementAuthorization,
+        baseURL: DayWeaveAPIBaseURL
+    ) throws {
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        let inventory = approval.inventory
+        guard inventory.fence == context.fence else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard inventory.currentSessionCanWriteAuthSessions else {
+            throw DurableDeviceSessionManagementError.currentSessionIsReadOnly
+        }
+        let targetIsCurrent = inventory.currentSessionID == approval.sessionID
+        guard targetIsCurrent == approval.expectsCurrentSession else {
+            if targetIsCurrent {
+                throw DurableDeviceSessionManagementError.currentSessionRequiresSignOut
+            }
+            throw DurableAuthError.concurrentStateChange
+        }
+        guard inventory.sessions.contains(where: { $0.id == approval.sessionID }) else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func requireSessionRevocationApprovalContinuity(
+        original: SessionRevocationApproval,
+        refreshedInventory: DurableDeviceSessionInventorySnapshot
+    ) throws {
+        let originalFence = original.inventory.fence
+        let refreshedFence = refreshedInventory.fence
+        guard originalFence.configurationIdentifier
+                == refreshedFence.configurationIdentifier,
+              originalFence.originIdentifier == refreshedFence.originIdentifier,
+              originalFence.authorizationBindingIdentifier
+                == refreshedFence.authorizationBindingIdentifier,
+              originalFence.currentSessionID == refreshedFence.currentSessionID,
+              originalFence.clientInstanceID == refreshedFence.clientInstanceID,
+              let originalTarget = original.inventory.sessions.first(where: {
+                  $0.id == original.sessionID
+              }),
+              let refreshedTarget = refreshedInventory.sessions.first(where: {
+                  $0.id == original.sessionID
+              }),
+              originalTarget.clientInstanceID == refreshedTarget.clientInstanceID,
+              originalTarget.clientKind == refreshedTarget.clientKind else {
+            throw DurableAuthError.concurrentStateChange
+        }
+    }
+
+    private func sendSessionManagementRequest(
+        method: String,
+        path: [String],
+        baseURL: DayWeaveAPIBaseURL,
+        context: inout SessionManagementAuthorization,
+        revocationApproval: SessionRevocationApproval? = nil
+    ) async throws -> DurableAuthHTTPResponse {
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        if let revocationApproval {
+            try requireSessionRevocationApproval(
+                revocationApproval,
+                context: context,
+                baseURL: baseURL
+            )
+        }
+        var response = try await send(
+            method: method,
+            path: path,
+            baseURL: baseURL,
+            bearer: context.authorization.bearerToken,
+            body: nil
+        )
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        guard response.statusCode == 401 else { return response }
+        guard Self.isDefinitiveUnauthorized(response) else {
+            throw DurableAuthError.invalidResponse
+        }
+        if context.recoveredFromUnauthorized {
+            if context.authorization.isDurable {
+                try retireDefinitivelyRejectedAuthorization(
+                    context.authorization,
+                    boundTo: baseURL
+                )
+                throw DurableAuthError.reauthenticationRequired
+            }
+            throw DurableAuthError.rejected
+        }
+
+        context.authorization = try await recoverFromUnauthorized(
+            rejectedBearer: context.authorization.bearerToken,
+            boundTo: baseURL
+        )
+        context.recoveredFromUnauthorized = true
+        guard let envelope = try loadState() else { throw DurableAuthError.notConfigured }
+        context.fence = try Self.deviceSessionInventoryFence(
+            envelope: envelope,
+            baseURL: baseURL
+        )
+        guard context.fence.authorizationBindingIdentifier
+                == context.authorization.bindingIdentifier,
+              Self.authorizationBearer(in: envelope.state)
+                == context.authorization.bearerToken else {
+            throw DurableAuthError.concurrentStateChange
+        }
+        var retryApproval = revocationApproval
+        if let revocationApproval {
+            let refreshedInventory = try await fetchDeviceSessionInventory(
+                boundTo: baseURL,
+                context: &context
+            )
+            try requireSessionRevocationApprovalContinuity(
+                original: revocationApproval,
+                refreshedInventory: refreshedInventory
+            )
+            retryApproval = .init(
+                sessionID: revocationApproval.sessionID,
+                inventory: refreshedInventory,
+                expectsCurrentSession: revocationApproval.expectsCurrentSession
+            )
+        }
+        if let retryApproval {
+            try requireSessionRevocationApproval(
+                retryApproval,
+                context: context,
+                baseURL: baseURL
+            )
+        }
+        response = try await send(
+            method: method,
+            path: path,
+            baseURL: baseURL,
+            bearer: context.authorization.bearerToken,
+            body: nil
+        )
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        if response.statusCode == 401 {
+            guard Self.isDefinitiveUnauthorized(response) else {
+                throw DurableAuthError.invalidResponse
+            }
+            if context.authorization.isDurable {
+                try retireDefinitivelyRejectedAuthorization(
+                    context.authorization,
+                    boundTo: baseURL
+                )
+                throw DurableAuthError.reauthenticationRequired
+            }
+            throw DurableAuthError.rejected
+        }
+        return response
+    }
+
+    private func fetchDeviceSessionInventory(
+        boundTo baseURL: DayWeaveAPIBaseURL,
+        context: inout SessionManagementAuthorization
+    ) async throws -> DurableDeviceSessionInventorySnapshot {
+        let response = try await sendSessionManagementRequest(
+            method: "GET",
+            path: ["v1", "auth", "sessions"],
+            baseURL: baseURL,
+            context: &context
+        )
+        guard response.statusCode == 200 else { throw try mapFailure(response) }
+        let fetchedAt = now()
+        let sessions = try decodeDeviceSessionInventory(
+            response,
+            fence: context.fence,
+            receivedAt: fetchedAt
+        )
+        try requireCurrentSessionManagementFence(context, baseURL: baseURL)
+        return .init(
+            sessions: sessions,
+            currentSessionID: context.fence.currentSessionID,
+            fetchedAt: fetchedAt,
+            fence: context.fence
+        )
+    }
+
+    private func reconcileRemoteSessionRevocation(
+        _ sessionID: UUID,
+        evidence: RemoteSessionDeleteEvidence,
+        baseURL: DayWeaveAPIBaseURL,
+        context: inout SessionManagementAuthorization
+    ) async throws -> DurableRemoteSessionRevocationResult {
+        let inventory: DurableDeviceSessionInventorySnapshot
+        do {
+            inventory = try await fetchDeviceSessionInventory(
+                boundTo: baseURL,
+                context: &context
+            )
+        } catch let error as DurableAuthError {
+            if Self.isAmbiguousRemoteMutation(error) {
+                throw DurableDeviceSessionManagementError.remoteRevocationVerificationRequired
+            }
+            throw error
+        }
+        let isStillActive = inventory.sessions.contains { $0.id == sessionID }
+        if isStillActive {
+            guard evidence == .ambiguous else { throw DurableAuthError.invalidResponse }
+            return .init(inventory: inventory, disposition: .stillActive)
+        }
+        let disposition: DurableRemoteSessionRevocationDisposition = switch evidence {
+        case .revoked: .revoked
+        case .alreadyAbsent: .alreadyAbsent
+        case .ambiguous: .revokedAfterReconciliation
+        }
+        return .init(inventory: inventory, disposition: disposition)
+    }
+
     private func send(
         _ journal: DurableAuthJournaledRequest,
         bearer: String
@@ -2827,6 +3523,15 @@ actor DurableAuthCoordinator {
             || (500...599).contains(statusCode)
     }
 
+    private static func isAmbiguousRemoteMutation(_ error: DurableAuthError) -> Bool {
+        switch error {
+        case .transport, .retryableServer:
+            true
+        default:
+            false
+        }
+    }
+
     private static func isDeterministicClientError(_ statusCode: Int) -> Bool {
         statusCode == 400 || statusCode == 403 || statusCode == 404
             || statusCode == 409 || statusCode == 422
@@ -2856,6 +3561,169 @@ actor DurableAuthCoordinator {
             ]
         )
         return try decode(DeviceSessionMutationResponse.self, from: response.body)
+    }
+
+    private func decodeDeviceSessionInventory(
+        _ response: DurableAuthHTTPResponse,
+        fence: DurableDeviceSessionInventoryFence,
+        receivedAt: Date
+    ) throws -> [DurableDeviceSessionMetadata] {
+        guard !response.body.isEmpty,
+              response.body.count <= URLSessionDurableAuthHTTPTransport.maximumResponseBytes,
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: response.body)
+        else { throw DurableAuthError.invalidResponse }
+        try validateNoStore(response)
+        guard let root = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any],
+              Set(root.keys) == ["sessions"],
+              let rawSessions = root["sessions"] as? [Any],
+              rawSessions.count <= Self.maximumDeviceSessionCount else {
+            throw DurableAuthError.invalidResponse
+        }
+
+        let sessionKeys: Set<String> = [
+            "id", "client_instance_id", "client_kind", "device_label", "scopes",
+            "client_contract_version", "client_version", "client_capabilities",
+            "created_at", "last_seen_at", "credential_issued_at", "access_expires_at",
+            "refresh_idle_expires_at", "absolute_expires_at", "revision",
+        ]
+        let timestampKeys = [
+            "created_at", "last_seen_at", "credential_issued_at", "access_expires_at",
+            "refresh_idle_expires_at", "absolute_expires_at",
+        ]
+        for rawSession in rawSessions {
+            guard let object = rawSession as? [String: Any],
+                  Set(object.keys) == sessionKeys,
+                  Self.isCanonicalUUIDString(object["id"]),
+                  Self.isCanonicalUUIDString(object["client_instance_id"]),
+                  let clientKind = object["client_kind"] as? String,
+                  clientKind == "macos" || clientKind == "android",
+                  let deviceLabel = object["device_label"] as? String,
+                  Self.isSafeSessionMetadataText(deviceLabel, maximum: 200),
+                  let scopes = object["scopes"] as? [String],
+                  !scopes.isEmpty,
+                  scopes.count <= DayWeaveAuthScope.deviceDefaults.count,
+                  Set(scopes).count == scopes.count,
+                  let clientVersion = object["client_version"] as? String,
+                  Self.isSafeSessionMetadataText(clientVersion, maximum: 100),
+                  let capabilities = object["client_capabilities"] as? [String],
+                  capabilities.count <= 100,
+                  Set(capabilities).count == capabilities.count,
+                  capabilities.allSatisfy({
+                      Self.isSafeSessionMetadataText($0, maximum: 100)
+                  }),
+                  object["client_contract_version"] is NSNumber,
+                  object["revision"] is NSNumber,
+                  timestampKeys.allSatisfy({ key in
+                      guard let value = object[key] as? String else { return false }
+                      return !value.isEmpty && value.utf8.count <= 64
+                  }) else {
+                throw DurableAuthError.invalidResponse
+            }
+        }
+
+        guard let decoded = try? decode(DeviceSessionListResponse.self, from: response.body),
+              decoded.sessions.count == rawSessions.count else {
+            throw DurableAuthError.invalidResponse
+        }
+        let sessions = decoded.sessions
+        guard Set(sessions.map(\.id)).count == sessions.count,
+              sessions.allSatisfy({
+                  Self.isValidInventorySession($0, receivedAt: receivedAt)
+              }),
+              Self.isAuthoritativelyOrdered(sessions) else {
+            throw DurableAuthError.invalidResponse
+        }
+        if let currentSessionID = fence.currentSessionID {
+            guard let current = sessions.first(where: { $0.id == currentSessionID }),
+                  current.clientInstanceID == fence.clientInstanceID,
+                  current.clientKind == "macos" else {
+                throw DurableAuthError.invalidResponse
+            }
+        }
+        return sessions
+    }
+
+    private static func isCanonicalUUIDString(_ raw: Any?) -> Bool {
+        guard let value = raw as? String,
+              let id = UUID(uuidString: value) else { return false }
+        return value == id.uuidString.lowercased()
+    }
+
+    private static func isSafeSessionMetadataText(
+        _ value: String,
+        maximum: Int
+    ) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.count <= maximum
+            && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
+    private static func isValidInventorySession(
+        _ session: DurableDeviceSessionMetadata,
+        receivedAt: Date
+    ) -> Bool {
+        let dates = [
+            session.createdAt, session.lastSeenAt, session.credentialIssuedAt,
+            session.accessExpiresAt, session.refreshIdleExpiresAt, session.absoluteExpiresAt,
+            receivedAt,
+        ]
+        return dates.allSatisfy { $0.timeIntervalSinceReferenceDate.isFinite }
+            && (session.clientKind == "macos" || session.clientKind == "android")
+            && Self.isSafeSessionMetadataText(session.deviceLabel, maximum: 200)
+            && Self.isSafeSessionMetadataText(session.clientVersion, maximum: 100)
+            && (session.clientContractVersion == 1
+                || session.clientContractVersion == DurableAuthClientDescriptor.contractVersion)
+            && (session.clientContractVersion != 1
+                || !session.scopes.contains(.schedulePublish))
+            && !session.scopes.isEmpty
+            && session.scopes.count <= DayWeaveAuthScope.deviceDefaults.count
+            && Set(session.scopes).count == session.scopes.count
+            && session.clientCapabilities.count <= 100
+            && Set(session.clientCapabilities).count == session.clientCapabilities.count
+            && session.clientCapabilities.allSatisfy {
+                Self.isSafeSessionMetadataText($0, maximum: 100)
+            }
+            && session.revision >= 1
+            && session.createdAt <= session.credentialIssuedAt
+            && session.credentialIssuedAt <= session.lastSeenAt
+            && session.lastSeenAt < session.absoluteExpiresAt
+            && session.credentialIssuedAt < session.accessExpiresAt
+            && session.accessExpiresAt.timeIntervalSince(session.credentialIssuedAt)
+                <= Self.accessLifetime + 1
+            && session.credentialIssuedAt < session.refreshIdleExpiresAt
+            && session.refreshIdleExpiresAt.timeIntervalSince(session.credentialIssuedAt)
+                <= Self.refreshIdleLifetime + 1
+            && session.credentialIssuedAt < session.absoluteExpiresAt
+            && session.absoluteExpiresAt.timeIntervalSince(session.createdAt)
+                <= Self.absoluteLifetime + 1
+            && session.accessExpiresAt <= session.absoluteExpiresAt
+            && session.refreshIdleExpiresAt <= session.absoluteExpiresAt
+            && session.createdAt
+                <= receivedAt.addingTimeInterval(Self.clockSkewAllowance)
+            && session.credentialIssuedAt
+                <= receivedAt.addingTimeInterval(Self.clockSkewAllowance)
+            && session.lastSeenAt
+                <= receivedAt.addingTimeInterval(Self.clockSkewAllowance)
+            && session.refreshIdleExpiresAt
+                > receivedAt.addingTimeInterval(-Self.clockSkewAllowance)
+            && session.absoluteExpiresAt
+                > receivedAt.addingTimeInterval(-Self.clockSkewAllowance)
+    }
+
+    private static func isAuthoritativelyOrdered(
+        _ sessions: [DurableDeviceSessionMetadata]
+    ) -> Bool {
+        guard sessions.count > 1 else { return true }
+        for index in 1..<sessions.count {
+            let previous = sessions[index - 1]
+            let current = sessions[index]
+            if previous.lastSeenAt < current.lastSeenAt { return false }
+            if previous.lastSeenAt == current.lastSeenAt,
+               previous.id.uuidString.lowercased() > current.id.uuidString.lowercased() {
+                return false
+            }
+        }
+        return true
     }
 
     private func validateNoStore(
@@ -3325,10 +4193,18 @@ final class DurableAuthSettingsModel: ObservableObject {
     @Published private(set) var presentation: DurableAuthPresentation
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var deviceSessionInventory: DurableDeviceSessionInventorySnapshot?
+    @Published private(set) var isRefreshingDeviceSessions = false
+    @Published private(set) var revokingDeviceSessionID: UUID?
+    @Published private(set) var deviceSessionInventoryIsStale = false
+    @Published private(set) var deviceSessionErrorMessage: String?
+    @Published private(set) var deviceSessionNotice: String?
 
     let coordinator: DurableAuthCoordinator
     private let configurationStore: any SuggestionAPIConfigurationStoring
     private let descriptor: DurableAuthClientDescriptor
+    private var deviceSessionInventoryGeneration: UInt64 = 0
+    private var deviceSessionRequestConfigurationIdentifier: String?
 
     init(
         coordinator: DurableAuthCoordinator,
@@ -3349,8 +4225,172 @@ final class DurableAuthSettingsModel: ObservableObject {
     }
 
     func reload(boundTo baseURL: DayWeaveAPIBaseURL?) {
+        invalidateDeviceSessionInventoryIfNeeded(boundTo: baseURL)
         guard !isBusy else { return }
         presentation = coordinator.presentation(boundTo: baseURL)
+    }
+
+    var isManagingDeviceSessions: Bool {
+        isRefreshingDeviceSessions || revokingDeviceSessionID != nil
+    }
+
+    var deviceSessionInventoryIsReadOnly: Bool {
+        guard let deviceSessionInventory else { return false }
+        return !deviceSessionInventory.currentSessionCanWriteAuthSessions
+    }
+
+    var canMutateDeviceSessionsFromInventory: Bool {
+        guard !deviceSessionInventoryIsStale,
+              let deviceSessionInventory else { return false }
+        return deviceSessionInventory.currentSessionCanWriteAuthSessions
+    }
+
+    var deviceSessionReadOnlyMessage: String? {
+        guard deviceSessionInventoryIsReadOnly else { return nil }
+        return DurableDeviceSessionManagementError.currentSessionIsReadOnly
+            .localizedDescription
+    }
+
+    /// When no authoritative row is available, retain the existing explicit
+    /// self-revoke fallback. A stale list may use that fallback only when its
+    /// exact current row most recently carried session-write authority.
+    var shouldOfferCurrentSessionRevokeFallback: Bool {
+        guard let deviceSessionInventory else { return true }
+        return deviceSessionInventoryIsStale
+            && deviceSessionInventory.currentSessionCanWriteAuthSessions
+    }
+
+    @discardableResult
+    func refreshDeviceSessions(baseURL: DayWeaveAPIBaseURL) async -> Bool {
+        guard !isBusy, !isRefreshingDeviceSessions, revokingDeviceSessionID == nil else {
+            return false
+        }
+        deviceSessionInventoryGeneration &+= 1
+        let generation = deviceSessionInventoryGeneration
+        deviceSessionRequestConfigurationIdentifier = baseURL.canonicalConfigurationIdentifier
+        isRefreshingDeviceSessions = true
+        deviceSessionErrorMessage = nil
+        deviceSessionNotice = nil
+        deviceSessionInventoryIsStale = false
+        defer {
+            if deviceSessionInventoryGeneration == generation {
+                isRefreshingDeviceSessions = false
+                deviceSessionRequestConfigurationIdentifier = nil
+            }
+        }
+        do {
+            let inventory = try await coordinator.listDeviceSessions(boundTo: baseURL)
+            guard deviceSessionInventoryGeneration == generation,
+                  coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL)
+            else { return false }
+            deviceSessionInventory = inventory
+            deviceSessionInventoryIsStale = false
+            return true
+        } catch {
+            guard deviceSessionInventoryGeneration == generation else { return false }
+            if let inventory = deviceSessionInventory,
+               !coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL) {
+                clearDeviceSessionInventory()
+                return false
+            }
+            deviceSessionInventoryIsStale = deviceSessionInventory != nil
+            deviceSessionErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    func revokeRemoteDeviceSession(
+        _ sessionID: UUID,
+        approvedFrom approvedInventory: DurableDeviceSessionInventorySnapshot,
+        baseURL: DayWeaveAPIBaseURL
+    ) async -> Bool {
+        guard !isBusy, !isRefreshingDeviceSessions, revokingDeviceSessionID == nil else {
+            return false
+        }
+        guard !deviceSessionInventoryIsStale else {
+            deviceSessionErrorMessage = "Refresh Active Devices before revoking access."
+            return false
+        }
+        guard deviceSessionInventory == approvedInventory else {
+            deviceSessionErrorMessage = "Refresh Active Devices before revoking access."
+            return false
+        }
+        guard approvedInventory.currentSessionCanWriteAuthSessions else {
+            deviceSessionErrorMessage = DurableDeviceSessionManagementError
+                .currentSessionIsReadOnly
+                .localizedDescription
+            return false
+        }
+        if approvedInventory.currentSessionID == sessionID {
+            deviceSessionErrorMessage = DurableDeviceSessionManagementError
+                .currentSessionRequiresSignOut
+                .localizedDescription
+            return false
+        }
+        deviceSessionInventoryGeneration &+= 1
+        let generation = deviceSessionInventoryGeneration
+        deviceSessionRequestConfigurationIdentifier = baseURL.canonicalConfigurationIdentifier
+        revokingDeviceSessionID = sessionID
+        deviceSessionErrorMessage = nil
+        deviceSessionNotice = nil
+        deviceSessionInventoryIsStale = false
+        defer {
+            if deviceSessionInventoryGeneration == generation {
+                revokingDeviceSessionID = nil
+                deviceSessionRequestConfigurationIdentifier = nil
+            }
+        }
+        do {
+            let result = try await coordinator.revokeRemoteDeviceSession(
+                sessionID,
+                approvedFrom: approvedInventory,
+                boundTo: baseURL
+            )
+            guard deviceSessionInventoryGeneration == generation,
+                  coordinator.isDeviceSessionInventoryCurrent(
+                      result.inventory,
+                      boundTo: baseURL
+                  ) else { return false }
+            deviceSessionInventory = result.inventory
+            deviceSessionInventoryIsStale = false
+            switch result.disposition {
+            case .revoked:
+                deviceSessionNotice = "Device access was revoked."
+                return true
+            case .alreadyAbsent:
+                deviceSessionNotice = "That device was already signed out."
+                return true
+            case .revokedAfterReconciliation:
+                deviceSessionNotice = "The device is no longer active."
+                return true
+            case .stillActive:
+                deviceSessionErrorMessage =
+                    "The server still reports this device as active. No local credentials were changed."
+                return false
+            }
+        } catch {
+            guard deviceSessionInventoryGeneration == generation else { return false }
+            if let inventory = deviceSessionInventory,
+               !coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL) {
+                clearDeviceSessionInventory()
+                return false
+            }
+            deviceSessionInventoryIsStale = deviceSessionInventory != nil
+            deviceSessionErrorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func clearDeviceSessionInventory() {
+        deviceSessionInventoryGeneration &+= 1
+        deviceSessionInventory = nil
+        isRefreshingDeviceSessions = false
+        revokingDeviceSessionID = nil
+        deviceSessionInventoryIsStale = false
+        deviceSessionErrorMessage = nil
+        deviceSessionNotice = nil
+        deviceSessionRequestConfigurationIdentifier = nil
     }
 
     @discardableResult
@@ -3390,9 +4430,30 @@ final class DurableAuthSettingsModel: ObservableObject {
     }
 
     @discardableResult
-    func revokeAndForget(baseURL: DayWeaveAPIBaseURL) async -> Bool {
-        await perform(baseURL: baseURL) {
-            try await self.coordinator.revokeAndForget(boundTo: baseURL)
+    func revokeAndForget(
+        baseURL: DayWeaveAPIBaseURL,
+        approvedFrom expectedInventory: DurableDeviceSessionInventorySnapshot? = nil
+    ) async -> Bool {
+        if let expectedInventory {
+            guard !deviceSessionInventoryIsStale,
+                  deviceSessionInventory == expectedInventory else {
+                errorMessage = "Refresh Active Devices before revoking access."
+                return false
+            }
+            guard expectedInventory.currentSessionCanWriteAuthSessions else {
+                let message = DurableDeviceSessionManagementError
+                    .currentSessionIsReadOnly
+                    .localizedDescription
+                errorMessage = message
+                deviceSessionErrorMessage = message
+                return false
+            }
+        }
+        return await perform(baseURL: baseURL) {
+            try await self.coordinator.revokeAndForget(
+                boundTo: baseURL,
+                approvedFrom: expectedInventory
+            )
         }
     }
 
@@ -3407,19 +4468,42 @@ final class DurableAuthSettingsModel: ObservableObject {
         baseURL: DayWeaveAPIBaseURL?,
         operation: () async throws -> Void
     ) async -> Bool {
-        guard !isBusy else { return false }
+        guard !isBusy, !isManagingDeviceSessions else { return false }
         isBusy = true
         errorMessage = nil
         defer {
             isBusy = false
             presentation = coordinator.presentation(boundTo: baseURL)
+            invalidateDeviceSessionInventoryIfNeeded(boundTo: baseURL)
         }
         do {
             try await operation()
+            clearDeviceSessionInventory()
             return true
         } catch {
             errorMessage = error.localizedDescription
             return false
+        }
+    }
+
+    private func invalidateDeviceSessionInventoryIfNeeded(
+        boundTo baseURL: DayWeaveAPIBaseURL?
+    ) {
+        guard let baseURL else {
+            if deviceSessionInventory != nil
+                || deviceSessionRequestConfigurationIdentifier != nil {
+                clearDeviceSessionInventory()
+            }
+            return
+        }
+        if let requestConfiguration = deviceSessionRequestConfigurationIdentifier,
+           requestConfiguration != baseURL.canonicalConfigurationIdentifier {
+            clearDeviceSessionInventory()
+            return
+        }
+        if let inventory = deviceSessionInventory,
+           !coordinator.isDeviceSessionInventoryCurrent(inventory, boundTo: baseURL) {
+            clearDeviceSessionInventory()
         }
     }
 }
