@@ -12,10 +12,11 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 
 internal const val DEVICE_AUTH_CONTRACT_VERSION = 2
-internal const val DEVICE_AUTH_ENVELOPE_VERSION = 2
+internal const val DEVICE_AUTH_ENVELOPE_VERSION = 3
 internal const val DEVICE_ACCESS_TOKEN_PREFIX = "dw_da1_"
 internal const val DEVICE_REFRESH_TOKEN_PREFIX = "dw_dr1_"
 internal const val DEVICE_ENROLLMENT_TOKEN_PREFIX = "dw_en1_"
+internal const val ACCOUNT_RECOVERY_TOKEN_PREFIX = "dw_rc1_"
 internal const val DEVICE_AUTH_TOKEN_PAYLOAD_LENGTH = 43
 internal val DEVICE_AUTH_ACCESS_TTL: Duration = Duration.ofMinutes(15)
 internal val DEVICE_AUTH_REFRESH_IDLE_TTL: Duration = Duration.ofDays(30)
@@ -195,8 +196,91 @@ internal data class StoredDeviceAuthEnvelope(
     @SerialName("schema_version") val schemaVersion: Int = DEVICE_AUTH_ENVELOPE_VERSION,
     val revision: Long,
     val state: StoredDeviceAuthState,
+    @SerialName("account_recovery_journal")
+    val accountRecoveryJournal: StoredAccountRecoveryJournal? = null,
     @Transient val storageIdentity: DeviceAuthStorageIdentity? = null,
 )
+
+/**
+ * Crash-safe recovery mutation/disclosure state stored inside the same Keystore envelope as the
+ * device credential. Keeping this at envelope level lets refreshes preserve an in-flight recovery
+ * tuple and lets a successful consume install its session and successor code in one durable CAS.
+ */
+@Serializable
+internal sealed class StoredAccountRecoveryJournal {
+    abstract val baseUrl: String?
+
+    /**
+     * Memory projection for a journal payload whose encrypted envelope remains authentic but
+     * cannot be safely interpreted by this build. It is never created silently as a replacement;
+     * the original ciphertext stays intact until an owner confirms recovery-only removal.
+     */
+    @Serializable
+    @SerialName("repair_required")
+    data class RepairRequired(
+        override val baseUrl: String? = null,
+        val reason: String,
+    ) : StoredAccountRecoveryJournal()
+
+    @Serializable
+    @SerialName("issuance_pending")
+    data class IssuancePending(
+        override val baseUrl: String,
+        @SerialName("configuration_id") val configurationId: String,
+        @SerialName("client_instance_id") val clientInstanceId: String,
+        @SerialName("candidate_id") val candidateId: String,
+        @SerialName("candidate_code") val candidateCode: DeviceAuthSecret,
+        @SerialName("replaces_id") val replacesId: String?,
+        @SerialName("replaces_revision") val replacesRevision: Long?,
+        @SerialName("prepared_at") val preparedAt: String,
+    ) : StoredAccountRecoveryJournal()
+
+    @Serializable
+    @SerialName("consumption_pending")
+    data class ConsumptionPending(
+        override val baseUrl: String,
+        @SerialName("previous_base_url") val previousBaseUrl: String?,
+        @SerialName("previous_binding_id") val previousBindingId: String?,
+        @SerialName("client_instance_id") val clientInstanceId: String,
+        @SerialName("session_id") val sessionId: String,
+        @SerialName("device_label") val deviceLabel: String,
+        @SerialName("client_version") val clientVersion: String,
+        @SerialName("prepared_at") val preparedAt: String,
+        @SerialName("recovery_code") val recoveryCode: DeviceAuthSecret,
+        @SerialName("access_token") val accessToken: DeviceAuthSecret,
+        @SerialName("refresh_token") val refreshToken: DeviceAuthSecret,
+        @SerialName("successor_id") val successorId: String,
+        @SerialName("successor_code") val successorCode: DeviceAuthSecret,
+    ) : StoredAccountRecoveryJournal()
+
+    /** Validated server commit captured before any fallible cache quarantine or local install. */
+    @Serializable
+    @SerialName("consumption_committed_awaiting_installation")
+    data class ConsumptionCommittedAwaitingInstallation(
+        override val baseUrl: String,
+        @SerialName("previous_base_url") val previousBaseUrl: String?,
+        @SerialName("previous_binding_id") val previousBindingId: String?,
+        @SerialName("client_instance_id") val clientInstanceId: String,
+        val session: DeviceSessionContract,
+        @SerialName("access_token") val accessToken: DeviceAuthSecret,
+        @SerialName("refresh_token") val refreshToken: DeviceAuthSecret,
+        @SerialName("successor_id") val successorId: String,
+        @SerialName("successor_code") val successorCode: DeviceAuthSecret,
+        @SerialName("successor_created_at") val successorCreatedAt: String,
+        @SerialName("successor_revision") val successorRevision: Long,
+    ) : StoredAccountRecoveryJournal()
+
+    @Serializable
+    @SerialName("disclosure_pending")
+    data class DisclosurePending(
+        override val baseUrl: String,
+        val id: String,
+        val code: DeviceAuthSecret,
+        @SerialName("created_at") val createdAt: String,
+        val revision: Long,
+        val source: String,
+    ) : StoredAccountRecoveryJournal()
+}
 
 /** Nonserialized exact durable-record identity; diagnostics never reveal its digest. */
 internal class DeviceAuthStorageIdentity(private val digest: ByteArray) {
@@ -242,6 +326,11 @@ internal fun StoredDeviceAuthState.bindingId(): String? = when (this) {
     is StoredDeviceAuthState.RefreshPending -> session.id
     else -> null
 }
+
+internal fun StoredAccountRecoveryJournal?.blocksApiBoundWork(): Boolean =
+    this is StoredAccountRecoveryJournal.ConsumptionPending ||
+        this is StoredAccountRecoveryJournal.ConsumptionCommittedAwaitingInstallation ||
+        this is StoredAccountRecoveryJournal.RepairRequired
 
 internal fun StoredDeviceAuthState.toUiState(
     isBusy: Boolean = false,
@@ -376,6 +465,163 @@ internal fun validateStoredDeviceAuthState(state: StoredDeviceAuthState) {
     }
 }
 
+internal fun validateStoredAccountRecoveryJournal(
+    journal: StoredAccountRecoveryJournal?,
+) {
+    journal ?: return
+    journal.baseUrl?.let(::requireCanonicalBaseUrl)
+    when (journal) {
+        is StoredAccountRecoveryJournal.RepairRequired -> {
+            require(journal.reason in ACCOUNT_RECOVERY_REPAIR_REASONS)
+        }
+        is StoredAccountRecoveryJournal.IssuancePending -> {
+            requireRecoveryNonNilUuid(journal.configurationId)
+            requireRecoveryNonNilUuid(journal.clientInstanceId)
+            requireRecoveryNonNilUuid(journal.candidateId)
+            validateExactDeviceToken(journal.candidateCode.value, ACCOUNT_RECOVERY_TOKEN_PREFIX)
+            require((journal.replacesId == null) == (journal.replacesRevision == null))
+            journal.replacesId?.let {
+                requireRecoveryNonNilUuid(it)
+                require(it != journal.candidateId)
+            }
+            journal.replacesRevision?.let { require(it > 0 && it < Long.MAX_VALUE) }
+            parseInstant(journal.preparedAt)
+        }
+        is StoredAccountRecoveryJournal.ConsumptionPending -> {
+            journal.previousBaseUrl?.let(::requireCanonicalBaseUrl)
+            journal.previousBindingId?.let(::requireRecoveryNonNilUuid)
+            requireRecoveryNonNilUuid(journal.clientInstanceId)
+            requireRecoveryNonNilUuid(journal.sessionId)
+            requireRecoveryNonNilUuid(journal.successorId)
+            require(journal.sessionId != journal.successorId)
+            requireValidDeviceIdentity(journal.deviceLabel, journal.clientVersion)
+            parseInstant(journal.preparedAt)
+            validateExactDeviceToken(journal.recoveryCode.value, ACCOUNT_RECOVERY_TOKEN_PREFIX)
+            validateExactDeviceToken(journal.accessToken.value, DEVICE_ACCESS_TOKEN_PREFIX)
+            validateExactDeviceToken(journal.refreshToken.value, DEVICE_REFRESH_TOKEN_PREFIX)
+            validateExactDeviceToken(journal.successorCode.value, ACCOUNT_RECOVERY_TOKEN_PREFIX)
+            requireDistinctCredentialMaterials(
+                journal.recoveryCode.value,
+                journal.accessToken.value,
+                journal.refreshToken.value,
+                journal.successorCode.value,
+            )
+        }
+        is StoredAccountRecoveryJournal.ConsumptionCommittedAwaitingInstallation -> {
+            journal.previousBaseUrl?.let(::requireCanonicalBaseUrl)
+            journal.previousBindingId?.let(::requireRecoveryNonNilUuid)
+            requireRecoveryNonNilUuid(journal.clientInstanceId)
+            requireRecoveryNonNilUuid(journal.successorId)
+            validateDeviceSessionContract(
+                session = journal.session,
+                expectedSessionId = journal.session.id,
+                expectedClientInstanceId = journal.clientInstanceId,
+                expectedDeviceLabel = journal.session.deviceLabel,
+                expectedClientVersion = journal.session.clientVersion,
+                expectedMinimumRevision = 1,
+            )
+            require(journal.session.revision == 1L)
+            require(journal.successorId != journal.session.id)
+            validateExactDeviceToken(journal.accessToken.value, DEVICE_ACCESS_TOKEN_PREFIX)
+            validateExactDeviceToken(journal.refreshToken.value, DEVICE_REFRESH_TOKEN_PREFIX)
+            validateExactDeviceToken(journal.successorCode.value, ACCOUNT_RECOVERY_TOKEN_PREFIX)
+            requireDistinctCredentialMaterials(
+                journal.accessToken.value,
+                journal.refreshToken.value,
+                journal.successorCode.value,
+            )
+            require(
+                parseInstant(journal.successorCreatedAt) ==
+                    parseInstant(journal.session.createdAt),
+            )
+            require(journal.successorRevision == 1L)
+        }
+        is StoredAccountRecoveryJournal.DisclosurePending -> {
+            requireRecoveryNonNilUuid(journal.id)
+            validateExactDeviceToken(journal.code.value, ACCOUNT_RECOVERY_TOKEN_PREFIX)
+            parseInstant(journal.createdAt)
+            require(journal.revision > 0 && journal.revision < Long.MAX_VALUE)
+            require(journal.source in setOf("issued", "successor"))
+        }
+    }
+}
+
+internal fun validateStoredDeviceAuthEnvelopeContents(
+    state: StoredDeviceAuthState,
+    journal: StoredAccountRecoveryJournal?,
+) {
+    validateStoredDeviceAuthState(state)
+    validateStoredAccountRecoveryJournal(journal)
+    when (journal) {
+        null, is StoredAccountRecoveryJournal.RepairRequired -> Unit
+        is StoredAccountRecoveryJournal.IssuancePending -> {
+            require(journal.baseUrl == state.baseUrl)
+            require(journal.clientInstanceId == state.clientInstanceId)
+            when (state) {
+                is StoredDeviceAuthState.Active -> {
+                    require(journal.configurationId == state.session.id)
+                    require(journal.clientInstanceId == state.session.clientInstanceId)
+                }
+                is StoredDeviceAuthState.RefreshPending -> {
+                    require(journal.configurationId == state.session.id)
+                    require(journal.clientInstanceId == state.session.clientInstanceId)
+                }
+                is StoredDeviceAuthState.Reauth -> {
+                    // A coordinated issuance can discover definitive session expiry/rejection
+                    // only after the exact request was persisted. Retain that request, but bind
+                    // it to the retired session so unrelated Reauth state cannot adopt it.
+                    require(journal.configurationId == state.previousSessionId)
+                }
+                else -> throw IllegalArgumentException("Recovery issuance has no exact binding")
+            }
+        }
+        is StoredAccountRecoveryJournal.ConsumptionPending -> {
+            require(state !is StoredDeviceAuthState.Incompatible)
+            require(journal.previousBaseUrl == state.baseUrl)
+            require(journal.previousBindingId == state.recoveryReplacementBindingId())
+            state.clientInstanceId?.let { require(journal.clientInstanceId == it) }
+            require(journal.sessionId != journal.previousBindingId)
+            require(journal.successorId != journal.previousBindingId)
+        }
+        is StoredAccountRecoveryJournal.ConsumptionCommittedAwaitingInstallation -> {
+            require(state !is StoredDeviceAuthState.Incompatible)
+            require(journal.previousBaseUrl == state.baseUrl)
+            require(journal.previousBindingId == state.recoveryReplacementBindingId())
+            state.clientInstanceId?.let { require(journal.clientInstanceId == it) }
+            require(journal.session.id != journal.previousBindingId)
+            require(journal.successorId != journal.previousBindingId)
+        }
+        is StoredAccountRecoveryJournal.DisclosurePending -> {
+            require(journal.baseUrl == state.baseUrl)
+            when (journal.source) {
+                "issued" -> require(
+                    state is StoredDeviceAuthState.Active ||
+                        state is StoredDeviceAuthState.RefreshPending,
+                )
+                "successor" -> {
+                    require(state is StoredDeviceAuthState.Active)
+                    require(journal.createdAt == state.session.createdAt)
+                    require(journal.id != state.session.id)
+                }
+            }
+        }
+    }
+}
+
+private fun StoredDeviceAuthState.recoveryReplacementBindingId(): String? = when (this) {
+    is StoredDeviceAuthState.Reauth -> previousSessionId
+    is StoredDeviceAuthState.EnrollmentCreationPending -> previousBindingId ?: enrollmentId
+    is StoredDeviceAuthState.EnrollmentPending -> previousBindingId ?: sessionId
+    else -> bindingId()
+}
+
+internal const val RECOVERY_JOURNAL_MALFORMED = "malformed_recovery_journal"
+internal const val RECOVERY_JOURNAL_UNSUPPORTED = "unsupported_recovery_journal"
+private val ACCOUNT_RECOVERY_REPAIR_REASONS = setOf(
+    RECOVERY_JOURNAL_MALFORMED,
+    RECOVERY_JOURNAL_UNSUPPORTED,
+)
+
 internal fun validateDeviceSessionContract(
     session: DeviceSessionContract,
     expectedSessionId: String,
@@ -463,14 +709,20 @@ internal fun validateExactDeviceToken(token: String, prefix: String): String {
 }
 
 private fun requireDistinctTokens(vararg tokens: String) {
-    val payloads = tokens.map(::deviceTokenMaterial)
+    val payloads = tokens.map(::credentialTokenMaterial)
     require(payloads.distinct().size == payloads.size) { "Credential material must be distinct" }
 }
 
-private fun deviceTokenMaterial(token: String): String = when {
+internal fun requireDistinctCredentialMaterials(vararg tokens: String) {
+    val payloads = tokens.map(::credentialTokenMaterial)
+    require(payloads.distinct().size == payloads.size) { "Credential material must be distinct" }
+}
+
+private fun credentialTokenMaterial(token: String): String = when {
     token.startsWith(DEVICE_ACCESS_TOKEN_PREFIX) -> token.removePrefix(DEVICE_ACCESS_TOKEN_PREFIX)
     token.startsWith(DEVICE_REFRESH_TOKEN_PREFIX) -> token.removePrefix(DEVICE_REFRESH_TOKEN_PREFIX)
     token.startsWith(DEVICE_ENROLLMENT_TOKEN_PREFIX) -> token.removePrefix(DEVICE_ENROLLMENT_TOKEN_PREFIX)
+    token.startsWith(ACCOUNT_RECOVERY_TOKEN_PREFIX) -> token.removePrefix(ACCOUNT_RECOVERY_TOKEN_PREFIX)
     else -> throw IllegalArgumentException("Invalid device credential")
 }
 
@@ -478,6 +730,11 @@ private fun requireUuid(value: String) {
     require(runCatching { UUID.fromString(value).toString() == value.lowercase() }.getOrDefault(false)) {
         "Invalid device identifier"
     }
+}
+
+internal fun requireRecoveryNonNilUuid(value: String) {
+    requireUuid(value)
+    require(UUID.fromString(value) != UUID(0L, 0L)) { "Invalid device identifier" }
 }
 
 private fun parseInstant(value: String): Instant = try {

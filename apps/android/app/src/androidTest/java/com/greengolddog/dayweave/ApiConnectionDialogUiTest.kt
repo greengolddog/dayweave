@@ -2,10 +2,12 @@ package com.greengolddog.dayweave
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -14,6 +16,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.DeviceAuthPhase
 import com.greengolddog.dayweave.network.DeviceAuthUiState
+import com.greengolddog.dayweave.network.AccountRecoveryPhase
+import com.greengolddog.dayweave.network.AccountRecoveryState
 import com.greengolddog.dayweave.sync.GoogleAuthorizationCorruptArtifactIdentity
 import com.greengolddog.dayweave.sync.GoogleAuthorizationRecoveryDiscardConfirmation
 import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
@@ -44,7 +48,7 @@ class ApiConnectionDialogUiTest {
         )
 
         composeRule.onNodeWithText(
-            "Review that recovery before enrollment, retry, or sign-out.",
+            "Review that recovery before enrollment, retry, sign-out, or account recovery.",
             substring = true,
         ).assertIsDisplayed()
         composeRule.onNodeWithText("One-time dw_en1_ code")
@@ -69,6 +73,63 @@ class ApiConnectionDialogUiTest {
             assertEquals(0, retryCalls)
             assertEquals(0, signOutCalls)
         }
+    }
+
+    @Test
+    fun accountRecoveryIsBlockedByLocalWriteJournalAndRequiresExplicitConfirmation() {
+        val blocked = mutableStateOf(true)
+        val consumed = mutableListOf<Pair<String, String>>()
+        showDialog(
+            authState = { deviceAuthState(DeviceAuthPhase.ACTIVE) },
+            discardRequired = { false },
+            credentialBlocked = { blocked.value },
+            accountRecoveryState = {
+                AccountRecoveryState(
+                    phase = AccountRecoveryPhase.READY,
+                    message = "Recovery ready.",
+                )
+            },
+            onConsumeAccountRecoveryCode = { baseUrl, code -> consumed += baseUrl to code },
+        )
+
+        composeRule.onNodeWithTag("account_recovery_entry_mode").performClick()
+        composeRule.onNodeWithText("Saved dw_rc1_ recovery code")
+            .performTextInput("dw_rc1_test-value")
+        composeRule.onNodeWithTag("consume_account_recovery_code").assertIsNotEnabled()
+        composeRule.onNodeWithText(
+            "before enrollment, sign-out, or account recovery",
+            substring = true,
+        ).assertIsDisplayed()
+
+        composeRule.runOnIdle { blocked.value = false }
+        composeRule.onNodeWithTag("consume_account_recovery_code")
+            .assertIsEnabled()
+            .performClick()
+        composeRule.onNodeWithText("Replace every account connection?").assertIsDisplayed()
+        composeRule.runOnIdle { assertEquals(0, consumed.size) }
+        composeRule.onNodeWithTag("confirm_account_recovery_consume").performClick()
+        composeRule.runOnIdle {
+            assertEquals(listOf(API_BASE_URL to "dw_rc1_test-value"), consumed)
+        }
+    }
+
+    @Test
+    fun committedRecoveryDisablesGenericCredentialDestruction() {
+        showDialog(
+            authState = { deviceAuthState(DeviceAuthPhase.ACTIVE) },
+            discardRequired = { false },
+            accountRecoveryState = {
+                AccountRecoveryState(
+                    phase = AccountRecoveryPhase.PENDING,
+                    message = "Recovery is committed and ready for local installation.",
+                    retryAvailable = true,
+                    deviceAuthorizationSuppressed = true,
+                )
+            },
+        )
+
+        composeRule.onNodeWithText("Revoke & sign out").assertIsNotEnabled()
+        composeRule.onNodeWithText("Local-only removal").assertIsNotEnabled()
     }
 
     @Test
@@ -125,8 +186,8 @@ class ApiConnectionDialogUiTest {
         composeRule.onNodeWithTag("api_confirm_google_authorization_discard")
             .performClick()
 
-        composeRule.onNodeWithTag("api_confirm_google_authorization_discard")
-            .assertDoesNotExist()
+        composeRule.onAllNodesWithTag("api_confirm_google_authorization_discard")
+            .assertCountEquals(0)
         composeRule.runOnIdle {
             assertEquals(1, providerCalls)
             assertEquals(1, discarded.size)
@@ -144,12 +205,20 @@ class ApiConnectionDialogUiTest {
         onRetryPending: () -> Unit = {},
         onRevokeAndSignOut: () -> Unit = {},
         onDiscard: (GoogleAuthorizationRecoveryDiscardConfirmation) -> Unit = {},
+        credentialBlocked: () -> Boolean = { false },
+        accountRecoveryState: () -> AccountRecoveryState = {
+            AccountRecoveryState(
+                phase = AccountRecoveryPhase.NOT_AVAILABLE,
+                message = "Account recovery is not loaded.",
+            )
+        },
+        onConsumeAccountRecoveryCode: (String, String) -> Unit = { _, _ -> },
     ) {
         composeRule.setContent {
             MaterialTheme {
                 ApiConnectionDialog(
                     authState = authState(),
-                    credentialReplacementBlocked = false,
+                    credentialReplacementBlocked = credentialBlocked(),
                     googleAuthorizationRecoveryDiscardRequired = discardRequired(),
                     onDismiss = {},
                     onUpgradeWithBootstrap = { _, _ -> },
@@ -160,6 +229,8 @@ class ApiConnectionDialogUiTest {
                     googleAuthorizationRecoveryDiscardConfirmationProvider =
                         confirmationProvider,
                     onDiscardGoogleAuthorizationRecovery = onDiscard,
+                    accountRecoveryState = accountRecoveryState(),
+                    onConsumeAccountRecoveryCode = onConsumeAccountRecoveryCode,
                 )
             }
         }

@@ -127,7 +127,7 @@ internal class OkHttpDeviceSessionsTransport(
         // Capture the freshness boundary only after the entire response has arrived.
         val receivedAt = now()
         val duplicateKeys = try {
-            StrictDeviceSessionsJsonScanner(text).hasDuplicateKeys()
+            StrictDeviceAuthJsonScanner(text).hasDuplicateKeys()
         } catch (_: SerializationException) {
             throw DeviceAuthApiException.InvalidResponse()
         } catch (_: IllegalArgumentException) {
@@ -361,7 +361,7 @@ private val DEVICE_SESSION_CLOCK_SKEW: Duration = Duration.ofMinutes(5)
 private val DEVICE_SESSION_TTL_TOLERANCE: Duration = Duration.ofSeconds(1)
 
 /** Rejects equivalent duplicate object keys and noncanonical numbers before tree decoding. */
-private class StrictDeviceSessionsJsonScanner(
+internal class StrictDeviceAuthJsonScanner(
     private val source: String,
 ) {
     private var index = 0

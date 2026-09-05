@@ -61,6 +61,8 @@ import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.network.DeviceAuthPhase
 import com.greengolddog.dayweave.network.DeviceAuthUiState
+import com.greengolddog.dayweave.network.AccountRecoveryPhase
+import com.greengolddog.dayweave.network.AccountRecoveryState
 import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
 import com.greengolddog.dayweave.network.RemoteProposalItemField
 import com.greengolddog.dayweave.sync.GoogleAuthorizationRecoveryDiscardConfirmation
@@ -1302,12 +1304,21 @@ fun ApiConnectionDialog(
         () -> GoogleAuthorizationRecoveryDiscardConfirmation? = { null },
     onDiscardGoogleAuthorizationRecovery:
         (GoogleAuthorizationRecoveryDiscardConfirmation) -> Unit = {},
+    accountRecoveryState: AccountRecoveryState = AccountRecoveryState(
+        phase = AccountRecoveryPhase.NOT_AVAILABLE,
+        message = "Account recovery is not loaded.",
+    ),
+    onConsumeAccountRecoveryCode: (baseUrl: String, recoveryCode: String) -> Unit = { _, _ -> },
+    onRetryAccountRecovery: () -> Unit = {},
 ) {
     var baseUrl by remember(authState.baseUrl) { mutableStateOf(authState.baseUrl.orEmpty()) }
     var secret by remember { mutableStateOf("") }
     var entryMode by remember { mutableStateOf(DeviceAuthEntryMode.ONE_TIME_CODE) }
     var confirmSignOut by remember { mutableStateOf(false) }
     var confirmLocalOnly by remember { mutableStateOf(false) }
+    var confirmAccountRecovery by remember { mutableStateOf(false) }
+    val accountRecoveryJournalPresent = accountRecoveryState.retryAvailable ||
+        accountRecoveryState.disclosureReady || accountRecoveryState.repairRequired
     var pendingGoogleAuthorizationRecoveryDiscard by remember {
         mutableStateOf<GoogleAuthorizationRecoveryDiscardConfirmation?>(null)
     }
@@ -1316,6 +1327,10 @@ fun ApiConnectionDialog(
         if (!googleAuthorizationRecoveryDiscardRequired) {
             pendingGoogleAuthorizationRecoveryDiscard = null
         }
+    }
+
+    LaunchedEffect(accountRecoveryJournalPresent) {
+        if (accountRecoveryJournalPresent) confirmLocalOnly = false
     }
 
     pendingGoogleAuthorizationRecoveryDiscard?.let { confirmation ->
@@ -1369,7 +1384,7 @@ fun ApiConnectionDialog(
                         confirmSignOut = false
                         onRevokeAndSignOut()
                     },
-                    enabled = !authState.isBusy,
+                    enabled = !authState.isBusy && !accountRecoveryJournalPresent,
                 ) { Text("Revoke & sign out") }
             },
             dismissButton = {
@@ -1395,12 +1410,49 @@ fun ApiConnectionDialog(
                         confirmLocalOnly = false
                         onDestroyLocalOnly()
                     },
-                    enabled = !authState.isBusy,
+                    enabled = !authState.isBusy && !accountRecoveryJournalPresent,
                 ) { Text("Remove local state only") }
             },
             dismissButton = {
                 TextButton(onClick = { confirmLocalOnly = false }) { Text("Cancel") }
             },
+        )
+        return
+    }
+
+    if (confirmAccountRecovery) {
+        AlertDialog(
+            onDismissRequest = { confirmAccountRecovery = false },
+            title = { Text("Replace every account connection?") },
+            text = {
+                Text(
+                    "Using this recovery code revokes every device session, enrollment, and " +
+                        "connected MCP client on the account. DayWeave will quarantine local " +
+                        "API-bound data before installing the recovered session. This exact " +
+                        "request is encrypted for safe retry if the response is lost.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val submittedSecret = secret
+                        secret = ""
+                        confirmAccountRecovery = false
+                        onConsumeAccountRecoveryCode(baseUrl, submittedSecret)
+                    },
+                    enabled = !authState.isBusy && !accountRecoveryState.isBusy &&
+                        !accountRecoveryJournalPresent &&
+                        !credentialReplacementBlocked &&
+                        !googleAuthorizationRecoveryDiscardRequired,
+                    modifier = Modifier.testTag("confirm_account_recovery_consume"),
+                ) { Text("Recover account") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmAccountRecovery = false }) { Text("Cancel") }
+            },
+            properties = DialogProperties(
+                securePolicy = SecureFlagPolicy.SecureOn,
+            ),
         )
         return
     }
@@ -1416,8 +1468,11 @@ fun ApiConnectionDialog(
         DeviceAuthPhase.REFRESH_PENDING,
     )
     val activeSession = authState.phase == DeviceAuthPhase.ACTIVE
+    val recoveryEntryAvailable = authState.phase != DeviceAuthPhase.INCOMPATIBLE
+    val recoveryPending = accountRecoveryState.retryAvailable
     val bindingChangeBlocked = credentialReplacementBlocked ||
-        googleAuthorizationRecoveryDiscardRequired || authState.isBusy
+        googleAuthorizationRecoveryDiscardRequired || accountRecoveryJournalPresent ||
+        authState.isBusy
 
     AlertDialog(
         onDismissRequest = {
@@ -1435,10 +1490,26 @@ fun ApiConnectionDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Text(
+                    accountRecoveryState.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (
+                        accountRecoveryState.phase in setOf(
+                            AccountRecoveryPhase.ERROR,
+                            AccountRecoveryPhase.AUTH_REQUIRED,
+                        )
+                    ) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.testTag("account_recovery_status"),
+                )
                 if (credentialReplacementBlocked) {
                     Text(
                         "Recover the exact schedule publication, proposal application, or " +
-                            "canonical/execution action before enrollment or sign-out. " +
+                            "canonical/execution action before enrollment, sign-out, or account " +
+                            "recovery. " +
                             "Confirmed local-only removal remains " +
                             "available and will quarantine that recovery journal first.",
                         style = MaterialTheme.typography.bodySmall,
@@ -1449,7 +1520,8 @@ fun ApiConnectionDialog(
                     Text(
                         "A saved Google authorization belongs to a different or unavailable " +
                             "Planner API connection. Google may already have accepted it. " +
-                            "Review that recovery before enrollment, retry, or sign-out.",
+                            "Review that recovery before enrollment, retry, sign-out, or account " +
+                            "recovery.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
@@ -1483,30 +1555,46 @@ fun ApiConnectionDialog(
                     Text("Current access expires $expiry", style = MaterialTheme.typography.bodySmall)
                 }
 
-                if (acceptsNewEnrollment) {
+                if (acceptsNewEnrollment || activeSession) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = entryMode == DeviceAuthEntryMode.ONE_TIME_CODE,
-                            onClick = {
-                                secret = ""
-                                entryMode = DeviceAuthEntryMode.ONE_TIME_CODE
-                            },
-                            label = { Text("One-time code") },
-                        )
-                        FilterChip(
-                            selected = entryMode == DeviceAuthEntryMode.HYBRID_BOOTSTRAP,
-                            onClick = {
-                                secret = ""
-                                entryMode = DeviceAuthEntryMode.HYBRID_BOOTSTRAP
-                            },
-                            label = { Text("Hybrid bootstrap") },
-                        )
+                        if (acceptsNewEnrollment) {
+                            FilterChip(
+                                selected = entryMode == DeviceAuthEntryMode.ONE_TIME_CODE,
+                                onClick = {
+                                    secret = ""
+                                    entryMode = DeviceAuthEntryMode.ONE_TIME_CODE
+                                },
+                                label = { Text("One-time code") },
+                            )
+                            FilterChip(
+                                selected = entryMode == DeviceAuthEntryMode.HYBRID_BOOTSTRAP,
+                                onClick = {
+                                    secret = ""
+                                    entryMode = DeviceAuthEntryMode.HYBRID_BOOTSTRAP
+                                },
+                                label = { Text("Hybrid bootstrap") },
+                            )
+                        }
+                        if (recoveryEntryAvailable) {
+                            FilterChip(
+                                selected = entryMode == DeviceAuthEntryMode.ACCOUNT_RECOVERY,
+                                onClick = {
+                                    secret = ""
+                                    entryMode = DeviceAuthEntryMode.ACCOUNT_RECOVERY
+                                },
+                                label = { Text("Account recovery") },
+                                modifier = Modifier.testTag("account_recovery_entry_mode"),
+                            )
+                        }
                     }
                     Text(
-                        if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
-                            "Mint the dw_en1_ code for the exact client ID shown above on an already authorized device. The code and proposed session credential tuple are journaled before the first consume request."
-                        } else {
-                            "Use only the reviewed migration bootstrap. It authorizes enrollment creation and is never reused as an ordinary API credential after durable activation."
+                        when (entryMode) {
+                            DeviceAuthEntryMode.ONE_TIME_CODE ->
+                                "Mint the dw_en1_ code for the exact client ID shown above on an already authorized device. The code and proposed session credential tuple are journaled before the first consume request."
+                            DeviceAuthEntryMode.HYBRID_BOOTSTRAP ->
+                                "Use only the reviewed migration bootstrap. It authorizes enrollment creation and is never reused as an ordinary API credential after durable activation."
+                            DeviceAuthEntryMode.ACCOUNT_RECOVERY ->
+                                "Enter the saved dw_rc1_ code. Recovery replaces every account connection and creates a new one-time successor code."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1529,10 +1617,12 @@ fun ApiConnectionDialog(
                         modifier = Modifier.fillMaxWidth(),
                         label = {
                             Text(
-                                if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
-                                    "One-time dw_en1_ code"
-                                } else {
-                                    "Reviewed bootstrap credential"
+                                when (entryMode) {
+                                    DeviceAuthEntryMode.ONE_TIME_CODE -> "One-time dw_en1_ code"
+                                    DeviceAuthEntryMode.HYBRID_BOOTSTRAP ->
+                                        "Reviewed bootstrap credential"
+                                    DeviceAuthEntryMode.ACCOUNT_RECOVERY ->
+                                        "Saved dw_rc1_ recovery code"
                                 },
                             )
                         },
@@ -1556,6 +1646,19 @@ fun ApiConnectionDialog(
         },
         confirmButton = {
             when {
+                recoveryPending -> TextButton(
+                    onClick = onRetryAccountRecovery,
+                    enabled = !accountRecoveryState.isBusy,
+                    modifier = Modifier.testTag("retry_pending_account_recovery"),
+                ) { Text("Retry recovery") }
+                entryMode == DeviceAuthEntryMode.ACCOUNT_RECOVERY &&
+                    (acceptsNewEnrollment || activeSession) -> TextButton(
+                    onClick = { confirmAccountRecovery = true },
+                    enabled = !bindingChangeBlocked && !accountRecoveryState.isBusy &&
+                        baseUrl.trim().startsWith("https://", ignoreCase = true) &&
+                        secret.isNotBlank(),
+                    modifier = Modifier.testTag("consume_account_recovery_code"),
+                ) { Text("Review recovery") }
                 activeSession -> TextButton(
                     onClick = { confirmSignOut = true },
                     enabled = !bindingChangeBlocked,
@@ -1604,7 +1707,7 @@ fun ApiConnectionDialog(
                 if (authState.phase != DeviceAuthPhase.UNCONFIGURED) {
                     TextButton(
                         onClick = { confirmLocalOnly = true },
-                        enabled = !authState.isBusy,
+                        enabled = !authState.isBusy && !accountRecoveryJournalPresent,
                     ) { Text("Local-only removal") }
                 }
                 TextButton(
@@ -1615,12 +1718,16 @@ fun ApiConnectionDialog(
                 ) { Text("Cancel") }
             }
         },
+        properties = DialogProperties(
+            securePolicy = SecureFlagPolicy.SecureOn,
+        ),
     )
 }
 
 private enum class DeviceAuthEntryMode {
     ONE_TIME_CODE,
     HYBRID_BOOTSTRAP,
+    ACCOUNT_RECOVERY,
 }
 
 private const val MIN_CUSTOM_MOVE_LEAD_SECONDS = 60L

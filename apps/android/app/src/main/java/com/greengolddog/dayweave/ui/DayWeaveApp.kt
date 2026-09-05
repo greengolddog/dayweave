@@ -456,6 +456,8 @@ private fun DayWeaveRoot(
     // Unlike durable planner projections, this private inventory must observe its memory-only
     // quarantine even while the Activity lifecycle is stopped.
     val deviceSessionsState by viewModel.deviceSessionsState.collectAsState()
+    // Recovery metadata and any one-time disclosure are also memory-only presentation state.
+    val accountRecoveryState by viewModel.accountRecoveryState.collectAsState()
     val timedBreakNotificationPermissionRequestDigest by
         viewModel.timedBreakNotificationPermissionRequestDigest.collectAsStateWithLifecycle()
     val scheduleCompositionProfileUpdateState by
@@ -483,7 +485,8 @@ private fun DayWeaveRoot(
         canonicalSyncState
     }
     val canonicalExecutionActionsEnabled =
-        !canonicalSyncState.isBusy && !executionSyncState.isBusy && !habitSyncState.isBusy &&
+        !accountRecoveryState.deviceAuthorizationSuppressed &&
+            !canonicalSyncState.isBusy && !executionSyncState.isBusy && !habitSyncState.isBusy &&
             !proposalApplicationState.isBusy && !googleCalendarOutboundState.isBusy &&
             !googleSchedulePublicationState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
@@ -621,8 +624,9 @@ private fun DayWeaveRoot(
         deviceAuthState.sessionId,
         deviceAuthState.isConfigured,
     ) {
-        if (state.destination == AppDestination.MORE && deviceAuthState.isConfigured) {
-            viewModel.refreshDeviceSessions()
+        if (state.destination == AppDestination.MORE) {
+            if (deviceAuthState.isConfigured) viewModel.refreshDeviceSessions()
+            viewModel.refreshAccountRecovery()
         }
     }
 
@@ -641,6 +645,7 @@ private fun DayWeaveRoot(
                 viewModel.refreshEnergySignal()
                 if (deviceAuthState.isConfigured) {
                     viewModel.refreshDeviceSessions()
+                    viewModel.refreshAccountRecovery()
                 }
                 runForegroundInvalidationWorkers(
                     executionInvalidationStream = if (deviceAuthState.isConfigured) {
@@ -1140,11 +1145,28 @@ private fun DayWeaveRoot(
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
                 deviceSessionsState = deviceSessionsState,
+                accountRecoveryState = accountRecoveryState,
+                accountRecoveryStartBlocked =
+                    viewModel.hasCredentialReplacementBlocker() ||
+                        googleAccountState.authorizationRecoveryDiscardRequired,
                 onRefreshDeviceSessions = viewModel::refreshDeviceSessions,
                 deviceSessionRevocationConfirmationProvider =
                     viewModel::deviceSessionRevocationConfirmation,
                 onRevokeRemoteDeviceSession = viewModel::revokeRemoteDeviceSession,
                 onSignOutCurrentDeviceSession = viewModel::signOutDeviceSessionIfCurrent,
+                onRefreshAccountRecovery = viewModel::refreshAccountRecovery,
+                accountRecoveryIssuanceConfirmationProvider =
+                    viewModel::accountRecoveryIssuanceConfirmation,
+                onIssueOrRotateAccountRecoveryCode =
+                    viewModel::issueOrRotateAccountRecoveryCode,
+                onRetryAccountRecovery = viewModel::retryPendingAccountRecovery,
+                accountRecoveryDisclosureProvider = viewModel::accountRecoveryDisclosure,
+                onAcknowledgeAccountRecoveryDisclosure =
+                    viewModel::acknowledgeAccountRecoveryDisclosure,
+                accountRecoveryJournalDiscardConfirmationProvider =
+                    viewModel::accountRecoveryJournalDiscardConfirmation,
+                onDiscardAccountRecoveryJournal =
+                    viewModel::discardAccountRecoveryJournal,
                 googleAccountState = googleAccountState,
                 googleCalendarImportState = googleCalendarImportState,
                 energySignalState = energySignalState,
@@ -1648,12 +1670,15 @@ private fun DayWeaveRoot(
     if (showApiConnection) {
         ApiConnectionDialog(
             authState = deviceAuthState,
+            accountRecoveryState = accountRecoveryState,
             credentialReplacementBlocked = viewModel.hasCredentialReplacementBlocker(),
             googleAuthorizationRecoveryDiscardRequired =
                 googleAccountState.authorizationRecoveryDiscardRequired,
             onDismiss = { showApiConnection = false },
             onUpgradeWithBootstrap = viewModel::upgradeDeviceAuthentication,
             onConsumeEnrollmentCode = viewModel::consumeDeviceEnrollmentCode,
+            onConsumeAccountRecoveryCode = viewModel::consumeAccountRecoveryCode,
+            onRetryAccountRecovery = viewModel::retryPendingAccountRecovery,
             onRetryPending = viewModel::retryDeviceAuthentication,
             onRevokeAndSignOut = viewModel::signOutDeviceSession,
             onDestroyLocalOnly = {

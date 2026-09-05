@@ -24,6 +24,11 @@ import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
+import com.greengolddog.dayweave.network.AccountRecoveryDisclosure
+import com.greengolddog.dayweave.network.AccountRecoveryIssuanceConfirmation
+import com.greengolddog.dayweave.network.AccountRecoveryJournalDiscardConfirmation
+import com.greengolddog.dayweave.network.AccountRecoveryManager
+import com.greengolddog.dayweave.network.AccountRecoveryState
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationRouteAccess
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteConsumption
@@ -87,6 +92,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
     private val deviceSessionManager: DeviceSessionManager =
         dayWeaveApplication.deviceSessionManager
+    private val accountRecoveryManager: AccountRecoveryManager =
+        dayWeaveApplication.accountRecoveryManager
     private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
     private val timedBreakNotificationRouteAccess =
         PlannerTimedBreakNotificationRouteAccess(plannerStore)
@@ -116,6 +123,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
     val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
     val deviceSessionsState: StateFlow<DeviceSessionsState> = deviceSessionManager.state
+    val accountRecoveryState: StateFlow<AccountRecoveryState> = accountRecoveryManager.state
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
     val timedBreakNotificationPermissionRequestDigest: StateFlow<String?> =
         timedBreakNotificationPermissionRequestState.requestDigest
@@ -506,6 +514,76 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     fun revokeRemoteDeviceSession(confirmation: DeviceSessionRevocationConfirmation) {
         viewModelScope.launch { deviceSessionManager.revokeRemote(confirmation) }
+    }
+
+    fun refreshAccountRecovery() {
+        viewModelScope.launch { accountRecoveryManager.refresh() }
+    }
+
+    fun accountRecoveryIssuanceConfirmation(): AccountRecoveryIssuanceConfirmation? =
+        accountRecoveryManager.issuanceConfirmation()
+
+    fun issueOrRotateAccountRecoveryCode(
+        confirmation: AccountRecoveryIssuanceConfirmation,
+    ) {
+        viewModelScope.launch { accountRecoveryManager.issueOrRotate(confirmation) }
+    }
+
+    fun consumeAccountRecoveryCode(baseUrl: String, recoveryCode: String) {
+        dayWeaveApplication.launchAccountRecoveryAction {
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                val result = accountRecoveryManager.consume(
+                    baseUrl = baseUrl,
+                    recoveryCode = recoveryCode,
+                    confirmed = true,
+                )
+                if (result == DeviceAuthActionResult.SUCCESS) {
+                    onRecoveredDeviceAuthenticationInstalled()
+                }
+            } finally {
+                assistantManager.restoreForegroundState()
+            }
+        }
+    }
+
+    fun retryPendingAccountRecovery() {
+        dayWeaveApplication.launchAccountRecoveryAction {
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                val result = accountRecoveryManager.retryPending()
+                if (result == DeviceAuthActionResult.SUCCESS) {
+                    onRecoveredDeviceAuthenticationInstalled()
+                }
+            } finally {
+                assistantManager.restoreForegroundState()
+            }
+        }
+    }
+
+    private suspend fun onRecoveredDeviceAuthenticationInstalled() {
+        deviceAuthCoordinator.reconcilePresentationFromDurableState()
+        dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+        dayWeaveApplication.refreshCanonicalState()
+        googleAccountManager.refresh()
+        deviceSessionManager.refresh()
+    }
+
+    fun accountRecoveryDisclosure(): AccountRecoveryDisclosure? =
+        accountRecoveryManager.disclosure()
+
+    fun acknowledgeAccountRecoveryDisclosure(disclosure: AccountRecoveryDisclosure) {
+        viewModelScope.launch { accountRecoveryManager.acknowledge(disclosure) }
+    }
+
+    fun accountRecoveryJournalDiscardConfirmation():
+        AccountRecoveryJournalDiscardConfirmation? =
+        accountRecoveryManager.journalDiscardConfirmation()
+
+    fun discardAccountRecoveryJournal(
+        confirmation: AccountRecoveryJournalDiscardConfirmation,
+    ) {
+        viewModelScope.launch { accountRecoveryManager.discardJournal(confirmation) }
     }
 
     fun destroyLocalDeviceAuthentication(confirmed: Boolean) {

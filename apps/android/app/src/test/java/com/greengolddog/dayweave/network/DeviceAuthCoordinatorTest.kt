@@ -1357,6 +1357,63 @@ class DeviceAuthCoordinatorTest {
     }
 
     @Test
+    fun localDestroyCannotDiscardCommittedRecoveryInstallation() = runBlocking {
+        val active = syntheticActiveState(now)
+        val recoveredSession = syntheticSession(
+            now = now,
+            id = "55555555-5555-4555-8555-555555555555",
+            clientInstanceId = active.clientInstanceId,
+        )
+        val committed = StoredAccountRecoveryJournal.ConsumptionCommittedAwaitingInstallation(
+            baseUrl = active.baseUrl,
+            previousBaseUrl = active.baseUrl,
+            previousBindingId = active.session.id,
+            clientInstanceId = active.clientInstanceId,
+            session = recoveredSession,
+            accessToken = DeviceAuthSecret(
+                syntheticDeviceToken(DEVICE_ACCESS_TOKEN_PREFIX, 70),
+            ),
+            refreshToken = DeviceAuthSecret(
+                syntheticDeviceToken(DEVICE_REFRESH_TOKEN_PREFIX, 71),
+            ),
+            successorId = "66666666-6666-4666-8666-666666666666",
+            successorCode = DeviceAuthSecret(
+                syntheticDeviceToken(ACCOUNT_RECOVERY_TOKEN_PREFIX, 72),
+            ),
+            successorCreatedAt = recoveredSession.createdAt,
+            successorRevision = 1,
+        )
+        val store = FakeDeviceAuthEnvelopeStore(active, committed)
+        var fenceCalls = 0
+        val fence = object : DeviceAuthBindingFence {
+            override suspend fun beforeBindingChange(
+                previousBaseUrl: String?,
+                previousBindingId: String?,
+                nextBaseUrl: String?,
+                nextBindingId: String?,
+            ): Boolean {
+                fenceCalls += 1
+                return true
+            }
+
+            override suspend fun beforeConfirmedLocalDestruction(
+                previousBaseUrl: String?,
+                previousBindingId: String?,
+            ): Boolean {
+                fenceCalls += 1
+                return true
+            }
+        }
+        val coordinator = coordinator(store, RecordingDeviceAuthTransport(), fence)
+
+        assertEquals(DeviceAuthActionResult.NOT_ALLOWED, coordinator.destroyLocalOnly(true))
+        assertEquals(active, store.envelope.state)
+        assertEquals(committed, store.envelope.accountRecoveryJournal)
+        assertEquals(0, fenceCalls)
+        assertNull(coordinator.authenticatedConfiguration())
+    }
+
+    @Test
     fun confirmedLocalDestroyUsesTheExplicitAmbiguousJournalQuarantinePath() = runBlocking {
         val active = syntheticActiveState(now)
         val store = FakeDeviceAuthEnvelopeStore(active)

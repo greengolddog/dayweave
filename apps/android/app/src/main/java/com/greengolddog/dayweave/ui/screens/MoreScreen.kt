@@ -1,5 +1,10 @@
 package com.greengolddog.dayweave.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.os.Build
+import android.os.PersistableBundle
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -44,16 +49,20 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.SecureFlagPolicy
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -65,6 +74,11 @@ import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
+import com.greengolddog.dayweave.network.AccountRecoveryDisclosure
+import com.greengolddog.dayweave.network.AccountRecoveryIssuanceConfirmation
+import com.greengolddog.dayweave.network.AccountRecoveryJournalDiscardConfirmation
+import com.greengolddog.dayweave.network.AccountRecoveryPhase
+import com.greengolddog.dayweave.network.AccountRecoveryState
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
@@ -88,6 +102,8 @@ import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
 import java.time.Duration
 import java.time.Instant
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun MoreScreen(
@@ -101,11 +117,23 @@ fun MoreScreen(
     suggestionSyncState: SuggestionSyncState,
     canonicalSyncState: CanonicalSyncState,
     deviceSessionsState: DeviceSessionsState,
+    accountRecoveryState: AccountRecoveryState,
+    accountRecoveryStartBlocked: Boolean,
     onRefreshDeviceSessions: () -> Unit,
     deviceSessionRevocationConfirmationProvider:
         (String) -> DeviceSessionRevocationConfirmation?,
     onRevokeRemoteDeviceSession: (DeviceSessionRevocationConfirmation) -> Unit,
     onSignOutCurrentDeviceSession: (String) -> Unit,
+    onRefreshAccountRecovery: () -> Unit,
+    accountRecoveryIssuanceConfirmationProvider:
+        () -> AccountRecoveryIssuanceConfirmation?,
+    onIssueOrRotateAccountRecoveryCode: (AccountRecoveryIssuanceConfirmation) -> Unit,
+    onRetryAccountRecovery: () -> Unit,
+    accountRecoveryDisclosureProvider: () -> AccountRecoveryDisclosure?,
+    onAcknowledgeAccountRecoveryDisclosure: (AccountRecoveryDisclosure) -> Unit,
+    accountRecoveryJournalDiscardConfirmationProvider:
+        () -> AccountRecoveryJournalDiscardConfirmation?,
+    onDiscardAccountRecoveryJournal: (AccountRecoveryJournalDiscardConfirmation) -> Unit,
     googleAccountState: GoogleAccountState,
     googleCalendarImportState: GoogleCalendarImportState,
     energySignalState: EnergySignalState,
@@ -322,6 +350,23 @@ fun MoreScreen(
                 onRevokeRemote = onRevokeRemoteDeviceSession,
                 onSignOutCurrent = onSignOutCurrentDeviceSession,
                 onConfigureApiConnection = onConfigureApiConnection,
+            )
+        }
+        item {
+            AccountRecoveryCard(
+                state = accountRecoveryState,
+                recoveryStartBlocked = accountRecoveryStartBlocked,
+                onRefresh = onRefreshAccountRecovery,
+                issuanceConfirmationProvider =
+                    accountRecoveryIssuanceConfirmationProvider,
+                onIssueOrRotate = onIssueOrRotateAccountRecoveryCode,
+                onRetry = onRetryAccountRecovery,
+                disclosureProvider = accountRecoveryDisclosureProvider,
+                onAcknowledgeDisclosure = onAcknowledgeAccountRecoveryDisclosure,
+                journalDiscardConfirmationProvider =
+                    accountRecoveryJournalDiscardConfirmationProvider,
+                onDiscardJournal = onDiscardAccountRecoveryJournal,
+                onRecoverAccount = onConfigureApiConnection,
             )
         }
         habitStatisticsContent?.let { content ->
@@ -768,6 +813,328 @@ internal fun ActiveDevicesCard(
         )
     }
 }
+
+@Composable
+internal fun AccountRecoveryCard(
+    state: AccountRecoveryState,
+    recoveryStartBlocked: Boolean,
+    onRefresh: () -> Unit,
+    issuanceConfirmationProvider: () -> AccountRecoveryIssuanceConfirmation?,
+    onIssueOrRotate: (AccountRecoveryIssuanceConfirmation) -> Unit,
+    onRetry: () -> Unit,
+    disclosureProvider: () -> AccountRecoveryDisclosure?,
+    onAcknowledgeDisclosure: (AccountRecoveryDisclosure) -> Unit,
+    journalDiscardConfirmationProvider: () -> AccountRecoveryJournalDiscardConfirmation?,
+    onDiscardJournal: (AccountRecoveryJournalDiscardConfirmation) -> Unit,
+    onRecoverAccount: () -> Unit,
+) {
+    var pendingIssuance by remember {
+        mutableStateOf<AccountRecoveryIssuanceConfirmation?>(null)
+    }
+    var disclosure by remember { mutableStateOf<AccountRecoveryDisclosure?>(null) }
+    var pendingDiscard by remember {
+        mutableStateOf<AccountRecoveryJournalDiscardConfirmation?>(null)
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    DisposableEffect(lifecycleOwner, disclosure) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                disclosure?.code?.let { clearRecoveryCodeClipboard(context, it) }
+                disclosure = null
+                pendingIssuance = null
+                pendingDiscard = null
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            disclosure?.code?.let { clearRecoveryCodeClipboard(context, it) }
+        }
+    }
+
+    LaunchedEffect(state) {
+        if (!state.canIssueOrRotate || state.isBusy) pendingIssuance = null
+        if (!state.disclosureReady) disclosure = null
+        if (!state.discardAvailable) pendingDiscard = null
+    }
+
+    pendingDiscard?.let { confirmation ->
+        AlertDialog(
+            onDismissRequest = { pendingDiscard = null },
+            icon = { Icon(Icons.Outlined.Shield, contentDescription = null) },
+            title = {
+                Text(
+                    if (confirmation.repairsUnreadableState) {
+                        "Remove unreadable recovery state?"
+                    } else {
+                        "Discard saved recovery request?"
+                    },
+                )
+            },
+            text = {
+                Text(
+                    if (confirmation.repairsUnreadableState) {
+                        "Only the unreadable account-recovery journal will be removed. Your " +
+                            "device session is preserved, but a request that reached the server " +
+                            "may still have changed the active recovery code."
+                    } else {
+                        "The exact encrypted retry tuple will be destroyed. The request may " +
+                            "already have reached the server, so verify account recovery state " +
+                            "before creating or using another code."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDiscard = null
+                        onDiscardJournal(confirmation)
+                    },
+                    enabled = state.discardAvailable && !state.isBusy,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                    modifier = Modifier.testTag("confirm_discard_account_recovery_journal"),
+                ) { Text("Discard recovery state") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDiscard = null }) { Text("Keep for retry") }
+            },
+            properties = DialogProperties(securePolicy = SecureFlagPolicy.SecureOn),
+        )
+    }
+
+    pendingIssuance?.let { confirmation ->
+        val rotating = state.currentCodeId != null
+        AlertDialog(
+            onDismissRequest = { pendingIssuance = null },
+            icon = { Icon(Icons.Outlined.Shield, contentDescription = null) },
+            title = { Text(if (rotating) "Rotate recovery code?" else "Create recovery code?") },
+            text = {
+                Text(
+                    if (rotating) {
+                        "The current recovery code will stop working immediately. The new code " +
+                            "is shown once and remains encrypted on this device until you confirm " +
+                            "that it is saved."
+                    } else {
+                        "The new code can replace every device session and connected client. " +
+                            "Store it somewhere private; DayWeave shows it only until you confirm " +
+                            "that it is saved."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingIssuance = null
+                        onIssueOrRotate(confirmation)
+                    },
+                    enabled = state.canIssueOrRotate && !state.isBusy,
+                    modifier = Modifier.testTag("confirm_account_recovery_issue"),
+                ) { Text(if (rotating) "Rotate code" else "Create code") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingIssuance = null }) { Text("Cancel") }
+            },
+            properties = DialogProperties(securePolicy = SecureFlagPolicy.SecureOn),
+        )
+    }
+
+    disclosure?.let { revealed ->
+        AlertDialog(
+            onDismissRequest = {
+                clearRecoveryCodeClipboard(context, revealed.code)
+                disclosure = null
+            },
+            icon = { Icon(Icons.Outlined.Shield, contentDescription = null) },
+            title = {
+                Text(
+                    if (revealed.source == "successor") {
+                        "Save your successor code"
+                    } else {
+                        "Save your recovery code"
+                    },
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "Anyone with this code can replace every active DayWeave connection. " +
+                            "Keep it separate from this device.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            revealed.code,
+                            modifier = Modifier
+                                .padding(12.dp)
+                                .testTag("account_recovery_code_value"),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            copyRecoveryCodeToClipboard(context, revealed.code)
+                            coroutineScope.launch {
+                                delay(RECOVERY_CLIPBOARD_TTL_MILLIS)
+                                clearRecoveryCodeClipboard(context, revealed.code)
+                            }
+                        },
+                        modifier = Modifier.testTag("copy_account_recovery_code"),
+                    ) { Text("Copy code") }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        clearRecoveryCodeClipboard(context, revealed.code)
+                        disclosure = null
+                        onAcknowledgeDisclosure(revealed)
+                    },
+                    modifier = Modifier.testTag("acknowledge_account_recovery_code"),
+                ) { Text("I saved it") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        clearRecoveryCodeClipboard(context, revealed.code)
+                        disclosure = null
+                    },
+                ) { Text("Hide for now") }
+            },
+            properties = DialogProperties(securePolicy = SecureFlagPolicy.SecureOn),
+        )
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("account_recovery_card")
+            .semantics { stateDescription = state.message },
+    ) {
+        ListItem(
+            headlineContent = { Text("Account recovery") },
+            supportingContent = { Text(state.message) },
+            leadingContent = { Icon(Icons.Outlined.Shield, contentDescription = null) },
+            trailingContent = {
+                if (state.isBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    IconButton(
+                        onClick = onRefresh,
+                        enabled = state.phase != AccountRecoveryPhase.LOCKED,
+                        modifier = Modifier.testTag("refresh_account_recovery"),
+                    ) {
+                        Icon(Icons.Outlined.Sync, contentDescription = "Refresh account recovery")
+                    }
+                }
+            },
+        )
+        state.currentCodeCreatedAt?.let { createdAt ->
+            Text(
+                "Active code created $createdAt",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            if (state.canIssueOrRotate) {
+                TextButton(
+                    onClick = { pendingIssuance = issuanceConfirmationProvider() },
+                    enabled = !state.isBusy,
+                    modifier = Modifier.testTag("issue_or_rotate_account_recovery"),
+                ) {
+                    Text(if (state.currentCodeId == null) "Create code" else "Rotate code")
+                }
+            }
+            if (state.disclosureReady) {
+                TextButton(
+                    onClick = { disclosure = disclosureProvider() },
+                    enabled = !state.isBusy,
+                    modifier = Modifier.testTag("reveal_account_recovery_code"),
+                ) { Text("Reveal & save") }
+            }
+            if (state.retryAvailable) {
+                TextButton(
+                    onClick = onRetry,
+                    enabled = !state.isBusy,
+                    modifier = Modifier.testTag("retry_account_recovery"),
+                ) { Text("Retry exact request") }
+            }
+            if (state.discardAvailable) {
+                TextButton(
+                    onClick = {
+                        pendingDiscard = journalDiscardConfirmationProvider()
+                    },
+                    enabled = !state.isBusy,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                    modifier = Modifier.testTag("discard_account_recovery_journal"),
+                ) {
+                    Text(if (state.repairRequired) "Repair state" else "Discard request")
+                }
+            }
+            if (!state.retryAvailable && !state.disclosureReady) {
+                TextButton(
+                    onClick = onRecoverAccount,
+                    enabled = !state.isBusy && !recoveryStartBlocked,
+                    modifier = Modifier.testTag("open_account_recovery"),
+                ) { Text("Use recovery code") }
+            }
+        }
+        if (recoveryStartBlocked) {
+            Text(
+                "Finish the saved Planner or Google operation before using a recovery code.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+        Text(
+            "Recovery metadata is fetched directly and kept only in memory while unlocked. " +
+                "A pending request or unacknowledged code stays encrypted in Android Keystore storage.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        )
+    }
+}
+
+private fun copyRecoveryCodeToClipboard(context: Context, code: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    val clip = ClipData.newPlainText("DayWeave recovery code", code)
+    clip.description.extras = PersistableBundle().apply {
+        putBoolean("android.content.extra.IS_SENSITIVE", true)
+    }
+    clipboard.setPrimaryClip(clip)
+}
+
+private fun clearRecoveryCodeClipboard(context: Context, expectedCode: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    val current = runCatching {
+        clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+    }.getOrNull()
+    if (current != expectedCode) return
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        clipboard.clearPrimaryClip()
+    } else {
+        clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+    }
+}
+
+private const val RECOVERY_CLIPBOARD_TTL_MILLIS = 60_000L
 
 internal fun deviceSessionInventoryPrivacyMessage(state: DeviceSessionsState): String =
     if (state.phase == DeviceSessionsPhase.READY && !state.currentSessionCanRevoke) {

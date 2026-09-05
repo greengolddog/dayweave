@@ -61,12 +61,16 @@ internal fun syntheticActiveState(
     refreshToken = DeviceAuthSecret(syntheticDeviceToken(DEVICE_REFRESH_TOKEN_PREFIX, refreshMarker)),
 )
 
-internal class FakeDeviceAuthEnvelopeStore(initialState: StoredDeviceAuthState) :
+internal class FakeDeviceAuthEnvelopeStore(
+    initialState: StoredDeviceAuthState,
+    initialRecoveryJournal: StoredAccountRecoveryJournal? = null,
+) :
     DeviceAuthEnvelopeStore {
     private var identityMarker = 1
     var envelope = StoredDeviceAuthEnvelope(
         revision = 1,
         state = initialState,
+        accountRecoveryJournal = initialRecoveryJournal,
         storageIdentity = nextIdentity(),
     )
         private set
@@ -87,6 +91,7 @@ internal class FakeDeviceAuthEnvelopeStore(initialState: StoredDeviceAuthState) 
     override fun compareAndSet(
         expected: StoredDeviceAuthEnvelope,
         nextState: StoredDeviceAuthState,
+        nextAccountRecoveryJournal: StoredAccountRecoveryJournal?,
     ): Boolean {
         if (failNextCompareAndSet) {
             failNextCompareAndSet = false
@@ -96,6 +101,7 @@ internal class FakeDeviceAuthEnvelopeStore(initialState: StoredDeviceAuthState) 
         envelope = StoredDeviceAuthEnvelope(
             revision = expected.revision + 1,
             state = nextState,
+            accountRecoveryJournal = nextAccountRecoveryJournal,
             storageIdentity = nextIdentity(),
         )
         return true
@@ -140,6 +146,14 @@ internal class FakeDeviceAuthEnvelopeStore(initialState: StoredDeviceAuthState) 
         )
     }
 
+    fun forceRecoveryJournal(journal: StoredAccountRecoveryJournal?) {
+        envelope = envelope.copy(
+            revision = envelope.revision + 1,
+            accountRecoveryJournal = journal,
+            storageIdentity = nextIdentity(),
+        )
+    }
+
     fun forceExactIdentityChange() {
         envelope = envelope.copy(storageIdentity = nextIdentity())
     }
@@ -180,6 +194,7 @@ private fun String.substringAfterDeviceTokenPrefix(): String = when {
     startsWith(DEVICE_ACCESS_TOKEN_PREFIX) -> removePrefix(DEVICE_ACCESS_TOKEN_PREFIX)
     startsWith(DEVICE_REFRESH_TOKEN_PREFIX) -> removePrefix(DEVICE_REFRESH_TOKEN_PREFIX)
     startsWith(DEVICE_ENROLLMENT_TOKEN_PREFIX) -> removePrefix(DEVICE_ENROLLMENT_TOKEN_PREFIX)
+    startsWith(ACCOUNT_RECOVERY_TOKEN_PREFIX) -> removePrefix(ACCOUNT_RECOVERY_TOKEN_PREFIX)
     else -> this
 }
 
@@ -306,6 +321,17 @@ internal class RevokeCall(
 
 internal class RecordingDeviceAuthFence(var allowed: Boolean = true) : DeviceAuthBindingFence {
     val calls = mutableListOf<List<String?>>()
+    val accountRecoveryPreflightCalls = mutableListOf<List<String?>>()
+    var accountRecoveryPreflightAllowed: Boolean = true
+
+    override suspend fun beforeAccountRecoveryRequest(
+        previousBaseUrl: String?,
+        previousBindingId: String?,
+        nextBaseUrl: String,
+    ): Boolean {
+        accountRecoveryPreflightCalls += listOf(previousBaseUrl, previousBindingId, nextBaseUrl)
+        return accountRecoveryPreflightAllowed
+    }
 
     override suspend fun beforeBindingChange(
         previousBaseUrl: String?,

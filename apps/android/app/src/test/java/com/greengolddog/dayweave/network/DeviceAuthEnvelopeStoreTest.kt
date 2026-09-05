@@ -1,6 +1,7 @@
 package com.greengolddog.dayweave.network
 
 import android.content.Context
+import java.time.Instant
 import java.security.SecureRandom
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -345,6 +346,129 @@ class DeviceAuthEnvelopeStoreTest {
     }
 
     @Test
+    fun versionTwoEnvelopeMigratesToEncryptedVersionThreeWithoutInventingRecoveryState() {
+        val keys = InMemoryDeviceAuthKeyAccess()
+        val store = testStore(keys)
+        store.read()
+        val active = syntheticActiveState(Instant.parse("2026-09-05T09:00:00Z"))
+        val json = envelopeJson()
+        val versionTwo = json.encodeToString(
+            StoredDeviceAuthEnvelope(
+                schemaVersion = 2,
+                revision = 7,
+                state = active,
+            ),
+        ).replace(",\"account_recovery_journal\":null", "")
+        writeEncrypted(store, keys, versionTwo)
+
+        val migrated = store.read()
+
+        assertEquals(DEVICE_AUTH_ENVELOPE_VERSION, migrated.schemaVersion)
+        assertEquals(8L, migrated.revision)
+        assertEquals(active, migrated.state)
+        assertEquals(null, migrated.accountRecoveryJournal)
+        val ciphertext = requireNotNull(
+            preferences.getString(KeystoreDeviceAuthEnvelopeStore.ENCRYPTED_ENVELOPE, null),
+        )
+        assertFalse(ciphertext.contains(active.accessToken.value))
+        assertFalse(ciphertext.contains(active.clientInstanceId))
+    }
+
+    @Test
+    fun recoveryJournalIsEncryptedAndAdvancesWithTheCredentialEnvelope() {
+        val keys = InMemoryDeviceAuthKeyAccess()
+        val store = testStore(keys)
+        val initial = store.read()
+        val active = syntheticActiveState(Instant.parse("2026-09-05T09:00:00Z"))
+        assertTrue(store.compareAndSet(initial, active))
+        val activeEnvelope = store.read()
+        val code = syntheticDeviceToken(ACCOUNT_RECOVERY_TOKEN_PREFIX, 91)
+        val journal = StoredAccountRecoveryJournal.DisclosurePending(
+            baseUrl = SYNTHETIC_BASE_URL,
+            id = "55555555-5555-4555-8555-555555555555",
+            code = DeviceAuthSecret(code),
+            createdAt = "2026-09-05T09:00:00Z",
+            revision = 1,
+            source = "issued",
+        )
+
+        assertTrue(store.compareAndSet(activeEnvelope, active, journal))
+
+        assertEquals(journal, store.read().accountRecoveryJournal)
+        val ciphertext = requireNotNull(
+            preferences.getString(KeystoreDeviceAuthEnvelopeStore.ENCRYPTED_ENVELOPE, null),
+        )
+        assertFalse(ciphertext.contains(code))
+        assertFalse(ciphertext.contains(journal.id))
+    }
+
+    @Test
+    fun unknownRecoveryJournalRequiresExactRecoveryOnlyRepairAndPreservesSession() {
+        val keys = InMemoryDeviceAuthKeyAccess()
+        val store = testStore(keys)
+        store.read()
+        val active = syntheticActiveState(Instant.parse("2026-09-05T09:00:00Z"))
+        val base = envelopeJson().encodeToString(
+            StoredDeviceAuthEnvelope(
+                revision = 9,
+                state = active,
+            ),
+        )
+        val future = base.replace(
+            "\"account_recovery_journal\":null",
+            "\"account_recovery_journal\":{" +
+                "\"phase\":\"future_pending\",\"opaque\":\"preserved\"}",
+        )
+        writeEncrypted(store, keys, future)
+
+        val loaded = store.read()
+
+        assertEquals(active, loaded.state)
+        val repair = loaded.accountRecoveryJournal as
+            StoredAccountRecoveryJournal.RepairRequired
+        assertEquals(RECOVERY_JOURNAL_UNSUPPORTED, repair.reason)
+        assertTrue(store.compareAndSet(loaded, loaded.state, null))
+        assertEquals(active, store.read().state)
+        assertEquals(null, store.read().accountRecoveryJournal)
+    }
+
+    @Test
+    fun malformedKnownRecoveryJournalDoesNotDestroyValidDeviceAuthentication() {
+        val keys = InMemoryDeviceAuthKeyAccess()
+        val store = testStore(keys)
+        store.read()
+        val active = syntheticActiveState(Instant.parse("2026-09-05T09:00:00Z"))
+        val malformed = StoredAccountRecoveryJournal.IssuancePending(
+            baseUrl = SYNTHETIC_BASE_URL,
+            configurationId = active.session.id,
+            clientInstanceId = active.clientInstanceId,
+            candidateId = "55555555-5555-4555-8555-555555555555",
+            candidateCode = DeviceAuthSecret("not-a-recovery-code"),
+            replacesId = null,
+            replacesRevision = null,
+            preparedAt = "2026-09-05T09:00:00Z",
+        )
+        writeEncrypted(
+            store,
+            keys,
+            envelopeJson().encodeToString(
+                StoredDeviceAuthEnvelope(
+                    revision = 10,
+                    state = active,
+                    accountRecoveryJournal = malformed,
+                ),
+            ),
+        )
+
+        val loaded = store.read()
+
+        assertEquals(active, loaded.state)
+        val repair = loaded.accountRecoveryJournal as
+            StoredAccountRecoveryJournal.RepairRequired
+        assertEquals(RECOVERY_JOURNAL_MALFORMED, repair.reason)
+    }
+
+    @Test
     fun compareAndSetAndDestroyVerifyExactReadback() {
         val keys = InMemoryDeviceAuthKeyAccess()
         val corrupt = testStore(keys, readbackOverride = { stored ->
@@ -398,6 +522,33 @@ class DeviceAuthEnvelopeStoreTest {
         readbackOverride = readbackOverride,
         legacyCleanupOverride = legacyCleanupOverride,
     )
+
+    private fun envelopeJson() = Json {
+        classDiscriminator = "phase"
+        ignoreUnknownKeys = false
+        explicitNulls = true
+        encodeDefaults = true
+    }
+
+    private fun writeEncrypted(
+        store: KeystoreDeviceAuthEnvelopeStore,
+        keys: InMemoryDeviceAuthKeyAccess,
+        plaintext: String,
+    ) {
+        val encrypt = store.javaClass.getDeclaredMethod(
+            "encrypt",
+            String::class.java,
+            SecretKey::class.java,
+        ).apply { isAccessible = true }
+        val encoded = encrypt.invoke(
+            store,
+            plaintext,
+            requireNotNull(keys.existing(TEST_KEY_ALIAS)),
+        ) as String
+        preferences.edit()
+            .putString(KeystoreDeviceAuthEnvelopeStore.ENCRYPTED_ENVELOPE, encoded)
+            .commit()
+    }
 
     private companion object {
         const val TEST_PREFERENCES = "durable-device-auth-envelope-test"

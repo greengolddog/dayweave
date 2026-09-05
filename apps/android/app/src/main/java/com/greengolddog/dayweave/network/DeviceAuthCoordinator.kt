@@ -59,6 +59,17 @@ private data class CurrentSessionRetirementIdentity(
 
 internal interface DeviceAuthBindingFence {
     /**
+     * Non-destructive preflight for public account recovery. Called only after the process-wide
+     * binding writer has drained prior authenticated operations, and before any recovery tuple is
+     * persisted or sent. Implementations must reject unresolved durable write journals.
+     */
+    suspend fun beforeAccountRecoveryRequest(
+        previousBaseUrl: String?,
+        previousBindingId: String?,
+        nextBaseUrl: String,
+    ): Boolean = true
+
+    /**
      * Must durably quarantine all API-bound cache before a new binding becomes usable. The
      * coordinator invokes this while holding the process-wide binding writer; implementations
      * must not acquire or release that writer themselves.
@@ -78,6 +89,23 @@ internal interface DeviceAuthBindingFence {
         previousBaseUrl: String?,
         previousBindingId: String?,
     ): Boolean = beforeBindingChange(previousBaseUrl, previousBindingId, null, null)
+
+    /**
+     * A confirmed recovery consume has already invalidated every old server authority. Local
+     * binding journals must therefore be quarantined before the recovered binding is installed,
+     * even when they can no longer be reconciled with the retired credential.
+     */
+    suspend fun beforeAccountRecovery(
+        previousBaseUrl: String?,
+        previousBindingId: String?,
+        nextBaseUrl: String,
+        nextBindingId: String,
+    ): Boolean = beforeBindingChange(
+        previousBaseUrl,
+        previousBindingId,
+        nextBaseUrl,
+        nextBindingId,
+    )
 }
 
 internal object AllowDeviceAuthBindingChange : DeviceAuthBindingFence {
@@ -182,8 +210,8 @@ internal class DurableDeviceAuthCoordinator(
         val envelope = store.read()
         val state = envelope.state
         updateUiAfterDestroyCleanup(state)
-        val usable = state is StoredDeviceAuthState.Active ||
-            state is StoredDeviceAuthState.RefreshPending
+        val usable = !envelope.accountRecoveryJournal.blocksApiBoundWork() &&
+            (state is StoredDeviceAuthState.Active || state is StoredDeviceAuthState.RefreshPending)
         return ApiConnectionSnapshot(
             baseUrl = state.baseUrl,
             hasBearerToken = usable,
@@ -194,7 +222,11 @@ internal class DurableDeviceAuthCoordinator(
     }
 
     override fun authenticatedConfiguration(): AuthenticatedApiConfiguration? {
-        val state = store.read().state
+        val envelope = store.read()
+        if (envelope.accountRecoveryJournal.blocksApiBoundWork()) {
+            return null
+        }
+        val state = envelope.state
         updateUiAfterDestroyCleanup(state)
         val token = when (state) {
             is StoredDeviceAuthState.Active -> state.accessToken.value
@@ -243,9 +275,18 @@ internal class DurableDeviceAuthCoordinator(
 
     override fun recordSuccessfulSync(epochMillis: Long) = store.recordSuccessfulSync(epochMillis)
 
+    /** Reconciles the redacted UI projection after an atomic recovery install owned by a peer. */
+    fun reconcilePresentationFromDurableState() {
+        mutableUiState.value = store.read().state.toUiState()
+    }
+
     suspend fun recoverPendingOrUpgradeLegacy(): DeviceAuthActionResult {
         setBusy("Checking durable authentication…")
         val envelope = store.read()
+        if (envelope.accountRecoveryJournal != null) {
+            refreshUi("Finish or acknowledge the saved account-recovery operation first.")
+            return DeviceAuthActionResult.NOT_ALLOWED
+        }
         val result = when (val state = envelope.state) {
             is StoredDeviceAuthState.Legacy -> upgradeLegacyLocked(envelope, state)
             is StoredDeviceAuthState.EnrollmentCreationPending ->
@@ -264,6 +305,10 @@ internal class DurableDeviceAuthCoordinator(
     ): DeviceAuthActionResult {
         setBusy("Upgrading the reviewed hybrid bootstrap…")
         val current = store.read()
+        if (current.accountRecoveryJournal != null) {
+            refreshUi("Finish or acknowledge the saved account-recovery operation first.")
+            return DeviceAuthActionResult.NOT_ALLOWED
+        }
         if (!canStartEnrollment(current.state)) {
             refreshUi("Sign out the active device session before replacing authentication.")
             return DeviceAuthActionResult.NOT_ALLOWED
@@ -300,6 +345,10 @@ internal class DurableDeviceAuthCoordinator(
     ): DeviceAuthActionResult {
         setBusy("Journaling the one-time enrollment…")
         val current = store.read()
+        if (current.accountRecoveryJournal != null) {
+            refreshUi("Finish or acknowledge the saved account-recovery operation first.")
+            return DeviceAuthActionResult.NOT_ALLOWED
+        }
         if (!canStartEnrollment(current.state)) {
             refreshUi("Sign out the active device session before consuming another enrollment.")
             return DeviceAuthActionResult.NOT_ALLOWED
@@ -344,6 +393,10 @@ internal class DurableDeviceAuthCoordinator(
     suspend fun signOutRevokeFirst(): DeviceAuthActionResult {
         setBusy("Revoking this device session…")
         var envelope = store.read()
+        if (envelope.accountRecoveryJournal != null) {
+            refreshUi("Save or finish the account-recovery operation before signing out.")
+            return DeviceAuthActionResult.NOT_ALLOWED
+        }
         if (envelope.state is StoredDeviceAuthState.RefreshPending) {
             val recovered = completeRefreshLocked(envelope.state as StoredDeviceAuthState.RefreshPending)
             if (recovered != DeviceAuthActionResult.SUCCESS) {
@@ -623,8 +676,15 @@ internal class DurableDeviceAuthCoordinator(
 
     suspend fun destroyLocalOnly(confirmed: Boolean): DeviceAuthActionResult {
         if (!confirmed) return DeviceAuthActionResult.NOT_ALLOWED
-        setBusy("Removing local authentication only…")
         val envelope = store.read()
+        if (envelope.accountRecoveryJournal != null) {
+            refreshUi(
+                "Resolve the saved account-recovery state with its recovery controls before " +
+                    "removing local authentication.",
+            )
+            return DeviceAuthActionResult.NOT_ALLOWED
+        }
+        setBusy("Removing local authentication only…")
         val state = envelope.state
         val destroyResult = try {
             bindingOperationGate.invalidateBeforeQuarantine {
@@ -742,6 +802,9 @@ internal class DurableDeviceAuthCoordinator(
     ): AuthorizationLease {
         repeat(MAX_AUTH_STATE_RETRIES) {
             val envelope = store.read()
+            if (envelope.accountRecoveryJournal.blocksApiBoundWork()) {
+                throw DeviceAuthenticationChangedException()
+            }
             when (val state = envelope.state) {
                 is StoredDeviceAuthState.EnrollmentPending -> {
                     when (completeEnrollmentLocked(state)) {

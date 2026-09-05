@@ -15,12 +15,22 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.longOrNull
 
 internal interface DeviceAuthEnvelopeStore {
     fun read(): StoredDeviceAuthEnvelope
 
     /** Atomically replaces exactly [expected], incrementing its revision once. */
-    fun compareAndSet(expected: StoredDeviceAuthEnvelope, nextState: StoredDeviceAuthState): Boolean
+    fun compareAndSet(
+        expected: StoredDeviceAuthEnvelope,
+        nextState: StoredDeviceAuthState,
+        nextAccountRecoveryJournal: StoredAccountRecoveryJournal? =
+            expected.accountRecoveryJournal,
+    ): Boolean
 
     /** Removes the envelope and device-bound key only if the exact envelope is still current. */
     fun destroy(expected: StoredDeviceAuthEnvelope): DeviceAuthDestroyResult
@@ -88,8 +98,9 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
     override fun compareAndSet(
         expected: StoredDeviceAuthEnvelope,
         nextState: StoredDeviceAuthState,
+        nextAccountRecoveryJournal: StoredAccountRecoveryJournal?,
     ): Boolean = synchronized(STORE_LOCK) {
-        validateStoredDeviceAuthState(nextState)
+        validateStoredDeviceAuthEnvelopeContents(nextState, nextAccountRecoveryJournal)
         val current = loadOrInitialize()
         if (current != expected || current.state is StoredDeviceAuthState.Incompatible) {
             return@synchronized false
@@ -101,6 +112,7 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
         val next = StoredDeviceAuthEnvelope(
             revision = Math.addExact(current.revision, 1),
             state = nextState,
+            accountRecoveryJournal = nextAccountRecoveryJournal,
         )
         val canonical = json.encodeToString(next)
         val encoded = encrypt(canonical, getOrCreateKey())
@@ -170,8 +182,8 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
         val encoded = preferences.getString(ENCRYPTED_ENVELOPE, null)
         if (encoded != null) {
             var envelope = decodeEnvelope(encoded)
-            if (envelope.schemaVersion == LEGACY_ENVELOPE_VERSION) {
-                envelope = migrateVersionOneEnvelope(envelope)
+            if (envelope.schemaVersion < DEVICE_AUTH_ENVELOPE_VERSION) {
+                envelope = migrateOlderEnvelope(envelope)
             }
             if (envelope.state !is StoredDeviceAuthState.Incompatible) retryLegacyCleanup()
             return envelope
@@ -249,12 +261,9 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
         return try {
             val envelope = json.decodeFromString<StoredDeviceAuthEnvelope>(plaintext)
             if (
-                envelope.schemaVersion !in setOf(
-                    LEGACY_ENVELOPE_VERSION,
-                    DEVICE_AUTH_ENVELOPE_VERSION,
-                ) ||
+                envelope.schemaVersion !in LEGACY_ENVELOPE_VERSION..DEVICE_AUTH_ENVELOPE_VERSION ||
                 envelope.revision !in 1 until Long.MAX_VALUE ||
-                envelope.schemaVersion == LEGACY_ENVELOPE_VERSION &&
+                envelope.schemaVersion < DEVICE_AUTH_ENVELOPE_VERSION &&
                 envelope.revision >= Long.MAX_VALUE - 1
             ) {
                 return incompatible("unsupported_state_version", encoded)
@@ -269,25 +278,75 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
             ) {
                 return incompatible("legacy_pending_request_binding_unavailable", encoded)
             }
-            validateStoredDeviceAuthState(envelope.state)
+            validateStoredDeviceAuthEnvelopeContents(
+                envelope.state,
+                envelope.accountRecoveryJournal,
+            )
             val canonical = json.encodeToString(envelope)
             envelope.copy(storageIdentity = storageIdentity(encoded, canonical))
         } catch (_: SerializationException) {
-            incompatible("stored_state_malformed", encoded)
+            decodeRecoveryRepairEnvelope(plaintext, encoded)
+                ?: incompatible("stored_state_malformed", encoded)
         } catch (_: IllegalArgumentException) {
-            incompatible("stored_state_invalid", encoded)
+            decodeRecoveryRepairEnvelope(plaintext, encoded)
+                ?: incompatible("stored_state_invalid", encoded)
         }
     }
 
+    /**
+     * Salvages only a strictly decodable device-auth state when the journal member itself is
+     * unreadable. The authenticated ciphertext is left untouched, old authorization remains
+     * suppressed, and an owner must explicitly remove just this recovery journal.
+     */
+    private fun decodeRecoveryRepairEnvelope(
+        plaintext: String,
+        encoded: String,
+    ): StoredDeviceAuthEnvelope? = runCatching {
+        if (StrictDeviceAuthJsonScanner(plaintext).hasDuplicateKeys()) return@runCatching null
+        val root = json.parseToJsonElement(plaintext) as? JsonObject ?: return@runCatching null
+        if (root.keys != RECOVERY_ENVELOPE_KEYS) return@runCatching null
+        val schemaVersion = (root["schema_version"] as? JsonPrimitive)?.longOrNull
+            ?: return@runCatching null
+        if (schemaVersion != DEVICE_AUTH_ENVELOPE_VERSION.toLong()) return@runCatching null
+        val revision = (root["revision"] as? JsonPrimitive)?.longOrNull
+            ?: return@runCatching null
+        if (revision !in 1 until Long.MAX_VALUE) return@runCatching null
+        val state = json.decodeFromJsonElement<StoredDeviceAuthState>(
+            root["state"] ?: return@runCatching null,
+        )
+        validateStoredDeviceAuthState(state)
+        val journalElement = root["account_recovery_journal"] ?: return@runCatching null
+        val journalPhase = (journalElement as? JsonObject)
+            ?.get("phase")
+            ?.let { it as? JsonPrimitive }
+            ?.contentOrNull
+        val reason = if (journalPhase != null && journalPhase !in KNOWN_RECOVERY_PHASES) {
+            RECOVERY_JOURNAL_UNSUPPORTED
+        } else {
+            RECOVERY_JOURNAL_MALFORMED
+        }
+        StoredDeviceAuthEnvelope(
+            schemaVersion = DEVICE_AUTH_ENVELOPE_VERSION,
+            revision = revision,
+            state = state,
+            accountRecoveryJournal = StoredAccountRecoveryJournal.RepairRequired(
+                baseUrl = state.baseUrl,
+                reason = reason,
+            ),
+            storageIdentity = storageIdentity(encoded, plaintext),
+        )
+    }.getOrNull()
+
     @SuppressLint("ApplySharedPref", "UseKtx")
-    private fun migrateVersionOneEnvelope(
+    private fun migrateOlderEnvelope(
         legacy: StoredDeviceAuthEnvelope,
     ): StoredDeviceAuthEnvelope {
-        check(legacy.schemaVersion == LEGACY_ENVELOPE_VERSION)
+        check(legacy.schemaVersion in LEGACY_ENVELOPE_VERSION until DEVICE_AUTH_ENVELOPE_VERSION)
         val migrated = StoredDeviceAuthEnvelope(
             schemaVersion = DEVICE_AUTH_ENVELOPE_VERSION,
             revision = Math.addExact(legacy.revision, 1),
             state = legacy.state,
+            accountRecoveryJournal = null,
         )
         val canonical = json.encodeToString(migrated)
         val encoded = encrypt(canonical, getOrCreateKey())
@@ -451,6 +510,19 @@ internal class KeystoreDeviceAuthEnvelopeStore private constructor(
         private const val LEGACY_WRAP_FORMAT = "v1"
         private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_BITS = 128
+        private val RECOVERY_ENVELOPE_KEYS = setOf(
+            "schema_version",
+            "revision",
+            "state",
+            "account_recovery_journal",
+        )
+        private val KNOWN_RECOVERY_PHASES = setOf(
+            "issuance_pending",
+            "consumption_pending",
+            "consumption_committed_awaiting_installation",
+            "disclosure_pending",
+            "repair_required",
+        )
         private val STORE_LOCK = Any()
 
         internal fun createForTest(

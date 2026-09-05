@@ -13,10 +13,12 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthBindingFence
+import com.greengolddog.dayweave.network.AccountRecoveryManager
 import com.greengolddog.dayweave.network.ApiBindingOperationGate
 import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
 import com.greengolddog.dayweave.network.KeystoreDeviceAuthEnvelopeStore
 import com.greengolddog.dayweave.network.OkHttpAssistantTransport
+import com.greengolddog.dayweave.network.OkHttpAccountRecoveryTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalItemInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
@@ -31,6 +33,7 @@ import com.greengolddog.dayweave.network.OkHttpHabitInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpHabitTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
+import com.greengolddog.dayweave.network.blocksApiBoundWork
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationCoordinator
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteMailbox
 import com.greengolddog.dayweave.notifications.WorkManagerTimedBreakNotificationBackend
@@ -179,6 +182,142 @@ class DayWeaveApplication : Application() {
 
     private val apiBindingOperationGate = ApiBindingOperationGate()
     private val deviceSessionsTransport by lazy { OkHttpDeviceSessionsTransport() }
+    private val accountRecoveryTransport by lazy { OkHttpAccountRecoveryTransport() }
+    private val localDeviceLabel: String by lazy {
+        listOf(Build.MANUFACTURER, Build.MODEL)
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
+            .joinToString(" ")
+            .take(200)
+            .ifBlank { "Personal Android device" }
+    }
+
+    private val deviceAuthBindingFence: DeviceAuthBindingFence = object : DeviceAuthBindingFence {
+        private suspend fun quarantineBinding(
+            allowAmbiguousJournal: Boolean,
+            quarantineAccountRecoveryPresentation: Boolean = true,
+        ): Boolean {
+            val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+            if (
+                loaded != PlannerLoadState.READY ||
+                !allowAmbiguousJournal && (
+                    plannerStore.hasCredentialReplacementBlocker() ||
+                        hasGoogleAuthorizationRecoveryBlocker() ||
+                        hasGoogleCalendarImportRecoveryBlocker() ||
+                        deviceAuthEnvelopeStore.read().accountRecoveryJournal != null
+                    )
+            ) {
+                return false
+            }
+            if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
+            cancelAndDrainLocalScheduleComposition()
+            if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
+                canonicalItemInvalidationManager.cancelAndDrainActiveSession()
+            }
+            if (executionInvalidationManagerDelegate.isInitialized()) {
+                executionInvalidationManager.cancelAndDrainActiveSession()
+            }
+            if (scheduleInvalidationManagerDelegate.isInitialized()) {
+                scheduleInvalidationManager.cancelAndDrainActiveSession()
+            }
+            if (habitInvalidationManagerDelegate.isInitialized()) {
+                habitInvalidationManager.cancelAndDrainActiveSession()
+            }
+            val quarantined = try {
+                plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+            } finally {
+                reconcileTimedBreakNotificationAfterAuthoritativeTransition()
+            }
+            if (
+                quarantined && allowAmbiguousJournal &&
+                !googleCalendarImportCoordinator.abandonPendingForConfirmedLocalDestruction()
+            ) {
+                return false
+            }
+            if (
+                quarantined && allowAmbiguousJournal &&
+                !googleAccountManager.abandonAuthorizationForConfirmedLocalDestruction()
+            ) {
+                return false
+            }
+            if (quarantined) {
+                if (suggestionSyncManagerDelegate.isInitialized()) {
+                    suggestionSyncManager.quarantineBindingState()
+                }
+                if (assistantManagerDelegate.isInitialized()) {
+                    assistantManager.quarantineBindingState()
+                }
+                if (proposalApplicationManagerDelegate.isInitialized()) {
+                    proposalApplicationManager.quarantineBindingState()
+                }
+                if (canonicalSyncManagerDelegate.isInitialized()) {
+                    canonicalSyncManager.quarantineBindingState()
+                }
+                if (executionSyncManagerDelegate.isInitialized()) {
+                    executionSyncManager.quarantineBindingState()
+                }
+                if (habitSyncManagerDelegate.isInitialized()) {
+                    habitSyncManager.quarantineBindingState()
+                }
+                if (deviceSessionManagerDelegate.isInitialized()) {
+                    deviceSessionManager.quarantineBindingState()
+                }
+                if (
+                    quarantineAccountRecoveryPresentation &&
+                    accountRecoveryManagerDelegate.isInitialized()
+                ) {
+                    accountRecoveryManager.quarantineForPrivacyBoundary()
+                }
+                if (googleAccountManagerDelegate.isInitialized()) {
+                    googleAccountManager.quarantineBindingState()
+                }
+                googleCalendarImportCoordinator.quarantineBindingState()
+                if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
+                    googleCalendarOutboundCoordinator.quarantineBindingState()
+                }
+                if (googleSchedulePublicationCoordinatorDelegate.isInitialized()) {
+                    googleSchedulePublicationCoordinator.quarantineBindingState()
+                }
+            }
+            return quarantined
+        }
+
+        override suspend fun beforeBindingChange(
+            previousBaseUrl: String?,
+            previousBindingId: String?,
+            nextBaseUrl: String?,
+            nextBindingId: String?,
+        ): Boolean = quarantineBinding(allowAmbiguousJournal = false)
+
+        override suspend fun beforeConfirmedLocalDestruction(
+            previousBaseUrl: String?,
+            previousBindingId: String?,
+        ): Boolean = quarantineBinding(allowAmbiguousJournal = true)
+
+        override suspend fun beforeAccountRecoveryRequest(
+            previousBaseUrl: String?,
+            previousBindingId: String?,
+            nextBaseUrl: String,
+        ): Boolean {
+            val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+            return loaded == PlannerLoadState.READY &&
+                !plannerStore.hasCredentialReplacementBlocker() &&
+                !hasGoogleAuthorizationRecoveryBlocker() &&
+                !hasGoogleCalendarImportRecoveryBlocker() &&
+                deviceAuthEnvelopeStore.read().accountRecoveryJournal == null
+        }
+
+        override suspend fun beforeAccountRecovery(
+            previousBaseUrl: String?,
+            previousBindingId: String?,
+            nextBaseUrl: String,
+            nextBindingId: String,
+        ): Boolean = quarantineBinding(
+            allowAmbiguousJournal = true,
+            quarantineAccountRecoveryPresentation = false,
+        )
+    }
 
     internal val deviceAuthCoordinator: DurableDeviceAuthCoordinator by lazy {
         DurableDeviceAuthCoordinator(
@@ -186,119 +325,28 @@ class DayWeaveApplication : Application() {
             transport = OkHttpDeviceAuthTransport(),
             deviceSessionsTransport = deviceSessionsTransport,
             clientVersion = BuildConfig.VERSION_NAME,
-            deviceLabel = listOf(Build.MANUFACTURER, Build.MODEL)
-                .map(String::trim)
-                .filter(String::isNotBlank)
-                .distinct()
-                .joinToString(" ")
-                .take(200)
-                .ifBlank { "Personal Android device" },
+            deviceLabel = localDeviceLabel,
             bindingOperationGate = apiBindingOperationGate,
-            bindingFence = object : DeviceAuthBindingFence {
-                private suspend fun quarantineBinding(
-                    allowAmbiguousJournal: Boolean,
-                ): Boolean {
-                    val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
-                    if (
-                        loaded != PlannerLoadState.READY ||
-                        !allowAmbiguousJournal && (
-                            plannerStore.hasCredentialReplacementBlocker() ||
-                                hasGoogleAuthorizationRecoveryBlocker() ||
-                                hasGoogleCalendarImportRecoveryBlocker()
-                        )
-                    ) {
-                        return false
-                    }
-                    if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
-                    cancelAndDrainLocalScheduleComposition()
-                    if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
-                        canonicalItemInvalidationManager.cancelAndDrainActiveSession()
-                    }
-                    if (executionInvalidationManagerDelegate.isInitialized()) {
-                        executionInvalidationManager.cancelAndDrainActiveSession()
-                    }
-                    if (scheduleInvalidationManagerDelegate.isInitialized()) {
-                        scheduleInvalidationManager.cancelAndDrainActiveSession()
-                    }
-                    if (habitInvalidationManagerDelegate.isInitialized()) {
-                        habitInvalidationManager.cancelAndDrainActiveSession()
-                    }
-                    val quarantined = try {
-                        plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
-                    } finally {
-                        // A failed quarantine restores the old durable lease's reminder; a
-                        // successful one confirms the cancellation against empty canonical state.
-                        reconcileTimedBreakNotificationAfterAuthoritativeTransition()
-                    }
-                    if (
-                        quarantined && allowAmbiguousJournal &&
-                        !googleCalendarImportCoordinator
-                            .abandonPendingForConfirmedLocalDestruction()
-                    ) {
-                        // Keep the credentials when the final destructive recovery fence fails.
-                        // Planner abandonment is idempotent, so an explicit retry remains safe.
-                        return false
-                    }
-                    if (
-                        quarantined && allowAmbiguousJournal &&
-                        !googleAccountManager.abandonAuthorizationForConfirmedLocalDestruction()
-                    ) {
-                        // The credential writer must not strand an old OAuth ceremony behind a
-                        // new binding. Retain the credentials until this explicit cleanup works.
-                        return false
-                    }
-                    if (quarantined) {
-                        if (suggestionSyncManagerDelegate.isInitialized()) {
-                            suggestionSyncManager.quarantineBindingState()
-                        }
-                        if (assistantManagerDelegate.isInitialized()) {
-                            assistantManager.quarantineBindingState()
-                        }
-                        if (proposalApplicationManagerDelegate.isInitialized()) {
-                            proposalApplicationManager.quarantineBindingState()
-                        }
-                        if (canonicalSyncManagerDelegate.isInitialized()) {
-                            canonicalSyncManager.quarantineBindingState()
-                        }
-                        if (executionSyncManagerDelegate.isInitialized()) {
-                            executionSyncManager.quarantineBindingState()
-                        }
-                        if (habitSyncManagerDelegate.isInitialized()) {
-                            habitSyncManager.quarantineBindingState()
-                        }
-                        if (deviceSessionManagerDelegate.isInitialized()) {
-                            deviceSessionManager.quarantineBindingState()
-                        }
-                        if (googleAccountManagerDelegate.isInitialized()) {
-                            googleAccountManager.quarantineBindingState()
-                        }
-                        googleCalendarImportCoordinator.quarantineBindingState()
-                        if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
-                            googleCalendarOutboundCoordinator.quarantineBindingState()
-                        }
-                        if (googleSchedulePublicationCoordinatorDelegate.isInitialized()) {
-                            googleSchedulePublicationCoordinator.quarantineBindingState()
-                        }
-                    }
-                    return quarantined
-                }
-
-                override suspend fun beforeBindingChange(
-                    previousBaseUrl: String?,
-                    previousBindingId: String?,
-                    nextBaseUrl: String?,
-                    nextBindingId: String?,
-                ): Boolean = quarantineBinding(allowAmbiguousJournal = false)
-
-                override suspend fun beforeConfirmedLocalDestruction(
-                    previousBaseUrl: String?,
-                    previousBindingId: String?,
-                ): Boolean = quarantineBinding(allowAmbiguousJournal = true)
-            },
+            bindingFence = deviceAuthBindingFence,
         )
     }
 
     private val apiCredentialStore by lazy { deviceAuthCoordinator }
+
+    private val accountRecoveryManagerDelegate: Lazy<AccountRecoveryManager> = lazy {
+        AccountRecoveryManager(
+            store = deviceAuthEnvelopeStore,
+            credentialStore = apiCredentialStore,
+            transport = accountRecoveryTransport,
+            bindingOperationGate = apiBindingOperationGate,
+            bindingFence = deviceAuthBindingFence,
+            deviceLabel = localDeviceLabel,
+            clientVersion = BuildConfig.VERSION_NAME,
+            operationAllowed = privatePresentationAllowed::get,
+        )
+    }
+    internal val accountRecoveryManager: AccountRecoveryManager
+        get() = accountRecoveryManagerDelegate.value
 
     private val deviceSessionManagerDelegate = lazy {
         DeviceSessionManager(
@@ -595,7 +643,8 @@ class DayWeaveApplication : Application() {
     ): Boolean {
         if (
             !privatePresentationAllowed.get() ||
-            plannerStore.loadState.value != PlannerLoadState.READY
+            plannerStore.loadState.value != PlannerLoadState.READY ||
+            hasAccountRecoveryWorkBlocker()
         ) {
             return false
         }
@@ -674,6 +723,10 @@ class DayWeaveApplication : Application() {
             is GoogleCalendarImportJournalLoadResult.Loaded -> loaded.journals.isNotEmpty()
             GoogleCalendarImportJournalLoadResult.Corrupt -> true
         }
+    }.getOrDefault(true)
+
+    private fun hasAccountRecoveryWorkBlocker(): Boolean = runCatching {
+        deviceAuthEnvelopeStore.read().accountRecoveryJournal.blocksApiBoundWork()
     }.getOrDefault(true)
 
     private fun googleAuthorizationBlockedByImportRecovery(
@@ -863,14 +916,16 @@ class DayWeaveApplication : Application() {
     fun launchDurableHabitAction(action: suspend () -> Boolean): Deferred<Boolean> {
         if (
             !onboardingRuntimeGate.backgroundWorkAllowed() ||
-            hasGoogleAuthorizationRecoveryBlocker()
+            hasGoogleAuthorizationRecoveryBlocker() ||
+            hasAccountRecoveryWorkBlocker()
         ) {
             return CompletableDeferred(false)
         }
         return persistenceScope.launchDurableBooleanAction {
             if (
                 !onboardingRuntimeGate.backgroundWorkAllowed() ||
-                hasGoogleAuthorizationRecoveryBlocker()
+                hasGoogleAuthorizationRecoveryBlocker() ||
+                hasAccountRecoveryWorkBlocker()
             ) {
                 false
             } else {
@@ -889,7 +944,8 @@ class DayWeaveApplication : Application() {
     ): Deferred<Boolean>? {
         if (
             !onboardingRuntimeGate.backgroundWorkAllowed() ||
-            hasGoogleAuthorizationRecoveryBlocker()
+            hasGoogleAuthorizationRecoveryBlocker() ||
+            hasAccountRecoveryWorkBlocker()
         ) {
             return null
         }
@@ -897,7 +953,10 @@ class DayWeaveApplication : Application() {
         return persistenceScope.async {
             try {
                 try {
-                    if (hasGoogleAuthorizationRecoveryBlocker()) false else action()
+                    if (
+                        hasGoogleAuthorizationRecoveryBlocker() ||
+                        hasAccountRecoveryWorkBlocker()
+                    ) false else action()
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: Exception) {
@@ -913,14 +972,18 @@ class DayWeaveApplication : Application() {
     fun launchCanonicalAction(action: suspend () -> Unit): Boolean {
         if (
             !onboardingRuntimeGate.backgroundWorkAllowed() ||
-            hasGoogleAuthorizationRecoveryBlocker()
+            hasGoogleAuthorizationRecoveryBlocker() ||
+            hasAccountRecoveryWorkBlocker()
         ) {
             return false
         }
         if (!canonicalActionGate.tryEnter()) return false
         persistenceScope.launch {
             try {
-                if (!hasGoogleAuthorizationRecoveryBlocker()) action()
+                if (
+                    !hasGoogleAuthorizationRecoveryBlocker() &&
+                    !hasAccountRecoveryWorkBlocker()
+                ) action()
             } finally {
                 canonicalActionGate.leave()
             }
@@ -972,9 +1035,28 @@ class DayWeaveApplication : Application() {
         return true
     }
 
+    /** Account-recovery retry is the sole canonical lane allowed to own its recovery blocker. */
+    fun launchAccountRecoveryAction(operation: suspend () -> Unit): Boolean {
+        if (
+            !onboardingRuntimeGate.privatePresentationAllowed() ||
+            !canonicalActionGate.tryEnter()
+        ) return false
+        persistenceScope.launch {
+            try {
+                if (privatePresentationAllowed.get()) operation()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+        return true
+    }
+
     /** Explicit OAuth-journal recovery may clear its own blocker, but no active lane may race it. */
     fun launchGoogleAuthorizationRecoveryAction(operation: suspend () -> Unit): Boolean {
-        if (!privatePresentationAllowed.get() || !canonicalActionGate.tryEnter()) return false
+        if (
+            !privatePresentationAllowed.get() || hasAccountRecoveryWorkBlocker() ||
+            !canonicalActionGate.tryEnter()
+        ) return false
         persistenceScope.launch {
             try {
                 if (privatePresentationAllowed.get()) operation()
@@ -1013,7 +1095,10 @@ class DayWeaveApplication : Application() {
         persistenceScope.launch {
             canonicalActionGate.enter()
             try {
-                if (!hasGoogleAuthorizationRecoveryBlocker()) action()
+                if (
+                    !hasGoogleAuthorizationRecoveryBlocker() &&
+                    !hasAccountRecoveryWorkBlocker()
+                ) action()
             } finally {
                 canonicalActionGate.leave()
             }
@@ -1024,6 +1109,7 @@ class DayWeaveApplication : Application() {
     fun launchLocalScheduleComposition(): Boolean =
         onboardingRuntimeGate.privatePresentationAllowed() &&
             !hasGoogleAuthorizationRecoveryBlocker() &&
+            !hasAccountRecoveryWorkBlocker() &&
             localScheduleCompositionLauncher.launch()
 
     /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
@@ -1054,6 +1140,9 @@ class DayWeaveApplication : Application() {
         }
         if (deviceSessionManagerDelegate.isInitialized()) {
             deviceSessionManager.quarantineBindingState()
+        }
+        if (accountRecoveryManagerDelegate.isInitialized()) {
+            accountRecoveryManager.quarantineForPrivacyBoundary()
         }
         ScheduleCompositionProfileDraftMemory.clear()
         setLocalScheduleCompositionForegroundActive(false)
