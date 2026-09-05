@@ -444,6 +444,13 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     assert!(document["paths"]["/v1/auth/recovery-codes/current"]["get"].is_object());
     assert!(document["paths"]["/v1/auth/recovery-codes"]["post"].is_object());
     assert!(document["paths"]["/v1/auth/recovery-codes/consume"]["post"].is_object());
+    for (path, method) in [
+        ("/v1/auth/recovery-codes/current", "get"),
+        ("/v1/auth/recovery-codes", "post"),
+        ("/v1/auth/recovery-codes/consume", "post"),
+    ] {
+        assert!(document["paths"][path][method]["responses"]["503"].is_object());
+    }
     for path in ["/v1/auth/recovery-codes", "/v1/auth/recovery-codes/consume"] {
         assert!(document["paths"][path]["post"]["responses"]["400"].is_object());
         assert!(document["paths"][path]["post"]["responses"]["413"].is_object());
@@ -453,6 +460,51 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     );
     assert!(
         document["paths"]["/v1/auth/recovery-codes/current"]["get"]["responses"]["413"].is_null()
+    );
+    let recovery_issue = &document["components"]["schemas"]["CreateAccountRecoveryCodeRequest"];
+    assert_eq!(recovery_issue["additionalProperties"], false);
+    assert_eq!(
+        recovery_issue["properties"]["recovery_code"],
+        json!({
+            "format": "password",
+            "maxLength": 50,
+            "minLength": 50,
+            "pattern": "^dw_rc1_[A-Za-z0-9_-]{43}$",
+            "type": "string",
+            "writeOnly": true
+        })
+    );
+    let recovery_consume = &document["components"]["schemas"]["ConsumeAccountRecoveryCodeRequest"];
+    assert_eq!(recovery_consume["additionalProperties"], false);
+    for (field, prefix) in [
+        ("access_token", "da"),
+        ("refresh_token", "dr"),
+        ("successor_recovery_code", "rc"),
+    ] {
+        let property = &recovery_consume["properties"][field];
+        assert_eq!(property["type"], "string");
+        assert_eq!(property["format"], "password");
+        assert_eq!(property["writeOnly"], true);
+        assert_eq!(property["minLength"], 50);
+        assert_eq!(property["maxLength"], 50);
+        assert_eq!(
+            property["pattern"],
+            format!("^dw_{prefix}1_[A-Za-z0-9_-]{{43}}$")
+        );
+    }
+    assert_eq!(
+        recovery_consume["properties"]["client_contract_version"]["default"],
+        2
+    );
+    assert_eq!(
+        recovery_consume["properties"]["client_capabilities"]["default"],
+        json!([])
+    );
+    let current_recovery = &document["components"]["schemas"]["CurrentAccountRecoveryCodeResponse"];
+    assert!(
+        current_recovery["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("recovery_code")))
     );
     assert!(document["paths"]["/v1/auth/device-enrollments"]["post"].is_object());
     assert!(

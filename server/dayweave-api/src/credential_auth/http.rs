@@ -113,6 +113,14 @@ impl Drop for SecretInput {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateAccountRecoveryCodeRequest {
     id: Uuid,
+    #[schema(
+        value_type = String,
+        format = Password,
+        write_only,
+        min_length = 50,
+        max_length = 50,
+        pattern = "^dw_rc1_[A-Za-z0-9_-]{43}$"
+    )]
     recovery_code: SecretInput,
     replaces_recovery_code_id: Option<Uuid>,
     replaces_recovery_code_revision: Option<u64>,
@@ -133,6 +141,7 @@ pub(crate) struct AccountRecoveryCodeMutationResponse {
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct CurrentAccountRecoveryCodeResponse {
+    #[schema(required)]
     recovery_code: Option<AccountRecoveryCodeResponse>,
 }
 
@@ -140,17 +149,43 @@ pub(crate) struct CurrentAccountRecoveryCodeResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsumeAccountRecoveryCodeRequest {
     session_id: Uuid,
+    #[schema(
+        value_type = String,
+        format = Password,
+        write_only,
+        min_length = 50,
+        max_length = 50,
+        pattern = "^dw_da1_[A-Za-z0-9_-]{43}$"
+    )]
     access_token: SecretInput,
+    #[schema(
+        value_type = String,
+        format = Password,
+        write_only,
+        min_length = 50,
+        max_length = 50,
+        pattern = "^dw_dr1_[A-Za-z0-9_-]{43}$"
+    )]
     refresh_token: SecretInput,
     client_instance_id: Uuid,
     client_kind: DeviceClientKind,
     device_label: String,
     #[serde(default = "current_device_contract_version")]
+    #[schema(default = current_device_contract_version)]
     client_contract_version: u16,
     client_version: String,
-    #[serde(default)]
+    #[serde(default = "empty_client_capabilities")]
+    #[schema(default = empty_client_capabilities)]
     client_capabilities: Vec<String>,
     successor_recovery_code_id: Uuid,
+    #[schema(
+        value_type = String,
+        format = Password,
+        write_only,
+        min_length = 50,
+        max_length = 50,
+        pattern = "^dw_rc1_[A-Za-z0-9_-]{43}$"
+    )]
     successor_recovery_code: SecretInput,
 }
 
@@ -264,7 +299,8 @@ pub(crate) struct McpClientListResponse {
     responses(
         (status = 200, description = "Secret-free active recovery-code metadata or null", body = CurrentAccountRecoveryCodeResponse),
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorEnvelope),
-        (status = 403, description = "Missing auth_sessions_read", body = crate::error::ErrorEnvelope)
+        (status = 403, description = "Missing auth_sessions_read", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable authentication is unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn get_current_recovery_code(
@@ -293,7 +329,8 @@ pub(crate) async fn get_current_recovery_code(
         (status = 400, description = "Malformed or structurally invalid JSON request", body = crate::error::ErrorEnvelope),
         (status = 409, description = "Stale recovery-code compare-and-swap or identifier conflict", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Request body exceeds the authentication route limit", body = crate::error::ErrorEnvelope),
-        (status = 422, description = "Invalid recovery-code tuple", body = crate::error::ErrorEnvelope)
+        (status = 422, description = "Invalid recovery-code tuple", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable authentication is unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn create_recovery_code(
@@ -359,7 +396,8 @@ pub(crate) async fn create_recovery_code(
         (status = 400, description = "Malformed or structurally invalid JSON request", body = crate::error::ErrorEnvelope),
         (status = 401, description = "Invalid, replaced, or consumed-with-another-tuple recovery credential", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Request body exceeds the authentication route limit", body = crate::error::ErrorEnvelope),
-        (status = 422, description = "Invalid successor credential or device tuple", body = crate::error::ErrorEnvelope)
+        (status = 422, description = "Invalid successor credential or device tuple", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable authentication is unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn consume_recovery_code(
@@ -822,6 +860,10 @@ fn default_mcp_scopes() -> Vec<Scope> {
 
 const fn current_device_contract_version() -> u16 {
     DEVICE_CLIENT_CONTRACT_VERSION
+}
+
+fn empty_client_capabilities() -> Vec<String> {
+    Vec::new()
 }
 
 const fn current_mcp_contract_version() -> u16 {
