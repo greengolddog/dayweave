@@ -73,7 +73,7 @@ integration, or verification checkpoint; the notes state what prevents 100%.
 
 | In-progress feature slice | Approx. complete | Evidence and next checkpoint |
 | --- | ---: | --- |
-| Native active-device inventory and session revocation | **90%** | The bounded PostgreSQL inventory/revocation contract and both native account surfaces have strict identity, scope, privacy, stale-state, and ambiguous remote-delete coverage; close a controlled two-client/service run, Android instrumented and owner-device UI acceptance, and ambiguous current-device revoke/sign-out recovery. |
+| Native active-device inventory and session revocation | **95%** | The bounded PostgreSQL contract and both native account surfaces have strict identity, scope, privacy, stale-state, and proof-based ambiguous-result recovery for remote and current-device revocation; close a controlled two-client/service run plus Android instrumented and owner-device UI acceptance. |
 | Native rich duration shape and provenance | **95%** | Exact, ranged, and unknown durations, provenance, rollback-safe persistence, and request replay are covered by the full macOS and Android gates; close the controlled native/service contract run and device acceptance. |
 | General habit minimum spacing | **95%** | Both native authoring paths and every shared recurrence family enforce the stricter applicable floor with explicit unmet demand; close the controlled native/service run and device acceptance. |
 | Missed-occurrence skip/carry/reduce/ask workflow | **90%** | Durable server-clock reconciliation, cancellation/restoration, current-publication scheduling effects, encrypted offline replay, migration hardening, and native review/action surfaces pass the Rust/PostgreSQL, macOS, and Android automated gates; close controlled native/service convergence and owner-device acceptance. |
@@ -102,7 +102,7 @@ percentage.
 
 | Product area | Status | Approx. complete | Work still required for full acceptance |
 | --- | --- | ---: | --- |
-| Identity and accounts (`ID`) | **In progress** | **65%** | Close controlled active-device and credential-only cutover acceptance, including current-device lost-response recovery; finish integration disconnect/reconnect parity, account deletion, the recovery-code flow, and final managed Codex login verification on both platforms. |
+| Identity and accounts (`ID`) | **In progress** | **65%** | Close controlled active-device and credential-only cutover acceptance; finish integration disconnect/reconnect parity, account deletion, the recovery-code flow, and final managed Codex login verification on both platforms. |
 | Common item model (`DOM`) | **In progress** | **70%** | Complete the remaining rich fields, templates, bulk operations, progress modes, audit/undo presentation, and cross-platform editing paths. |
 | Hierarchy, goals, projects, routines, dependencies (`HIE`, `GOAL`, `ROU`) | **In progress** | **40%** | Add polished hierarchy navigation, roll-ups, milestones/measures, weekly goal allocation, routine authoring/execution, and complete dependency conflict explanations. |
 | Scheduling restrictions and profiles (`CON`) | **In progress** | **65%** | Close the remaining per-item hard/soft restrictions, buffers, caps, pinning, partial-work accounting, acknowledged overrides, and profile precedence cases. |
