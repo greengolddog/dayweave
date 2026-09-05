@@ -9,6 +9,10 @@ pub const ACCESS_TOKEN_TTL: Duration = Duration::minutes(15);
 pub const DEVICE_SESSION_REFRESH_IDLE_TTL: Duration = Duration::days(30);
 pub const DEVICE_SESSION_ABSOLUTE_TTL: Duration = Duration::days(180);
 pub const ENROLLMENT_TOKEN_TTL: Duration = Duration::minutes(10);
+/// Maximum refreshable device-session authorities owned by one workspace user.
+pub const MAX_ACTIVE_DEVICE_SESSIONS: usize = 16;
+/// Maximum live, unconsumed enrollment authorities owned by one workspace user.
+pub const MAX_PENDING_DEVICE_ENROLLMENTS: usize = 16;
 pub const MCP_CREDENTIAL_DEFAULT_TTL: Duration = Duration::days(90);
 pub const MAX_MCP_CREDENTIAL_TTL: Duration = Duration::days(365);
 pub const DEVICE_CLIENT_CONTRACT_VERSION: u16 = 2;
@@ -123,4 +127,15 @@ pub struct McpClient {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub revision: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn personal_device_authority_bounds_are_explicit_and_aligned() {
+        assert_eq!(MAX_ACTIVE_DEVICE_SESSIONS, 16);
+        assert_eq!(MAX_PENDING_DEVICE_ENROLLMENTS, 16);
+    }
 }

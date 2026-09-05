@@ -11,10 +11,11 @@ use dayweave_api::{
     auth::{RuntimeAuthenticator, Scope, hash_token},
     config::AuthMode,
     credential_auth::{
-        ACCESS_TOKEN_TTL, CredentialKind, CredentialRepository, CredentialRepositoryError,
-        DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
+        ACCESS_TOKEN_TTL, CredentialKind, CredentialMutation, CredentialRepository,
+        CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
         DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
-        McpClientSpec, OpaqueCredential,
+        MAX_ACTIVE_DEVICE_SESSIONS, MAX_PENDING_DEVICE_ENROLLMENTS, McpClientSpec,
+        OpaqueCredential,
     },
     http::router,
     persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository},
@@ -1676,6 +1677,596 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
     test_database.destroy().await;
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers the complete two-device inventory and remote-revocation contract.
+async fn two_device_inventory_and_remote_revocation_are_scoped_ordered_and_secret_free() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-inventory-owner", "auth-inventory").await;
+    let postgres_repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let base = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("current timestamp")
+        - ChronoDuration::minutes(5);
+    let shared_label = "Owner device";
+    let mac = issue_device_session_with_metadata(
+        &postgres_repository,
+        base,
+        160,
+        DeviceClientKind::Macos,
+        shared_label,
+        vec![
+            Scope::ItemsRead,
+            Scope::AuthSessionsRead,
+            Scope::AuthSessionsWrite,
+        ],
+        "macos-inventory-1",
+        vec!["session-inventory".to_owned()],
+    )
+    .await;
+    let android = issue_device_session_with_metadata(
+        &postgres_repository,
+        base + ChronoDuration::seconds(1),
+        170,
+        DeviceClientKind::Android,
+        shared_label,
+        vec![Scope::ItemsRead, Scope::AuthSessionsRead],
+        "android-inventory-1",
+        vec!["session-inventory".to_owned()],
+    )
+    .await;
+
+    let repository: Arc<dyn CredentialRepository> = Arc::new(postgres_repository.clone());
+    let clock = Arc::new(SystemClock);
+    let authenticator = Arc::new(RuntimeAuthenticator::new(
+        None,
+        repository.clone(),
+        clock.clone(),
+    ));
+    let proposal_repository: Arc<dyn ProposalRepository> =
+        Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposal_repository,
+        clock,
+        Duration::from_hours(24),
+    ));
+    let app =
+        router(
+            AppState::new(proposals, authenticator.clone(), Readiness::default())
+                .with_credential_auth(repository, authenticator, AuthMode::CredentialOnly),
+        );
+
+    let listed_response = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/sessions",
+            &android.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed_response.status(), StatusCode::OK);
+    assert_eq!(
+        listed_response.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let listed_bytes = listed_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let listed_text = String::from_utf8(listed_bytes.to_vec()).unwrap();
+    for secret in [
+        &mac.enrollment_raw,
+        &mac.access_raw,
+        &mac.refresh_raw,
+        &android.enrollment_raw,
+        &android.access_raw,
+        &android.refresh_raw,
+    ] {
+        assert!(
+            !listed_text.contains(secret),
+            "session inventory must never echo credential plaintext"
+        );
+    }
+    let listed: Value = serde_json::from_str(&listed_text).unwrap();
+    assert_eq!(listed.as_object().expect("inventory envelope").len(), 1);
+    let sessions = listed["sessions"].as_array().expect("session array");
+    assert_eq!(sessions.len(), 2);
+
+    let android_last_seen: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT last_seen_at FROM sessions WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(android.session.id)
+    .fetch_one(pool)
+    .await
+    .expect("authenticated Android last-seen timestamp");
+    let mut expected_android = android.session.clone();
+    expected_android.last_seen_at = android_last_seen;
+    assert_device_session_json(&sessions[0], &expected_android);
+    assert_device_session_json(&sessions[1], &mac.session);
+    assert_eq!(
+        sessions[0]["id"],
+        android.session.id.to_string(),
+        "the caller's locally stored session UUID is the current-device basis"
+    );
+    assert_eq!(sessions[0]["device_label"], sessions[1]["device_label"]);
+
+    let reader_cannot_revoke = app
+        .clone()
+        .oneshot(auth_request(
+            "DELETE",
+            &format!("/v1/auth/sessions/{}", mac.session.id),
+            &android.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reader_cannot_revoke.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(reader_cannot_revoke).await["error"]["code"],
+        "forbidden"
+    );
+
+    let revoked = app
+        .clone()
+        .oneshot(auth_request(
+            "DELETE",
+            &format!("/v1/auth/sessions/{}", android.session.id),
+            &mac.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        revoked.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    assert!(
+        revoked
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+
+    let rejected_access = app
+        .clone()
+        .oneshot(auth_request("GET", "/v1/items", &android.access_raw, None))
+        .await
+        .unwrap();
+    assert_eq!(rejected_access.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(rejected_access).await["error"]["code"],
+        "unauthorized"
+    );
+
+    let next_access = token(CredentialKind::DeviceAccess, 180);
+    let next_refresh = token(CredentialKind::DeviceRefresh, 181);
+    let rejected_refresh = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/sessions/refresh",
+            &android.refresh_raw,
+            Some(json!({
+                "next_access_token": next_access,
+                "next_refresh_token": next_refresh,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected_refresh.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(rejected_refresh).await["error"]["code"],
+        "unauthorized"
+    );
+
+    let relisted = app
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/sessions",
+            &mac.access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(relisted.status(), StatusCode::OK);
+    let relisted = response_json(relisted).await;
+    let remaining = relisted["sessions"].as_array().expect("remaining sessions");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], mac.session.id.to_string());
+    assert!(
+        remaining
+            .iter()
+            .all(|session| session["id"] != android.session.id.to_string()),
+        "the remotely revoked session must be absent from active inventory"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exercises the complete transactional cap and HTTP failure contract.
+async fn active_device_session_capacity_serializes_consumption_and_keeps_recovery_paths() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-session-cap-owner", "auth-session-cap").await;
+    let postgres_repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let base = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("current timestamp")
+        - ChronoDuration::minutes(1);
+
+    let mut active = Vec::new();
+    for index in 0..(MAX_ACTIVE_DEVICE_SESSIONS - 1) {
+        let marker = u8::try_from(index * 3 + 1).expect("fixture marker range");
+        let scopes = if index == 0 {
+            vec![Scope::ScheduleRead, Scope::AuthSessionsRead]
+        } else {
+            vec![Scope::ScheduleRead]
+        };
+        active.push(
+            issue_device_session_with_metadata(
+                &postgres_repository,
+                base,
+                marker,
+                DeviceClientKind::Macos,
+                &format!("Capacity device {index}"),
+                scopes,
+                "capacity-test-1",
+                vec!["session-capacity".to_owned()],
+            )
+            .await,
+        );
+    }
+
+    let first = pending_device_enrollment_fixture(
+        base + ChronoDuration::seconds(1),
+        100,
+        Uuid::new_v4(),
+        DeviceClientKind::Android,
+        "Concurrent contender A",
+        vec![Scope::ScheduleRead],
+    );
+    let second = pending_device_enrollment_fixture(
+        base + ChronoDuration::seconds(1),
+        110,
+        Uuid::new_v4(),
+        DeviceClientKind::Android,
+        "Concurrent contender B",
+        vec![Scope::ScheduleRead],
+    );
+    persist_pending_device_enrollment(&postgres_repository, &first).await;
+    persist_pending_device_enrollment(&postgres_repository, &second).await;
+
+    let issuance_time = base + ChronoDuration::seconds(2);
+    let (first_result, second_result) = tokio::join!(
+        consume_pending_device_enrollment(&postgres_repository, &first, issuance_time),
+        consume_pending_device_enrollment(&postgres_repository, &second, issuance_time),
+    );
+    let (winner, loser, issued) = match (first_result, second_result) {
+        (Ok(issued), Err(CredentialRepositoryError::Conflict)) => (&first, &second, issued),
+        (Err(CredentialRepositoryError::Conflict), Ok(issued)) => (&second, &first, issued),
+        unexpected => panic!("exactly one concurrent consumption must win: {unexpected:?}"),
+    };
+    assert!(!issued.replayed);
+    assert_eq!(issued.id, winner.session_id);
+
+    let at_capacity = postgres_repository
+        .list_device_sessions(issuance_time)
+        .await
+        .expect("bounded active inventory");
+    assert_eq!(at_capacity.len(), MAX_ACTIVE_DEVICE_SESSIONS);
+    assert!(
+        at_capacity
+            .iter()
+            .any(|session| session.id == winner.session_id)
+    );
+    assert!(
+        at_capacity
+            .iter()
+            .all(|session| session.id != loser.session_id)
+    );
+
+    let replay = consume_pending_device_enrollment(
+        &postgres_repository,
+        winner,
+        issuance_time + ChronoDuration::seconds(1),
+    )
+    .await
+    .expect("exact committed consume remains recoverable at capacity");
+    assert!(replay.replayed);
+    assert_eq!(replay.id, winner.session_id);
+
+    let repository: Arc<dyn CredentialRepository> = Arc::new(postgres_repository.clone());
+    let clock = Arc::new(SystemClock);
+    let authenticator = Arc::new(RuntimeAuthenticator::new(
+        None,
+        repository.clone(),
+        clock.clone(),
+    ));
+    let proposal_repository: Arc<dyn ProposalRepository> =
+        Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposal_repository,
+        clock,
+        Duration::from_hours(24),
+    ));
+    let app =
+        router(
+            AppState::new(proposals, authenticator.clone(), Readiness::default())
+                .with_credential_auth(repository, authenticator, AuthMode::CredentialOnly),
+        );
+
+    let rejected = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments/consume",
+            &loser.enrollment_raw,
+            Some(json!({
+                "session_id": loser.session_id,
+                "access_token": loser.access_raw,
+                "refresh_token": loser.refresh_raw,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(rejected).await["error"]["code"], "conflict");
+
+    let replacement = pending_device_enrollment_fixture(
+        issuance_time + ChronoDuration::seconds(2),
+        120,
+        active[1].session.client_instance_id,
+        DeviceClientKind::Macos,
+        "Replacement installation",
+        vec![Scope::ScheduleRead],
+    );
+    persist_pending_device_enrollment(&postgres_repository, &replacement).await;
+    let replacement_result = consume_pending_device_enrollment(
+        &postgres_repository,
+        &replacement,
+        issuance_time + ChronoDuration::seconds(3),
+    )
+    .await
+    .expect("same-installation replacement remains available at capacity");
+    assert!(!replacement_result.replayed);
+    let after_replacement = postgres_repository
+        .list_device_sessions(issuance_time + ChronoDuration::seconds(3))
+        .await
+        .expect("bounded inventory after replacement");
+    assert_eq!(after_replacement.len(), MAX_ACTIVE_DEVICE_SESSIONS);
+    assert!(
+        after_replacement
+            .iter()
+            .all(|session| session.id != active[1].session.id)
+    );
+    assert!(
+        after_replacement
+            .iter()
+            .any(|session| session.id == replacement.session_id)
+    );
+    let replacement_replay = consume_pending_device_enrollment(
+        &postgres_repository,
+        &replacement,
+        issuance_time + ChronoDuration::seconds(4),
+    )
+    .await
+    .expect("replacement response-loss replay remains available at capacity");
+    assert!(replacement_replay.replayed);
+
+    let after_access_expiry = issuance_time + ACCESS_TOKEN_TTL + ChronoDuration::seconds(5);
+    assert_eq!(
+        postgres_repository
+            .list_device_sessions(after_access_expiry)
+            .await
+            .expect("refreshable sessions outlive their access credentials")
+            .len(),
+        MAX_ACTIVE_DEVICE_SESSIONS
+    );
+    let after_access_expiry_contender = pending_device_enrollment_fixture(
+        after_access_expiry,
+        130,
+        Uuid::new_v4(),
+        DeviceClientKind::Android,
+        "Contender after access expiry",
+        vec![Scope::ScheduleRead],
+    );
+    persist_pending_device_enrollment(&postgres_repository, &after_access_expiry_contender).await;
+    assert_eq!(
+        consume_pending_device_enrollment(
+            &postgres_repository,
+            &after_access_expiry_contender,
+            after_access_expiry,
+        )
+        .await,
+        Err(CredentialRepositoryError::Conflict),
+        "access-token expiry must not free a refreshable authority slot"
+    );
+
+    // Simulate a historical invariant violation without defining a migration
+    // that would silently discard authority. Listing must error, never truncate.
+    let overflow_access_hash = hash_token("historical-overflow-access");
+    let overflow_refresh_hash = hash_token("historical-overflow-refresh");
+    sqlx::query(
+        "INSERT INTO sessions (id, workspace_id, user_id, token_hash, client_kind, \
+         device_label, metadata, created_at, last_seen_at, expires_at, auth_version, \
+         client_instance_id, refresh_token_hash, scopes, refresh_idle_expires_at, \
+         absolute_expires_at, credential_issued_at, revision, client_contract_version, \
+         client_version, client_capabilities) \
+         SELECT $1, workspace_id, user_id, $2, client_kind, device_label, metadata, created_at, \
+         last_seen_at, expires_at, auth_version, $3, $4, scopes, refresh_idle_expires_at, \
+         absolute_expires_at, credential_issued_at, revision, client_contract_version, \
+         client_version, client_capabilities FROM sessions WHERE id = $5",
+    )
+    .bind(Uuid::new_v4())
+    .bind(overflow_access_hash.as_slice())
+    .bind(Uuid::new_v4())
+    .bind(overflow_refresh_hash.as_slice())
+    .bind(active[0].session.id)
+    .execute(pool)
+    .await
+    .expect("historical overflow fixture inserted");
+    assert_eq!(
+        postgres_repository
+            .list_device_sessions(issuance_time + ChronoDuration::seconds(4))
+            .await,
+        Err(CredentialRepositoryError::Internal),
+        "a legacy overflow must fail closed instead of hiding sessions"
+    );
+    let overflow_response = app
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/sessions",
+            &active[0].access_raw,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        overflow_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Keeps the concurrent, replay, revocation, and expiry boundaries together.
+async fn pending_device_enrollment_capacity_is_live_bounded_and_concurrent_safe() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-pending-cap-owner", "auth-pending-cap").await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let base = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .expect("current timestamp");
+
+    let mut pending = Vec::new();
+    for index in 0..(MAX_PENDING_DEVICE_ENROLLMENTS - 1) {
+        let fixture = pending_device_enrollment_fixture(
+            base,
+            u8::try_from(index * 3 + 1).expect("fixture marker range"),
+            Uuid::new_v4(),
+            DeviceClientKind::Android,
+            &format!("Pending device {index}"),
+            vec![Scope::ScheduleRead],
+        );
+        persist_pending_device_enrollment(&repository, &fixture).await;
+        pending.push(fixture);
+    }
+
+    let first = pending_device_enrollment_fixture(
+        base,
+        100,
+        Uuid::new_v4(),
+        DeviceClientKind::Macos,
+        "Pending contender A",
+        vec![Scope::ScheduleRead],
+    );
+    let second = pending_device_enrollment_fixture(
+        base,
+        110,
+        Uuid::new_v4(),
+        DeviceClientKind::Macos,
+        "Pending contender B",
+        vec![Scope::ScheduleRead],
+    );
+    let first_token =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &first.enrollment_raw).unwrap();
+    let second_token =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &second.enrollment_raw).unwrap();
+    let (first_result, second_result) = tokio::join!(
+        repository.create_or_replay_device_enrollment(first.spec.clone(), &first_token),
+        repository.create_or_replay_device_enrollment(second.spec.clone(), &second_token),
+    );
+    let (winner, loser) = match (first_result, second_result) {
+        (Ok(created), Err(CredentialRepositoryError::Conflict)) => {
+            assert!(!created.replayed);
+            (&first, &second)
+        }
+        (Err(CredentialRepositoryError::Conflict), Ok(created)) => {
+            assert!(!created.replayed);
+            (&second, &first)
+        }
+        unexpected => panic!("exactly one concurrent pending creation must win: {unexpected:?}"),
+    };
+    let live_pending = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM device_enrollments WHERE workspace_id = $1 AND user_id = $2 \
+         AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(base)
+    .fetch_one(pool)
+    .await
+    .expect("pending enrollment count");
+    assert_eq!(
+        usize::try_from(live_pending).expect("nonnegative pending count"),
+        MAX_PENDING_DEVICE_ENROLLMENTS
+    );
+
+    let winner_token =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &winner.enrollment_raw).unwrap();
+    let mut replay_spec = winner.spec.clone();
+    replay_spec.created_at = base + ChronoDuration::seconds(1);
+    let replay = repository
+        .create_or_replay_device_enrollment(replay_spec, &winner_token)
+        .await
+        .expect("exact pending request remains replayable at capacity");
+    assert!(replay.replayed);
+    assert_postgres_instant_eq(replay.expires_at, base + ChronoDuration::minutes(10));
+
+    let loser_token =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &loser.enrollment_raw).unwrap();
+    assert_eq!(
+        repository
+            .create_device_enrollment(loser.spec.clone(), &loser_token)
+            .await,
+        Err(CredentialRepositoryError::Conflict),
+        "the non-replay repository entry point enforces the same pending cap"
+    );
+
+    assert!(
+        repository
+            .revoke_device_enrollment(pending[0].spec.id, base + ChronoDuration::seconds(1))
+            .await
+            .expect("one pending authority revoked")
+    );
+    let admitted = repository
+        .create_or_replay_device_enrollment(loser.spec.clone(), &loser_token)
+        .await
+        .expect("revocation frees one pending slot");
+    assert!(!admitted.replayed);
+
+    let after_expiry = pending_device_enrollment_fixture(
+        base + ChronoDuration::minutes(11),
+        120,
+        Uuid::new_v4(),
+        DeviceClientKind::Android,
+        "Pending after expiry",
+        vec![Scope::ScheduleRead],
+    );
+    persist_pending_device_enrollment(&repository, &after_expiry).await;
+
+    test_database.destroy().await;
+}
+
 struct IssuedDeviceSession {
     session: DeviceSession,
     enrollment_raw: String,
@@ -1683,11 +2274,104 @@ struct IssuedDeviceSession {
     refresh_raw: String,
 }
 
+struct PendingDeviceEnrollment {
+    spec: DeviceEnrollmentSpec,
+    session_id: Uuid,
+    enrollment_raw: String,
+    access_raw: String,
+    refresh_raw: String,
+}
+
+fn pending_device_enrollment_fixture(
+    now: DateTime<Utc>,
+    marker: u8,
+    client_instance_id: Uuid,
+    client_kind: DeviceClientKind,
+    device_label: &str,
+    scopes: Vec<Scope>,
+) -> PendingDeviceEnrollment {
+    PendingDeviceEnrollment {
+        spec: DeviceEnrollmentSpec {
+            id: Uuid::new_v4(),
+            client_instance_id,
+            client_kind,
+            device_label: device_label.to_owned(),
+            scopes,
+            client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+            client_version: "capacity-test-1".to_owned(),
+            client_capabilities: vec!["session-capacity".to_owned()],
+            created_at: now,
+        },
+        session_id: Uuid::new_v4(),
+        enrollment_raw: token(CredentialKind::Enrollment, marker),
+        access_raw: token(
+            CredentialKind::DeviceAccess,
+            marker.checked_add(1).expect("fixture marker range"),
+        ),
+        refresh_raw: token(
+            CredentialKind::DeviceRefresh,
+            marker.checked_add(2).expect("fixture marker range"),
+        ),
+    }
+}
+
+async fn persist_pending_device_enrollment(
+    repository: &PostgresCredentialRepository,
+    pending: &PendingDeviceEnrollment,
+) {
+    let enrollment =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &pending.enrollment_raw).unwrap();
+    repository
+        .create_device_enrollment(pending.spec.clone(), &enrollment)
+        .await
+        .expect("pending enrollment created");
+}
+
+async fn consume_pending_device_enrollment(
+    repository: &PostgresCredentialRepository,
+    pending: &PendingDeviceEnrollment,
+    now: DateTime<Utc>,
+) -> Result<CredentialMutation<DeviceSession>, CredentialRepositoryError> {
+    let enrollment =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &pending.enrollment_raw).unwrap();
+    let access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &pending.access_raw).unwrap();
+    let refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &pending.refresh_raw).unwrap();
+    repository
+        .consume_device_enrollment(&enrollment, pending.session_id, &access, &refresh, now)
+        .await
+}
+
 async fn issue_device_session(
     repository: &PostgresCredentialRepository,
     now: DateTime<Utc>,
     marker: u8,
     device_label: &str,
+) -> IssuedDeviceSession {
+    issue_device_session_with_metadata(
+        repository,
+        now,
+        marker,
+        DeviceClientKind::Macos,
+        device_label,
+        vec![Scope::ScheduleRead],
+        "replay-boundary-test-1",
+        vec!["exact-replay".to_owned()],
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Test helper keeps every client-visible identity field explicit.
+async fn issue_device_session_with_metadata(
+    repository: &PostgresCredentialRepository,
+    now: DateTime<Utc>,
+    marker: u8,
+    client_kind: DeviceClientKind,
+    device_label: &str,
+    scopes: Vec<Scope>,
+    client_version: &str,
+    client_capabilities: Vec<String>,
 ) -> IssuedDeviceSession {
     let enrollment_raw = token(CredentialKind::Enrollment, marker);
     let access_raw = token(
@@ -1706,12 +2390,12 @@ async fn issue_device_session(
             DeviceEnrollmentSpec {
                 id: Uuid::new_v4(),
                 client_instance_id: Uuid::new_v4(),
-                client_kind: DeviceClientKind::Macos,
+                client_kind,
                 device_label: device_label.to_owned(),
-                scopes: vec![Scope::ScheduleRead],
+                scopes,
                 client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
-                client_version: "replay-boundary-test-1".to_owned(),
-                client_capabilities: vec!["exact-replay".to_owned()],
+                client_version: client_version.to_owned(),
+                client_capabilities,
                 created_at: now,
             },
             &enrollment,
@@ -1756,6 +2440,30 @@ fn auth_request(method: &str, uri: &str, bearer: &str, body: Option<Value>) -> R
 async fn response_json(response: Response<Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn assert_device_session_json(actual: &Value, expected: &DeviceSession) {
+    assert_eq!(
+        actual,
+        &json!({
+            "id": expected.id,
+            "client_instance_id": expected.client_instance_id,
+            "client_kind": expected.client_kind,
+            "device_label": expected.device_label,
+            "scopes": expected.scopes,
+            "client_contract_version": expected.client_contract_version,
+            "client_version": expected.client_version,
+            "client_capabilities": expected.client_capabilities,
+            "created_at": expected.created_at,
+            "last_seen_at": expected.last_seen_at,
+            "credential_issued_at": expected.credential_issued_at,
+            "access_expires_at": expected.access_expires_at,
+            "refresh_idle_expires_at": expected.refresh_idle_expires_at,
+            "absolute_expires_at": expected.absolute_expires_at,
+            "revision": expected.revision,
+        }),
+        "session inventory must contain the exact secret-free metadata contract"
+    );
 }
 
 fn token(kind: CredentialKind, marker: u8) -> String {

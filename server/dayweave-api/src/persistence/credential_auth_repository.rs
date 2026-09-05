@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use url::Url;
 use uuid::Uuid;
 
@@ -12,9 +12,9 @@ use crate::{
         ACCESS_TOKEN_TTL, CredentialKind, CredentialMutation, CredentialRepository,
         CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
         DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentCreation,
-        DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_MCP_CREDENTIAL_TTL,
-        MCP_CLIENT_CONTRACT_VERSION, MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec,
-        OpaqueCredential,
+        DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_ACTIVE_DEVICE_SESSIONS,
+        MAX_MCP_CREDENTIAL_TTL, MAX_PENDING_DEVICE_ENROLLMENTS, MCP_CLIENT_CONTRACT_VERSION,
+        MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec, OpaqueCredential,
     },
 };
 
@@ -49,6 +49,8 @@ impl CredentialRepository for PostgresCredentialRepository {
         let token_hash = enrollment_token.persistence_digest();
         let scopes = scope_names(&spec.scopes);
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_device_authority_space(&mut transaction, self.scope).await?;
+        ensure_pending_enrollment_capacity(&mut transaction, self.scope, spec.created_at).await?;
         sqlx::query(
             "INSERT INTO device_enrollments (id, workspace_id, user_id, client_instance_id, \
              client_kind, device_label, token_hash, scopes, created_at, expires_at, \
@@ -100,54 +102,10 @@ impl CredentialRepository for PostgresCredentialRepository {
         let token_hash = enrollment_token.persistence_digest();
         let scopes = scope_names(&spec.scopes);
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let inserted = sqlx::query_scalar::<_, DateTime<Utc>>(
-            "INSERT INTO device_enrollments (id, workspace_id, user_id, client_instance_id, \
-             client_kind, device_label, token_hash, scopes, created_at, expires_at, \
-             client_contract_version, client_version, client_capabilities) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-             ON CONFLICT DO NOTHING RETURNING expires_at",
-        )
-        .bind(spec.id)
-        .bind(self.scope.workspace_id)
-        .bind(self.scope.user_id)
-        .bind(spec.client_instance_id)
-        .bind(spec.client_kind.as_storage_name())
-        .bind(&spec.device_label)
-        .bind(token_hash.as_slice())
-        .bind(&scopes)
-        .bind(spec.created_at)
-        .bind(expires_at)
-        .bind(
-            i16::try_from(spec.client_contract_version)
-                .map_err(|_| CredentialRepositoryError::InvalidInput)?,
-        )
-        .bind(&spec.client_version)
-        .bind(&spec.client_capabilities)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(write_error)?;
-        if let Some(expires_at) = inserted {
-            insert_auth_audit(
-                &mut transaction,
-                self.scope,
-                "auth.device_enrollment.created",
-                "device_enrollment",
-                spec.id,
-                None,
-                Some(1),
-                spec.created_at,
-            )
-            .await?;
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(CredentialMutation {
-                value: DeviceEnrollmentCreation { expires_at },
-                replayed: false,
-            });
-        }
+        lock_device_authority_space(&mut transaction, self.scope).await?;
 
-        // PostgreSQL's uniqueness checks serialize concurrent attempts. Only
-        // the same still-pending, unexpired semantic tuple is a recoverable
-        // response-loss replay; every other conflict stays fail-closed.
+        // Capacity must not break response-loss recovery: the exact same live
+        // request remains replayable even when all pending slots are occupied.
         let replayed_expires_at = sqlx::query_scalar::<_, DateTime<Utc>>(
             "SELECT expires_at FROM device_enrollments WHERE id = $1 \
              AND workspace_id = $2 AND user_id = $3 AND client_instance_id = $4 \
@@ -175,13 +133,55 @@ impl CredentialRepository for PostgresCredentialRepository {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        let Some(expires_at) = replayed_expires_at else {
-            return Err(CredentialRepositoryError::Conflict);
-        };
+        if let Some(expires_at) = replayed_expires_at {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CredentialMutation {
+                value: DeviceEnrollmentCreation { expires_at },
+                replayed: true,
+            });
+        }
+
+        ensure_pending_enrollment_capacity(&mut transaction, self.scope, spec.created_at).await?;
+        sqlx::query(
+            "INSERT INTO device_enrollments (id, workspace_id, user_id, client_instance_id, \
+             client_kind, device_label, token_hash, scopes, created_at, expires_at, \
+             client_contract_version, client_version, client_capabilities) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.client_instance_id)
+        .bind(spec.client_kind.as_storage_name())
+        .bind(&spec.device_label)
+        .bind(token_hash.as_slice())
+        .bind(&scopes)
+        .bind(spec.created_at)
+        .bind(expires_at)
+        .bind(
+            i16::try_from(spec.client_contract_version)
+                .map_err(|_| CredentialRepositoryError::InvalidInput)?,
+        )
+        .bind(&spec.client_version)
+        .bind(&spec.client_capabilities)
+        .execute(&mut *transaction)
+        .await
+        .map_err(write_error)?;
+        insert_auth_audit(
+            &mut transaction,
+            self.scope,
+            "auth.device_enrollment.created",
+            "device_enrollment",
+            spec.id,
+            None,
+            Some(1),
+            spec.created_at,
+        )
+        .await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(CredentialMutation {
             value: DeviceEnrollmentCreation { expires_at },
-            replayed: true,
+            replayed: false,
         })
     }
 
@@ -206,6 +206,9 @@ impl CredentialRepository for PostgresCredentialRepository {
         let absolute_expires_at = checked_add(now, DEVICE_SESSION_ABSOLUTE_TTL)?;
 
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Lock before any enrollment row so every writer uses one canonical
+        // order and distinct installations cannot race past the owner cap.
+        lock_device_authority_space(&mut transaction, self.scope).await?;
         let enrollment = sqlx::query(
             "SELECT id, client_instance_id, client_kind, device_label, scopes, expires_at, \
              consumed_session_id, revoked_at, client_contract_version, client_version, \
@@ -314,6 +317,8 @@ impl CredentialRepository for PostgresCredentialRepository {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+
+        ensure_active_session_capacity(&mut transaction, self.scope, now).await?;
 
         sqlx::query(
             "INSERT INTO sessions (id, workspace_id, user_id, token_hash, client_kind, \
@@ -600,14 +605,21 @@ impl CredentialRepository for PostgresCredentialRepository {
              client_contract_version, client_version, client_capabilities \
              FROM sessions WHERE workspace_id = $1 AND user_id = $2 AND auth_version = 1 \
              AND revoked_at IS NULL AND refresh_idle_expires_at > $3 AND absolute_expires_at > $3 \
-             ORDER BY last_seen_at DESC, id",
+             ORDER BY last_seen_at DESC, id LIMIT $4",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
         .bind(now)
+        .bind(
+            i64::try_from(MAX_ACTIVE_DEVICE_SESSIONS + 1)
+                .map_err(|_| CredentialRepositoryError::Internal)?,
+        )
         .fetch_all(&self.pool)
         .await
         .map_err(storage_error)?;
+        if rows.len() > MAX_ACTIVE_DEVICE_SESSIONS {
+            return Err(CredentialRepositoryError::Internal);
+        }
         rows.iter().map(device_session_from_row).collect()
     }
 
@@ -836,6 +848,77 @@ fn checked_add(
     value
         .checked_add_signed(duration)
         .ok_or(CredentialRepositoryError::InvalidInput)
+}
+
+/// Serializes capacity-changing device-authority transactions for one owner.
+///
+/// The advisory namespace is domain-separated, and every caller acquires this
+/// lock before an enrollment row lock to keep the ordering deadlock-free.
+async fn lock_device_authority_space(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<(), CredentialRepositoryError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.device-authority.v1:' || $1::text || ':' || $2::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+async fn ensure_pending_enrollment_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), CredentialRepositoryError> {
+    let pending = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM device_enrollments \
+         WHERE workspace_id = $1 AND user_id = $2 \
+         AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    let maximum = i64::try_from(MAX_PENDING_DEVICE_ENROLLMENTS)
+        .map_err(|_| CredentialRepositoryError::Internal)?;
+    if pending >= maximum {
+        return Err(CredentialRepositoryError::Conflict);
+    }
+    Ok(())
+}
+
+async fn ensure_active_session_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), CredentialRepositoryError> {
+    // This is intentionally identical to the active-authority predicate used
+    // by list_device_sessions. Access-token expiry is not session expiry: a
+    // refreshable session still occupies a slot after its access token lapses.
+    let active = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM sessions \
+         WHERE workspace_id = $1 AND user_id = $2 AND auth_version = 1 \
+         AND revoked_at IS NULL AND refresh_idle_expires_at > $3 AND absolute_expires_at > $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    let maximum = i64::try_from(MAX_ACTIVE_DEVICE_SESSIONS)
+        .map_err(|_| CredentialRepositoryError::Internal)?;
+    if active >= maximum {
+        return Err(CredentialRepositoryError::Conflict);
+    }
+    Ok(())
 }
 
 fn validate_device_enrollment(

@@ -204,7 +204,7 @@ pub(crate) struct McpClientListResponse {
         (status = 200, description = "Exact still-pending enrollment creation replayed", body = DeviceEnrollmentResponse),
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorEnvelope),
         (status = 403, description = "Scope delegation is not allowed", body = crate::error::ErrorEnvelope),
-        (status = 409, description = "Enrollment conflicts with existing state", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Enrollment conflicts with existing state or pending capacity is reached", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid client or scope contract", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -277,6 +277,7 @@ pub(crate) async fn create_device_enrollment(
         (status = 201, description = "Device session issued", body = DeviceSessionMutationResponse),
         (status = 200, description = "Exact committed issuance replayed", body = DeviceSessionMutationResponse),
         (status = 401, description = "Invalid, expired, consumed-with-another-tuple, or revoked enrollment", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Active device-session capacity reached", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Credential tuple is invalid", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -367,9 +368,10 @@ pub(crate) async fn refresh_session(
     tag = "authentication",
     security(("bearer_token" = [])),
     responses(
-        (status = 200, description = "Active refreshable device sessions", body = DeviceSessionListResponse),
+        (status = 200, description = "At most 16 active refreshable device sessions", body = DeviceSessionListResponse),
         (status = 401, description = "Missing or invalid credential", body = crate::error::ErrorEnvelope),
-        (status = 403, description = "Missing auth_sessions_read", body = crate::error::ErrorEnvelope)
+        (status = 403, description = "Missing auth_sessions_read", body = crate::error::ErrorEnvelope),
+        (status = 500, description = "Session inventory invariant violated or unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn list_sessions(
@@ -662,5 +664,69 @@ impl From<&McpClient> for McpClientResponse {
             expires_at: client.expires_at,
             revision: client.revision,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+
+    use super::*;
+    use crate::credential_auth::MAX_ACTIVE_DEVICE_SESSIONS;
+
+    const NATIVE_SESSION_INVENTORY_LIMIT_BYTES: usize = 1024 * 1024;
+
+    #[test]
+    fn worst_case_bounded_session_inventory_serializes_below_one_mib() {
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid fixture time");
+        let maximal_device_label = "\u{10ffff}".repeat(200);
+        let maximal_client_version = "\u{10ffff}".repeat(100);
+        let maximal_capabilities = (0_u32..100)
+            .map(|index| {
+                let unique = char::from_u32(0x1_0000 + index).expect("valid scalar");
+                format!("{unique}{}", "\u{10ffff}".repeat(99))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            maximal_capabilities
+                .iter()
+                .all(|capability| capability.chars().count() == 100)
+        );
+        let maximal_rest_scopes = Scope::ALL
+            .into_iter()
+            .filter(|scope| scope.is_rest())
+            .collect::<Vec<_>>();
+        let sessions = (0..MAX_ACTIVE_DEVICE_SESSIONS)
+            .map(|index| {
+                let session = DeviceSession {
+                    id: Uuid::from_u128(index as u128 + 1),
+                    workspace_id: Uuid::from_u128(u128::MAX - 1),
+                    user_id: Uuid::from_u128(u128::MAX),
+                    client_instance_id: Uuid::from_u128(index as u128 + 100),
+                    client_kind: DeviceClientKind::Android,
+                    device_label: maximal_device_label.clone(),
+                    scopes: maximal_rest_scopes.clone(),
+                    client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+                    client_version: maximal_client_version.clone(),
+                    client_capabilities: maximal_capabilities.clone(),
+                    created_at: now,
+                    last_seen_at: now,
+                    credential_issued_at: now,
+                    access_expires_at: now + Duration::minutes(15),
+                    refresh_idle_expires_at: now + Duration::days(30),
+                    absolute_expires_at: now + Duration::days(180),
+                    revision: u64::MAX,
+                };
+                DeviceSessionResponse::from(&session)
+            })
+            .collect();
+        let body = serde_json::to_vec(&DeviceSessionListResponse { sessions })
+            .expect("bounded inventory serializes");
+
+        assert!(
+            body.len() < NATIVE_SESSION_INVENTORY_LIMIT_BYTES,
+            "maximal valid inventory serialized to {} bytes",
+            body.len()
+        );
     }
 }
