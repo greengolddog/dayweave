@@ -9,7 +9,8 @@ mod service;
 pub use domain::*;
 pub(crate) use repository::OccurrencePageCursor;
 pub use repository::{
-    HabitIdempotency, HabitRepository, HabitRepositoryError, InMemoryHabitRepository, OutcomeWrite,
-    PauseCreate, PauseResume,
+    HabitIdempotency, HabitMissedConfiguration, HabitRepository, HabitRepositoryError,
+    InMemoryHabitRepository, MissedReconcileWrite, MissedResolveWrite, OutcomeWrite, PauseCreate,
+    PauseResume,
 };
 pub use service::{HabitIdempotencyKey, HabitService, HabitServiceError};

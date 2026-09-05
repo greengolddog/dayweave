@@ -1,23 +1,31 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Datelike as _, Days, Duration, NaiveDate, NaiveTime, Utc};
+use dayweave_compose::{MAX_CANONICAL_ITEMS, SchedulingMetadata};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    items::{ItemKind, ItemRepositoryError, ItemService, ItemServiceError},
+    items::{
+        Item, ItemKind, ItemQuery, ItemRepositoryError, ItemService, ItemServiceError, ItemStatus,
+        SplitPolicy,
+    },
     proposals::Clock,
     scheduling::truncate_to_postgres_timestamp_precision,
 };
 
 use super::{
-    HabitAnalytics, HabitAnalyticsBucket, HabitDeltaChange, HabitDomainError, HabitIdempotency,
-    HabitMutation, HabitOccurrence, HabitOutcomeCommand, HabitPause, HabitPauseResumeCommand,
+    HabitAnalytics, HabitAnalyticsBucket, HabitAnalyticsLifecycle, HabitDeltaChange,
+    HabitDomainError, HabitIdempotency, HabitMissedConfiguration, HabitMissedReconcileCommand,
+    HabitMissedReconcileResult, HabitMissedResolution, HabitMissedResolveCommand, HabitMutation,
+    HabitOccurrence, HabitOutcomeCommand, HabitPause, HabitPauseResumeCommand,
     HabitPauseStartCommand, HabitRepository, HabitRepositoryError, MAX_HABIT_DATE_YEAR,
-    MIN_HABIT_DATE_YEAR, OutcomeWrite, PauseCreate, PauseResume, calculate_analytics,
+    MIN_HABIT_DATE_YEAR, MissedReconcileWrite, MissedResolveWrite, OutcomeWrite, PauseCreate,
+    PauseResume, calculate_analytics, effective_lifecycle_window,
     invalidation::{HabitInvalidationHub, HabitInvalidationOpenError, HabitInvalidationStream},
     repository::OccurrencePageCursor,
 };
@@ -31,6 +39,8 @@ const MAX_ANALYTICS_OCCURRENCES: usize = 50_000;
 pub const DEFAULT_HABIT_PAGE_LIMIT: usize = 100;
 pub const MAX_HABIT_PAGE_LIMIT: usize = 200;
 pub const MAX_HABIT_RANGE_DAYS: i64 = 366;
+pub const DEFAULT_HABIT_RECONCILE_LIMIT: usize = 50;
+pub const MAX_HABIT_RECONCILE_LIMIT: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct HabitIdempotencyKey {
@@ -248,6 +258,179 @@ impl HabitService {
         Ok(mutation)
     }
 
+    /// Reconciles a bounded workspace-wide page of overdue occurrences using
+    /// the server clock and each habit's persisted policy.
+    ///
+    /// Ask-policy rows are durably projected as decision-required so repeated
+    /// scans advance instead of returning the same unresolved occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, canonical-item, or repository errors when the
+    /// bounded command cannot be evaluated atomically.
+    pub async fn reconcile_missed(
+        &self,
+        command: HabitMissedReconcileCommand,
+        limit: usize,
+        key: HabitIdempotencyKey,
+    ) -> Result<HabitMutation<HabitMissedReconcileResult>, HabitServiceError> {
+        validate_ids(&[command.operation_id])?;
+        validate_reconcile_limit(limit)?;
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
+        let idempotency = make_idempotency(
+            "habits.missed.reconcile",
+            &key,
+            command.operation_id,
+            &(limit, &command),
+        )?;
+        if let Some(value) = self
+            .repository
+            .replay_missed_reconcile(&idempotency)
+            .await?
+        {
+            return Ok(HabitMutation {
+                value,
+                replayed: true,
+            });
+        }
+        let items = self
+            .items
+            .list(ItemQuery {
+                parent_id: None,
+                include_deleted: true,
+                limit: MAX_CANONICAL_ITEMS + 1,
+            })
+            .await
+            .map_err(HabitServiceError::Items)?;
+        if items.len() > MAX_CANONICAL_ITEMS {
+            return Err(HabitServiceError::TooManyItems);
+        }
+        let policies = items
+            .into_iter()
+            .filter(|item| item.kind == ItemKind::Habit)
+            .map(|item| {
+                let policy_fingerprint = habit_policy_fingerprint(&item)?;
+                let metadata: SchedulingMetadata =
+                    serde_json::from_value(item.flexible_constraints)
+                        .map_err(|_| HabitServiceError::Internal)?;
+                Ok((
+                    item.id,
+                    HabitMissedConfiguration {
+                        item_revision: item.revision,
+                        policy_fingerprint,
+                        policy: metadata.habit_missed_policy.into(),
+                        is_active: item.is_executable
+                            && item.recurrence.is_some()
+                            && item.deleted_at.is_none()
+                            && !matches!(
+                                item.status,
+                                ItemStatus::Completed
+                                    | ItemStatus::Skipped
+                                    | ItemStatus::Cancelled
+                                    | ItemStatus::Blocked
+                            ),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, HabitServiceError>>()?;
+        let mutation = self
+            .repository
+            .reconcile_missed(MissedReconcileWrite {
+                policies,
+                limit,
+                recorded_at: now,
+                idempotency,
+            })
+            .await?;
+        if !mutation.replayed && !mutation.value.resolutions.is_empty() {
+            self.invalidations.poke();
+        }
+        Ok(mutation)
+    }
+
+    /// Resolves one durable ask-policy prompt. The server derives carry
+    /// windows and reduction targets from authoritative evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, habit lookup, idempotency, revision-conflict, or
+    /// repository errors without partially advancing the projection.
+    pub async fn resolve_missed(
+        &self,
+        habit_id: Uuid,
+        occurrence_id: Uuid,
+        command: HabitMissedResolveCommand,
+        key: HabitIdempotencyKey,
+    ) -> Result<HabitMutation<HabitMissedResolution>, HabitServiceError> {
+        validate_ids(&[habit_id, occurrence_id, command.operation_id])?;
+        if command.expected_revision == 0 {
+            return Err(HabitServiceError::InvalidCorrectionRevision);
+        }
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
+        let idempotency = make_idempotency(
+            "habits.missed.resolve",
+            &key,
+            command.operation_id,
+            &(habit_id, occurrence_id, &command),
+        )?;
+        if let Some(value) = self
+            .repository
+            .replay_missed_resolution(&idempotency)
+            .await?
+        {
+            return Ok(HabitMutation {
+                value,
+                replayed: true,
+            });
+        }
+        // Explicit resolution must be able to close a stale prompt after the
+        // canonical habit was deleted, lost recurrence, or became a container.
+        // Those states are scheduling-inactive, not authority to resurrect it.
+        let item =
+            self.items
+                .get_including_deleted(habit_id)
+                .await
+                .map_err(|error| match error {
+                    ItemServiceError::Repository(ItemRepositoryError::NotFound(_)) => {
+                        HabitServiceError::Repository(HabitRepositoryError::HabitNotFound(habit_id))
+                    }
+                    other => HabitServiceError::Items(other),
+                })?;
+        if item.kind != ItemKind::Habit {
+            return Err(HabitServiceError::Repository(
+                HabitRepositoryError::NotHabit(habit_id),
+            ));
+        }
+        let current_policy_fingerprint = habit_policy_fingerprint(&item)?;
+        let mutation = self
+            .repository
+            .resolve_missed(MissedResolveWrite {
+                habit_id,
+                occurrence_id,
+                expected_revision: command.expected_revision,
+                action: command.action,
+                current_item_revision: item.revision,
+                current_policy_fingerprint,
+                current_item_is_active: item.is_executable
+                    && item.recurrence.is_some()
+                    && item.deleted_at.is_none()
+                    && !matches!(
+                        item.status,
+                        ItemStatus::Completed
+                            | ItemStatus::Skipped
+                            | ItemStatus::Cancelled
+                            | ItemStatus::Blocked
+                    ),
+                recorded_at: now,
+                idempotency,
+            })
+            .await?;
+        if !mutation.replayed {
+            self.invalidations.poke();
+        }
+        Ok(mutation)
+    }
+
     /// Lists an exact bounded local-date page of authoritative occurrences.
     ///
     /// # Errors
@@ -337,7 +520,18 @@ impl HabitService {
         end_date: NaiveDate,
         bucket: HabitAnalyticsBucket,
     ) -> Result<HabitAnalytics, HabitServiceError> {
-        self.verify_habit(habit_id).await?;
+        let item = self.verify_habit(habit_id).await?;
+        let current_policy_fingerprint = habit_policy_fingerprint(&item)?;
+        let current_item_is_active = item.is_executable
+            && item.recurrence.is_some()
+            && item.deleted_at.is_none()
+            && !matches!(
+                item.status,
+                ItemStatus::Completed
+                    | ItemStatus::Skipped
+                    | ItemStatus::Cancelled
+                    | ItemStatus::Blocked
+            );
         validate_range(start_date, end_date)?;
         let mut occurrences = Vec::new();
         let mut after = None;
@@ -365,14 +559,25 @@ impl HabitService {
             .ok_or(HabitServiceError::InvalidDateRange)?
             .and_time(NaiveTime::MIN)
             .and_utc();
+        let planner_occurrence_ids = occurrences
+            .iter()
+            .map(|occurrence| occurrence.evidence.planner_occurrence_id)
+            .collect::<Vec<_>>();
+        let effective_reduction_targets = self
+            .repository
+            .effective_reduction_targets(
+                habit_id,
+                current_policy_fingerprint,
+                current_item_is_active,
+                &planner_occurrence_ids,
+            )
+            .await?;
         let (pause_start, pause_end) =
             occurrences
                 .iter()
                 .fold((range_start, range_end), |(start, end), occurrence| {
-                    (
-                        start.min(occurrence.evidence.window_start),
-                        end.max(occurrence.evidence.window_end),
-                    )
+                    let (window_start, window_end) = effective_lifecycle_window(occurrence);
+                    (start.min(window_start), end.max(window_end))
                 });
         let pauses = self
             .repository
@@ -381,7 +586,7 @@ impl HabitService {
         Ok(calculate_analytics(
             habit_id,
             &occurrences,
-            &pauses,
+            HabitAnalyticsLifecycle::new(&effective_reduction_targets, &pauses),
             start_date,
             end_date,
             bucket,
@@ -410,6 +615,45 @@ impl HabitService {
         }
         Ok(item)
     }
+}
+
+fn habit_policy_fingerprint(item: &Item) -> Result<[u8; 32], HabitServiceError> {
+    let bytes = serde_json::to_vec(&habit_policy_projection(item))
+        .map_err(|_| HabitServiceError::Internal)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn habit_policy_projection(item: &Item) -> serde_json::Value {
+    let (split_allowed, minimum_chunk_seconds, maximum_chunk_seconds) = match item.split_policy {
+        SplitPolicy::Indivisible => (false, None, None),
+        SplitPolicy::Splittable {
+            minimum_chunk_seconds,
+            maximum_chunk_seconds,
+        } => (
+            true,
+            Some(minimum_chunk_seconds),
+            Some(maximum_chunk_seconds),
+        ),
+    };
+    json!({
+        "schema":"dayweave-habit-policy/1",
+        "habit_id":item.id,
+        "timezone_name":item.timezone_name,
+        "recurrence":item.recurrence,
+        "constraints":item.flexible_constraints,
+        "duration":{
+            "kind":item.duration_kind,
+            "seconds":item.duration_seconds,
+            "minimum_seconds":item.duration_min_seconds,
+            "maximum_seconds":item.duration_max_seconds,
+            "source":item.duration_source,
+        },
+        "split":{
+            "allowed":split_allowed,
+            "minimum_seconds":minimum_chunk_seconds,
+            "maximum_seconds":maximum_chunk_seconds,
+        }
+    })
 }
 
 fn validate_ids(ids: &[Uuid]) -> Result<(), HabitServiceError> {
@@ -450,6 +694,14 @@ fn validate_limit(limit: usize) -> Result<(), HabitServiceError> {
         return Err(HabitServiceError::InvalidLimit);
     }
     Ok(())
+}
+
+fn validate_reconcile_limit(limit: usize) -> Result<(), HabitServiceError> {
+    if (1..=MAX_HABIT_RECONCILE_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(HabitServiceError::InvalidReconcileLimit)
+    }
 }
 
 fn make_idempotency<T: Serialize>(
@@ -611,6 +863,8 @@ pub enum HabitServiceError {
     InvalidDateRange,
     #[error("limit must be between 1 and 200")]
     InvalidLimit,
+    #[error("reconcile limit must be between 1 and 200")]
+    InvalidReconcileLimit,
     #[error("cursor is invalid or belongs to another query/workspace")]
     InvalidCursor,
     #[error("stream cursor is ahead of authoritative state")]
@@ -619,6 +873,8 @@ pub enum HabitServiceError {
     StreamCapacity,
     #[error("analytics occurrence bound was exceeded")]
     AnalyticsTooLarge,
+    #[error("canonical item bound was exceeded while reconciling habits")]
+    TooManyItems,
     #[error("habit service operation failed")]
     Internal,
 }
@@ -626,12 +882,79 @@ pub enum HabitServiceError {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone as _, Utc};
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
     use uuid::Uuid;
+
+    use crate::items::{
+        DurationKind, DurationSource, Item, ItemKind, ItemStatus, NewItem, SplitPolicy,
+    };
 
     use super::{
         HabitServiceError, OccurrencePageCursor, decode_delta_cursor, decode_occurrence_cursor,
-        encode_delta_cursor, encode_occurrence_cursor,
+        encode_delta_cursor, encode_occurrence_cursor, habit_policy_fingerprint,
+        habit_policy_projection,
     };
+
+    #[test]
+    fn habit_policy_fingerprint_has_a_cross_client_canonical_vector() {
+        let item = Item::new(
+            NewItem {
+                id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+                is_sensitive: false,
+                kind: ItemKind::Habit,
+                status: ItemStatus::Planned,
+                title: "Fingerprint vector".to_owned(),
+                notes: None,
+                timezone_name: "Europe/Paris".to_owned(),
+                duration_kind: Some(DurationKind::Range),
+                duration_seconds: Some(2_400),
+                duration_min_seconds: Some(1_200),
+                duration_max_seconds: Some(3_600),
+                duration_source: Some(DurationSource::User),
+                deadline_kind: None,
+                deadline_date: None,
+                deadline_at: None,
+                deadline_strength: None,
+                deadline_soft_weight: None,
+                earliest_start_at: None,
+                recurrence: Some(json!({
+                    "type": "custom",
+                    "rrule": "rrule:count=8;byday=fr,mo;freq=weekly"
+                })),
+                flexible_constraints: json!({
+                    "habit_target": {"amount": 12, "unit": "reps"},
+                    "habit_missed_policy": "reduce_frequency",
+                    "habit_minimum_spacing_minutes": 45,
+                    "preserves_streak_when_paused": false
+                }),
+                has_own_effort: None,
+                split_policy: SplitPolicy::Splittable {
+                    minimum_chunk_seconds: 600,
+                    maximum_chunk_seconds: 1_800,
+                },
+                importance: 50,
+                urgency: 50,
+                parent_id: None,
+                sibling_order: 0,
+                blocked_reason_kind: None,
+                blocked_by_item_id: None,
+                blocked_reason: None,
+            },
+            "2026-09-01T08:00:00Z".parse().unwrap(),
+        )
+        .expect("canonical habit vector");
+        let bytes = serde_json::to_vec(&habit_policy_projection(&item)).unwrap();
+        let expected_bytes = br#"{"constraints":{"habit_minimum_spacing_minutes":45,"habit_missed_policy":"reduce_frequency","habit_target":{"amount":12,"unit":"reps"},"preserves_streak_when_paused":false},"duration":{"kind":"range","maximum_seconds":3600,"minimum_seconds":1200,"seconds":2400,"source":"user"},"habit_id":"00112233-4455-6677-8899-aabbccddeeff","recurrence":{"rrule":"FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,FR;COUNT=8","type":"custom"},"schema":"dayweave-habit-policy/1","split":{"allowed":true,"maximum_seconds":1800,"minimum_seconds":600},"timezone_name":"Europe/Paris"}"#;
+        assert_eq!(bytes, expected_bytes);
+        let expected_digest = [
+            0x4b, 0xfc, 0x50, 0x89, 0x8f, 0x2b, 0x4f, 0x24, 0xcd, 0xa1, 0x7d, 0x04, 0x0b, 0x21,
+            0x64, 0x7e, 0x4d, 0x5b, 0xa5, 0xfe, 0x7f, 0xab, 0x7e, 0x74, 0x09, 0x02, 0x42, 0x17,
+            0xc8, 0x24, 0x9e, 0xbf,
+        ];
+        assert_eq!(habit_policy_fingerprint(&item).unwrap(), expected_digest);
+        assert_eq!(Sha256::digest(expected_bytes).as_slice(), expected_digest);
+    }
 
     #[test]
     fn cursors_are_canonical_tamper_evident_and_bound_to_workspace_and_query() {

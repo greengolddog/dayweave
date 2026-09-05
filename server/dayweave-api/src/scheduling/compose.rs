@@ -584,9 +584,10 @@ fn contained_moved_occurrence_ids(request: &ComposeScheduleRequest) -> Vec<Uuid>
 }
 
 /// Replaces caller-controlled recurrence lifecycle state for persisted habits
-/// with the ledger projection read from `PostgreSQL`. Move exceptions remain
-/// caller inputs because they represent an explicit scheduling request; skip,
-/// completion, anchor and pause evidence are server-owned facts.
+/// with the ledger projection read from `PostgreSQL`. Caller moves remain only
+/// when no authoritative exception already owns that occurrence; missed-policy
+/// moves/skips, completion, anchor and pause evidence are server-owned facts.
+#[allow(clippy::too_many_lines)] // Ownership proof and all authoritative recurrence fields must be merged together.
 fn merge_authoritative_habit_recurrence(
     request: &mut ComposeScheduleRequest,
     items: &[Item],
@@ -600,6 +601,17 @@ fn merge_authoritative_habit_recurrence(
     if habit_ids.is_empty() {
         return Ok(());
     }
+    let authoritative_exception_ids = authoritative
+        .context
+        .exceptions
+        .iter()
+        .filter_map(|exception| {
+            let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
+                return None;
+            };
+            habit_ids.contains(&exception.item_id).then_some(id)
+        })
+        .collect::<BTreeSet<_>>();
 
     request
         .recurrence_context
@@ -621,8 +633,53 @@ fn merge_authoritative_habit_recurrence(
 
     request.recurrence_context.exceptions.retain(|exception| {
         !habit_ids.contains(&exception.item_id)
-            || matches!(exception.action, RecurrenceExceptionAction::Move { .. })
+            || (matches!(exception.action, RecurrenceExceptionAction::Move { .. })
+                && !matches!(
+                    exception.selector,
+                    RecurrenceExceptionSelector::Occurrence { id }
+                        if authoritative_exception_ids.contains(&id)
+                ))
     });
+
+    let mut authoritative_exceptions = authoritative
+        .context
+        .exceptions
+        .iter()
+        .filter(|exception| habit_ids.contains(&exception.item_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // Validate each server-owned carry independently against the current
+    // recurrence. A stale historical source becomes a source skip without
+    // weakening or cancelling any unrelated valid carry.
+    let canonical_items = items
+        .iter()
+        .cloned()
+        .map(into_canonical_item)
+        .collect::<Vec<_>>();
+    let mut move_probe = request.clone();
+    move_probe.recurrence_context.exceptions.clear();
+    move_probe
+        .recurrence_context
+        .completed_occurrence_ids
+        .clear();
+    move_probe.recurrence_context.partial_progress.clear();
+    for exception in &mut authoritative_exceptions {
+        if !matches!(exception.action, RecurrenceExceptionAction::Move { .. }) {
+            continue;
+        }
+        let mut candidate = move_probe.clone();
+        candidate
+            .recurrence_context
+            .exceptions
+            .push(exception.clone());
+        let is_current = prepare_canonical_schedule(canonical_items.clone(), candidate)
+            .ok()
+            .is_some_and(|prepared| expand_occurrences(&prepared.plan_request).is_ok());
+        if !is_current {
+            exception.action = RecurrenceExceptionAction::Skip;
+        }
+    }
 
     // Completion and partial-progress keys do not encode their owning item.
     // Materialize a lifecycle-free copy of the current canonical graph to
@@ -640,10 +697,13 @@ fn merge_authoritative_habit_recurrence(
         .recurrence_context
         .partial_progress
         .clear();
-    let canonical_items = items.iter().cloned().map(into_canonical_item).collect();
-    let prepared = prepare_canonical_schedule(canonical_items, ownership_request)
+    ownership_request
+        .recurrence_context
+        .exceptions
+        .retain(|exception| !habit_ids.contains(&exception.item_id));
+    let prepared = prepare_canonical_schedule(canonical_items.clone(), ownership_request.clone())
         .map_err(map_prepare_error)?;
-    let habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
+    let current_habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
         .map_err(|error| ComposeScheduleError::InvalidRequest(error.to_string()))?
         .into_iter()
         .filter_map(|occurrence| {
@@ -653,19 +713,42 @@ fn merge_authoritative_habit_recurrence(
         })
         .collect::<BTreeSet<_>>();
 
-    request.recurrence_context.exceptions.extend(
-        authoritative
-            .context
-            .exceptions
-            .iter()
-            .filter_map(|exception| {
-                let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
-                    return None;
-                };
-                (habit_ids.contains(&exception.item_id) && habit_occurrence_ids.contains(&id))
-                    .then_some(exception.clone())
-            }),
-    );
+    ownership_request
+        .recurrence_context
+        .exceptions
+        .extend(authoritative_exceptions.clone());
+    let prepared = prepare_canonical_schedule(canonical_items, ownership_request)
+        .map_err(map_prepare_error)?;
+    let effective_habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
+        .map_err(|error| ComposeScheduleError::InvalidRequest(error.to_string()))?
+        .into_iter()
+        .filter_map(|occurrence| {
+            habit_ids
+                .contains(&occurrence.series_item_id)
+                .then_some(occurrence.id)
+        })
+        .collect::<BTreeSet<_>>();
+    let habit_occurrence_ids = current_habit_occurrence_ids
+        .union(&effective_habit_occurrence_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    request
+        .recurrence_context
+        .exceptions
+        .extend(authoritative_exceptions.iter().filter_map(|exception| {
+            let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
+                return None;
+            };
+            let occurrence_is_current = match exception.action {
+                RecurrenceExceptionAction::Skip => current_habit_occurrence_ids.contains(&id),
+                RecurrenceExceptionAction::Move { .. } => {
+                    effective_habit_occurrence_ids.contains(&id)
+                }
+            };
+            (habit_ids.contains(&exception.item_id) && occurrence_is_current)
+                .then_some(exception.clone())
+        }));
 
     request
         .recurrence_context
@@ -1832,8 +1915,8 @@ mod tests {
         SchedulerConfigInput,
     };
     use dayweave_core::{
-        ItemKind as PlanningItemKind, Minutes, RecurrenceContext, RecurrencePartialProgress,
-        WorkItem,
+        ItemKind as PlanningItemKind, Minutes, RecurrenceContext, RecurrenceException,
+        RecurrenceMoveSource, RecurrencePartialProgress, WorkItem,
     };
     use serde_json::json;
 
@@ -2035,6 +2118,111 @@ mod tests {
                 .completed_occurrence_ids
                 .contains(&stale_habit_occurrence),
             "an occurrence identity no longer generated by the current recurrence must not be admitted"
+        );
+    }
+
+    fn recurrence_move_for(
+        item: &Item,
+        request: &ComposeScheduleRequest,
+        minutes: i64,
+    ) -> RecurrenceException {
+        let prepared =
+            prepare_canonical_schedule(vec![into_canonical_item(item.clone())], request.clone())
+                .expect("prepare source recurrence");
+        let source = expand_occurrences(&prepared.plan_request)
+            .expect("expand source recurrence")
+            .into_iter()
+            .next()
+            .expect("source occurrence");
+        let start = source.window_start + time::Duration::minutes(minutes);
+        RecurrenceException {
+            item_id: source.series_item_id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+            action: RecurrenceExceptionAction::Move {
+                start,
+                end: start + time::Duration::minutes(30),
+                source: RecurrenceMoveSource {
+                    item_revision: item.revision,
+                    identity: source.identity,
+                    nominal_start: source.nominal_start,
+                    nominal_end: source.nominal_end,
+                    local_date: source.local_date,
+                    ordinal: source.ordinal,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn stale_authoritative_carry_does_not_discard_an_unrelated_valid_carry() {
+        let mut valid_habit = canonical_item(Uuid::from_u128(36));
+        valid_habit.kind = ItemKind::Habit;
+        valid_habit.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        let mut edited_habit = canonical_item(Uuid::from_u128(37));
+        edited_habit.kind = ItemKind::Habit;
+        edited_habit.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+        let mut request = preview_request();
+        let valid_move = recurrence_move_for(&valid_habit, &request, 30);
+        let stale_move = recurrence_move_for(&edited_habit, &request, 60);
+        let RecurrenceExceptionSelector::Occurrence {
+            id: valid_occurrence_id,
+        } = valid_move.selector
+        else {
+            unreachable!()
+        };
+        let RecurrenceExceptionSelector::Occurrence {
+            id: stale_occurrence_id,
+        } = stale_move.selector
+        else {
+            unreachable!()
+        };
+        // The immutable carry source was admitted under the old daily rule.
+        // The current weekly recurrence no longer derives that identity.
+        edited_habit.recurrence = Some(json!({
+            "type":"weekly",
+            "weekdays":["monday"]
+        }));
+        let authoritative = AuthoritativeHabitRecurrence {
+            change_head: 2,
+            context: RecurrenceContext {
+                exceptions: vec![valid_move, stale_move],
+                ..RecurrenceContext::default()
+            },
+        };
+
+        merge_authoritative_habit_recurrence(
+            &mut request,
+            &[valid_habit, edited_habit],
+            &authoritative,
+        )
+        .expect("one stale carry must not brick or downgrade the valid carry");
+
+        assert!(
+            request
+                .recurrence_context
+                .exceptions
+                .iter()
+                .any(|exception| {
+                    matches!(
+                        (exception.selector, exception.action),
+                        (
+                            RecurrenceExceptionSelector::Occurrence { id },
+                            RecurrenceExceptionAction::Move { .. }
+                        ) if id == valid_occurrence_id
+                    )
+                })
+        );
+        assert!(
+            request
+                .recurrence_context
+                .exceptions
+                .iter()
+                .all(|exception| {
+                    !matches!(
+                        exception.selector,
+                        RecurrenceExceptionSelector::Occurrence { id } if id == stale_occurrence_id
+                    ) || matches!(exception.action, RecurrenceExceptionAction::Skip)
+                })
         );
     }
 

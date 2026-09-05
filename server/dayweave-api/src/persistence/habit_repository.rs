@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike as _, NaiveDate, Offset as _, Utc};
 use dayweave_core::{
-    ItemId, Minutes, Occurrence, OccurrenceId, RecurrenceContext, RecurrenceException,
-    RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrencePartialProgress,
-    RecurrencePause, is_valid_habit_quantity_unit,
+    ItemId, Minutes, Occurrence, OccurrenceId, OccurrenceState, RecurrenceContext,
+    RecurrenceException, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    RecurrenceMoveSource, RecurrenceOccurrenceIdentity, RecurrencePartialProgress, RecurrencePause,
+    is_valid_habit_quantity_unit,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,9 +17,15 @@ use uuid::Uuid;
 
 use crate::{
     habits::{
-        HabitDeltaChange, HabitDeltaPage, HabitIdempotency, HabitMutation, HabitOccurrence,
-        HabitOccurrenceEvidence, HabitOutcome, HabitPause, HabitRepository, HabitRepositoryError,
-        MAX_HABIT_QUANTITY, OccurrencePageCursor, OutcomeWrite, PauseCreate, PauseResume,
+        HabitDeltaChange, HabitDeltaPage, HabitIdempotency, HabitMissedCancellationReason,
+        HabitMissedConfiguration, HabitMissedExplicitAction, HabitMissedPolicy,
+        HabitMissedReconcileResult, HabitMissedResolution, HabitMissedResolutionAction,
+        HabitMissedResumeAction, HabitMutation, HabitOccurrence, HabitOccurrenceEvidence,
+        HabitOutcome, HabitOutcomeStatus, HabitPause, HabitRepository, HabitRepositoryError,
+        MAX_HABIT_QUANTITY, MissedReconcileWrite, MissedResolveWrite, OccurrencePageCursor,
+        OutcomeWrite, PauseCreate, PauseResume, derive_missed_resolution_action,
+        recurrence_identity_ordinal, valid_explicit_missed_cancellation_transition,
+        valid_missed_resolution_transition,
     },
     scheduling::ComposeScheduleResult,
 };
@@ -27,6 +34,9 @@ use super::{DatabaseScope, lock_canonical_item_space};
 
 const MAX_AUTHORITATIVE_MOVED_OCCURRENCES: usize = 10_000;
 const MAX_RECURRENCE_IDENTITY_BYTES: usize = 4_096;
+const MAX_STORED_RECONCILE_RESOLUTIONS: usize = 200;
+const MISSED_RECONCILE_NAMESPACE: &str = "habits.missed.reconcile";
+const MISSED_RECONCILE_EPHEMERAL_RESOURCE: &str = "habit_missed_reconcile_receipt";
 
 #[derive(Clone)]
 pub struct PostgresHabitRepository {
@@ -56,15 +66,28 @@ impl PostgresHabitRepository {
 enum StoredReceipt {
     Occurrence(HabitOccurrence),
     Pause(HabitPause),
+    MissedReconcile(HabitMissedReconcileResult),
+    MissedResolution(HabitMissedResolution),
 }
 
 impl StoredReceipt {
     fn validate(&self) -> Result<(), HabitRepositoryError> {
-        if let Self::Occurrence(occurrence) = self {
-            occurrence
-                .evidence
-                .validate()
-                .map_err(|_| HabitRepositoryError::Internal)?;
+        match self {
+            Self::Occurrence(occurrence) => validate_occurrence(occurrence)?,
+            Self::MissedReconcile(result) => {
+                if result.resolutions.len() > MAX_STORED_RECONCILE_RESOLUTIONS {
+                    return Err(HabitRepositoryError::Internal);
+                }
+                let mut evidence_ids = BTreeSet::new();
+                for resolution in &result.resolutions {
+                    validate_resolution(resolution)?;
+                    if !evidence_ids.insert(resolution.occurrence_evidence_id) {
+                        return Err(HabitRepositoryError::Internal);
+                    }
+                }
+            }
+            Self::MissedResolution(resolution) => validate_resolution(resolution)?,
+            Self::Pause(_) => {}
         }
         Ok(())
     }
@@ -72,12 +95,38 @@ impl StoredReceipt {
 
 fn validate_change(change: &HabitDeltaChange) -> Result<(), HabitRepositoryError> {
     if let HabitDeltaChange::OccurrenceUpsert { occurrence } = change {
-        occurrence
-            .evidence
-            .validate()
-            .map_err(|_| HabitRepositoryError::Internal)?;
+        validate_occurrence(occurrence)?;
     }
     Ok(())
+}
+
+fn validate_occurrence(occurrence: &HabitOccurrence) -> Result<(), HabitRepositoryError> {
+    occurrence
+        .evidence
+        .validate()
+        .map_err(|_| HabitRepositoryError::Internal)?;
+    if let Some(resolution) = &occurrence.missed_resolution {
+        validate_resolution(resolution)?;
+        if resolution.occurrence_evidence_id != occurrence.evidence.id
+            || resolution.habit_id != occurrence.evidence.habit_id
+            || resolution.source_planner_occurrence_id != occurrence.evidence.planner_occurrence_id
+            || matches!(
+                &resolution.action,
+                HabitMissedResolutionAction::ReduceFrequency {
+                    suppressed_planner_occurrence_ids,
+                } if suppressed_planner_occurrence_ids.contains(&occurrence.evidence.planner_occurrence_id)
+            )
+        {
+            return Err(HabitRepositoryError::Internal);
+        }
+    }
+    Ok(())
+}
+
+fn validate_resolution(resolution: &HabitMissedResolution) -> Result<(), HabitRepositoryError> {
+    resolution
+        .validate()
+        .map_err(|_| HabitRepositoryError::Internal)
 }
 
 #[async_trait]
@@ -96,7 +145,9 @@ impl HabitRepository for PostgresHabitRepository {
         tx.commit().await.map_err(storage)?;
         receipt.map_or(Ok(None), |receipt| match receipt {
             StoredReceipt::Occurrence(value) => Ok(Some(value)),
-            StoredReceipt::Pause(_) => Err(HabitRepositoryError::IdempotencyConflict),
+            StoredReceipt::Pause(_)
+            | StoredReceipt::MissedReconcile(_)
+            | StoredReceipt::MissedResolution(_) => Err(HabitRepositoryError::IdempotencyConflict),
         })
     }
 
@@ -109,7 +160,39 @@ impl HabitRepository for PostgresHabitRepository {
         tx.commit().await.map_err(storage)?;
         receipt.map_or(Ok(None), |receipt| match receipt {
             StoredReceipt::Pause(value) => Ok(Some(value)),
-            StoredReceipt::Occurrence(_) => Err(HabitRepositoryError::IdempotencyConflict),
+            StoredReceipt::Occurrence(_)
+            | StoredReceipt::MissedReconcile(_)
+            | StoredReceipt::MissedResolution(_) => Err(HabitRepositoryError::IdempotencyConflict),
+        })
+    }
+
+    async fn replay_missed_reconcile(
+        &self,
+        idempotency: &HabitIdempotency,
+    ) -> Result<Option<HabitMissedReconcileResult>, HabitRepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let receipt = replay_receipt(&mut tx, self.scope, idempotency).await?;
+        tx.commit().await.map_err(storage)?;
+        receipt.map_or(Ok(None), |receipt| match receipt {
+            StoredReceipt::MissedReconcile(value) => Ok(Some(value)),
+            StoredReceipt::Occurrence(_)
+            | StoredReceipt::Pause(_)
+            | StoredReceipt::MissedResolution(_) => Err(HabitRepositoryError::IdempotencyConflict),
+        })
+    }
+
+    async fn replay_missed_resolution(
+        &self,
+        idempotency: &HabitIdempotency,
+    ) -> Result<Option<HabitMissedResolution>, HabitRepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let receipt = replay_receipt(&mut tx, self.scope, idempotency).await?;
+        tx.commit().await.map_err(storage)?;
+        receipt.map_or(Ok(None), |receipt| match receipt {
+            StoredReceipt::MissedResolution(value) => Ok(Some(value)),
+            StoredReceipt::Occurrence(_)
+            | StoredReceipt::Pause(_)
+            | StoredReceipt::MissedReconcile(_) => Err(HabitRepositoryError::IdempotencyConflict),
         })
     }
 
@@ -225,6 +308,7 @@ impl HabitRepository for PostgresHabitRepository {
         let updated = HabitOccurrence {
             evidence: current.evidence,
             outcome: Some(outcome),
+            missed_resolution: current.missed_resolution,
         };
         let change = HabitDeltaChange::OccurrenceUpsert {
             occurrence: updated.clone(),
@@ -593,6 +677,689 @@ impl HabitRepository for PostgresHabitRepository {
         })
     }
 
+    async fn reconcile_missed(
+        &self,
+        write: MissedReconcileWrite,
+    ) -> Result<HabitMutation<HabitMissedReconcileResult>, HabitRepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        lock_habit_mutation_space(&mut tx, self.scope.workspace_id).await?;
+        if let Some(receipt) = replay_receipt(&mut tx, self.scope, &write.idempotency).await? {
+            let StoredReceipt::MissedReconcile(value) = receipt else {
+                return Err(HabitRepositoryError::IdempotencyConflict);
+            };
+            tx.commit().await.map_err(storage)?;
+            return Ok(HabitMutation {
+                value,
+                replayed: true,
+            });
+        }
+        if write.policies.is_empty() {
+            let result = HabitMissedReconcileResult {
+                resolutions: Vec::new(),
+                has_more: false,
+            };
+            insert_ephemeral_reconcile_receipt(&mut tx, self.scope, &write.idempotency, &result)
+                .await?;
+            tx.commit().await.map_err(storage)?;
+            return Ok(HabitMutation {
+                value: result,
+                replayed: false,
+            });
+        }
+        let habit_ids = write.policies.keys().copied().collect::<Vec<_>>();
+        let item_revisions = write
+            .policies
+            .values()
+            .map(|configuration| to_i64(configuration.item_revision))
+            .collect::<Result<Vec<_>, _>>()?;
+        let policy_fingerprints = write
+            .policies
+            .values()
+            .map(|configuration| configuration.policy_fingerprint.to_vec())
+            .collect::<Vec<_>>();
+        let active_items = write
+            .policies
+            .values()
+            .map(|configuration| configuration.is_active)
+            .collect::<Vec<_>>();
+        let mut resolutions = Vec::with_capacity(write.limit);
+        let mut transitioned = Vec::new();
+        let mut deferred_pending_work = false;
+
+        // First sweep actions whose applicability changed after a correction,
+        // pause, recurrence edit, carried-window expiry, or reduction-target
+        // change. The SQL predicate is deliberately the same proof used by the
+        // transition helper, so bounded pages cannot be consumed by no-ops.
+        let maintenance_capacity = write.limit.saturating_sub(resolutions.len());
+        let maintenance_limit = i64::try_from(maintenance_capacity.saturating_add(1))
+            .map_err(|_| HabitRepositoryError::Internal)?;
+        let maintenance_sql = format!(
+            "WITH configuration AS MATERIALIZED ( \
+               SELECT * FROM UNNEST($2::uuid[], $3::bigint[], $4::bytea[], $5::boolean[]) \
+                 AS configured(habit_id, item_revision, policy_fingerprint, is_active) \
+             ), ranked AS MATERIALIZED ( \
+               SELECT evidence.id AS candidate_id, \
+                 ROW_NUMBER() OVER (PARTITION BY evidence.habit_id \
+                   ORDER BY resolution.created_at, evidence.id) AS candidate_rank \
+               FROM habit_occurrence_evidence evidence \
+               JOIN habit_missed_resolutions resolution \
+                 ON resolution.workspace_id = evidence.workspace_id \
+                AND resolution.occurrence_evidence_id = evidence.id \
+               JOIN configuration configured ON configured.habit_id = evidence.habit_id \
+               WHERE evidence.workspace_id = $1 \
+             ), candidates AS MATERIALIZED ( \
+               SELECT evidence.id AS candidate_id, resolution.updated_at AS candidate_updated_at, \
+                 ranked.candidate_rank \
+               FROM habit_occurrence_evidence evidence \
+               JOIN habit_missed_resolutions resolution \
+                 ON resolution.workspace_id = evidence.workspace_id \
+                AND resolution.occurrence_evidence_id = evidence.id \
+               JOIN ranked ON ranked.candidate_id = evidence.id \
+               JOIN configuration configured ON configured.habit_id = evidence.habit_id \
+               JOIN items item ON item.workspace_id = evidence.workspace_id \
+                 AND item.id = evidence.habit_id AND item.revision = configured.item_revision \
+               LEFT JOIN habit_occurrence_outcomes outcome \
+                 ON outcome.workspace_id = evidence.workspace_id \
+                AND outcome.occurrence_evidence_id = evidence.id \
+               LEFT JOIN LATERAL ( \
+                 SELECT CASE WHEN version.previous_snapshot #>> '{{action,type}}' = 'carry' \
+                   THEN (version.previous_snapshot #>> '{{action,window_start}}')::timestamptz END \
+                     AS window_start, \
+                   CASE WHEN version.previous_snapshot #>> '{{action,type}}' = 'carry' \
+                   THEN (version.previous_snapshot #>> '{{action,window_end}}')::timestamptz END \
+                     AS window_end \
+                 FROM habit_missed_resolution_versions version \
+                 WHERE version.workspace_id = resolution.workspace_id \
+                   AND version.occurrence_evidence_id = resolution.occurrence_evidence_id \
+                   AND version.revision = resolution.revision \
+               ) cancelled_prior ON resolution.action = 'cancelled' \
+               WHERE evidence.workspace_id = $1 AND item.kind = 'habit' \
+                 AND ( \
+                   (resolution.action <> 'cancelled' AND ( \
+                     NOT configured.is_active \
+                     OR item.trashed_at IS NOT NULL \
+                     OR item.status IN ('completed', 'skipped', 'cancelled', 'blocked') \
+                     OR outcome.status IN ('completed', 'skipped') \
+                     OR evidence.policy_fingerprint <> configured.policy_fingerprint \
+                     OR EXISTS (SELECT 1 FROM habit_pauses source_pause \
+                       WHERE source_pause.workspace_id = evidence.workspace_id \
+                         AND source_pause.habit_id = evidence.habit_id \
+                         AND source_pause.started_at < CASE WHEN resolution.action = 'carry' \
+                           THEN resolution.carry_window_end ELSE evidence.window_end END \
+                         AND (source_pause.ended_at IS NULL OR source_pause.ended_at > \
+                           CASE WHEN resolution.action = 'carry' \
+                             THEN resolution.carry_window_start ELSE evidence.window_start END)) \
+                     OR (resolution.action = 'carry' AND resolution.carry_window_end <= $6) \
+                     OR (resolution.action = 'reduce_frequency' AND EXISTS ( \
+                       SELECT 1 FROM habit_occurrence_evidence target \
+                       LEFT JOIN habit_occurrence_outcomes target_outcome \
+                         ON target_outcome.workspace_id = target.workspace_id \
+                        AND target_outcome.occurrence_evidence_id = target.id \
+                       WHERE target.workspace_id = evidence.workspace_id \
+                         AND target.habit_id = evidence.habit_id \
+                         AND target.planner_occurrence_id = resolution.suppressed_planner_occurrence_id \
+                         AND ( \
+                           (target_outcome.status IS NOT NULL AND target_outcome.status <> 'unresolved') \
+                           OR EXISTS (SELECT 1 FROM habit_pauses target_pause \
+                             WHERE target_pause.workspace_id = target.workspace_id \
+                               AND target_pause.habit_id = target.habit_id \
+                               AND target_pause.started_at < target.window_end \
+                               AND (target_pause.ended_at IS NULL \
+                                 OR target_pause.ended_at > target.window_start)) \
+                           OR EXISTS (SELECT 1 FROM schedule_revisions current_revision \
+                             WHERE current_revision.workspace_id = target.workspace_id \
+                               AND current_revision.state = 'published' \
+                               AND current_revision.horizon_start <= target.window_start \
+                               AND current_revision.horizon_end >= target.window_end \
+                               AND NOT EXISTS (SELECT 1 FROM habit_occurrence_publications publication \
+                                 WHERE publication.workspace_id = target.workspace_id \
+                                   AND publication.schedule_revision_id = current_revision.id \
+                                   AND publication.occurrence_evidence_id = target.id \
+                                   AND publication.occurrence_state IN ('generated', 'skipped') \
+                                   AND target.policy_fingerprint = configured.policy_fingerprint)) \
+                         ))) \
+                   )) \
+                   OR (resolution.action = 'cancelled' \
+                     AND configured.is_active \
+                     AND item.trashed_at IS NULL \
+                     AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+                     AND outcome.status IS DISTINCT FROM 'completed' \
+                     AND outcome.status IS DISTINCT FROM 'skipped' \
+                     AND evidence.policy_fingerprint = configured.policy_fingerprint \
+                     AND NOT EXISTS (SELECT 1 FROM habit_pauses source_pause \
+                       WHERE source_pause.workspace_id = evidence.workspace_id \
+                         AND source_pause.habit_id = evidence.habit_id \
+                         AND source_pause.started_at < \
+                           COALESCE(cancelled_prior.window_end, evidence.window_end) \
+                         AND (source_pause.ended_at IS NULL \
+                           OR source_pause.ended_at > \
+                             COALESCE(cancelled_prior.window_start, evidence.window_start)))) \
+                 ) \
+             ), selected AS MATERIALIZED ( \
+               SELECT candidate_id, candidate_updated_at, candidate_rank FROM candidates \
+               ORDER BY candidate_rank, candidate_updated_at, candidate_id LIMIT $7 \
+             ) \
+             SELECT {EVIDENCE_COLUMNS}, selected.candidate_rank, selected.candidate_updated_at{OCCURRENCE_OUTCOME_SELECT} \
+             JOIN selected ON selected.candidate_id = evidence.id \
+             WHERE evidence.workspace_id = $1 \
+             ORDER BY selected.candidate_rank, selected.candidate_updated_at, evidence.id \
+             FOR UPDATE OF evidence"
+        );
+        let maintenance_rows = sqlx::query(AssertSqlSafe(maintenance_sql))
+            .bind(self.scope.workspace_id)
+            .bind(&habit_ids)
+            .bind(&item_revisions)
+            .bind(&policy_fingerprints)
+            .bind(&active_items)
+            .bind(write.recorded_at)
+            .bind(maintenance_limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let maintenance_overflow = maintenance_rows.len() > maintenance_capacity;
+        for row in maintenance_rows.iter().take(maintenance_capacity) {
+            let occurrence = occurrence_from_row(row)?;
+            let occurrence_id = occurrence.evidence.id;
+            let configuration = write
+                .policies
+                .get(&occurrence.evidence.habit_id)
+                .ok_or(HabitRepositoryError::EvidenceConflict)?;
+            let current = occurrence
+                .missed_resolution
+                .clone()
+                .ok_or(HabitRepositoryError::Internal)?;
+            let Some(action) = maintenance_action_tx(
+                &mut tx,
+                self.scope.workspace_id,
+                &occurrence,
+                configuration,
+                write.recorded_at,
+            )
+            .await?
+            else {
+                return Err(HabitRepositoryError::EvidenceConflict);
+            };
+            if matches!(action, HabitMissedResolutionAction::ReductionPending) {
+                match reduction_action_tx(
+                    &mut tx,
+                    self.scope.workspace_id,
+                    &occurrence,
+                    configuration,
+                    write.recorded_at,
+                )
+                .await
+                {
+                    Ok(_) => deferred_pending_work = true,
+                    Err(HabitRepositoryError::MissedReductionUnavailable) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let resolution = HabitMissedResolution {
+                revision: current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(HabitRepositoryError::Internal)?,
+                action,
+                updated_at: write.recorded_at,
+                ..current.clone()
+            };
+            let child_operation_id = Uuid::new_v5(
+                &write.idempotency.operation_id,
+                occurrence.evidence.id.as_bytes(),
+            );
+            update_missed_resolution_tx(
+                &mut tx,
+                self.scope,
+                write.idempotency.actor_session_id,
+                child_operation_id,
+                occurrence,
+                &current,
+                &resolution,
+                false,
+                write.recorded_at,
+            )
+            .await?;
+            resolutions.push(resolution);
+            transitioned.push(occurrence_id);
+        }
+
+        // Bind durable reduction-pending rows only when the exact target is a
+        // generated occurrence in the unique current publication. Ranking by
+        // per-habit position prevents one dense habit from starving others.
+        let pending_capacity = write.limit.saturating_sub(resolutions.len());
+        let pending_limit = i64::try_from(pending_capacity.saturating_add(1))
+            .map_err(|_| HabitRepositoryError::Internal)?;
+        let pending_rows = sqlx::query(AssertSqlSafe(format!(
+            "WITH configuration AS MATERIALIZED ( \
+               SELECT * FROM UNNEST($2::uuid[], $3::bigint[], $4::bytea[], $5::boolean[]) \
+                 AS configured(habit_id, item_revision, policy_fingerprint, is_active) \
+             ), ranked AS MATERIALIZED ( \
+               SELECT evidence.id AS candidate_id, \
+                 ROW_NUMBER() OVER (PARTITION BY evidence.habit_id \
+                   ORDER BY resolution.created_at, evidence.id) AS candidate_rank \
+               FROM habit_occurrence_evidence evidence \
+               JOIN habit_missed_resolutions resolution \
+                 ON resolution.workspace_id = evidence.workspace_id \
+                AND resolution.occurrence_evidence_id = evidence.id \
+               JOIN configuration configured ON configured.habit_id = evidence.habit_id \
+               WHERE evidence.workspace_id = $1 \
+             ), candidates AS MATERIALIZED ( \
+               SELECT evidence.id AS candidate_id, resolution.created_at AS candidate_created_at, \
+                 ranked.candidate_rank \
+               FROM habit_occurrence_evidence evidence \
+               JOIN habit_missed_resolutions resolution \
+                 ON resolution.workspace_id = evidence.workspace_id \
+                AND resolution.occurrence_evidence_id = evidence.id \
+               JOIN ranked ON ranked.candidate_id = evidence.id \
+               JOIN configuration configured ON configured.habit_id = evidence.habit_id \
+               JOIN items item ON item.workspace_id = evidence.workspace_id \
+                 AND item.id = evidence.habit_id AND item.revision = configured.item_revision \
+               LEFT JOIN habit_occurrence_outcomes outcome \
+                 ON outcome.workspace_id = evidence.workspace_id \
+                AND outcome.occurrence_evidence_id = evidence.id \
+               WHERE evidence.workspace_id = $1 AND configured.is_active \
+                 AND item.kind = 'habit' AND item.trashed_at IS NULL \
+                 AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+                 AND resolution.action = 'reduction_pending' \
+                 AND evidence.policy_fingerprint = configured.policy_fingerprint \
+                 AND (outcome.status IS NULL OR outcome.status IN ('unresolved', 'partial')) \
+                 AND NOT (evidence.id = ANY($7::uuid[])) \
+                 AND NOT EXISTS (SELECT 1 FROM habit_pauses source_pause \
+                   WHERE source_pause.workspace_id = evidence.workspace_id \
+                     AND source_pause.habit_id = evidence.habit_id \
+                     AND source_pause.started_at < evidence.window_end \
+                     AND (source_pause.ended_at IS NULL \
+                       OR source_pause.ended_at > evidence.window_start)) \
+                 AND EXISTS (SELECT 1 FROM habit_available_reduction_target( \
+                   evidence.workspace_id, evidence.habit_id, evidence.id, \
+                   evidence.nominal_start, evidence.recurrence_ordinal, evidence.planner_occurrence_id, \
+                   configured.policy_fingerprint, $6)) \
+             ), selected AS MATERIALIZED ( \
+               SELECT candidate_id, candidate_created_at, candidate_rank FROM candidates \
+               ORDER BY candidate_rank, candidate_created_at, candidate_id LIMIT $8 \
+             ) \
+             SELECT {EVIDENCE_COLUMNS}, selected.candidate_rank, selected.candidate_created_at{OCCURRENCE_OUTCOME_SELECT} \
+             JOIN selected ON selected.candidate_id = evidence.id \
+             WHERE evidence.workspace_id = $1 \
+             ORDER BY selected.candidate_rank, selected.candidate_created_at, evidence.id \
+             FOR UPDATE OF evidence"
+        )))
+        .bind(self.scope.workspace_id)
+        .bind(&habit_ids)
+        .bind(&item_revisions)
+        .bind(&policy_fingerprints)
+        .bind(&active_items)
+        .bind(write.recorded_at)
+        .bind(&transitioned)
+        .bind(pending_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let pending_overflow = pending_rows.len() > pending_capacity;
+        for row in pending_rows.iter().take(pending_capacity) {
+            let occurrence = occurrence_from_row(row)?;
+            let configuration = write
+                .policies
+                .get(&occurrence.evidence.habit_id)
+                .ok_or(HabitRepositoryError::EvidenceConflict)?;
+            let current = occurrence
+                .missed_resolution
+                .clone()
+                .ok_or(HabitRepositoryError::Internal)?;
+            let action = match reduction_action_tx(
+                &mut tx,
+                self.scope.workspace_id,
+                &occurrence,
+                configuration,
+                write.recorded_at,
+            )
+            .await
+            {
+                Ok(action) => action,
+                Err(HabitRepositoryError::MissedReductionUnavailable) => {
+                    deferred_pending_work = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let resolution = HabitMissedResolution {
+                revision: current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(HabitRepositoryError::Internal)?,
+                action,
+                updated_at: write.recorded_at,
+                ..current.clone()
+            };
+            let child_operation_id = Uuid::new_v5(
+                &write.idempotency.operation_id,
+                occurrence.evidence.id.as_bytes(),
+            );
+            update_missed_resolution_tx(
+                &mut tx,
+                self.scope,
+                write.idempotency.actor_session_id,
+                child_operation_id,
+                occurrence,
+                &current,
+                &resolution,
+                false,
+                write.recorded_at,
+            )
+            .await?;
+            resolutions.push(resolution);
+            transitioned.push(current.occurrence_evidence_id);
+        }
+
+        // Finally admit never-before-reconciled overdue evidence. Immutable
+        // evidence must carry the exact current policy fingerprint; obsolete
+        // history is not silently assigned a new policy after a recurrence edit.
+        let fresh_capacity = write.limit.saturating_sub(resolutions.len());
+        let fresh_limit = i64::try_from(fresh_capacity.saturating_add(1))
+            .map_err(|_| HabitRepositoryError::Internal)?;
+        let fresh_rows = sqlx::query(AssertSqlSafe(format!(
+            "WITH configuration AS MATERIALIZED ( \
+               SELECT * FROM UNNEST($2::uuid[], $3::bigint[], $4::bytea[], $5::boolean[]) \
+                 AS configured(habit_id, item_revision, policy_fingerprint, is_active) \
+             ), ranked AS MATERIALIZED ( \
+               SELECT evidence.id AS candidate_id, evidence.window_end AS candidate_window_end, \
+                 ROW_NUMBER() OVER (PARTITION BY evidence.habit_id \
+                   ORDER BY evidence.window_end, evidence.id) AS candidate_rank \
+               FROM habit_occurrence_evidence evidence \
+               JOIN configuration configured ON configured.habit_id = evidence.habit_id \
+               JOIN items item ON item.workspace_id = evidence.workspace_id \
+                 AND item.id = evidence.habit_id AND item.revision = configured.item_revision \
+               LEFT JOIN habit_occurrence_outcomes outcome \
+                 ON outcome.workspace_id = evidence.workspace_id \
+                AND outcome.occurrence_evidence_id = evidence.id \
+               WHERE evidence.workspace_id = $1 AND configured.is_active \
+                 AND item.kind = 'habit' AND item.trashed_at IS NULL \
+                 AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+                 AND evidence.policy_fingerprint = configured.policy_fingerprint \
+                 AND evidence.window_end <= $6 \
+                 AND (outcome.status IS NULL OR outcome.status IN ('unresolved', 'partial')) \
+                 AND NOT EXISTS (SELECT 1 FROM habit_effective_reduction_targets( \
+                   evidence.workspace_id, evidence.habit_id, configured.policy_fingerprint) \
+                   WHERE planner_occurrence_id = evidence.planner_occurrence_id) \
+                 AND NOT EXISTS (SELECT 1 FROM habit_pauses source_pause \
+                   WHERE source_pause.workspace_id = evidence.workspace_id \
+                     AND source_pause.habit_id = evidence.habit_id \
+                     AND source_pause.started_at < evidence.window_end \
+                     AND (source_pause.ended_at IS NULL \
+                       OR source_pause.ended_at > evidence.window_start)) \
+             ), candidates AS MATERIALIZED ( \
+               SELECT ranked.candidate_id, ranked.candidate_window_end, ranked.candidate_rank \
+               FROM ranked LEFT JOIN habit_missed_resolutions resolution \
+                 ON resolution.workspace_id = $1 \
+                AND resolution.occurrence_evidence_id = ranked.candidate_id \
+               WHERE resolution.occurrence_evidence_id IS NULL \
+             ), selected AS MATERIALIZED ( \
+               SELECT candidate_id, candidate_window_end, candidate_rank FROM candidates \
+               ORDER BY candidate_rank, candidate_window_end, candidate_id LIMIT $7 \
+             ) \
+             SELECT {EVIDENCE_COLUMNS}, item.scheduling_constraints AS item_constraints, \
+               selected.candidate_rank, selected.candidate_window_end{OCCURRENCE_OUTCOME_SELECT} \
+             JOIN items item ON item.workspace_id = evidence.workspace_id AND item.id = evidence.habit_id \
+             JOIN selected ON selected.candidate_id = evidence.id \
+             WHERE evidence.workspace_id = $1 \
+             ORDER BY selected.candidate_rank, selected.candidate_window_end, evidence.id \
+             FOR UPDATE OF evidence"
+        )))
+        .bind(self.scope.workspace_id)
+        .bind(&habit_ids)
+        .bind(&item_revisions)
+        .bind(&policy_fingerprints)
+        .bind(&active_items)
+        .bind(write.recorded_at)
+        .bind(fresh_limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let fresh_overflow = fresh_rows.len() > fresh_capacity;
+        for row in fresh_rows.iter().take(fresh_capacity) {
+            let occurrence = occurrence_from_row(row)?;
+            let configuration = write
+                .policies
+                .get(&occurrence.evidence.habit_id)
+                .ok_or(HabitRepositoryError::EvidenceConflict)?;
+            let constraints: Value = row.try_get("item_constraints").map_err(storage)?;
+            if missed_policy_from_constraints(&constraints)? != configuration.policy {
+                return Err(HabitRepositoryError::EvidenceConflict);
+            }
+            let action = missed_action_tx(
+                &mut tx,
+                self.scope.workspace_id,
+                &occurrence,
+                configuration,
+                write.recorded_at,
+            )
+            .await?;
+            let resolution = HabitMissedResolution {
+                occurrence_evidence_id: occurrence.evidence.id,
+                habit_id: occurrence.evidence.habit_id,
+                source_planner_occurrence_id: occurrence.evidence.planner_occurrence_id,
+                revision: 1,
+                configured_policy: configuration.policy,
+                action,
+                created_at: write.recorded_at,
+                updated_at: write.recorded_at,
+            };
+            let child_operation_id = Uuid::new_v5(
+                &write.idempotency.operation_id,
+                occurrence.evidence.id.as_bytes(),
+            );
+            insert_new_missed_resolution_tx(
+                &mut tx,
+                self.scope,
+                write.idempotency.actor_session_id,
+                child_operation_id,
+                occurrence,
+                &resolution,
+                write.recorded_at,
+            )
+            .await?;
+            resolutions.push(resolution);
+        }
+        let result = HabitMissedReconcileResult {
+            resolutions,
+            has_more: maintenance_overflow
+                || pending_overflow
+                || fresh_overflow
+                || deferred_pending_work,
+        };
+        if !result.resolutions.is_empty() || result.has_more {
+            insert_receipt(
+                &mut tx,
+                self.scope,
+                &write.idempotency,
+                &StoredReceipt::MissedReconcile(result.clone()),
+                write.recorded_at,
+            )
+            .await?;
+        } else {
+            insert_ephemeral_reconcile_receipt(&mut tx, self.scope, &write.idempotency, &result)
+                .await?;
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(HabitMutation {
+            value: result,
+            replayed: false,
+        })
+    }
+
+    async fn resolve_missed(
+        &self,
+        write: MissedResolveWrite,
+    ) -> Result<HabitMutation<HabitMissedResolution>, HabitRepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        lock_habit_mutation_space(&mut tx, self.scope.workspace_id).await?;
+        if let Some(receipt) = replay_receipt(&mut tx, self.scope, &write.idempotency).await? {
+            let StoredReceipt::MissedResolution(value) = receipt else {
+                return Err(HabitRepositoryError::IdempotencyConflict);
+            };
+            tx.commit().await.map_err(storage)?;
+            return Ok(HabitMutation {
+                value,
+                replayed: true,
+            });
+        }
+        let current_item = sqlx::query(
+            "SELECT item.revision, item.status, item.trashed_at, item.recurrence, \
+               item.scheduling_constraints, \
+               NOT EXISTS (SELECT 1 FROM item_hierarchy child_edge \
+                 JOIN items child ON child.workspace_id = child_edge.workspace_id \
+                   AND child.id = child_edge.child_item_id \
+                 WHERE child_edge.workspace_id = item.workspace_id \
+                   AND child_edge.parent_item_id = item.id AND child.trashed_at IS NULL) AS is_leaf \
+             FROM items item WHERE item.workspace_id = $1 AND item.id = $2 \
+               AND item.kind = 'habit' FOR SHARE OF item",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(write.habit_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?
+        .ok_or(HabitRepositoryError::HabitNotFound(write.habit_id))?;
+        // A stored ask prompt can race any canonical edit. Parse the current
+        // policy for integrity, but let applicability below turn the race into
+        // a durable SourceObsolete cancellation and replayable HTTP 200.
+        let constraints: Value = current_item
+            .try_get("scheduling_constraints")
+            .map_err(storage)?;
+        missed_policy_from_constraints(&constraints)?;
+        let current_item_revision: i64 = current_item.try_get("revision").map_err(storage)?;
+        if from_i64(current_item_revision)? != write.current_item_revision {
+            return Err(HabitRepositoryError::EvidenceConflict);
+        }
+        let current_item_status: String = current_item.try_get("status").map_err(storage)?;
+        let trashed_at: Option<DateTime<Utc>> =
+            current_item.try_get("trashed_at").map_err(storage)?;
+        let recurrence: Option<Value> = current_item.try_get("recurrence").map_err(storage)?;
+        let is_leaf: bool = current_item.try_get("is_leaf").map_err(storage)?;
+        let item_is_active = trashed_at.is_none()
+            && recurrence.is_some()
+            && is_leaf
+            && !matches!(
+                current_item_status.as_str(),
+                "completed" | "skipped" | "cancelled" | "blocked"
+            );
+        if item_is_active != write.current_item_is_active {
+            return Err(HabitRepositoryError::EvidenceConflict);
+        }
+        let configuration = HabitMissedConfiguration {
+            item_revision: write.current_item_revision,
+            policy_fingerprint: write.current_policy_fingerprint,
+            policy: HabitMissedPolicy::Ask,
+            is_active: write.current_item_is_active,
+        };
+        let row = occurrence_row_for_update(
+            &mut tx,
+            self.scope.workspace_id,
+            write.habit_id,
+            write.occurrence_id,
+        )
+        .await?
+        .ok_or(HabitRepositoryError::MissedResolutionNotFound(
+            write.occurrence_id,
+        ))?;
+        let occurrence = occurrence_from_row(&row)?;
+        let current = occurrence.missed_resolution.clone().ok_or(
+            HabitRepositoryError::MissedResolutionNotFound(write.occurrence_id),
+        )?;
+        if current.revision != write.expected_revision {
+            return Err(HabitRepositoryError::RevisionConflict {
+                expected: write.expected_revision,
+                actual: current.revision,
+                current_occurrence: Some(Box::new(occurrence)),
+                current_pause: None,
+            });
+        }
+        if !matches!(
+            current.action,
+            HabitMissedResolutionAction::DecisionRequired
+        ) {
+            return Err(HabitRepositoryError::MissedResolutionAlreadyResolved(
+                Box::new(current),
+            ));
+        }
+        let cancellation_reason = if item_is_active {
+            source_cancellation_reason_tx(
+                &mut tx,
+                self.scope.workspace_id,
+                &occurrence,
+                &configuration,
+            )
+            .await?
+        } else {
+            Some(HabitMissedCancellationReason::SourceObsolete)
+        };
+        let action = if let Some(reason) = cancellation_reason {
+            let resume_action = match write.action {
+                HabitMissedExplicitAction::Skip => HabitMissedResumeAction::Skip,
+                HabitMissedExplicitAction::Carry => HabitMissedResumeAction::Carry,
+                HabitMissedExplicitAction::ReduceFrequency => {
+                    HabitMissedResumeAction::ReduceFrequency
+                }
+            };
+            HabitMissedResolutionAction::Cancelled {
+                reason,
+                resume_action,
+            }
+        } else {
+            explicit_missed_action_tx(
+                &mut tx,
+                self.scope.workspace_id,
+                &occurrence,
+                write.action,
+                &configuration,
+                write.recorded_at,
+            )
+            .await?
+        };
+        let resolution = HabitMissedResolution {
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or(HabitRepositoryError::Internal)?,
+            action,
+            updated_at: write.recorded_at,
+            ..current.clone()
+        };
+        update_missed_resolution_tx(
+            &mut tx,
+            self.scope,
+            write.idempotency.actor_session_id,
+            write.idempotency.operation_id,
+            occurrence,
+            &current,
+            &resolution,
+            matches!(
+                resolution.action,
+                HabitMissedResolutionAction::Cancelled {
+                    resume_action: HabitMissedResumeAction::Skip
+                        | HabitMissedResumeAction::Carry
+                        | HabitMissedResumeAction::ReduceFrequency,
+                    ..
+                }
+            ),
+            write.recorded_at,
+        )
+        .await?;
+        insert_receipt(
+            &mut tx,
+            self.scope,
+            &write.idempotency,
+            &StoredReceipt::MissedResolution(resolution.clone()),
+            write.recorded_at,
+        )
+        .await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(HabitMutation {
+            value: resolution,
+            replayed: false,
+        })
+    }
+
     async fn list_occurrences(
         &self,
         habit_id: Uuid,
@@ -630,6 +1397,31 @@ impl HabitRepository for PostgresHabitRepository {
         let has_more = values.len() > limit;
         values.truncate(limit);
         Ok((values, has_more))
+    }
+
+    async fn effective_reduction_targets(
+        &self,
+        habit_id: Uuid,
+        current_policy_fingerprint: [u8; 32],
+        current_item_is_active: bool,
+        planner_occurrence_ids: &[Uuid],
+    ) -> Result<BTreeSet<Uuid>, HabitRepositoryError> {
+        if !current_item_is_active || planner_occurrence_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let targets = sqlx::query_scalar(
+            "SELECT target.planner_occurrence_id \
+             FROM habit_effective_reduction_targets($1, $2, $3) target \
+             WHERE target.planner_occurrence_id = ANY($4)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(habit_id)
+        .bind(current_policy_fingerprint.as_slice())
+        .bind(planner_occurrence_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(targets.into_iter().collect())
     }
 
     async fn list_pauses(
@@ -712,10 +1504,20 @@ const EVIDENCE_COLUMNS: &str = "evidence.id, evidence.habit_id, evidence.planner
 
 const OCCURRENCE_OUTCOME_SELECT: &str = ", outcome.revision AS outcome_revision, outcome.status AS outcome_status, \
      outcome.progress_basis_points, outcome.quantity, outcome.unit, outcome.actual_seconds, \
-     outcome.note, outcome.occurred_at, outcome.updated_at \
+     outcome.note, outcome.occurred_at, outcome.updated_at, \
+     resolution.revision AS missed_resolution_revision, \
+     resolution.source_planner_occurrence_id AS missed_source_planner_occurrence_id, \
+     resolution.configured_policy AS missed_configured_policy, \
+     resolution.action AS missed_action, resolution.cancellation_reason, \
+     resolution.cancelled_resume_action, resolution.carry_window_start, \
+     resolution.carry_window_end, resolution.suppressed_planner_occurrence_ids, \
+     resolution.created_at AS missed_created_at, resolution.updated_at AS missed_updated_at \
      FROM habit_occurrence_evidence evidence LEFT JOIN habit_occurrence_outcomes outcome \
        ON outcome.workspace_id = evidence.workspace_id \
-      AND outcome.occurrence_evidence_id = evidence.id";
+      AND outcome.occurrence_evidence_id = evidence.id \
+     LEFT JOIN habit_missed_resolutions resolution \
+       ON resolution.workspace_id = evidence.workspace_id \
+      AND resolution.occurrence_evidence_id = evidence.id";
 
 async fn occurrence_row_for_update(
     tx: &mut Transaction<'_, Postgres>,
@@ -761,7 +1563,56 @@ fn occurrence_from_row(
             })
         })
         .transpose()?;
-    Ok(HabitOccurrence { evidence, outcome })
+    let missed_revision: Option<i64> =
+        row.try_get("missed_resolution_revision").map_err(storage)?;
+    let missed_resolution = missed_revision
+        .map(|revision| missed_resolution_from_row(row, revision))
+        .transpose()?;
+    let occurrence = HabitOccurrence {
+        evidence,
+        outcome,
+        missed_resolution,
+    };
+    validate_occurrence(&occurrence)?;
+    Ok(occurrence)
+}
+
+fn missed_resolution_from_row(
+    row: &sqlx::postgres::PgRow,
+    revision: i64,
+) -> Result<HabitMissedResolution, HabitRepositoryError> {
+    let policy: String = row.try_get("missed_configured_policy").map_err(storage)?;
+    let action: String = row.try_get("missed_action").map_err(storage)?;
+    let cancellation_reason: Option<String> =
+        row.try_get("cancellation_reason").map_err(storage)?;
+    let cancelled_resume_action: Option<String> =
+        row.try_get("cancelled_resume_action").map_err(storage)?;
+    let carry_start: Option<DateTime<Utc>> = row.try_get("carry_window_start").map_err(storage)?;
+    let carry_end: Option<DateTime<Utc>> = row.try_get("carry_window_end").map_err(storage)?;
+    let suppressed: Vec<Uuid> = row
+        .try_get("suppressed_planner_occurrence_ids")
+        .map_err(storage)?;
+    let resolution = HabitMissedResolution {
+        occurrence_evidence_id: row.try_get("id").map_err(storage)?,
+        habit_id: row.try_get("habit_id").map_err(storage)?,
+        source_planner_occurrence_id: row
+            .try_get("missed_source_planner_occurrence_id")
+            .map_err(storage)?,
+        revision: from_i64(revision)?,
+        configured_policy: parse_missed_policy(&policy)?,
+        action: parse_missed_action(
+            &action,
+            cancellation_reason.as_deref(),
+            cancelled_resume_action.as_deref(),
+            carry_start,
+            carry_end,
+            suppressed,
+        )?,
+        created_at: row.try_get("missed_created_at").map_err(storage)?,
+        updated_at: row.try_get("missed_updated_at").map_err(storage)?,
+    };
+    validate_resolution(&resolution)?;
+    Ok(resolution)
 }
 
 fn evidence_from_row(
@@ -813,6 +1664,636 @@ fn pause_from_row(row: &sqlx::postgres::PgRow) -> Result<HabitPause, HabitReposi
     })
 }
 
+fn missed_policy_from_constraints(
+    value: &Value,
+) -> Result<HabitMissedPolicy, HabitRepositoryError> {
+    let metadata: dayweave_compose::SchedulingMetadata =
+        serde_json::from_value(value.clone()).map_err(|_| HabitRepositoryError::Internal)?;
+    Ok(metadata.habit_missed_policy.into())
+}
+
+async fn missed_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    configuration: &HabitMissedConfiguration,
+    now: DateTime<Utc>,
+) -> Result<HabitMissedResolutionAction, HabitRepositoryError> {
+    let action = derive_missed_resolution_action(occurrence, configuration.policy, now)
+        .map_err(|_| HabitRepositoryError::Internal)?;
+    if matches!(action, HabitMissedResolutionAction::ReductionPending) {
+        match reduction_action_tx(tx, workspace_id, occurrence, configuration, now).await {
+            Ok(bound) => Ok(bound),
+            Err(HabitRepositoryError::MissedReductionUnavailable) => Ok(action),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(action)
+    }
+}
+
+async fn source_cancellation_reason_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    configuration: &HabitMissedConfiguration,
+) -> Result<Option<HabitMissedCancellationReason>, HabitRepositoryError> {
+    if !configuration.is_active {
+        return Ok(Some(HabitMissedCancellationReason::SourceObsolete));
+    }
+    match occurrence.outcome.as_ref().map(|outcome| outcome.status) {
+        Some(HabitOutcomeStatus::Completed) => {
+            return Ok(Some(HabitMissedCancellationReason::SourceCompleted));
+        }
+        Some(HabitOutcomeStatus::Skipped) => {
+            return Ok(Some(HabitMissedCancellationReason::SourceSkipped));
+        }
+        _ => {}
+    }
+    let (window_start, window_end) = match occurrence
+        .missed_resolution
+        .as_ref()
+        .map(|resolution| &resolution.action)
+    {
+        Some(HabitMissedResolutionAction::Carry {
+            window_start,
+            window_end,
+        }) => (*window_start, *window_end),
+        Some(HabitMissedResolutionAction::Cancelled {
+            resume_action: HabitMissedResumeAction::Carry,
+            ..
+        }) => {
+            let previous_snapshot: Option<Value> = sqlx::query_scalar(
+                "SELECT previous_snapshot FROM habit_missed_resolution_versions \
+                 WHERE workspace_id = $1 AND occurrence_evidence_id = $2 AND revision = $3",
+            )
+            .bind(workspace_id)
+            .bind(occurrence.evidence.id)
+            .bind(to_i64(
+                occurrence
+                    .missed_resolution
+                    .as_ref()
+                    .ok_or(HabitRepositoryError::Internal)?
+                    .revision,
+            )?)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(storage)?
+            .flatten();
+            previous_snapshot
+                .and_then(|snapshot| serde_json::from_value::<HabitMissedResolution>(snapshot).ok())
+                .and_then(|resolution| match resolution.action {
+                    HabitMissedResolutionAction::Carry {
+                        window_start,
+                        window_end,
+                    } => Some((window_start, window_end)),
+                    _ => None,
+                })
+                .unwrap_or((
+                    occurrence.evidence.window_start,
+                    occurrence.evidence.window_end,
+                ))
+        }
+        _ => (
+            occurrence.evidence.window_start,
+            occurrence.evidence.window_end,
+        ),
+    };
+    let paused: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM habit_pauses WHERE workspace_id = $1 \
+         AND habit_id = $2 AND started_at < $4 \
+         AND (ended_at IS NULL OR ended_at > $3))",
+    )
+    .bind(workspace_id)
+    .bind(occurrence.evidence.habit_id)
+    .bind(window_start)
+    .bind(window_end)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if paused {
+        return Ok(Some(HabitMissedCancellationReason::SourcePaused));
+    }
+    if occurrence.evidence.policy_fingerprint
+        != prefixed_hex(configuration.policy_fingerprint.as_slice())
+    {
+        return Ok(Some(HabitMissedCancellationReason::SourceObsolete));
+    }
+    Ok(None)
+}
+
+async fn bound_reduction_needs_rebind_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    configuration: &HabitMissedConfiguration,
+) -> Result<bool, HabitRepositoryError> {
+    let Some(HabitMissedResolutionAction::ReduceFrequency {
+        suppressed_planner_occurrence_ids,
+    }) = occurrence
+        .missed_resolution
+        .as_ref()
+        .map(|resolution| &resolution.action)
+    else {
+        return Ok(false);
+    };
+    let Some(target_id) = suppressed_planner_occurrence_ids.first() else {
+        return Ok(true);
+    };
+    let row = sqlx::query(
+        "SELECT \
+           (target_outcome.status IS NULL OR target_outcome.status = 'unresolved') AS outcome_eligible, \
+           EXISTS (SELECT 1 FROM habit_pauses target_pause \
+             WHERE target_pause.workspace_id = target.workspace_id \
+               AND target_pause.habit_id = target.habit_id \
+               AND target_pause.started_at < target.window_end \
+               AND (target_pause.ended_at IS NULL \
+                 OR target_pause.ended_at > target.window_start)) AS target_paused, \
+           EXISTS (SELECT 1 FROM schedule_revisions current_revision \
+             WHERE current_revision.workspace_id = target.workspace_id \
+               AND current_revision.state = 'published' \
+               AND current_revision.horizon_start <= target.window_start \
+               AND current_revision.horizon_end >= target.window_end) AS horizon_covers_target, \
+           EXISTS (SELECT 1 FROM habit_occurrence_publications publication \
+             JOIN schedule_revisions current_revision \
+               ON current_revision.workspace_id = publication.workspace_id \
+              AND current_revision.id = publication.schedule_revision_id \
+              AND current_revision.state = 'published' \
+             WHERE publication.workspace_id = target.workspace_id \
+               AND publication.occurrence_evidence_id = target.id \
+               AND publication.occurrence_state IN ('generated', 'skipped') \
+               AND target.policy_fingerprint = $4) AS current_member \
+         FROM habit_occurrence_evidence target \
+         LEFT JOIN habit_occurrence_outcomes target_outcome \
+           ON target_outcome.workspace_id = target.workspace_id \
+          AND target_outcome.occurrence_evidence_id = target.id \
+         WHERE target.workspace_id = $1 AND target.habit_id = $2 \
+           AND target.planner_occurrence_id = $3",
+    )
+    .bind(workspace_id)
+    .bind(occurrence.evidence.habit_id)
+    .bind(target_id)
+    .bind(configuration.policy_fingerprint.as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let Some(row) = row else {
+        return Ok(true);
+    };
+    let outcome_eligible: bool = row.try_get("outcome_eligible").map_err(storage)?;
+    let target_paused: bool = row.try_get("target_paused").map_err(storage)?;
+    let horizon_covers_target: bool = row.try_get("horizon_covers_target").map_err(storage)?;
+    let current_member: bool = row.try_get("current_member").map_err(storage)?;
+    Ok(!outcome_eligible || target_paused || (horizon_covers_target && !current_member))
+}
+
+async fn maintenance_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    configuration: &HabitMissedConfiguration,
+    now: DateTime<Utc>,
+) -> Result<Option<HabitMissedResolutionAction>, HabitRepositoryError> {
+    let current = occurrence
+        .missed_resolution
+        .as_ref()
+        .ok_or(HabitRepositoryError::Internal)?;
+    if let Some(reason) =
+        source_cancellation_reason_tx(tx, workspace_id, occurrence, configuration).await?
+    {
+        if matches!(
+            current.action,
+            HabitMissedResolutionAction::Cancelled { .. }
+        ) {
+            return Ok(None);
+        }
+        let resume_action =
+            missed_resume_action(&current.action).ok_or(HabitRepositoryError::Internal)?;
+        return Ok(Some(HabitMissedResolutionAction::Cancelled {
+            reason,
+            resume_action,
+        }));
+    }
+    let reduction_needs_rebind = if matches!(
+        current.action,
+        HabitMissedResolutionAction::ReduceFrequency { .. }
+    ) {
+        bound_reduction_needs_rebind_tx(tx, workspace_id, occurrence, configuration).await?
+    } else {
+        false
+    };
+    match &current.action {
+        HabitMissedResolutionAction::Cancelled {
+            reason:
+                HabitMissedCancellationReason::SourceCompleted
+                | HabitMissedCancellationReason::SourceSkipped
+                | HabitMissedCancellationReason::SourcePaused
+                | HabitMissedCancellationReason::SourceObsolete,
+            resume_action,
+        } => restore_action_tx(
+            tx,
+            workspace_id,
+            occurrence,
+            *resume_action,
+            configuration,
+            now,
+        )
+        .await
+        .map(Some),
+        HabitMissedResolutionAction::ReduceFrequency { .. } if reduction_needs_rebind => {
+            Ok(Some(HabitMissedResolutionAction::ReductionPending))
+        }
+        HabitMissedResolutionAction::Carry { window_end, .. } if *window_end <= now => {
+            if current.configured_policy == HabitMissedPolicy::Ask {
+                Ok(Some(HabitMissedResolutionAction::DecisionRequired))
+            } else {
+                derive_missed_resolution_action(occurrence, HabitMissedPolicy::Carry, now)
+                    .map(Some)
+                    .map_err(|_| HabitRepositoryError::Internal)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn restore_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    resume_action: HabitMissedResumeAction,
+    configuration: &HabitMissedConfiguration,
+    now: DateTime<Utc>,
+) -> Result<HabitMissedResolutionAction, HabitRepositoryError> {
+    let policy = match resume_action {
+        HabitMissedResumeAction::DecisionRequired => HabitMissedPolicy::Ask,
+        HabitMissedResumeAction::Skip => HabitMissedPolicy::Skip,
+        HabitMissedResumeAction::Carry => HabitMissedPolicy::Carry,
+        HabitMissedResumeAction::ReduceFrequency => HabitMissedPolicy::ReduceFrequency,
+    };
+    let action = derive_missed_resolution_action(occurrence, policy, now)
+        .map_err(|_| HabitRepositoryError::Internal)?;
+    if matches!(action, HabitMissedResolutionAction::ReductionPending) {
+        match reduction_action_tx(tx, workspace_id, occurrence, configuration, now).await {
+            Ok(action) => Ok(action),
+            Err(HabitRepositoryError::MissedReductionUnavailable) => {
+                Ok(HabitMissedResolutionAction::ReductionPending)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(action)
+    }
+}
+
+const fn missed_resume_action(
+    action: &HabitMissedResolutionAction,
+) -> Option<HabitMissedResumeAction> {
+    match action {
+        HabitMissedResolutionAction::DecisionRequired => {
+            Some(HabitMissedResumeAction::DecisionRequired)
+        }
+        HabitMissedResolutionAction::Skip => Some(HabitMissedResumeAction::Skip),
+        HabitMissedResolutionAction::Carry { .. } => Some(HabitMissedResumeAction::Carry),
+        HabitMissedResolutionAction::ReductionPending
+        | HabitMissedResolutionAction::ReduceFrequency { .. } => {
+            Some(HabitMissedResumeAction::ReduceFrequency)
+        }
+        HabitMissedResolutionAction::Cancelled { .. } => None,
+    }
+}
+
+async fn explicit_missed_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    action: HabitMissedExplicitAction,
+    configuration: &HabitMissedConfiguration,
+    now: DateTime<Utc>,
+) -> Result<HabitMissedResolutionAction, HabitRepositoryError> {
+    let policy = match action {
+        HabitMissedExplicitAction::Skip => HabitMissedPolicy::Skip,
+        HabitMissedExplicitAction::Carry => HabitMissedPolicy::Carry,
+        HabitMissedExplicitAction::ReduceFrequency => HabitMissedPolicy::ReduceFrequency,
+    };
+    let derived = derive_missed_resolution_action(occurrence, policy, now)
+        .map_err(|_| HabitRepositoryError::Internal)?;
+    if matches!(derived, HabitMissedResolutionAction::ReductionPending) {
+        match reduction_action_tx(tx, workspace_id, occurrence, configuration, now).await {
+            Ok(bound) => Ok(bound),
+            Err(HabitRepositoryError::MissedReductionUnavailable) => Ok(derived),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(derived)
+    }
+}
+
+async fn reduction_action_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    occurrence: &HabitOccurrence,
+    configuration: &HabitMissedConfiguration,
+    now: DateTime<Utc>,
+) -> Result<HabitMissedResolutionAction, HabitRepositoryError> {
+    let source_ordinal = recurrence_identity_ordinal(&occurrence.evidence.identity)
+        .ok_or(HabitRepositoryError::Internal)?;
+    let target: Option<Uuid> = sqlx::query_scalar(
+        "SELECT planner_occurrence_id FROM habit_available_reduction_target( \
+           $1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(workspace_id)
+    .bind(occurrence.evidence.habit_id)
+    .bind(occurrence.evidence.id)
+    .bind(occurrence.evidence.nominal_start)
+    .bind(i64::from(source_ordinal))
+    .bind(occurrence.evidence.planner_occurrence_id)
+    .bind(configuration.policy_fingerprint.as_slice())
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let target = target.ok_or(HabitRepositoryError::MissedReductionUnavailable)?;
+    Ok(HabitMissedResolutionAction::ReduceFrequency {
+        suppressed_planner_occurrence_ids: vec![target],
+    })
+}
+
+async fn insert_new_missed_resolution_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    actor_session_id: Option<Uuid>,
+    operation_id: Uuid,
+    occurrence: HabitOccurrence,
+    resolution: &HabitMissedResolution,
+    now: DateTime<Utc>,
+) -> Result<(), HabitRepositoryError> {
+    validate_resolution(resolution)?;
+    if occurrence.evidence.id != resolution.occurrence_evidence_id
+        || occurrence.evidence.habit_id != resolution.habit_id
+        || occurrence.evidence.planner_occurrence_id != resolution.source_planner_occurrence_id
+        || occurrence.missed_resolution.is_some()
+    {
+        return Err(HabitRepositoryError::Internal);
+    }
+    let columns = missed_action_columns(&resolution.action);
+    sqlx::query(
+        "INSERT INTO habit_missed_resolutions (workspace_id, occurrence_evidence_id, habit_id, \
+         source_planner_occurrence_id, revision, configured_policy, action, cancellation_reason, \
+         cancelled_resume_action, carry_window_start, carry_window_end, \
+         suppressed_planner_occurrence_ids, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)",
+    )
+    .bind(scope.workspace_id)
+    .bind(resolution.occurrence_evidence_id)
+    .bind(resolution.habit_id)
+    .bind(resolution.source_planner_occurrence_id)
+    .bind(to_i64(resolution.revision)?)
+    .bind(missed_policy_name(resolution.configured_policy))
+    .bind(columns.action)
+    .bind(columns.cancellation_reason)
+    .bind(columns.cancelled_resume_action)
+    .bind(columns.carry_start)
+    .bind(columns.carry_end)
+    .bind(&columns.suppressed)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let snapshot = serde_json::to_value(resolution).map_err(|_| HabitRepositoryError::Internal)?;
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO habit_missed_resolution_versions (id, workspace_id, occurrence_evidence_id, \
+         revision, operation_id, previous_snapshot, resolution_snapshot, recorded_at) \
+         VALUES ($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(version_id)
+    .bind(scope.workspace_id)
+    .bind(resolution.occurrence_evidence_id)
+    .bind(to_i64(resolution.revision)?)
+    .bind(operation_id)
+    .bind(snapshot)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    emit_missed_resolution_change_tx(
+        tx,
+        scope,
+        actor_session_id,
+        operation_id,
+        occurrence,
+        resolution,
+        0,
+        version_id,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Projection, immutable history, audit, delta, and outbox share one transaction.
+async fn update_missed_resolution_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    actor_session_id: Option<Uuid>,
+    operation_id: Uuid,
+    occurrence: HabitOccurrence,
+    previous: &HabitMissedResolution,
+    resolution: &HabitMissedResolution,
+    explicit_selection: bool,
+    now: DateTime<Utc>,
+) -> Result<(), HabitRepositoryError> {
+    if !(valid_missed_resolution_transition(previous, resolution)
+        || explicit_selection
+            && valid_explicit_missed_cancellation_transition(previous, resolution))
+    {
+        return Err(HabitRepositoryError::Internal);
+    }
+    let columns = missed_action_columns(&resolution.action);
+    let updated = sqlx::query(
+        "UPDATE habit_missed_resolutions SET revision = $4, action = $5, \
+         cancellation_reason = $6, cancelled_resume_action = $7, \
+         cancelled_explicit_selection = $8, carry_window_start = $9, carry_window_end = $10, \
+         suppressed_planner_occurrence_ids = $11, updated_at = $12 \
+         WHERE workspace_id = $1 AND occurrence_evidence_id = $2 AND habit_id = $3 AND revision = $13",
+    )
+    .bind(scope.workspace_id)
+    .bind(resolution.occurrence_evidence_id)
+    .bind(resolution.habit_id)
+    .bind(to_i64(resolution.revision)?)
+    .bind(columns.action)
+    .bind(columns.cancellation_reason)
+    .bind(columns.cancelled_resume_action)
+    .bind(explicit_selection)
+    .bind(columns.carry_start)
+    .bind(columns.carry_end)
+    .bind(&columns.suppressed)
+    .bind(now)
+    .bind(to_i64(previous.revision)?)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if updated.rows_affected() != 1 {
+        return Err(HabitRepositoryError::Internal);
+    }
+    let previous_snapshot =
+        serde_json::to_value(previous).map_err(|_| HabitRepositoryError::Internal)?;
+    let snapshot = serde_json::to_value(resolution).map_err(|_| HabitRepositoryError::Internal)?;
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO habit_missed_resolution_versions (id, workspace_id, occurrence_evidence_id, \
+         revision, operation_id, previous_snapshot, resolution_snapshot, recorded_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(version_id)
+    .bind(scope.workspace_id)
+    .bind(resolution.occurrence_evidence_id)
+    .bind(to_i64(resolution.revision)?)
+    .bind(operation_id)
+    .bind(previous_snapshot)
+    .bind(snapshot)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    emit_missed_resolution_change_tx(
+        tx,
+        scope,
+        actor_session_id,
+        operation_id,
+        occurrence,
+        resolution,
+        previous.revision,
+        version_id,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_missed_resolution_change_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    actor_session_id: Option<Uuid>,
+    operation_id: Uuid,
+    mut occurrence: HabitOccurrence,
+    resolution: &HabitMissedResolution,
+    previous_revision: u64,
+    version_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), HabitRepositoryError> {
+    occurrence.missed_resolution = Some(resolution.clone());
+    validate_occurrence(&occurrence)?;
+    let change = HabitDeltaChange::OccurrenceUpsert { occurrence };
+    let sequence = insert_change(
+        tx,
+        scope.workspace_id,
+        "occurrence_upsert",
+        resolution.occurrence_evidence_id,
+        resolution.revision,
+        &change,
+        now,
+    )
+    .await?;
+    insert_audit(
+        tx,
+        scope,
+        actor_session_id,
+        operation_id,
+        "habit.missed.resolved",
+        "habit_occurrence",
+        resolution.occurrence_evidence_id,
+        previous_revision,
+        resolution.revision,
+        json!({
+            "version_id": version_id,
+            "action": missed_action_name(&resolution.action),
+            "change_sequence": sequence,
+        }),
+        now,
+    )
+    .await?;
+    insert_content_free_outbox(
+        tx,
+        scope.workspace_id,
+        resolution.occurrence_evidence_id,
+        resolution.revision,
+        "habit.occurrence.changed",
+        sequence,
+        now,
+    )
+    .await
+}
+
+struct MissedActionColumns {
+    action: &'static str,
+    cancellation_reason: Option<&'static str>,
+    cancelled_resume_action: Option<&'static str>,
+    carry_start: Option<DateTime<Utc>>,
+    carry_end: Option<DateTime<Utc>>,
+    suppressed: Vec<Uuid>,
+}
+
+fn missed_action_columns(action: &HabitMissedResolutionAction) -> MissedActionColumns {
+    match action {
+        HabitMissedResolutionAction::DecisionRequired => MissedActionColumns {
+            action: "decision_required",
+            cancellation_reason: None,
+            cancelled_resume_action: None,
+            carry_start: None,
+            carry_end: None,
+            suppressed: Vec::new(),
+        },
+        HabitMissedResolutionAction::ReductionPending => MissedActionColumns {
+            action: "reduction_pending",
+            cancellation_reason: None,
+            cancelled_resume_action: None,
+            carry_start: None,
+            carry_end: None,
+            suppressed: Vec::new(),
+        },
+        HabitMissedResolutionAction::Cancelled {
+            reason,
+            resume_action,
+        } => MissedActionColumns {
+            action: "cancelled",
+            cancellation_reason: Some(missed_cancellation_reason_name(*reason)),
+            cancelled_resume_action: Some(missed_resume_action_name(*resume_action)),
+            carry_start: None,
+            carry_end: None,
+            suppressed: Vec::new(),
+        },
+        HabitMissedResolutionAction::Skip => MissedActionColumns {
+            action: "skip",
+            cancellation_reason: None,
+            cancelled_resume_action: None,
+            carry_start: None,
+            carry_end: None,
+            suppressed: Vec::new(),
+        },
+        HabitMissedResolutionAction::Carry {
+            window_start,
+            window_end,
+        } => MissedActionColumns {
+            action: "carry",
+            cancellation_reason: None,
+            cancelled_resume_action: None,
+            carry_start: Some(*window_start),
+            carry_end: Some(*window_end),
+            suppressed: Vec::new(),
+        },
+        HabitMissedResolutionAction::ReduceFrequency {
+            suppressed_planner_occurrence_ids,
+        } => MissedActionColumns {
+            action: "reduce_frequency",
+            cancellation_reason: None,
+            cancelled_resume_action: None,
+            carry_start: None,
+            carry_end: None,
+            suppressed: suppressed_planner_occurrence_ids.clone(),
+        },
+    }
+}
+
 async fn lock_habit_mutation_space(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -820,13 +2301,25 @@ async fn lock_habit_mutation_space(
     lock_canonical_item_space(tx, workspace_id)
         .await
         .map_err(storage)?;
+    lock_habit_change_space(tx, workspace_id)
+        .await
+        .map_err(storage)
+}
+
+/// Serializes changes to the authoritative habit projection after the caller
+/// has acquired the canonical-item workspace lock. Schedule publication uses
+/// the same lock after its execution/canonical locks so its habit-change-head
+/// fence remains valid until commit.
+pub(crate) async fn lock_habit_change_space(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended('dayweave.habits.v1:' || $1::text, 0))",
     )
     .bind(workspace_id)
     .execute(&mut **tx)
-    .await
-    .map_err(storage)?;
+    .await?;
     Ok(())
 }
 
@@ -858,7 +2351,7 @@ async fn replay_receipt(
     scope: DatabaseScope,
     idempotency: &HabitIdempotency,
 ) -> Result<Option<StoredReceipt>, HabitRepositoryError> {
-    let rows = sqlx::query(
+    let mut rows = sqlx::query(
         "SELECT namespace, key_hash, request_fingerprint, response_json \
          FROM habit_operation_receipts WHERE workspace_id = $1 \
          AND ((namespace = $2 AND key_hash = $3) OR operation_id = $4) FOR SHARE",
@@ -870,6 +2363,43 @@ async fn replay_receipt(
     .fetch_all(&mut **tx)
     .await
     .map_err(storage)?;
+    if rows.is_empty() {
+        // Empty reconcile receipts share the workspace-global operation-id
+        // namespace with permanent habit receipts. Every habit mutation must
+        // observe a still-live ephemeral operation before it can claim the
+        // same identifier in the permanent ledger.
+        sqlx::query(
+            "DELETE FROM idempotency_keys WHERE workspace_id = $1 \
+             AND namespace = $2 \
+             AND resource_type = $3 AND expires_at <= clock_timestamp() \
+             AND (resource_id = $5 OR ($6 AND key_hash = $4))",
+        )
+        .bind(scope.workspace_id)
+        .bind(MISSED_RECONCILE_NAMESPACE)
+        .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+        .bind(idempotency.key_hash.as_slice())
+        .bind(idempotency.operation_id)
+        .bind(idempotency.namespace == MISSED_RECONCILE_NAMESPACE)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        rows = sqlx::query(
+            "SELECT namespace, key_hash, request_fingerprint, response_json \
+             FROM idempotency_keys WHERE workspace_id = $1 AND namespace = $2 \
+               AND resource_type = $3 AND state = 'completed' \
+               AND expires_at > clock_timestamp() \
+               AND (resource_id = $5 OR ($6 AND key_hash = $4)) FOR SHARE",
+        )
+        .bind(scope.workspace_id)
+        .bind(MISSED_RECONCILE_NAMESPACE)
+        .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+        .bind(idempotency.key_hash.as_slice())
+        .bind(idempotency.operation_id)
+        .bind(idempotency.namespace == MISSED_RECONCILE_NAMESPACE)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(storage)?;
+    }
     if rows.is_empty() {
         return Ok(None);
     }
@@ -927,25 +2457,114 @@ async fn insert_receipt(
     Ok(())
 }
 
+async fn insert_ephemeral_reconcile_receipt(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    idempotency: &HabitIdempotency,
+    response: &HabitMissedReconcileResult,
+) -> Result<(), HabitRepositoryError> {
+    let stored = StoredReceipt::MissedReconcile(response.clone());
+    stored.validate()?;
+    let response = serde_json::to_value(stored).map_err(|_| HabitRepositoryError::Internal)?;
+
+    // Automatic clients poll frequently. Expiry plus a hard per-workspace cap
+    // preserves a useful exact-retry window without allowing terminal scans to
+    // grow the immutable mutation-receipt ledger forever.
+    sqlx::query(
+        "DELETE FROM idempotency_keys WHERE workspace_id = $1 AND namespace = $2 \
+         AND resource_type = $3 AND expires_at <= clock_timestamp()",
+    )
+    .bind(scope.workspace_id)
+    .bind(MISSED_RECONCILE_NAMESPACE)
+    .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM idempotency_keys WHERE workspace_id = $1 AND namespace = $2 \
+         AND resource_type = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(MISSED_RECONCILE_NAMESPACE)
+    .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if retained >= 4_096 {
+        sqlx::query(
+            "DELETE FROM idempotency_keys WHERE ctid IN ( \
+               SELECT ctid FROM idempotency_keys WHERE workspace_id = $1 AND namespace = $2 \
+                 AND resource_type = $3 \
+                 AND created_at <= clock_timestamp() - INTERVAL '12 hours' \
+               ORDER BY created_at, expires_at LIMIT 1)",
+        )
+        .bind(scope.workspace_id)
+        .bind(MISSED_RECONCILE_NAMESPACE)
+        .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE workspace_id = $1 AND namespace = $2 \
+             AND resource_type = $3",
+        )
+        .bind(scope.workspace_id)
+        .bind(MISSED_RECONCILE_NAMESPACE)
+        .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)?;
+        if retained >= 4_096 {
+            return Err(HabitRepositoryError::ReconcileReceiptCapacity);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO idempotency_keys (workspace_id, namespace, key_hash, request_fingerprint, \
+           state, resource_type, resource_id, response_json, created_at, updated_at, expires_at) \
+         VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, clock_timestamp(), \
+           clock_timestamp(), clock_timestamp() + INTERVAL '24 hours')",
+    )
+    .bind(scope.workspace_id)
+    .bind(idempotency.namespace)
+    .bind(idempotency.key_hash.as_slice())
+    .bind(idempotency.request_fingerprint.as_slice())
+    .bind(MISSED_RECONCILE_EPHEMERAL_RESOURCE)
+    .bind(idempotency.operation_id)
+    .bind(response)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| {
+        if error
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+        {
+            HabitRepositoryError::IdempotencyConflict
+        } else {
+            HabitRepositoryError::Internal
+        }
+    })?;
+    Ok(())
+}
+
 async fn insert_change(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     kind: &str,
     entity_id: Uuid,
-    entity_revision: u64,
+    component_revision: u64,
     change: &HabitDeltaChange,
     changed_at: DateTime<Utc>,
 ) -> Result<u64, HabitRepositoryError> {
     validate_change(change)?;
     let payload = serde_json::to_value(change).map_err(|_| HabitRepositoryError::Internal)?;
     let sequence: i64 = sqlx::query_scalar(
-        "INSERT INTO habit_changes (workspace_id, change_kind, entity_id, entity_revision, payload, changed_at) \
+        "INSERT INTO habit_changes (workspace_id, change_kind, entity_id, component_revision, payload, changed_at) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING sequence",
     )
     .bind(workspace_id)
     .bind(kind)
     .bind(entity_id)
-    .bind(to_i64(entity_revision)?)
+    .bind(to_i64(component_revision)?)
     .bind(payload)
     .bind(changed_at)
     .fetch_one(&mut **tx)
@@ -995,7 +2614,7 @@ async fn insert_content_free_outbox(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     entity_id: Uuid,
-    revision: u64,
+    component_revision: u64,
     event_type: &str,
     sequence: u64,
     now: DateTime<Utc>,
@@ -1008,10 +2627,15 @@ async fn insert_content_free_outbox(
     .bind(Uuid::new_v4())
     .bind(workspace_id)
     .bind(entity_id)
-    .bind(to_i64(revision)?)
+    .bind(to_i64(sequence)?)
     .bind(event_type)
-    .bind(format!("habit:{entity_id}:{revision}:{sequence}"))
-    .bind(json!({"entity_id":entity_id,"revision":revision,"change_sequence":sequence}))
+    .bind(format!("habit:{entity_id}:{sequence}"))
+    .bind(json!({
+        "entity_id": entity_id,
+        "aggregate_revision": sequence,
+        "component_revision": component_revision,
+        "change_sequence": sequence,
+    }))
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -1142,6 +2766,222 @@ pub(crate) async fn authoritative_habit_recurrence_tx(
                 action: RecurrenceExceptionAction::Skip,
             }),
             _ => return Err(PublishedHabitEvidenceError::Invalid),
+        }
+    }
+    let missed_rows = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {EVIDENCE_COLUMNS}, item.revision AS current_item_revision, \
+         item.timezone_name AS current_timezone_name, item.recurrence AS current_recurrence, \
+         item.scheduling_constraints AS current_constraints, \
+         item.duration_seconds AS current_duration_seconds, item.duration_kind AS current_duration_kind, \
+         item.duration_min_seconds AS current_duration_min_seconds, \
+         item.duration_max_seconds AS current_duration_max_seconds, \
+         item.duration_source AS current_duration_source, item.split_allowed AS current_split_allowed, \
+         item.minimum_chunk_seconds AS current_minimum_chunk_seconds, \
+         item.maximum_chunk_seconds AS current_maximum_chunk_seconds, \
+         resolution.revision AS missed_resolution_revision, \
+         resolution.source_planner_occurrence_id AS missed_source_planner_occurrence_id, \
+         resolution.configured_policy AS missed_configured_policy, \
+         resolution.action AS missed_action, resolution.cancellation_reason, \
+         resolution.cancelled_resume_action, resolution.carry_window_start, \
+         resolution.carry_window_end, resolution.suppressed_planner_occurrence_ids, \
+         resolution.created_at AS missed_created_at, resolution.updated_at AS missed_updated_at, \
+         source_outcome.status AS missed_source_outcome_status, \
+         EXISTS (SELECT 1 FROM habit_effective_reduction_targets( \
+           evidence.workspace_id, evidence.habit_id, evidence.policy_fingerprint) \
+           WHERE planner_occurrence_id = evidence.planner_occurrence_id) \
+           AS missed_source_is_effectively_suppressed, \
+         CASE WHEN resolution.action = 'reduce_frequency' THEN EXISTS ( \
+           SELECT 1 FROM habit_effective_reduction_targets( \
+             evidence.workspace_id, evidence.habit_id, evidence.policy_fingerprint) \
+           WHERE planner_occurrence_id = resolution.suppressed_planner_occurrence_id) \
+         ELSE false END AS missed_reduction_is_effective, \
+         EXISTS (SELECT 1 FROM habit_pauses source_pause \
+           WHERE source_pause.workspace_id = evidence.workspace_id \
+             AND source_pause.habit_id = evidence.habit_id \
+             AND source_pause.started_at < CASE WHEN resolution.action = 'carry' \
+               THEN resolution.carry_window_end ELSE evidence.window_end END \
+             AND (source_pause.ended_at IS NULL OR source_pause.ended_at > \
+               CASE WHEN resolution.action = 'carry' \
+                 THEN resolution.carry_window_start ELSE evidence.window_start END)) \
+           AS missed_source_paused, \
+         CASE WHEN resolution.action = 'reduce_frequency' THEN EXISTS ( \
+           SELECT 1 FROM habit_occurrence_evidence target \
+           LEFT JOIN habit_occurrence_outcomes target_outcome \
+             ON target_outcome.workspace_id = target.workspace_id \
+            AND target_outcome.occurrence_evidence_id = target.id \
+           WHERE target.workspace_id = evidence.workspace_id \
+             AND target.habit_id = evidence.habit_id \
+             AND target.planner_occurrence_id = resolution.suppressed_planner_occurrence_id \
+             AND ( \
+               (target_outcome.status IS NOT NULL AND target_outcome.status <> 'unresolved') \
+               OR EXISTS (SELECT 1 FROM habit_pauses target_pause \
+                 WHERE target_pause.workspace_id = target.workspace_id \
+                   AND target_pause.habit_id = target.habit_id \
+                   AND target_pause.started_at < target.window_end \
+                   AND (target_pause.ended_at IS NULL \
+                     OR target_pause.ended_at > target.window_start)) \
+               OR EXISTS (SELECT 1 FROM schedule_revisions current_revision \
+                 WHERE current_revision.workspace_id = target.workspace_id \
+                   AND current_revision.state = 'published' \
+                   AND current_revision.horizon_start <= target.window_start \
+                   AND current_revision.horizon_end >= target.window_end \
+                   AND NOT EXISTS (SELECT 1 FROM habit_occurrence_publications publication \
+                     WHERE publication.workspace_id = target.workspace_id \
+                       AND publication.schedule_revision_id = current_revision.id \
+                       AND publication.occurrence_evidence_id = target.id \
+                       AND publication.occurrence_state IN ('generated', 'skipped'))))) \
+         ELSE false END AS missed_target_ineligible \
+         FROM habit_occurrence_evidence evidence JOIN habit_missed_resolutions resolution \
+           ON resolution.workspace_id = evidence.workspace_id \
+          AND resolution.occurrence_evidence_id = evidence.id \
+         LEFT JOIN habit_occurrence_outcomes source_outcome \
+           ON source_outcome.workspace_id = evidence.workspace_id \
+          AND source_outcome.occurrence_evidence_id = evidence.id \
+         JOIN items item ON item.workspace_id = evidence.workspace_id AND item.id = evidence.habit_id \
+         WHERE evidence.workspace_id = $1 AND item.kind = 'habit' \
+           AND item.recurrence IS NOT NULL AND item.trashed_at IS NULL \
+           AND item.status NOT IN ('completed', 'skipped', 'cancelled', 'blocked') \
+           AND NOT EXISTS (SELECT 1 FROM item_hierarchy child_edge \
+             JOIN items child ON child.workspace_id = child_edge.workspace_id \
+               AND child.id = child_edge.child_item_id \
+             WHERE child_edge.workspace_id = item.workspace_id \
+               AND child_edge.parent_item_id = item.id AND child.trashed_at IS NULL) \
+           AND ((evidence.window_start < $3 AND evidence.window_end > $2) \
+             OR (resolution.action = 'carry' AND resolution.carry_window_start < $3 \
+                 AND resolution.carry_window_end > $2) \
+             OR evidence.planner_occurrence_id = ANY($4) \
+             OR resolution.suppressed_planner_occurrence_id = ANY($4) \
+             OR EXISTS (SELECT 1 FROM habit_occurrence_evidence target \
+                 WHERE target.workspace_id = evidence.workspace_id \
+                   AND target.habit_id = evidence.habit_id \
+                   AND target.planner_occurrence_id = resolution.suppressed_planner_occurrence_id \
+                   AND target.window_start < $3 AND target.window_end > $2)) \
+         ORDER BY evidence.habit_id, evidence.nominal_start, evidence.recurrence_ordinal, evidence.id"
+    )))
+    .bind(workspace_id)
+    .bind(horizon_start)
+    .bind(horizon_end)
+    .bind(moved_occurrence_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    // A reduction only suppresses its target while the reduction source and
+    // target are both currently applicable. Process immutable source order so
+    // a suppressed occurrence cannot cascade its own stale reduction action.
+    // Reduction targets are strictly later occurrences by domain and schema
+    // validation, making this a deterministic forward pass.
+    let mut effective_reduction_targets = BTreeSet::new();
+    for row in missed_rows {
+        let evidence = authoritative_evidence_from_row(&row)?;
+        let revision: i64 = row
+            .try_get("missed_resolution_revision")
+            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let resolution = missed_resolution_from_row(&row, revision)
+            .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+        if resolution.occurrence_evidence_id != evidence.id
+            || resolution.habit_id != evidence.habit_id
+            || resolution.source_planner_occurrence_id != evidence.planner_occurrence_id
+        {
+            return Err(PublishedHabitEvidenceError::Invalid);
+        }
+        let source_outcome_status: Option<String> = row
+            .try_get("missed_source_outcome_status")
+            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let source_paused: bool = row
+            .try_get("missed_source_paused")
+            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let source_is_effectively_suppressed: bool = row
+            .try_get("missed_source_is_effectively_suppressed")
+            .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        let current_policy_fingerprint = current_policy_fingerprint_from_row(&row)?;
+        if matches!(
+            source_outcome_status.as_deref(),
+            Some("completed" | "skipped")
+        ) || source_paused
+            || source_is_effectively_suppressed
+            || evidence.policy_fingerprint != prefixed_hex(&current_policy_fingerprint)
+            || effective_reduction_targets
+                .contains(&(evidence.habit_id, evidence.planner_occurrence_id))
+        {
+            continue;
+        }
+        match &resolution.action {
+            HabitMissedResolutionAction::DecisionRequired
+            | HabitMissedResolutionAction::ReductionPending
+            | HabitMissedResolutionAction::Cancelled { .. } => {}
+            HabitMissedResolutionAction::Skip => {
+                context
+                    .partial_progress
+                    .remove(&OccurrenceId(evidence.planner_occurrence_id));
+                push_unique_skip(
+                    &mut context,
+                    ItemId(evidence.habit_id),
+                    OccurrenceId(evidence.planner_occurrence_id),
+                );
+            }
+            HabitMissedResolutionAction::Carry {
+                window_start,
+                window_end,
+            } => {
+                context.exceptions.retain(|exception| {
+                    !(exception.item_id == ItemId(evidence.habit_id)
+                        && matches!(
+                            exception.selector,
+                            RecurrenceExceptionSelector::Occurrence { id }
+                                if id == OccurrenceId(evidence.planner_occurrence_id)
+                        ))
+                });
+                if horizon_start <= *window_start && *window_end <= horizon_end {
+                    let current_item_revision: i64 = row
+                        .try_get("current_item_revision")
+                        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+                    let source = recurrence_move_source(&evidence, current_item_revision)?;
+                    context.exceptions.push(RecurrenceException {
+                        item_id: ItemId(evidence.habit_id),
+                        selector: RecurrenceExceptionSelector::Occurrence {
+                            id: OccurrenceId(evidence.planner_occurrence_id),
+                        },
+                        action: RecurrenceExceptionAction::Move {
+                            start: chrono_to_offset(*window_start)?,
+                            end: chrono_to_offset(*window_end)?,
+                            source,
+                        },
+                    });
+                } else {
+                    context
+                        .partial_progress
+                        .remove(&OccurrenceId(evidence.planner_occurrence_id));
+                    push_unique_skip(
+                        &mut context,
+                        ItemId(evidence.habit_id),
+                        OccurrenceId(evidence.planner_occurrence_id),
+                    );
+                }
+            }
+            HabitMissedResolutionAction::ReduceFrequency {
+                suppressed_planner_occurrence_ids,
+            } => {
+                let target_ineligible: bool = row
+                    .try_get("missed_target_ineligible")
+                    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+                let reduction_is_effective: bool = row
+                    .try_get("missed_reduction_is_effective")
+                    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+                if target_ineligible || !reduction_is_effective {
+                    continue;
+                }
+                for occurrence_id in suppressed_planner_occurrence_ids {
+                    effective_reduction_targets.insert((evidence.habit_id, *occurrence_id));
+                    context
+                        .partial_progress
+                        .remove(&OccurrenceId(*occurrence_id));
+                    push_unique_skip(
+                        &mut context,
+                        ItemId(evidence.habit_id),
+                        OccurrenceId(*occurrence_id),
+                    );
+                }
+            }
         }
     }
     let anchors = sqlx::query(AssertSqlSafe(format!(
@@ -1385,10 +3225,19 @@ async fn insert_published_occurrence(
     let window_end = offset_to_chrono(occurrence.window_end)?;
     let local_date =
         occurrence_local_date(occurrence.local_date, nominal_start, &policy.timezone_name)?;
+    let evidence_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM habit_occurrence_evidence WHERE workspace_id = $1 \
+         AND habit_id = $2 AND planner_occurrence_id = $3)",
+    )
+    .bind(workspace_id)
+    .bind(occurrence.series_item_id.0)
+    .bind(occurrence.id.0)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
     if nominal_end <= nominal_start
         || window_end <= window_start
-        || nominal_start < window_start
-        || nominal_end > window_end
+        || (!evidence_exists && (nominal_start < window_start || nominal_end > window_end))
     {
         return Err(PublishedHabitEvidenceError::Invalid);
     }
@@ -1411,10 +3260,15 @@ async fn insert_published_occurrence(
         expected_quantity: policy.expected_quantity,
         expected_unit: policy.expected_unit.clone(),
     };
-    evidence
-        .validate()
-        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
-    let inserted = sqlx::query(
+    if !evidence_exists {
+        evidence
+            .validate()
+            .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    }
+    let inserted = if evidence_exists {
+        false
+    } else {
+        sqlx::query(
         "INSERT INTO habit_occurrence_evidence (id, workspace_id, habit_id, planner_occurrence_id, \
          source_schedule_revision_id, source_item_revision, policy_fingerprint, recurrence_identity, \
          nominal_start, nominal_end, window_start, window_end, local_date, timezone_name, \
@@ -1440,15 +3294,19 @@ async fn insert_published_occurrence(
     .bind(policy.expected_quantity)
     .bind(&policy.expected_unit)
     .bind(policy.is_sensitive)
-    .bind(published_at)
-    .execute(&mut **tx)
-    .await
-    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
-    if inserted.rows_affected() == 1 {
+        .bind(published_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?
+        .rows_affected()
+            == 1
+    };
+    if inserted {
         let change = HabitDeltaChange::OccurrenceUpsert {
             occurrence: HabitOccurrence {
                 evidence,
                 outcome: None,
+                missed_resolution: None,
             },
         };
         insert_change(
@@ -1462,17 +3320,34 @@ async fn insert_published_occurrence(
         )
         .await
         .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+        record_occurrence_publication(
+            tx,
+            workspace_id,
+            schedule_revision_id,
+            evidence_id,
+            policy.source_revision,
+            occurrence.state,
+            published_at,
+        )
+        .await?;
         return Ok(());
     }
     let existing = sqlx::query(AssertSqlSafe(format!(
         "SELECT {EVIDENCE_COLUMNS}, (policy_fingerprint = $4 \
          AND recurrence_identity = $5 AND nominal_start = $6 \
-         AND nominal_end = $7 AND window_start = $8 AND window_end = $9 AND local_date = $10 \
+         AND nominal_end = $7 AND local_date = $10 \
          AND timezone_name = $11 AND expected_duration_seconds IS NOT DISTINCT FROM $12 \
          AND expected_quantity IS NOT DISTINCT FROM $13 \
-         AND expected_unit IS NOT DISTINCT FROM $14) AS content_matches \
+         AND expected_unit IS NOT DISTINCT FROM $14) AS base_content_matches, \
+         (evidence.window_start = $8 AND evidence.window_end = $9) AS window_matches, \
+         resolution.action AS missed_action, resolution.carry_window_start, \
+         resolution.carry_window_end \
          FROM habit_occurrence_evidence evidence \
-         WHERE workspace_id = $1 AND habit_id = $2 AND planner_occurrence_id = $3"
+         LEFT JOIN habit_missed_resolutions resolution \
+           ON resolution.workspace_id = evidence.workspace_id \
+          AND resolution.occurrence_evidence_id = evidence.id \
+         WHERE evidence.workspace_id = $1 AND evidence.habit_id = $2 \
+           AND evidence.planner_occurrence_id = $3"
     )))
     .bind(workspace_id)
     .bind(occurrence.series_item_id.0)
@@ -1500,19 +3375,95 @@ async fn insert_published_occurrence(
     // A matching unique key may have been written by an older binary or a
     // privileged operator. Equality alone cannot promote malformed stored
     // evidence into trusted history, so hydrate the complete row first.
-    let _ = authoritative_evidence_from_row(&existing)?;
-    let matches: bool = existing
-        .try_get("content_matches")
+    let existing_evidence = authoritative_evidence_from_row(&existing)
         .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
-    if !matches {
+    let base_matches: bool = existing
+        .try_get("base_content_matches")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let window_matches: bool = existing
+        .try_get("window_matches")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let missed_action: Option<String> = existing
+        .try_get("missed_action")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let carry_start: Option<DateTime<Utc>> = existing
+        .try_get("carry_window_start")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let carry_end: Option<DateTime<Utc>> = existing
+        .try_get("carry_window_end")
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let authorized_carry = missed_action.as_deref() == Some("carry")
+        && carry_start == Some(window_start)
+        && carry_end == Some(window_end);
+    if !base_matches || (!window_matches && !authorized_carry) {
         return Err(PublishedHabitEvidenceError::Conflict);
     }
+    record_occurrence_publication(
+        tx,
+        workspace_id,
+        schedule_revision_id,
+        existing_evidence.id,
+        policy.source_revision,
+        occurrence.state,
+        published_at,
+    )
+    .await?;
     // An exact re-publication is intentionally a storage no-op. In
     // particular, read/preview refreshes must not manufacture a habit change
     // or advance an observation timestamp merely because the schedule content
     // was revalidated. The first admitted publication remains the immutable
     // provenance for this occurrence.
     Ok(())
+}
+
+async fn record_occurrence_publication(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    schedule_revision_id: Uuid,
+    occurrence_evidence_id: Uuid,
+    item_revision: u64,
+    state: OccurrenceState,
+    recorded_at: DateTime<Utc>,
+) -> Result<(), PublishedHabitEvidenceError> {
+    let state = match state {
+        OccurrenceState::Generated => "generated",
+        OccurrenceState::Completed => "completed",
+        OccurrenceState::Paused => "paused",
+        OccurrenceState::Skipped => "skipped",
+    };
+    sqlx::query(
+        "INSERT INTO habit_occurrence_publications (workspace_id, schedule_revision_id, \
+         occurrence_evidence_id, item_revision, occurrence_state, recorded_at) \
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+    )
+    .bind(workspace_id)
+    .bind(schedule_revision_id)
+    .bind(occurrence_evidence_id)
+    .bind(i64::try_from(item_revision).map_err(|_| PublishedHabitEvidenceError::Invalid)?)
+    .bind(state)
+    .bind(recorded_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    let matches: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM habit_occurrence_publications \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2 \
+           AND occurrence_evidence_id = $3 AND item_revision = $4 \
+           AND occurrence_state = $5)",
+    )
+    .bind(workspace_id)
+    .bind(schedule_revision_id)
+    .bind(occurrence_evidence_id)
+    .bind(i64::try_from(item_revision).map_err(|_| PublishedHabitEvidenceError::Invalid)?)
+    .bind(state)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    if matches {
+        Ok(())
+    } else {
+        Err(PublishedHabitEvidenceError::Conflict)
+    }
 }
 
 fn occurrence_local_date(
@@ -1550,6 +3501,125 @@ fn chrono_to_offset(
         .map_err(|_| PublishedHabitEvidenceError::Invalid)
 }
 
+fn current_policy_fingerprint_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<[u8; 32], PublishedHabitEvidenceError> {
+    let habit_id: Uuid = row
+        .try_get("habit_id")
+        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    let timezone_name: String = row
+        .try_get("current_timezone_name")
+        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    let recurrence: Value = row
+        .try_get::<Option<Value>, _>("current_recurrence")
+        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?
+        .ok_or(PublishedHabitEvidenceError::Invalid)?;
+    let constraints: Value = row
+        .try_get("current_constraints")
+        .map_err(|_| PublishedHabitEvidenceError::Unavailable)?;
+    let policy = json!({
+        "schema":"dayweave-habit-policy/1",
+        "habit_id":habit_id,
+        "timezone_name":timezone_name,
+        "recurrence":recurrence,
+        "constraints":constraints,
+        "duration":{
+            "kind":row.try_get::<String,_>("current_duration_kind")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "seconds":row.try_get::<Option<i32>,_>("current_duration_seconds")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "minimum_seconds":row.try_get::<Option<i32>,_>("current_duration_min_seconds")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "maximum_seconds":row.try_get::<Option<i32>,_>("current_duration_max_seconds")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "source":row.try_get::<Option<String>,_>("current_duration_source")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+        },
+        "split":{
+            "allowed":row.try_get::<bool,_>("current_split_allowed")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "minimum_seconds":row.try_get::<Option<i32>,_>("current_minimum_chunk_seconds")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+            "maximum_seconds":row.try_get::<Option<i32>,_>("current_maximum_chunk_seconds")
+                .map_err(|_| PublishedHabitEvidenceError::Unavailable)?,
+        }
+    });
+    let bytes = serde_json::to_vec(&policy).map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn recurrence_move_source(
+    evidence: &HabitOccurrenceEvidence,
+    current_item_revision: i64,
+) -> Result<RecurrenceMoveSource, PublishedHabitEvidenceError> {
+    let identity: RecurrenceOccurrenceIdentity = serde_json::from_value(evidence.identity.clone())
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let ordinal = recurrence_identity_ordinal(&evidence.identity)
+        .ok_or(PublishedHabitEvidenceError::Invalid)?;
+    let month = u8::try_from(evidence.local_date.month())
+        .ok()
+        .and_then(|month| time::Month::try_from(month).ok())
+        .ok_or(PublishedHabitEvidenceError::Invalid)?;
+    let local_date = Some(
+        time::Date::from_calendar_date(
+            evidence.local_date.year(),
+            month,
+            u8::try_from(evidence.local_date.day())
+                .map_err(|_| PublishedHabitEvidenceError::Invalid)?,
+        )
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?,
+    );
+    Ok(RecurrenceMoveSource {
+        item_revision: u64::try_from(current_item_revision)
+            .map_err(|_| PublishedHabitEvidenceError::Invalid)?,
+        identity,
+        nominal_start: chrono_to_offset_in_timezone(
+            evidence.nominal_start,
+            &evidence.timezone_name,
+        )?,
+        nominal_end: chrono_to_offset_in_timezone(evidence.nominal_end, &evidence.timezone_name)?,
+        local_date,
+        ordinal,
+    })
+}
+
+fn chrono_to_offset_in_timezone(
+    value: DateTime<Utc>,
+    timezone_name: &str,
+) -> Result<time::OffsetDateTime, PublishedHabitEvidenceError> {
+    let timezone = timezone_name
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    let offset_seconds = value
+        .with_timezone(&timezone)
+        .offset()
+        .fix()
+        .local_minus_utc();
+    let offset = time::UtcOffset::from_whole_seconds(offset_seconds)
+        .map_err(|_| PublishedHabitEvidenceError::Invalid)?;
+    chrono_to_offset(value).map(|value| value.to_offset(offset))
+}
+
+fn push_unique_skip(context: &mut RecurrenceContext, item_id: ItemId, occurrence_id: OccurrenceId) {
+    let exists = context.exceptions.iter().any(|exception| {
+        exception.item_id == item_id
+            && matches!(
+                (exception.selector, exception.action),
+                (
+                    RecurrenceExceptionSelector::Occurrence { id },
+                    RecurrenceExceptionAction::Skip
+                ) if id == occurrence_id
+            )
+    });
+    if !exists {
+        context.exceptions.push(RecurrenceException {
+            item_id,
+            selector: RecurrenceExceptionSelector::Occurrence { id: occurrence_id },
+            action: RecurrenceExceptionAction::Skip,
+        });
+    }
+}
+
 fn outcome_status_name(status: crate::habits::HabitOutcomeStatus) -> &'static str {
     match status {
         crate::habits::HabitOutcomeStatus::Unresolved => "unresolved",
@@ -1567,6 +3637,122 @@ fn parse_outcome_status(
         "partial" => Ok(crate::habits::HabitOutcomeStatus::Partial),
         "completed" => Ok(crate::habits::HabitOutcomeStatus::Completed),
         "skipped" => Ok(crate::habits::HabitOutcomeStatus::Skipped),
+        _ => Err(HabitRepositoryError::Internal),
+    }
+}
+
+const fn missed_policy_name(policy: HabitMissedPolicy) -> &'static str {
+    match policy {
+        HabitMissedPolicy::Skip => "skip",
+        HabitMissedPolicy::Carry => "carry",
+        HabitMissedPolicy::ReduceFrequency => "reduce_frequency",
+        HabitMissedPolicy::Ask => "ask",
+    }
+}
+
+fn parse_missed_policy(value: &str) -> Result<HabitMissedPolicy, HabitRepositoryError> {
+    match value {
+        "skip" => Ok(HabitMissedPolicy::Skip),
+        "carry" => Ok(HabitMissedPolicy::Carry),
+        "reduce_frequency" => Ok(HabitMissedPolicy::ReduceFrequency),
+        "ask" => Ok(HabitMissedPolicy::Ask),
+        _ => Err(HabitRepositoryError::Internal),
+    }
+}
+
+fn missed_action_name(action: &HabitMissedResolutionAction) -> &'static str {
+    match action {
+        HabitMissedResolutionAction::DecisionRequired => "decision_required",
+        HabitMissedResolutionAction::ReductionPending => "reduction_pending",
+        HabitMissedResolutionAction::Cancelled { .. } => "cancelled",
+        HabitMissedResolutionAction::Skip => "skip",
+        HabitMissedResolutionAction::Carry { .. } => "carry",
+        HabitMissedResolutionAction::ReduceFrequency { .. } => "reduce_frequency",
+    }
+}
+
+const fn missed_cancellation_reason_name(reason: HabitMissedCancellationReason) -> &'static str {
+    match reason {
+        HabitMissedCancellationReason::SourceCompleted => "source_completed",
+        HabitMissedCancellationReason::SourceSkipped => "source_skipped",
+        HabitMissedCancellationReason::SourcePaused => "source_paused",
+        HabitMissedCancellationReason::SourceObsolete => "source_obsolete",
+    }
+}
+
+fn parse_missed_cancellation_reason(
+    value: &str,
+) -> Result<HabitMissedCancellationReason, HabitRepositoryError> {
+    match value {
+        "source_completed" => Ok(HabitMissedCancellationReason::SourceCompleted),
+        "source_skipped" => Ok(HabitMissedCancellationReason::SourceSkipped),
+        "source_paused" => Ok(HabitMissedCancellationReason::SourcePaused),
+        "source_obsolete" => Ok(HabitMissedCancellationReason::SourceObsolete),
+        _ => Err(HabitRepositoryError::Internal),
+    }
+}
+
+const fn missed_resume_action_name(action: HabitMissedResumeAction) -> &'static str {
+    match action {
+        HabitMissedResumeAction::DecisionRequired => "decision_required",
+        HabitMissedResumeAction::Skip => "skip",
+        HabitMissedResumeAction::Carry => "carry",
+        HabitMissedResumeAction::ReduceFrequency => "reduce_frequency",
+    }
+}
+
+fn parse_missed_resume_action(
+    value: &str,
+) -> Result<HabitMissedResumeAction, HabitRepositoryError> {
+    match value {
+        "decision_required" => Ok(HabitMissedResumeAction::DecisionRequired),
+        "skip" => Ok(HabitMissedResumeAction::Skip),
+        "carry" => Ok(HabitMissedResumeAction::Carry),
+        "reduce_frequency" => Ok(HabitMissedResumeAction::ReduceFrequency),
+        _ => Err(HabitRepositoryError::Internal),
+    }
+}
+
+fn parse_missed_action(
+    value: &str,
+    cancellation_reason: Option<&str>,
+    cancelled_resume_action: Option<&str>,
+    carry_start: Option<DateTime<Utc>>,
+    carry_end: Option<DateTime<Utc>>,
+    suppressed: Vec<Uuid>,
+) -> Result<HabitMissedResolutionAction, HabitRepositoryError> {
+    match (
+        value,
+        cancellation_reason,
+        cancelled_resume_action,
+        carry_start,
+        carry_end,
+        suppressed.as_slice(),
+    ) {
+        ("decision_required", None, None, None, None, []) => {
+            Ok(HabitMissedResolutionAction::DecisionRequired)
+        }
+        ("reduction_pending", None, None, None, None, []) => {
+            Ok(HabitMissedResolutionAction::ReductionPending)
+        }
+        ("skip", None, None, None, None, []) => Ok(HabitMissedResolutionAction::Skip),
+        ("carry", None, None, Some(window_start), Some(window_end), []) => {
+            Ok(HabitMissedResolutionAction::Carry {
+                window_start,
+                window_end,
+            })
+        }
+        ("reduce_frequency", None, None, None, None, [_]) => {
+            Ok(HabitMissedResolutionAction::ReduceFrequency {
+                suppressed_planner_occurrence_ids: suppressed,
+            })
+        }
+        ("cancelled", Some(reason), Some(resume_action), None, None, []) => {
+            Ok(HabitMissedResolutionAction::Cancelled {
+                reason: parse_missed_cancellation_reason(reason)?,
+                resume_action: parse_missed_resume_action(resume_action)?,
+            })
+        }
         _ => Err(HabitRepositoryError::Internal),
     }
 }

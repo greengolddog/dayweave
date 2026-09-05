@@ -26,8 +26,8 @@ use crate::{
     persistence::{
         AuthoritativeHabitRecurrence, DatabaseScope, PublishedHabitEvidenceError,
         authoritative_habit_recurrence_tx, fetch_item_batch_tx, insert_proposal_tx,
-        lock_canonical_item_space, lock_execution_and_canonical_item_space, proposal_from_row,
-        record_published_habit_occurrences_tx,
+        lock_canonical_item_space, lock_execution_and_canonical_item_space,
+        lock_habit_change_space, proposal_from_row, record_published_habit_occurrences_tx,
     },
     proposals::{PROPOSAL_CHANGE_SET_SCHEMA_V1, ProposalCommand},
 };
@@ -780,6 +780,9 @@ impl PostgresSchedulingRepository {
         // space. Publication follows the same order so a defer cannot race a
         // schedule seal that omits or changes its promised placement.
         lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        lock_habit_change_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         lock_owner(&mut transaction, self.scope)

@@ -386,6 +386,8 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
         | (
             &Method::PUT | &Method::POST,
             "/habits/{habit_id}/occurrences/{occurrence_id}"
+            | "/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution"
+            | "/habits/missed/reconcile"
             | "/habits/{habit_id}/pauses"
             | "/habits/{habit_id}/pauses/{pause_id}/resume",
         ) => Some(Scope::ItemsWrite),
@@ -620,6 +622,17 @@ mod tests {
         );
         assert_eq!(
             required_rest_scope(&Method::PUT, Some("/v1/items/{id}")),
+            Some(Scope::ItemsWrite)
+        );
+        assert_eq!(
+            required_rest_scope(&Method::POST, Some("/v1/habits/missed/reconcile")),
+            Some(Scope::ItemsWrite)
+        );
+        assert_eq!(
+            required_rest_scope(
+                &Method::PUT,
+                Some("/v1/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution")
+            ),
             Some(Scope::ItemsWrite)
         );
         assert_eq!(

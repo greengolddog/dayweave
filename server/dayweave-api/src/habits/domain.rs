@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike as _, Duration, NaiveDate, Utc};
-use dayweave_core::{RecurrenceOccurrenceIdentity, is_valid_habit_quantity_unit};
+use dayweave_core::{
+    HabitMissedDecision, HabitOccurrenceValue, RecurrenceOccurrenceIdentity,
+    decide_habit_missed_behavior, is_valid_habit_quantity_unit,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -65,6 +68,447 @@ pub struct HabitPauseResumeCommand {
     pub operation_id: Uuid,
     pub expected_revision: u64,
     pub ended_at: DateTime<Utc>,
+}
+
+/// Configured behavior captured when an overdue occurrence is reconciled.
+/// Later habit edits therefore cannot reinterpret historical scheduling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HabitMissedPolicy {
+    Skip,
+    Carry,
+    ReduceFrequency,
+    Ask,
+}
+
+impl From<dayweave_core::HabitMissedPolicy> for HabitMissedPolicy {
+    fn from(value: dayweave_core::HabitMissedPolicy) -> Self {
+        match value {
+            dayweave_core::HabitMissedPolicy::Skip => Self::Skip,
+            dayweave_core::HabitMissedPolicy::Carry => Self::Carry,
+            dayweave_core::HabitMissedPolicy::ReduceFrequency => Self::ReduceFrequency,
+            dayweave_core::HabitMissedPolicy::Ask => Self::Ask,
+        }
+    }
+}
+
+impl From<HabitMissedPolicy> for dayweave_core::HabitMissedPolicy {
+    fn from(value: HabitMissedPolicy) -> Self {
+        match value {
+            HabitMissedPolicy::Skip => Self::Skip,
+            HabitMissedPolicy::Carry => Self::Carry,
+            HabitMissedPolicy::ReduceFrequency => Self::ReduceFrequency,
+            HabitMissedPolicy::Ask => Self::Ask,
+        }
+    }
+}
+
+/// Server-computed scheduling action for one overdue occurrence.
+/// Carry windows and reduction targets are outputs, never client inputs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HabitMissedResolutionAction {
+    DecisionRequired,
+    ReductionPending,
+    Cancelled {
+        reason: HabitMissedCancellationReason,
+        resume_action: HabitMissedResumeAction,
+    },
+    Skip,
+    Carry {
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+    },
+    ReduceFrequency {
+        suppressed_planner_occurrence_ids: Vec<Uuid>,
+    },
+}
+
+/// Why a previously applicable missed decision became scheduling-inactive.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HabitMissedCancellationReason {
+    SourceCompleted,
+    SourceSkipped,
+    SourcePaused,
+    SourceObsolete,
+}
+
+/// Active decision family retained while a missed resolution is cancelled so
+/// a later outcome correction can restore the exact user/policy choice.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HabitMissedResumeAction {
+    DecisionRequired,
+    Skip,
+    Carry,
+    ReduceFrequency,
+}
+
+/// Current revisioned projection of missed-occurrence handling.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HabitMissedResolution {
+    pub occurrence_evidence_id: Uuid,
+    pub habit_id: Uuid,
+    pub source_planner_occurrence_id: Uuid,
+    pub revision: u64,
+    pub configured_policy: HabitMissedPolicy,
+    pub action: HabitMissedResolutionAction,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl HabitMissedResolution {
+    /// Validates a repository projection before it is placed on the wire or
+    /// consumed as authoritative scheduling evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HabitDomainError::InvalidMissedResolution`] when identifiers,
+    /// revisions, timestamps, or the configured-policy/action transition do
+    /// not form one supported projection state.
+    #[allow(clippy::match_same_arms, clippy::unnested_or_patterns)]
+    pub fn validate(&self) -> Result<(), HabitDomainError> {
+        if self.occurrence_evidence_id.is_nil()
+            || self.habit_id.is_nil()
+            || self.source_planner_occurrence_id.is_nil()
+            || self.revision == 0
+            || !valid_api_datetime(self.created_at)
+            || !valid_api_datetime(self.updated_at)
+            || self.updated_at < self.created_at
+        {
+            return Err(HabitDomainError::InvalidMissedResolution);
+        }
+        let shape_is_valid = match (&self.configured_policy, &self.action, self.revision) {
+            (HabitMissedPolicy::Ask, HabitMissedResolutionAction::DecisionRequired, 1..)
+            | (HabitMissedPolicy::Skip, HabitMissedResolutionAction::Skip, 1..)
+            | (
+                HabitMissedPolicy::ReduceFrequency,
+                HabitMissedResolutionAction::ReductionPending,
+                1..,
+            )
+            | (HabitMissedPolicy::Ask, HabitMissedResolutionAction::Skip, 2..)
+            | (HabitMissedPolicy::Ask, HabitMissedResolutionAction::ReductionPending, 2..) => true,
+            (
+                HabitMissedPolicy::Ask,
+                HabitMissedResolutionAction::Carry {
+                    window_start,
+                    window_end,
+                },
+                2..,
+            )
+            | (
+                HabitMissedPolicy::Carry,
+                HabitMissedResolutionAction::Carry {
+                    window_start,
+                    window_end,
+                },
+                1..,
+            ) => valid_carry_window(*window_start, *window_end, self.updated_at),
+            (
+                HabitMissedPolicy::Ask,
+                HabitMissedResolutionAction::ReduceFrequency {
+                    suppressed_planner_occurrence_ids,
+                },
+                2..,
+            )
+            | (
+                HabitMissedPolicy::ReduceFrequency,
+                HabitMissedResolutionAction::ReduceFrequency {
+                    suppressed_planner_occurrence_ids,
+                },
+                1..,
+            ) => valid_reduction_targets(
+                suppressed_planner_occurrence_ids,
+                self.source_planner_occurrence_id,
+            ),
+            (HabitMissedPolicy::Ask, HabitMissedResolutionAction::Cancelled { .. }, 2..)
+            | (
+                HabitMissedPolicy::Skip,
+                HabitMissedResolutionAction::Cancelled {
+                    resume_action: HabitMissedResumeAction::Skip,
+                    ..
+                },
+                2..,
+            )
+            | (
+                HabitMissedPolicy::Carry,
+                HabitMissedResolutionAction::Cancelled {
+                    resume_action: HabitMissedResumeAction::Carry,
+                    ..
+                },
+                2..,
+            )
+            | (
+                HabitMissedPolicy::ReduceFrequency,
+                HabitMissedResolutionAction::Cancelled {
+                    resume_action: HabitMissedResumeAction::ReduceFrequency,
+                    ..
+                },
+                2..,
+            ) => true,
+            _ => false,
+        };
+        if shape_is_valid {
+            Ok(())
+        } else {
+            Err(HabitDomainError::InvalidMissedResolution)
+        }
+    }
+}
+
+fn valid_carry_window(start: DateTime<Utc>, end: DateTime<Utc>, updated_at: DateTime<Utc>) -> bool {
+    valid_api_datetime(start)
+        && valid_api_datetime(end)
+        && start == updated_at
+        && end > start
+        && end - start <= Duration::days(366)
+}
+
+fn valid_reduction_targets(targets: &[Uuid], source_planner_occurrence_id: Uuid) -> bool {
+    targets.len() == 1
+        && !targets[0].is_nil()
+        && targets[0].get_version_num() == 5
+        && targets[0] != source_planner_occurrence_id
+}
+
+#[allow(clippy::unnested_or_patterns)] // Keep the audited state-transition matrix explicit.
+pub(crate) fn valid_missed_resolution_transition(
+    previous: &HabitMissedResolution,
+    next: &HabitMissedResolution,
+) -> bool {
+    if previous.occurrence_evidence_id != next.occurrence_evidence_id
+        || previous.habit_id != next.habit_id
+        || previous.source_planner_occurrence_id != next.source_planner_occurrence_id
+        || previous.configured_policy != next.configured_policy
+        || previous.created_at != next.created_at
+        || previous
+            .revision
+            .checked_add(1)
+            .is_none_or(|revision| revision != next.revision)
+        || next.updated_at < previous.updated_at
+        || next.validate().is_err()
+    {
+        return false;
+    }
+    matches!(
+        (&previous.action, &next.action),
+        (
+            HabitMissedResolutionAction::DecisionRequired,
+            HabitMissedResolutionAction::Skip
+                | HabitMissedResolutionAction::Carry { .. }
+                | HabitMissedResolutionAction::ReductionPending
+                | HabitMissedResolutionAction::ReduceFrequency { .. }
+        ) | (
+            HabitMissedResolutionAction::DecisionRequired,
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::DecisionRequired,
+                ..
+            }
+        ) | (
+            HabitMissedResolutionAction::ReductionPending,
+            HabitMissedResolutionAction::ReduceFrequency { .. }
+        ) | (
+            HabitMissedResolutionAction::ReductionPending,
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::ReduceFrequency,
+                ..
+            }
+        ) | (
+            HabitMissedResolutionAction::ReduceFrequency { .. },
+            HabitMissedResolutionAction::ReductionPending
+        ) | (
+            HabitMissedResolutionAction::ReduceFrequency { .. },
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::ReduceFrequency,
+                ..
+            }
+        ) | (
+            HabitMissedResolutionAction::Skip,
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::Skip,
+                ..
+            }
+        ) | (
+            HabitMissedResolutionAction::Carry { .. },
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::Carry,
+                ..
+            }
+        ) | (
+            HabitMissedResolutionAction::Carry { .. },
+            HabitMissedResolutionAction::Carry { .. }
+        ) | (
+            HabitMissedResolutionAction::Carry { .. },
+            HabitMissedResolutionAction::DecisionRequired
+        ) | (
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::DecisionRequired,
+                ..
+            },
+            HabitMissedResolutionAction::DecisionRequired
+        ) | (
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::Skip,
+                ..
+            },
+            HabitMissedResolutionAction::Skip
+        ) | (
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::Carry,
+                ..
+            },
+            HabitMissedResolutionAction::Carry { .. }
+        ) | (
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::ReduceFrequency,
+                ..
+            },
+            HabitMissedResolutionAction::ReductionPending
+                | HabitMissedResolutionAction::ReduceFrequency { .. }
+        )
+    )
+}
+
+pub(crate) fn valid_explicit_missed_cancellation_transition(
+    previous: &HabitMissedResolution,
+    next: &HabitMissedResolution,
+) -> bool {
+    previous.occurrence_evidence_id == next.occurrence_evidence_id
+        && previous.habit_id == next.habit_id
+        && previous.source_planner_occurrence_id == next.source_planner_occurrence_id
+        && previous.configured_policy == HabitMissedPolicy::Ask
+        && next.configured_policy == HabitMissedPolicy::Ask
+        && previous.created_at == next.created_at
+        && previous
+            .revision
+            .checked_add(1)
+            .is_some_and(|revision| revision == next.revision)
+        && next.updated_at >= previous.updated_at
+        && matches!(
+            previous.action,
+            HabitMissedResolutionAction::DecisionRequired
+        )
+        && matches!(
+            next.action,
+            HabitMissedResolutionAction::Cancelled {
+                resume_action: HabitMissedResumeAction::Skip
+                    | HabitMissedResumeAction::Carry
+                    | HabitMissedResumeAction::ReduceFrequency,
+                ..
+            }
+        )
+        && next.validate().is_ok()
+}
+
+pub(crate) fn recurrence_identity_ordinal(identity: &Value) -> Option<u32> {
+    match serde_json::from_value::<RecurrenceOccurrenceIdentity>(identity.clone()).ok()? {
+        RecurrenceOccurrenceIdentity::CalendarDay { bucket_ordinal, .. }
+        | RecurrenceOccurrenceIdentity::CalendarWeek { bucket_ordinal, .. }
+        | RecurrenceOccurrenceIdentity::CalendarMonth { bucket_ordinal, .. } => {
+            Some(u32::from(bucket_ordinal))
+        }
+        RecurrenceOccurrenceIdentity::RollingMinutes { index, .. } => u32::try_from(index).ok(),
+        RecurrenceOccurrenceIdentity::AfterCompletion { .. }
+        | RecurrenceOccurrenceIdentity::Custom => Some(0),
+        RecurrenceOccurrenceIdentity::RollingMonth { index, .. } => Some(u32::from(index)),
+        RecurrenceOccurrenceIdentity::CustomRule { sequence, .. } => Some(sequence),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HabitMissedReconcileCommand {
+    pub operation_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HabitMissedExplicitAction {
+    Skip,
+    Carry,
+    ReduceFrequency,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HabitMissedResolveCommand {
+    pub operation_id: Uuid,
+    pub expected_revision: u64,
+    pub action: HabitMissedExplicitAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HabitMissedReconcileResult {
+    pub resolutions: Vec<HabitMissedResolution>,
+    pub has_more: bool,
+}
+
+pub(crate) fn derive_missed_resolution_action(
+    occurrence: &HabitOccurrence,
+    policy: HabitMissedPolicy,
+    now: DateTime<Utc>,
+) -> Result<HabitMissedResolutionAction, HabitDomainError> {
+    let recorded_at = now;
+    let now = chrono_to_time(recorded_at)?;
+    let value = match occurrence.outcome.as_ref() {
+        None
+        | Some(HabitOutcome {
+            status: HabitOutcomeStatus::Unresolved,
+            ..
+        }) => HabitOccurrenceValue::pending(),
+        // Missed scheduling branches only on the unmet lifecycle class. Raw
+        // note/quantity/time evidence remains untouched in the occurrence
+        // ledger and is intentionally not rematerialized into core's stricter
+        // value grammar merely to derive a skip/move exception.
+        Some(outcome) if outcome.status == HabitOutcomeStatus::Partial => {
+            HabitOccurrenceValue::partial(
+                outcome.progress_basis_points,
+                None,
+                None,
+                None,
+                chrono_to_time(outcome.occurred_at.min(recorded_at))?,
+            )
+        }
+        Some(_) => return Err(HabitDomainError::InvalidMissedResolution),
+    };
+    let decision = decide_habit_missed_behavior(
+        policy.into(),
+        now,
+        chrono_to_time(occurrence.evidence.window_start)?,
+        chrono_to_time(occurrence.evidence.window_end)?,
+        &value,
+        &[],
+    )
+    .map_err(|_| HabitDomainError::InvalidMissedResolution)?;
+    match decision {
+        HabitMissedDecision::MarkSkipped { .. } => Ok(HabitMissedResolutionAction::Skip),
+        HabitMissedDecision::CarryForward {
+            window_start,
+            window_end,
+        } => Ok(HabitMissedResolutionAction::Carry {
+            window_start: time_to_chrono(window_start)?,
+            window_end: time_to_chrono(window_end)?,
+        }),
+        HabitMissedDecision::ReduceFrequency { .. } => {
+            Ok(HabitMissedResolutionAction::ReductionPending)
+        }
+        HabitMissedDecision::RequestDecision => Ok(HabitMissedResolutionAction::DecisionRequired),
+        HabitMissedDecision::NoAction { .. } => Err(HabitDomainError::InvalidMissedResolution),
+    }
+}
+
+fn chrono_to_time(value: DateTime<Utc>) -> Result<time::OffsetDateTime, HabitDomainError> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(value.timestamp_micros()) * 1_000)
+        .map_err(|_| HabitDomainError::InvalidMissedResolution)
+}
+
+fn time_to_chrono(value: time::OffsetDateTime) -> Result<DateTime<Utc>, HabitDomainError> {
+    DateTime::from_timestamp(value.unix_timestamp(), value.nanosecond())
+        .map(|value| DateTime::from_timestamp_micros(value.timestamp_micros()).unwrap_or(value))
+        .ok_or(HabitDomainError::InvalidMissedResolution)
 }
 
 impl HabitOutcomeInput {
@@ -384,6 +828,8 @@ fn naive_to_time_date(value: NaiveDate) -> Option<time::Date> {
 pub struct HabitOccurrence {
     pub evidence: HabitOccurrenceEvidence,
     pub outcome: Option<HabitOutcome>,
+    #[serde(default)]
+    pub missed_resolution: Option<HabitMissedResolution>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -491,11 +937,48 @@ enum ClassifiedState {
     Unresolved,
 }
 
+pub(crate) fn effective_lifecycle_window(
+    occurrence: &HabitOccurrence,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    occurrence
+        .missed_resolution
+        .as_ref()
+        .and_then(|resolution| match &resolution.action {
+            HabitMissedResolutionAction::Carry {
+                window_start,
+                window_end,
+            } => Some((*window_start, *window_end)),
+            _ => None,
+        })
+        .unwrap_or((
+            occurrence.evidence.window_start,
+            occurrence.evidence.window_end,
+        ))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HabitAnalyticsLifecycle<'a> {
+    effective_reduction_targets: &'a BTreeSet<Uuid>,
+    pauses: &'a [HabitPause],
+}
+
+impl<'a> HabitAnalyticsLifecycle<'a> {
+    pub(crate) fn new(
+        effective_reduction_targets: &'a BTreeSet<Uuid>,
+        pauses: &'a [HabitPause],
+    ) -> Self {
+        Self {
+            effective_reduction_targets,
+            pauses,
+        }
+    }
+}
+
 #[must_use]
-pub fn calculate_analytics(
+pub(crate) fn calculate_analytics(
     habit_id: Uuid,
     occurrences: &[HabitOccurrence],
-    pauses: &[HabitPause],
+    lifecycle: HabitAnalyticsLifecycle<'_>,
     start_date: NaiveDate,
     end_date: NaiveDate,
     bucket: HabitAnalyticsBucket,
@@ -512,8 +995,11 @@ pub fn calculate_analytics(
         value.evidence.habit_id == habit_id
             && value.evidence.local_date >= start_date
             && value.evidence.local_date <= end_date
+            && !lifecycle
+                .effective_reduction_targets
+                .contains(&value.evidence.planner_occurrence_id)
     }) {
-        let state = classify(occurrence, pauses, now);
+        let state = classify(occurrence, lifecycle.pauses, now);
         accumulate(
             &mut totals,
             &mut raw_quantities,
@@ -521,7 +1007,8 @@ pub fn calculate_analytics(
             occurrence,
             state,
         );
-        if state != ClassifiedState::Excused && occurrence.evidence.window_end <= now {
+        let (_, due_at) = effective_lifecycle_window(occurrence);
+        if state != ClassifiedState::Excused && due_at <= now {
             days.entry(occurrence.evidence.local_date)
                 .or_default()
                 .push(state);
@@ -594,24 +1081,51 @@ fn classify(
     pauses: &[HabitPause],
     now: DateTime<Utc>,
 ) -> ClassifiedState {
+    let (window_start, window_end) = effective_lifecycle_window(occurrence);
     if pauses.iter().any(|pause| {
         pause.habit_id == occurrence.evidence.habit_id
             && pause.preserves_streak
-            && pause.started_at < occurrence.evidence.window_end
-            && pause
-                .ended_at
-                .is_none_or(|ended| ended > occurrence.evidence.window_start)
+            && pause.started_at < window_end
+            && pause.ended_at.is_none_or(|ended| ended > window_start)
     }) {
         return ClassifiedState::Excused;
     }
     match occurrence.outcome.as_ref().map(|outcome| outcome.status) {
         Some(HabitOutcomeStatus::Completed) => ClassifiedState::Completed,
+        Some(HabitOutcomeStatus::Unresolved | HabitOutcomeStatus::Partial) | None
+            if occurrence
+                .missed_resolution
+                .as_ref()
+                .is_some_and(|resolution| {
+                    matches!(resolution.action, HabitMissedResolutionAction::Skip)
+                }) =>
+        {
+            ClassifiedState::Skipped
+        }
         Some(HabitOutcomeStatus::Partial) => ClassifiedState::Partial,
         Some(HabitOutcomeStatus::Skipped) => ClassifiedState::Skipped,
-        Some(HabitOutcomeStatus::Unresolved) | None if occurrence.evidence.window_end <= now => {
-            ClassifiedState::Missed
-        }
-        Some(HabitOutcomeStatus::Unresolved) | None => ClassifiedState::Unresolved,
+        Some(HabitOutcomeStatus::Unresolved) | None => match occurrence
+            .missed_resolution
+            .as_ref()
+            .map(|resolution| &resolution.action)
+        {
+            Some(HabitMissedResolutionAction::Skip) => ClassifiedState::Skipped,
+            Some(HabitMissedResolutionAction::Carry { window_end, .. }) if *window_end > now => {
+                ClassifiedState::Unresolved
+            }
+            Some(
+                HabitMissedResolutionAction::Carry { .. }
+                | HabitMissedResolutionAction::DecisionRequired
+                | HabitMissedResolutionAction::ReductionPending
+                | HabitMissedResolutionAction::ReduceFrequency { .. },
+            )
+            | None
+                if occurrence.evidence.window_end <= now =>
+            {
+                ClassifiedState::Missed
+            }
+            Some(_) | None => ClassifiedState::Unresolved,
+        },
     }
 }
 
@@ -729,10 +1243,14 @@ pub enum HabitDomainError {
     InvalidOccurredAt,
     #[error("habit occurrence evidence has invalid recurrence identity or temporal context")]
     InvalidOccurrenceEvidence,
+    #[error("missed-occurrence resolution is invalid")]
+    InvalidMissedResolution,
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone as _;
+
     use super::*;
 
     #[derive(serde::Deserialize)]
@@ -814,6 +1332,7 @@ mod tests {
                 occurred_at: start,
                 updated_at: start,
             }),
+            missed_resolution: None,
         }
     }
 
@@ -1014,7 +1533,7 @@ mod tests {
         let analytics = calculate_analytics(
             Uuid::from_u128(1),
             &values,
-            &[],
+            HabitAnalyticsLifecycle::new(&BTreeSet::new(), &[]),
             start,
             start + Duration::days(2),
             HabitAnalyticsBucket::Day,
@@ -1027,6 +1546,190 @@ mod tests {
         assert_eq!(analytics.totals.missed, 1);
         assert_eq!(analytics.totals.adherence_basis_points, 5_000);
         assert_eq!(analytics.longest_streak, 1);
+    }
+
+    #[test]
+    fn analytics_removes_effective_reduction_targets_from_success_demand() {
+        let source_date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut source = occurrence(source_date, None);
+        let target = occurrence(source_date + Duration::days(1), None);
+        source.missed_resolution = Some(HabitMissedResolution {
+            occurrence_evidence_id: source.evidence.id,
+            habit_id: source.evidence.habit_id,
+            source_planner_occurrence_id: source.evidence.planner_occurrence_id,
+            revision: 1,
+            configured_policy: HabitMissedPolicy::ReduceFrequency,
+            action: HabitMissedResolutionAction::ReduceFrequency {
+                suppressed_planner_occurrence_ids: vec![target.evidence.planner_occurrence_id],
+            },
+            created_at: source.evidence.window_end,
+            updated_at: source.evidence.window_end,
+        });
+        let effective_targets = BTreeSet::from([target.evidence.planner_occurrence_id]);
+
+        let analytics = calculate_analytics(
+            source.evidence.habit_id,
+            &[source, target],
+            HabitAnalyticsLifecycle::new(&effective_targets, &[]),
+            source_date,
+            source_date + Duration::days(1),
+            HabitAnalyticsBucket::Day,
+            source_date.and_hms_opt(12, 0, 0).unwrap().and_utc() + Duration::days(2),
+        );
+
+        assert_eq!(analytics.totals.expected, 1);
+        assert_eq!(analytics.totals.eligible, 1);
+        assert_eq!(analytics.totals.missed, 1);
+        assert_eq!(analytics.trends.len(), 1);
+    }
+
+    #[test]
+    fn active_carry_uses_its_derived_window_for_pauses_and_streak_deadline() {
+        let first_date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let completed = occurrence(first_date, Some(HabitOutcomeStatus::Completed));
+        let mut carried = occurrence(first_date + Duration::days(1), None);
+        let carry_start = carried.evidence.window_end + Duration::minutes(1);
+        let carry_end = carry_start + Duration::days(1);
+        carried.missed_resolution = Some(HabitMissedResolution {
+            occurrence_evidence_id: carried.evidence.id,
+            habit_id: carried.evidence.habit_id,
+            source_planner_occurrence_id: carried.evidence.planner_occurrence_id,
+            revision: 1,
+            configured_policy: HabitMissedPolicy::Carry,
+            action: HabitMissedResolutionAction::Carry {
+                window_start: carry_start,
+                window_end: carry_end,
+            },
+            created_at: carry_start,
+            updated_at: carry_start,
+        });
+        let now = carry_start + Duration::hours(1);
+
+        let analytics = calculate_analytics(
+            completed.evidence.habit_id,
+            &[completed.clone(), carried.clone()],
+            HabitAnalyticsLifecycle::new(&BTreeSet::new(), &[]),
+            first_date,
+            first_date + Duration::days(1),
+            HabitAnalyticsBucket::Day,
+            now,
+        );
+        assert_eq!(analytics.totals.unresolved, 1);
+        assert_eq!(analytics.current_streak, 1);
+        assert_eq!(analytics.longest_streak, 1);
+
+        let preserving_pause = HabitPause {
+            id: Uuid::new_v4(),
+            habit_id: carried.evidence.habit_id,
+            revision: 1,
+            started_at: carry_start + Duration::minutes(10),
+            ended_at: Some(carry_start + Duration::minutes(20)),
+            preserves_streak: true,
+            created_at: carry_start + Duration::minutes(10),
+            updated_at: carry_start + Duration::minutes(20),
+        };
+        let paused = calculate_analytics(
+            completed.evidence.habit_id,
+            &[completed, carried],
+            HabitAnalyticsLifecycle::new(&BTreeSet::new(), &[preserving_pause]),
+            first_date,
+            first_date + Duration::days(1),
+            HabitAnalyticsBucket::Day,
+            now,
+        );
+        assert_eq!(paused.totals.excused, 1);
+        assert_eq!(paused.totals.eligible, 1);
+        assert_eq!(paused.current_streak, 1);
+    }
+
+    #[test]
+    fn missed_cancellation_transitions_preserve_the_exact_resume_family() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 5, 8, 0, 0).unwrap();
+        let base = HabitMissedResolution {
+            occurrence_evidence_id: Uuid::from_u128(10),
+            habit_id: Uuid::from_u128(11),
+            source_planner_occurrence_id: Uuid::from_u128(12),
+            revision: 1,
+            configured_policy: HabitMissedPolicy::Ask,
+            action: HabitMissedResolutionAction::DecisionRequired,
+            created_at: now,
+            updated_at: now,
+        };
+        let automatic = HabitMissedResolution {
+            revision: 2,
+            action: HabitMissedResolutionAction::Cancelled {
+                reason: HabitMissedCancellationReason::SourcePaused,
+                resume_action: HabitMissedResumeAction::DecisionRequired,
+            },
+            updated_at: now + Duration::seconds(1),
+            ..base.clone()
+        };
+        assert!(valid_missed_resolution_transition(&base, &automatic));
+        assert!(!valid_explicit_missed_cancellation_transition(
+            &base, &automatic
+        ));
+        let explicit = HabitMissedResolution {
+            action: HabitMissedResolutionAction::Cancelled {
+                reason: HabitMissedCancellationReason::SourceObsolete,
+                resume_action: HabitMissedResumeAction::Carry,
+            },
+            ..automatic.clone()
+        };
+        assert!(!valid_missed_resolution_transition(&base, &explicit));
+        assert!(valid_explicit_missed_cancellation_transition(
+            &base, &explicit
+        ));
+
+        let skip = HabitMissedResolution {
+            configured_policy: HabitMissedPolicy::Skip,
+            action: HabitMissedResolutionAction::Skip,
+            ..base
+        };
+        let cancelled_skip = HabitMissedResolution {
+            revision: 2,
+            action: HabitMissedResolutionAction::Cancelled {
+                reason: HabitMissedCancellationReason::SourceCompleted,
+                resume_action: HabitMissedResumeAction::Skip,
+            },
+            updated_at: now + Duration::seconds(1),
+            ..skip.clone()
+        };
+        assert!(valid_missed_resolution_transition(&skip, &cancelled_skip));
+        let wrong_family = HabitMissedResolution {
+            action: HabitMissedResolutionAction::Cancelled {
+                reason: HabitMissedCancellationReason::SourceCompleted,
+                resume_action: HabitMissedResumeAction::Carry,
+            },
+            ..cancelled_skip
+        };
+        assert!(!valid_missed_resolution_transition(&skip, &wrong_family));
+    }
+
+    #[test]
+    fn frequency_reduction_requires_a_v5_planner_target() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 5, 8, 0, 0).unwrap();
+        let source_planner_occurrence_id =
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"missed-reduction-source");
+        let mut resolution = HabitMissedResolution {
+            occurrence_evidence_id: Uuid::from_u128(10),
+            habit_id: Uuid::from_u128(11),
+            source_planner_occurrence_id,
+            revision: 1,
+            configured_policy: HabitMissedPolicy::ReduceFrequency,
+            action: HabitMissedResolutionAction::ReduceFrequency {
+                suppressed_planner_occurrence_ids: vec![Uuid::new_v4()],
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(resolution.validate().is_err());
+        resolution.action = HabitMissedResolutionAction::ReduceFrequency {
+            suppressed_planner_occurrence_ids: vec![Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                b"missed-reduction-target",
+            )],
+        };
+        assert!(resolution.validate().is_ok());
     }
 
     #[test]
@@ -1046,7 +1749,7 @@ mod tests {
         let analytics = calculate_analytics(
             value.evidence.habit_id,
             &[value],
-            &[pause],
+            HabitAnalyticsLifecycle::new(&BTreeSet::new(), &[pause]),
             date,
             date,
             HabitAnalyticsBucket::Day,

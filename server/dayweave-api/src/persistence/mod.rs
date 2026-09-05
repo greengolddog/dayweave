@@ -19,7 +19,7 @@ pub(crate) use google_sync_repository::PostgresGoogleSyncRepository;
 pub use habit_repository::PostgresHabitRepository;
 pub(crate) use habit_repository::{
     AuthoritativeHabitRecurrence, PublishedHabitEvidenceError, authoritative_habit_recurrence_tx,
-    record_published_habit_occurrences_tx,
+    lock_habit_change_space, record_published_habit_occurrences_tx,
 };
 pub use idempotency::{IdempotencyDecision, IdempotencyError, PostgresIdempotencyRepository};
 pub use item_repository::PostgresItemRepository;

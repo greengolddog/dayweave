@@ -32,7 +32,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26
+            25, 26, 27
         ]
     );
 
@@ -63,6 +63,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0024_structural_item_fields.sql"),
         include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
         include_str!("../migrations/0026_habit_occurrence_ledger.sql"),
+        include_str!("../migrations/0027_habit_missed_resolutions.sql"),
     ]
     .join("\n");
     for table in [
@@ -129,6 +130,9 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "habit_pause_versions",
         "habit_changes",
         "habit_operation_receipts",
+        "habit_missed_resolutions",
+        "habit_missed_resolution_versions",
+        "habit_occurrence_publications",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }

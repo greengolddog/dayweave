@@ -4022,7 +4022,7 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         .expect("execution defer authorization migration applies");
     for migration in MIGRATOR
         .iter()
-        .filter(|migration| (22..=26).contains(&migration.version))
+        .filter(|migration| (22..=27).contains(&migration.version))
     {
         test_database
             .pool
@@ -4219,7 +4219,7 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
 
     for migration in MIGRATOR
         .iter()
-        .filter(|migration| (21..=26).contains(&migration.version))
+        .filter(|migration| (21..=27).contains(&migration.version))
     {
         test_database
             .pool
@@ -4448,6 +4448,7 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         include_str!("../migrations/0024_structural_item_fields.sql"),
         include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
         include_str!("../migrations/0026_habit_occurrence_ledger.sql"),
+        include_str!("../migrations/0027_habit_missed_resolutions.sql"),
     ] {
         test_database
             .pool

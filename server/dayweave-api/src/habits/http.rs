@@ -20,14 +20,22 @@ use serde_json::json;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::{AppState, auth::Principal, error::ApiError};
+use crate::{
+    AppState,
+    auth::{Principal, Scope},
+    error::ApiError,
+};
 
 use super::{
-    HabitAnalytics, HabitAnalyticsBucket, HabitDeltaChange, HabitIdempotencyKey, HabitOccurrence,
-    HabitOutcomeCommand, HabitPause, HabitPauseResumeCommand, HabitPauseStartCommand,
-    HabitRepositoryError, HabitServiceError,
+    HabitAnalytics, HabitAnalyticsBucket, HabitDeltaChange, HabitIdempotencyKey,
+    HabitMissedReconcileCommand, HabitMissedReconcileResult, HabitMissedResolution,
+    HabitMissedResolveCommand, HabitOccurrence, HabitOutcomeCommand, HabitPause,
+    HabitPauseResumeCommand, HabitPauseStartCommand, HabitRepositoryError, HabitServiceError,
     invalidation::HabitInvalidationSignal,
-    service::{DEFAULT_HABIT_PAGE_LIMIT, MAX_HABIT_PAGE_LIMIT},
+    service::{
+        DEFAULT_HABIT_PAGE_LIMIT, DEFAULT_HABIT_RECONCILE_LIMIT, MAX_HABIT_PAGE_LIMIT,
+        MAX_HABIT_RECONCILE_LIMIT,
+    },
 };
 
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -40,10 +48,15 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/habits/occurrences/delta", get(habit_delta))
         .route("/habits/stream", get(habit_stream))
+        .route("/habits/missed/reconcile", post(reconcile_missed))
         .route("/habits/{habit_id}/occurrences", get(list_occurrences))
         .route(
             "/habits/{habit_id}/occurrences/{occurrence_id}",
             put(put_outcome),
+        )
+        .route(
+            "/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution",
+            put(resolve_missed),
         )
         .route("/habits/{habit_id}/pauses", post(start_pause))
         .route(
@@ -77,6 +90,12 @@ pub(crate) struct HabitAnalyticsQuery {
     pub bucket: HabitAnalyticsBucket,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HabitMissedReconcileQuery {
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct HabitOccurrenceEnvelope {
     pub occurrence: HabitOccurrence,
@@ -106,6 +125,123 @@ pub(crate) struct HabitDeltaEnvelope {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct HabitAnalyticsEnvelope {
     pub analytics: HabitAnalytics,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct HabitMissedReconcileEnvelope {
+    #[serde(flatten)]
+    pub result: HabitMissedReconcileResult,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct HabitMissedResolutionEnvelope {
+    pub resolution: HabitMissedResolution,
+    pub replayed: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/habits/missed/reconcile",
+    tag = "habits",
+    security(("bearer_token" = [])),
+    params(HabitMissedReconcileQuery, ("Idempotency-Key" = String, Header)),
+    request_body = HabitMissedReconcileCommand,
+    responses(
+        (status = 200, description = "Bounded server-clock missed occurrence reconciliation", body = HabitMissedReconcileEnvelope),
+        (status = 400, description = "Malformed limit, idempotency key, or body", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Credential lacks items_write or items_read", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid operation or limit", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Reconciliation receipt capacity is temporarily exhausted", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn reconcile_missed(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    headers: HeaderMap,
+    query: Result<Query<HabitMissedReconcileQuery>, QueryRejection>,
+    request: Result<Json<HabitMissedReconcileCommand>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    // The REST scope matrix enforces items_write. This workspace-wide response also exposes
+    // occurrence resolution metadata, so it requires the corresponding read authority.
+    if !principal.has_scope(Scope::ItemsRead) {
+        return Err(ApiError::forbidden());
+    }
+    let query = strict_query(query)?;
+    let command = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let limit = query.limit.unwrap_or(DEFAULT_HABIT_RECONCILE_LIMIT);
+    if !(1..=MAX_HABIT_RECONCILE_LIMIT).contains(&limit) {
+        return Err(ApiError::validation(format!(
+            "limit must be between 1 and {MAX_HABIT_RECONCILE_LIMIT}"
+        )));
+    }
+    let mutation = state
+        .habits
+        .reconcile_missed(
+            command,
+            limit,
+            idempotency(&headers, principal.credential_id)?,
+        )
+        .await
+        .map_err(map_habit_error)?;
+    Ok(mutation_response(
+        Json(HabitMissedReconcileEnvelope {
+            result: mutation.value,
+            replayed: mutation.replayed,
+        })
+        .into_response(),
+        mutation.replayed,
+    ))
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution",
+    tag = "habits",
+    security(("bearer_token" = [])),
+    params(
+        ("habit_id" = Uuid, Path),
+        ("evidence_id" = Uuid, Path, description = "Server-issued occurrence evidence id"),
+        ("Idempotency-Key" = String, Header)
+    ),
+    request_body = HabitMissedResolveCommand,
+    responses(
+        (status = 200, description = "Ask-policy decision resolved or exactly replayed", body = HabitMissedResolutionEnvelope),
+        (status = 404, description = "Habit or missed resolution not found", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale revision, resolved decision, or idempotency conflict", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid resolution command", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn resolve_missed(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Path((habit_id, evidence_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    request: Result<Json<HabitMissedResolveCommand>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let command = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let mutation = state
+        .habits
+        .resolve_missed(
+            habit_id,
+            evidence_id,
+            command,
+            idempotency(&headers, principal.credential_id)?,
+        )
+        .await
+        .map_err(map_habit_error)?;
+    Ok(mutation_response(
+        Json(HabitMissedResolutionEnvelope {
+            resolution: mutation.value,
+            replayed: mutation.replayed,
+        })
+        .into_response(),
+        mutation.replayed,
+    ))
 }
 
 #[utoipa::path(
@@ -471,14 +607,17 @@ fn map_habit_error(error: HabitServiceError) -> ApiError {
         | HabitServiceError::InvalidCorrectionRevision
         | HabitServiceError::InvalidMutationTime
         | HabitServiceError::InvalidDateRange
-        | HabitServiceError::InvalidLimit => ApiError::validation(error.to_string()),
+        | HabitServiceError::InvalidLimit
+        | HabitServiceError::InvalidReconcileLimit => ApiError::validation(error.to_string()),
         HabitServiceError::InvalidIdempotencyKey | HabitServiceError::InvalidCursor => {
             ApiError::bad_request(error.to_string())
         }
         HabitServiceError::CursorAhead => ApiError::conflict(error.to_string()),
         HabitServiceError::StreamCapacity => ApiError::unavailable(error.to_string()),
         HabitServiceError::AnalyticsTooLarge => ApiError::payload_too_large(error.to_string()),
-        HabitServiceError::Items(_) | HabitServiceError::Internal => ApiError::internal(),
+        HabitServiceError::Items(_)
+        | HabitServiceError::TooManyItems
+        | HabitServiceError::Internal => ApiError::internal(),
     }
 }
 
@@ -486,7 +625,10 @@ fn map_repository_error(error: HabitRepositoryError) -> ApiError {
     match error {
         HabitRepositoryError::HabitNotFound(_)
         | HabitRepositoryError::OccurrenceNotFound(_)
-        | HabitRepositoryError::PauseNotFound(_) => ApiError::not_found("habit resource"),
+        | HabitRepositoryError::PauseNotFound(_)
+        | HabitRepositoryError::MissedResolutionNotFound(_) => {
+            ApiError::not_found("habit resource")
+        }
         HabitRepositoryError::NotHabit(_) | HabitRepositoryError::TargetUnitMismatch => {
             ApiError::validation(error.to_string())
         }
@@ -517,6 +659,16 @@ fn map_repository_error(error: HabitRepositoryError) -> ApiError {
         HabitRepositoryError::IdempotencyConflict => {
             ApiError::conflict("Idempotency-Key or operation_id was reused for different content")
         }
+        HabitRepositoryError::ReconcileReceiptCapacity => {
+            ApiError::unavailable("missed-occurrence reconciliation is temporarily rate limited")
+        }
+        HabitRepositoryError::MissedResolutionAlreadyResolved(current) => {
+            ApiError::conflict("missed occurrence decision is already resolved")
+                .with_details(json!({"current_resolution": current}))
+        }
+        HabitRepositoryError::MissedReductionUnavailable => ApiError::conflict(
+            "no authoritative future occurrence is available for frequency reduction",
+        ),
         HabitRepositoryError::InvalidCursor => ApiError::bad_request("habit cursor is invalid"),
         HabitRepositoryError::EvidenceConflict | HabitRepositoryError::Internal => {
             ApiError::unavailable("habit ledger is temporarily unavailable")

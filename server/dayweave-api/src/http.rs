@@ -77,6 +77,8 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::habits::http::start_pause,
         crate::habits::http::resume_pause,
         crate::habits::http::habit_analytics,
+        crate::habits::http::reconcile_missed,
+        crate::habits::http::resolve_missed,
         crate::scheduling::http::preview_schedule,
         crate::scheduling::http::publish_schedule,
         crate::scheduling::http::get_current_schedule,
@@ -195,11 +197,20 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::habits::HabitAnalyticsTotals,
         crate::habits::HabitTrendBucket,
         crate::habits::HabitAnalytics,
+        crate::habits::HabitMissedPolicy,
+        crate::habits::HabitMissedResolutionAction,
+        crate::habits::HabitMissedResolution,
+        crate::habits::HabitMissedReconcileCommand,
+        crate::habits::HabitMissedExplicitAction,
+        crate::habits::HabitMissedResolveCommand,
+        crate::habits::HabitMissedReconcileResult,
         crate::habits::http::HabitOccurrenceEnvelope,
         crate::habits::http::HabitOccurrenceListEnvelope,
         crate::habits::http::HabitPauseEnvelope,
         crate::habits::http::HabitDeltaEnvelope,
         crate::habits::http::HabitAnalyticsEnvelope,
+        crate::habits::http::HabitMissedReconcileEnvelope,
+        crate::habits::http::HabitMissedResolutionEnvelope,
         crate::scheduling::ComposeScheduleRequest,
         crate::scheduling::ComposeScheduleResult,
         crate::scheduling::http::PublishScheduleRequest,
@@ -1037,6 +1048,11 @@ mod tests {
             ("/v1/habits/{habit_id}/pauses", "post"),
             ("/v1/habits/{habit_id}/pauses/{pause_id}/resume", "post"),
             ("/v1/habits/{habit_id}/analytics", "get"),
+            ("/v1/habits/missed/reconcile", "post"),
+            (
+                "/v1/habits/{habit_id}/occurrences/{evidence_id}/missed-resolution",
+                "put",
+            ),
         ] {
             let operation = &document["paths"][path][method];
             assert!(operation.is_object(), "missing {method} {path}");
@@ -1048,6 +1064,9 @@ mod tests {
             "HabitDeltaChange",
             "HabitPause",
             "HabitAnalytics",
+            "HabitMissedResolution",
+            "HabitMissedReconcileCommand",
+            "HabitMissedResolveCommand",
         ] {
             assert!(
                 document["components"]["schemas"][schema].is_object(),
