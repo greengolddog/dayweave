@@ -9,6 +9,11 @@ pub const ACCOUNT_DELETION_APPROVAL_PHRASE: &str = "DELETE MY DAYWEAVE ACCOUNT";
 const ACCOUNT_DELETION_APPROVAL_DOMAIN: &[u8] = b"dayweave/account-deletion-approval/v1\0";
 const ACCOUNT_DELETION_PRINCIPAL_DOMAIN: &[u8] =
     b"dayweave/account-deletion-external-principal/v1\0";
+const ACCOUNT_DELETION_PROVIDER_MANIFEST_DOMAIN: &[u8] =
+    b"dayweave/account-deletion-provider-cleanup-manifest/v1\0";
+
+pub const ACCOUNT_DELETION_PROVIDER_CLEANUP_MAX_ATTEMPTS: u32 = 12;
+pub const ACCOUNT_DELETION_PROVIDER_CLEANUP_MAX_TARGETS: usize = 64;
 
 /// Binds the exact destructive phrase and v1 policy to this owner and request.
 /// An HTTP layer must compare the user-supplied phrase exactly before calling
@@ -311,9 +316,307 @@ pub struct AccountDeletionFenceSafetyEvidence {
     pub external_tombstone_hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AccountDeletionProvider {
+    Google,
+}
+
+impl AccountDeletionProvider {
+    #[must_use]
+    pub const fn as_storage_name(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "google" => Some(Self::Google),
+            _ => None,
+        }
+    }
+
+    const fn manifest_tag(self) -> u8 {
+        match self {
+            Self::Google => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountDeletionProviderCleanupStatus {
+    Pending,
+    Claimed,
+    RetryWait,
+    Revoked,
+    OperatorRequired,
+}
+
+impl AccountDeletionProviderCleanupStatus {
+    #[must_use]
+    pub const fn as_storage_name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::RetryWait => "retry_wait",
+            Self::Revoked => "revoked",
+            Self::OperatorRequired => "operator_required",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "retry_wait" => Some(Self::RetryWait),
+            "revoked" => Some(Self::Revoked),
+            "operator_required" => Some(Self::OperatorRequired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountDeletionProviderCleanupFailure {
+    ProviderUnavailable,
+    ProviderRejected,
+    CredentialUnavailable,
+    CredentialDrift,
+    ClaimLeaseExpired,
+    RetryExhausted,
+    DeadlineExceeded,
+}
+
+impl AccountDeletionProviderCleanupFailure {
+    #[must_use]
+    pub const fn as_storage_name(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderRejected => "provider_rejected",
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::CredentialDrift => "credential_drift",
+            Self::ClaimLeaseExpired => "claim_lease_expired",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "provider_unavailable" => Some(Self::ProviderUnavailable),
+            "provider_rejected" => Some(Self::ProviderRejected),
+            "credential_unavailable" => Some(Self::CredentialUnavailable),
+            "credential_drift" => Some(Self::CredentialDrift),
+            "claim_lease_expired" => Some(Self::ClaimLeaseExpired),
+            "retry_exhausted" => Some(Self::RetryExhausted),
+            "deadline_exceeded" => Some(Self::DeadlineExceeded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountDeletionProviderCleanupOutcome {
+    Revoked { evidence_hash: [u8; 32] },
+    AlreadyAbsent { evidence_hash: [u8; 32] },
+    RetryableFailure,
+    OperatorRequired(AccountDeletionProviderCleanupFailure),
+}
+
+pub(crate) struct AccountDeletionProviderCredentialEnvelope {
+    key_version: u32,
+    ciphertext: Vec<u8>,
+}
+
+impl AccountDeletionProviderCredentialEnvelope {
+    pub(crate) fn new(key_version: u32, ciphertext: Vec<u8>) -> Self {
+        Self {
+            key_version,
+            ciphertext,
+        }
+    }
+
+    pub(crate) const fn key_version(&self) -> u32 {
+        self.key_version
+    }
+
+    pub(crate) fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+}
+
+impl std::fmt::Debug for AccountDeletionProviderCredentialEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountDeletionProviderCredentialEnvelope")
+            .field("key_version", &self.key_version)
+            .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for AccountDeletionProviderCredentialEnvelope {
+    fn drop(&mut self) {
+        self.ciphertext.zeroize();
+    }
+}
+
+pub struct AccountDeletionProviderCleanupClaim {
+    pub deletion_id: Uuid,
+    pub provider_account_id: Uuid,
+    pub provider: AccountDeletionProvider,
+    pub provider_account_revision: u64,
+    pub credential_generation: u64,
+    pub encrypted_credentials_hash: [u8; 32],
+    pub claim_id: Uuid,
+    pub attempt: u32,
+    pub lease_expires_at: DateTime<Utc>,
+    pub replayed: bool,
+    credential: AccountDeletionProviderCredentialEnvelope,
+}
+
+impl AccountDeletionProviderCleanupClaim {
+    pub(crate) const fn credential(&self) -> &AccountDeletionProviderCredentialEnvelope {
+        &self.credential
+    }
+
+    pub(crate) fn new(
+        deletion_id: Uuid,
+        target: AccountDeletionProviderCleanupTargetBinding,
+        claim_id: Uuid,
+        attempt: u32,
+        lease_expires_at: DateTime<Utc>,
+        replayed: bool,
+        credential: AccountDeletionProviderCredentialEnvelope,
+    ) -> Self {
+        Self {
+            deletion_id,
+            provider_account_id: target.provider_account_id,
+            provider: target.provider,
+            provider_account_revision: target.provider_account_revision,
+            credential_generation: target.credential_generation,
+            encrypted_credentials_hash: target.encrypted_credentials_hash,
+            claim_id,
+            attempt,
+            lease_expires_at,
+            replayed,
+            credential,
+        }
+    }
+}
+
+impl std::fmt::Debug for AccountDeletionProviderCleanupClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountDeletionProviderCleanupClaim")
+            .field("deletion_id", &self.deletion_id)
+            .field("provider_account_id", &self.provider_account_id)
+            .field("provider", &self.provider)
+            .field("provider_account_revision", &self.provider_account_revision)
+            .field("credential_generation", &self.credential_generation)
+            .field("encrypted_credentials_hash", &"[REDACTED]")
+            .field("claim_id", &self.claim_id)
+            .field("attempt", &self.attempt)
+            .field("lease_expires_at", &self.lease_expires_at)
+            .field("replayed", &self.replayed)
+            .field("credential_key_version", &self.credential().key_version())
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountDeletionProviderCleanupCompletion {
+    pub deletion_id: Uuid,
+    pub provider_account_id: Uuid,
+    pub claim_id: Uuid,
+    pub attempt: u32,
+    pub outcome: AccountDeletionProviderCleanupOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The recorded result of one attempt. A replay is historical: use the cleanup
+/// summary, not this result, to determine the target's current state.
+pub struct AccountDeletionProviderCleanupMutation {
+    pub deletion_id: Uuid,
+    pub provider_account_id: Uuid,
+    pub status: AccountDeletionProviderCleanupStatus,
+    pub attempt: u32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub replayed: bool,
+}
+
+/// One consistent, content-free view of cleanup progress. Definitive provider
+/// outcomes do not authorize local purge or prove account deletion complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountDeletionProviderCleanupSummary {
+    pub deletion_id: Uuid,
+    pub lifecycle_status: AccountDeletionStatus,
+    pub manifest_sealed: bool,
+    pub target_count: u32,
+    pub pending_count: u32,
+    pub claimed_count: u32,
+    pub retry_wait_count: u32,
+    pub revoked_count: u32,
+    pub operator_required_count: u32,
+    /// Earliest pending/retry time or current claim lease expiry. This can be
+    /// in the past when work is due. None alone never means completion.
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub operator_reasons: Vec<AccountDeletionProviderCleanupFailure>,
+}
+
+impl AccountDeletionProviderCleanupSummary {
+    #[must_use]
+    pub const fn all_provider_outcomes_recorded(&self) -> bool {
+        self.manifest_sealed
+            && self.revoked_count == self.target_count
+            && self.pending_count == 0
+            && self.claimed_count == 0
+            && self.retry_wait_count == 0
+            && self.operator_required_count == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AccountDeletionProviderCleanupTargetBinding {
+    pub provider: AccountDeletionProvider,
+    pub provider_account_id: Uuid,
+    pub provider_account_revision: u64,
+    pub credential_generation: u64,
+    pub credential_key_version: u32,
+    pub encrypted_credentials_hash: [u8; 32],
+}
+
+pub(crate) fn account_deletion_provider_cleanup_manifest_digest(
+    deletion_id: Uuid,
+    targets: &[AccountDeletionProviderCleanupTargetBinding],
+) -> [u8; 32] {
+    let mut ordered = targets.to_vec();
+    ordered.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update((ACCOUNT_DELETION_PROVIDER_MANIFEST_DOMAIN.len() as u64).to_be_bytes());
+    digest.update(ACCOUNT_DELETION_PROVIDER_MANIFEST_DOMAIN);
+    digest.update(deletion_id.as_bytes());
+    digest.update((ordered.len() as u64).to_be_bytes());
+    for target in ordered {
+        digest.update([target.provider.manifest_tag()]);
+        digest.update(target.provider_account_id.as_bytes());
+        digest.update(target.provider_account_revision.to_be_bytes());
+        digest.update(target.credential_generation.to_be_bytes());
+        digest.update(target.credential_key_version.to_be_bytes());
+        digest.update(target.encrypted_credentials_hash);
+    }
+    digest.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AccountDeletionPrincipalKey, AccountDeletionPseudonymError};
+    use super::{
+        AccountDeletionPrincipalKey, AccountDeletionProvider,
+        AccountDeletionProviderCleanupTargetBinding, AccountDeletionPseudonymError,
+        account_deletion_provider_cleanup_manifest_digest,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn external_principal_is_stable_domain_separated_and_redacted() {
@@ -374,6 +677,55 @@ mod tests {
         assert_eq!(
             key.bind(&"x".repeat(501)).unwrap_err(),
             AccountDeletionPseudonymError::InvalidOwnerSubject
+        );
+    }
+
+    #[test]
+    fn provider_cleanup_manifest_is_stable_order_independent_and_bound_to_credentials() {
+        let deletion_id = Uuid::from_u128(1);
+        let first = AccountDeletionProviderCleanupTargetBinding {
+            provider: AccountDeletionProvider::Google,
+            provider_account_id: Uuid::from_u128(2),
+            provider_account_revision: 3,
+            credential_generation: 4,
+            credential_key_version: 5,
+            encrypted_credentials_hash: [0x51; 32],
+        };
+        let second = AccountDeletionProviderCleanupTargetBinding {
+            provider: AccountDeletionProvider::Google,
+            provider_account_id: Uuid::from_u128(6),
+            provider_account_revision: 7,
+            credential_generation: 8,
+            credential_key_version: 9,
+            encrypted_credentials_hash: [0x52; 32],
+        };
+        let expected =
+            account_deletion_provider_cleanup_manifest_digest(deletion_id, &[first, second]);
+        assert_eq!(
+            expected,
+            account_deletion_provider_cleanup_manifest_digest(deletion_id, &[second, first])
+        );
+        assert_ne!(
+            expected,
+            account_deletion_provider_cleanup_manifest_digest(
+                deletion_id,
+                &[
+                    AccountDeletionProviderCleanupTargetBinding {
+                        encrypted_credentials_hash: [0x53; 32],
+                        ..first
+                    },
+                    second
+                ]
+            )
+        );
+        assert_eq!(
+            expected,
+            [
+                0x95, 0xfe, 0xde, 0x0f, 0x05, 0xa1, 0x6b, 0x1e, 0x5d, 0x86, 0x97, 0x14, 0xdd, 0xb1,
+                0x02, 0x5e, 0xb5, 0xea, 0x04, 0xaa, 0xd8, 0x53, 0x72, 0x3d, 0xd3, 0x5a, 0x9c, 0x88,
+                0xc3, 0x4b, 0xf2, 0x2a,
+            ],
+            "the sealed provider manifest encoding is a permanent contract"
         );
     }
 }

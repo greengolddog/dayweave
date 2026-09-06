@@ -7,7 +7,9 @@ use crate::credential_auth::OpaqueCredential;
 use super::{
     AccountDeletionFenceConfirmation, AccountDeletionFenceSafetyEvidence, AccountDeletionLifecycle,
     AccountDeletionMutation, AccountDeletionPreparation, AccountDeletionPreparationSafetyEvidence,
-    AccountDeletionPrincipalPseudonym, AccountDeletionTransition,
+    AccountDeletionPrincipalPseudonym, AccountDeletionProviderCleanupClaim,
+    AccountDeletionProviderCleanupCompletion, AccountDeletionProviderCleanupMutation,
+    AccountDeletionProviderCleanupSummary, AccountDeletionTransition,
 };
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -78,6 +80,8 @@ pub enum AccountDeletionRepositoryError {
     UnsupportedScope,
     #[error("account deletion state conflicts with the request")]
     Conflict,
+    #[error("provider activity must be reconciled before account deletion can continue")]
+    ProviderCleanupBlocked,
     #[error("account deletion repository operation failed")]
     Internal,
 }
@@ -107,6 +111,42 @@ pub trait AccountDeletionRepository: Send + Sync {
         &self,
         confirmation: AccountDeletionFenceConfirmation,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError>;
+
+    /// Atomically seals the supported provider credential source coordinates
+    /// and hashes in a content-free manifest and enters `provider_cleanup`.
+    /// No provider call is made by this persistence boundary.
+    async fn seal_provider_cleanup(
+        &self,
+        transition: AccountDeletionTransition,
+    ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError>;
+
+    /// Claims one due provider target using the database clock. The returned
+    /// encrypted envelope exists only in memory and is bound to the immutable
+    /// target revision/key/ciphertext commitment. None means no eligible claim;
+    /// consult `provider_cleanup_status` to distinguish waiting/intervention
+    /// from definitive outcomes. A resolved or expired claim id cannot be reused.
+    async fn claim_provider_cleanup(
+        &self,
+        deletion_id: Uuid,
+        claim_id: Uuid,
+    ) -> Result<Option<AccountDeletionProviderCleanupClaim>, AccountDeletionRepositoryError>;
+
+    /// Records one exact provider result. Retry timing, exhaustion, and the
+    /// 24-hour intervention deadline are calculated by the repository.
+    /// Replay returns the original attempt result, not the current state.
+    /// Evidence must be supplied only by a trusted provider worker; this method
+    /// must never be exposed as a client-controlled evidence-submission route.
+    async fn resolve_provider_cleanup(
+        &self,
+        completion: AccountDeletionProviderCleanupCompletion,
+    ) -> Result<AccountDeletionProviderCleanupMutation, AccountDeletionRepositoryError>;
+
+    /// Reads current counts, manifest integrity, retry/lease wakeup time, and
+    /// fixed intervention reasons in one database snapshot.
+    async fn provider_cleanup_status(
+        &self,
+        deletion_id: Uuid,
+    ) -> Result<Option<AccountDeletionProviderCleanupSummary>, AccountDeletionRepositoryError>;
 
     /// Advances an exact lifecycle edge only through `provider_cleanup` intent.
     /// This foundation deliberately exposes no provider-cleanup-to-purge edge:

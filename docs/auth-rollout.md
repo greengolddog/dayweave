@@ -167,8 +167,9 @@ suspicious-authentication alerts remain required defense in depth.
 
 ### Account deletion foundation (not active)
 
-Migrations `0029_account_deletion_lifecycle.sql` and
-`0030_account_deletion_external_principal.sql`, together with the PostgreSQL
+Migrations `0029_account_deletion_lifecycle.sql`,
+`0030_account_deletion_external_principal.sql`, and
+`0031_account_deletion_provider_cleanup.sql`, together with the PostgreSQL
 repository, are a route-less, default-disabled foundation. They provide
 content-free lifecycle evidence, exact transition receipts, a hard
 tenant/identity mutation fence, anti-resurrection checks, a narrowly tested
@@ -180,15 +181,43 @@ the external identity. No HTTP route, configuration switch, or native client
 currently turns that primitive into an account-deletion workflow, and operators
 must not invoke it directly as a substitute.
 
+Migration 0031 adds the provider-cleanup persistence/claim/status substrate. An
+atomic seal binds up to 64 Google provider targets to their source revision,
+credential generation, key version, and ciphertext hash. PostgreSQL reproduces
+the manifest digest and rejects omitted targets or mismatched source evidence.
+Detached targets and immutable attempt receipts hold fixed codes and hashes,
+not credential ciphertext, external account identities, payloads, or raw error
+text.
+Claims load an exact encrypted source envelope into a redacted, zeroizing
+in-memory value. The database clock governs at most 12 attempts, 15-minute
+leases, bounded retry delays, and a 24-hour deadline for new claims/retries;
+a still-live lease can finish after that deadline. Expired workers cannot
+record new results. Exact completion replay returns the historical attempt's
+result, while the separate status summary reports current counts, manifest
+integrity, retry/lease wakeup time, and fixed intervention reasons. An empty
+claim result alone does not establish completion.
+
+This substrate does not call Google or scrub source credentials. Even a target
+with a recorded successful outcome retains its source ciphertext behind the
+tenant fence. Durable OAuth/sync/outbox checks reject unsettled database work
+before fencing/sealing; they do not prove that runtime or distributed provider
+I/O has drained. Both Rust and PostgreSQL block advancement into purge, even
+when every target has a definitive outcome. Legacy unsealed cleanup rows and
+legacy purge rows likewise cannot advance into destructive completion after
+the migration.
+
 Activation requires all of the following to be wired and reviewed together:
 an append-only external tombstone authority outside PostgreSQL and its backups,
 using the pinned deployment-keyed identity and an exclusive permit retained for
-the service runtime's admission lifetime; durable Google and other
-provider-revocation outcomes with bounded retries; a credential-only HTTP
-service with the full fresh-owner/recovery/confirmation policy; secure native
-journals and explicit owner approval; separate least-privilege migration and
-runtime database roles; and verifiable expiry evidence for every retained
-backup. A one-shot restore lookup is not sufficient because deletion could race
+the service runtime's admission lifetime; a runtime guardian and distributed
+admission gate that closes new provider I/O and drains existing work before
+fencing; proof of the Google OAuth project-and-subject grant identity before
+revocation; a real provider worker that records verified outcomes and scrubs
+credentials; a credential-only HTTP service with the full
+fresh-owner/recovery/confirmation policy; secure native journals, teardown, and
+explicit owner approval; separate least-privilege migration and runtime database
+roles; and verifiable expiry evidence for every retained backup. A one-shot
+restore lookup is not sufficient because deletion could race
 between that lookup and service admission. Until these controls and destructive
 restore rehearsals pass, account deletion is unavailable. The current
 foundation does not prove provider cleanup, restore safety, native teardown, or
@@ -212,8 +241,8 @@ is never retried against the static-token authenticator.
 ## Cutover checklist
 
 1. Back up PostgreSQL, restore it in isolation, and apply migrations through
-   `0030_account_deletion_external_principal.sql` before changing authentication
-   mode. Applying migrations 0029 and 0030 does not activate account deletion.
+   `0031_account_deletion_provider_cleanup.sql` before changing authentication
+   mode. Applying migrations 0029–0031 does not activate account deletion.
 2. Deploy in `legacy_static`; verify existing clients and inspect migration and
    audit health.
 3. Set `DAYWEAVE_AUTH_MODE=hybrid` while retaining the existing static token.
@@ -278,9 +307,11 @@ their automated gates and independent code audits pass. A controlled
 two-client/service recovery run, owner-device UI acceptance, and a real-device
 credential-only cutover rehearsal remain in progress.
 Account deletion remains unavailable: its route-less foundation must stay
-default-disabled until the external tombstone/restore authority, provider
-cleanup ledger and retries, credential-only HTTP/native flows, database role
-split, and backup-expiry evidence are implemented and independently rehearsed.
+default-disabled until the external tombstone/restore authority, runtime
+provider-I/O gate, Google grant proof, actual provider revocation and credential
+scrubbing, credential-only HTTP/native flows, database role split, and
+backup-expiry evidence are implemented and independently rehearsed. The durable
+cleanup ledger alone cannot authorize purge.
 Published ChatGPT/Codex account linking remains
 blocked until the documented Auth0/tunnel activation preflight, a
 deployed end-to-end schedule read and simulation rehearsal, and an independent

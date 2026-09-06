@@ -573,6 +573,39 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         Err(AccountDeletionRepositoryError::Disabled),
         "removing external configuration disables a prepared lifecycle"
     );
+    sqlx::query(
+        "INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation, \
+         revocation_kind, revocation_owner_id, revocation_claim_id, revocation_claimed_at, \
+         revocation_generation) VALUES ($1, $2, 0, 'guardian', $3, $4, clock_timestamp(), 0)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("durable Google revocation still in progress");
+    assert_eq!(
+        repository.begin_fence(confirmation.clone()).await,
+        Err(AccountDeletionRepositoryError::ProviderCleanupBlocked),
+        "a durable provider operation must quiesce before the hard fence commits"
+    );
+    assert!(
+        !credential_repository
+            .is_account_deletion_fenced()
+            .await
+            .expect("fence remains absent")
+    );
+    sqlx::query(
+        "UPDATE google_oauth_scope_state SET revocation_kind = NULL, \
+        revocation_owner_id = NULL, revocation_claim_id = NULL, revocation_claimed_at = NULL, \
+        revocation_generation = NULL WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(pool)
+    .await
+    .expect("durable revocation is settled before retrying the fence");
     let fenced = repository
         .begin_fence(confirmation.clone())
         .await
@@ -672,7 +705,18 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         AccountDeletionStatus::Fenced,
         AccountDeletionStatus::ProviderCleanup,
     );
-    repository.advance(cleanup_transition).await.unwrap();
+    repository
+        .seal_provider_cleanup(cleanup_transition)
+        .await
+        .unwrap();
+    let empty_cleanup = repository
+        .provider_cleanup_status(deletion_id)
+        .await
+        .expect("empty provider cleanup summary")
+        .expect("sealed lifecycle");
+    assert!(empty_cleanup.manifest_sealed);
+    assert_eq!(empty_cleanup.target_count, 0);
+    assert!(empty_cleanup.all_provider_outcomes_recorded());
     let purge_transition = transition(
         deletion_id,
         4,
@@ -683,8 +727,26 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     assert_eq!(
         repository.advance(purge_transition).await,
         Err(AccountDeletionRepositoryError::InvalidInput),
-        "provider cleanup cannot reach purge until durable provider outcomes exist"
+        "provider outcomes alone cannot authorize purge without the runtime-held restore permit"
     );
+    let direct_purge_error = sqlx::query(
+        "WITH operation AS (SELECT clock_timestamp() AS at) \
+         UPDATE account_deletion_lifecycles SET status = 'purge', revision = revision + 1, \
+         purge_at = operation.at, updated_at = operation.at FROM operation \
+         WHERE id = $1 AND status = 'provider_cleanup' AND revision = 4",
+    )
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect_err("a zero-target manifest still cannot bypass the missing runtime permit");
+    assert_eq!(postgres_code(&direct_purge_error).as_deref(), Some("DWREQ"));
+    sqlx::query(
+        "ALTER TABLE account_deletion_lifecycles DISABLE TRIGGER \
+         account_deletion_provider_cleanup_lifecycle_guard",
+    )
+    .execute(pool)
+    .await
+    .expect("test-only runtime permit boundary bypass");
     sqlx::query(
         "WITH operation AS (SELECT clock_timestamp() AS at) \
          UPDATE account_deletion_lifecycles SET status = 'purge', revision = revision + 1, \
@@ -722,6 +784,13 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     .await
     .expect("lost local purge response replays from detached evidence");
     assert_eq!(replayed, (6, true));
+    sqlx::query(
+        "ALTER TABLE account_deletion_lifecycles ENABLE TRIGGER \
+         account_deletion_provider_cleanup_lifecycle_guard",
+    )
+    .execute(pool)
+    .await
+    .expect("restore provider-cleanup lifecycle guard");
 
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE id = $1")
@@ -782,6 +851,7 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     test_database.destroy().await;
 }
 
+#[allow(clippy::too_many_lines)] // One catalog inventory verifies all deletion guards together.
 async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     assert_account_deletion_barrier_modes(pool).await;
 
@@ -813,6 +883,55 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     .await
     .expect("external principal guard privilege inventory");
     assert!(!public_can_execute_binding_guard);
+
+    let provider_cleanup_triggers = sqlx::query_scalar::<_, String>(
+        "SELECT trigger.tgname FROM pg_trigger AS trigger \
+         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         WHERE namespace.nspname = current_schema() AND NOT trigger.tgisinternal \
+         AND trigger.tgname IN ('account_deletion_provider_cleanup_attempt_guard', \
+             'account_deletion_provider_cleanup_attempt_consumed', \
+             'account_deletion_provider_cleanup_target_guard', \
+             'account_deletion_provider_cleanup_target_sealed', \
+             'account_deletion_provider_cleanup_lifecycle_guard') ORDER BY trigger.tgname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("provider cleanup trigger inventory");
+    assert_eq!(
+        provider_cleanup_triggers,
+        vec![
+            "account_deletion_provider_cleanup_attempt_consumed",
+            "account_deletion_provider_cleanup_attempt_guard",
+            "account_deletion_provider_cleanup_lifecycle_guard",
+            "account_deletion_provider_cleanup_target_guard",
+            "account_deletion_provider_cleanup_target_sealed",
+        ]
+    );
+    let provider_cleanup_functions_hardened = sqlx::query_scalar::<_, bool>(
+        "SELECT count(*) = 6 AND bool_and( \
+             function.proconfig IS NOT NULL \
+             AND array_to_string(function.proconfig, ',') = \
+                 'search_path=' || current_schema() || ', pg_catalog, pg_temp' \
+             AND NOT has_function_privilege('public', function.oid, 'EXECUTE')) \
+         FROM pg_proc AS function \
+         JOIN pg_namespace AS namespace ON namespace.oid = function.pronamespace \
+         WHERE namespace.nspname = current_schema() \
+         AND function.proname IN ( \
+             'calculate_account_deletion_provider_cleanup_manifest', \
+             'guard_account_deletion_provider_cleanup_attempt', \
+             'require_account_deletion_provider_cleanup_attempt_consumed', \
+             'guard_account_deletion_provider_cleanup_target', \
+             'require_account_deletion_provider_cleanup_seal', \
+             'guard_account_deletion_provider_cleanup_lifecycle')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("provider cleanup function hardening inventory");
+    assert!(
+        provider_cleanup_functions_hardened,
+        "every provider-cleanup function must pin its search path and revoke PUBLIC execution"
+    );
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
@@ -1020,7 +1139,9 @@ async fn assert_detached_evidence_is_content_free(pool: &PgPool) {
         "SELECT table_name || '.' || column_name FROM information_schema.columns \
          WHERE table_schema = current_schema() \
          AND table_name IN ('account_deletion_lifecycles', \
-             'account_deletion_transition_receipts', 'account_deletion_fences') \
+             'account_deletion_transition_receipts', 'account_deletion_fences', \
+             'account_deletion_provider_cleanup_targets', \
+             'account_deletion_provider_cleanup_attempts') \
          AND (data_type IN ('json', 'jsonb', 'text') OR column_name IN (\
              'title', 'name', 'display_name', 'auth_subject', 'payload', 'metadata', \
              'notes', 'token', 'credential')) ORDER BY 1",
@@ -1037,7 +1158,9 @@ async fn assert_detached_evidence_is_content_free(pool: &PgPool) {
         "SELECT table_name || '.' || column_name FROM information_schema.columns \
          WHERE table_schema = current_schema() \
          AND table_name IN ('account_deletion_lifecycles', \
-             'account_deletion_transition_receipts', 'account_deletion_fences') \
+             'account_deletion_transition_receipts', 'account_deletion_fences', \
+             'account_deletion_provider_cleanup_targets', \
+             'account_deletion_provider_cleanup_attempts') \
          AND data_type = 'character varying' ORDER BY 1",
     )
     .fetch_all(pool)
@@ -1048,6 +1171,11 @@ async fn assert_detached_evidence_is_content_free(pool: &PgPool) {
         vec![
             "account_deletion_lifecycles.failure_code",
             "account_deletion_lifecycles.status",
+            "account_deletion_provider_cleanup_attempts.failure_code",
+            "account_deletion_provider_cleanup_attempts.outcome",
+            "account_deletion_provider_cleanup_targets.last_failure_code",
+            "account_deletion_provider_cleanup_targets.provider",
+            "account_deletion_provider_cleanup_targets.status",
             "account_deletion_transition_receipts.failure_code",
             "account_deletion_transition_receipts.from_status",
             "account_deletion_transition_receipts.to_status",

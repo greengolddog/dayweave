@@ -136,14 +136,28 @@ effects must flow through an auditable proposal or outbox boundary.
   atomic personal-scope purge primitive. New lifecycle rows also persist an
   immutable versioned HMAC-derived external principal and reject owner/key
   drift before external mutation; the local unkeyed subject digest cannot be
-  substituted. Activation remains prohibited until a tombstone authority
-  outside PostgreSQL/backups participates in deletion and grants an exclusive
-  permit held throughout service admission and runtime, provider-revocation
-  outcomes and retries are durable, only credential-only HTTP/native approval
-  paths can enter the lifecycle, migration/runtime database roles are
-  separated, and backup expiry is proven. A one-shot restore lookup does not
-  close the deletion/admission race. The foundation alone does not establish
-  provider cleanup, native teardown, restore safety, or backup erasure.
+  substituted. Migration 0031 adds provider-cleanup persistence/claim/status:
+  a database-verified manifest of source revision, credential generation,
+  key version and ciphertext hash; immutable fixed-code attempt receipts;
+  and a separate current status summary. Its 12-attempt limit, 15-minute leases,
+  and 24-hour stop for new claims/retries are enforced using database time.
+  Still-live leases may finish after the deadline; historical result replay
+  never substitutes for current status. Detached cleanup evidence contains no
+  ciphertext, raw provider identities, or error payloads. Claims expose only an
+  exact encrypted source envelope in a redacted, zeroizing in-memory value.
+  The implementation makes no provider calls and does not scrub credentials;
+  source ciphertext remains behind the fence even after a recorded success.
+  Durable OAuth/sync/outbox checks do not prove runtime I/O has drained. Rust
+  and PostgreSQL block purge even with all successful outcomes and prevent
+  legacy cleanup/purge rows from advancing into destructive completion.
+  Activation still requires a tombstone authority outside PostgreSQL/backups
+  with an exclusive permit held throughout service admission and runtime;
+  runtime guardian/distributed provider-I/O admission and draining; Google
+  project-and-subject grant proof; real provider revocation and credential
+  scrubbing; credential-only HTTP/native approval and teardown; separate
+  migration/runtime database roles; and proven backup expiry. A one-shot
+  restore lookup does not close the deletion/admission race. See the
+  [account-deletion rollout boundary](auth-rollout.md#account-deletion-foundation-not-active).
 - PostgreSQL adapters are explicitly scoped by the configured user/workspace,
   and every durable credential row carries that user/workspace/client scope.
   Static bootstrap principals do not independently prove that scope and must be
@@ -329,9 +343,10 @@ ready:
 - provision and verify least-privilege PostgreSQL migration/runtime roles so no
   unrelated role can write canonical execution, assessment, or claim tables;
 - keep account deletion disabled while implementing and rehearsing its external
-  tombstone authority with a runtime-held exclusive admission permit, provider
-  cleanup outcomes and bounded retries, credential-only HTTP and native
-  confirmation paths, scoped database grants, and backup-expiry evidence;
+  tombstone authority with a runtime-held exclusive admission permit, runtime
+  provider-I/O draining and Google grant proof, actual revocation and credential
+  scrubbing, credential-only HTTP/native confirmation and teardown, scoped
+  database grants, and backup-expiry evidence;
 - provision least-privilege Nebius identities, private versioned storage,
   tunnel HTTPS, budget alerts, and automated security patch/restart reporting;
 - rehearse backup restore and credential/key rotation against the deployed

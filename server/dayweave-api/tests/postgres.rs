@@ -1,7 +1,14 @@
-use std::{collections::BTreeSet, str::FromStr, time::Duration};
+use std::{collections::BTreeSet, str::FromStr, sync::Arc, time::Duration};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use dayweave_api::{
+    account_deletion::{
+        AccountDeletionPrincipalBinding, AccountDeletionPrincipalKey,
+        AccountDeletionProviderCleanupCompletion, AccountDeletionProviderCleanupFailure,
+        AccountDeletionProviderCleanupOutcome, AccountDeletionProviderCleanupStatus,
+        AccountDeletionRepository, AccountDeletionRepositoryError, AccountDeletionStatus,
+        AccountDeletionTransition, DisabledAccountDeletionSafetyGate,
+    },
     google_oauth::{
         AuthorizationCompletion, AuthorizationResolution, CallbackClaim, DisconnectMutation,
         EncryptedCredentials, GoogleAccountStatus, GoogleOAuthRepository,
@@ -9,8 +16,8 @@ use dayweave_api::{
     },
     persistence::{
         DatabaseScope, IdempotencyDecision, IdempotencyError, MIGRATOR, NewOutboxMessage,
-        PostgresGoogleOAuthRepository, PostgresIdempotencyRepository, PostgresOutboxRepository,
-        PostgresProposalRepository,
+        PostgresAccountDeletionRepository, PostgresGoogleOAuthRepository,
+        PostgresIdempotencyRepository, PostgresOutboxRepository, PostgresProposalRepository,
     },
     proposals::{
         NewProposal, Proposal, ProposalKind, ProposalRepository, ProposalSource, RepositoryError,
@@ -32,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30
+            25, 26, 27, 28, 29, 30, 31
         ]
     );
 
@@ -67,6 +74,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0028_account_recovery_codes.sql"),
         include_str!("../migrations/0029_account_deletion_lifecycle.sql"),
         include_str!("../migrations/0030_account_deletion_external_principal.sql"),
+        include_str!("../migrations/0031_account_deletion_provider_cleanup.sql"),
     ]
     .join("\n");
     for table in [
@@ -94,6 +102,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "account_deletion_lifecycles",
         "account_deletion_transition_receipts",
         "account_deletion_fences",
+        "account_deletion_provider_cleanup_targets",
+        "account_deletion_provider_cleanup_attempts",
         "idempotency_keys",
         "item_changes",
         "execution_sessions",
@@ -174,6 +184,12 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("account_recovery_codes_one_active_owner_uq"));
     assert!(schema.contains("purge_fenced_personal_account_scope"));
     assert!(schema.contains("account deletion fence is active"));
+    assert!(schema.contains("provider_cleanup_manifest_hash bytea"));
+    assert!(schema.contains("encrypted_credentials_hash bytea NOT NULL"));
+    assert!(schema.contains("account_deletion_provider_cleanup_target_sealed"));
+    assert!(schema.contains("runtime-held external restore permit is unavailable"));
+    assert!(!schema.contains("account_deletion_provider_cleanup_targets (\n    workspace_id"));
+    assert!(!schema.contains("account_deletion_provider_cleanup_attempts (\n    workspace_id"));
     assert!(schema.contains("DEFERRABLE INITIALLY DEFERRED"));
     assert!(schema.contains("DELETE FROM provider_sync_cursors cursor"));
     assert!(schema.contains("cursor.collection_key = 'calendar:' || collection.id::text"));
@@ -4218,6 +4234,1462 @@ async fn google_oauth_migration_quarantines_until_verified_operator_recovery() {
     assert!(duplicate_default.is_err());
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // One end-to-end fixture covers the durable cleanup state machine.
+async fn account_deletion_provider_cleanup_seals_claims_resolves_and_blocks_purge() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+
+    let owner_subject = format!("provider-cleanup-owner-{}", Uuid::new_v4().simple());
+    let scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    insert_scope(pool, scope, &owner_subject, "provider-cleanup-personal").await;
+    sqlx::query(
+        "INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation) \
+         VALUES ($1, $2, 7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(pool)
+    .await
+    .expect("Google credential generation fixture");
+    let provider_account_id = Uuid::new_v4();
+    let credential_ciphertext = vec![0x71_u8; 64];
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+         external_account_id, display_label, encrypted_credentials, credential_key_version, \
+         status, sync_enabled, is_default, revision) VALUES ($1, $2, $3, 'google', $4, $5, \
+         $6, 3, 'active', true, true, 5)",
+    )
+    .bind(provider_account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind("provider-cleanup-external-identity")
+    .bind("Provider cleanup content must not escape")
+    .bind(&credential_ciphertext)
+    .execute(pool)
+    .await
+    .expect("active Google account fixture");
+
+    let principal = AccountDeletionPrincipalKey::new(4, [0x42; 32])
+        .expect("valid external principal key")
+        .bind(&owner_subject)
+        .expect("canonical owner subject");
+    let deletion_id = seed_provider_cleanup_deletion_state(pool, scope, principal, true).await;
+    let repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
+        .with_safety_gate(Arc::new(DisabledAccountDeletionSafetyGate), principal);
+    let unsealed = repository
+        .provider_cleanup_status(deletion_id)
+        .await
+        .expect("unsealed cleanup status")
+        .expect("existing fenced lifecycle");
+    assert!(!unsealed.manifest_sealed);
+    assert!(!unsealed.all_provider_outcomes_recorded());
+    assert_eq!(unsealed.target_count, 0);
+    let other_scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    assert!(
+        PostgresAccountDeletionRepository::new(pool.clone(), other_scope)
+            .provider_cleanup_status(deletion_id)
+            .await
+            .expect("scope-filtered status query")
+            .is_none()
+    );
+    let seal = AccountDeletionTransition {
+        deletion_id,
+        request_hash: [0x81; 32],
+        expected_revision: 3,
+        from: AccountDeletionStatus::Fenced,
+        to: AccountDeletionStatus::ProviderCleanup,
+        failure_code: None,
+    };
+    assert_eq!(
+        repository.advance(seal.clone()).await,
+        Err(AccountDeletionRepositoryError::InvalidInput),
+        "generic lifecycle advancement cannot bypass manifest sealing"
+    );
+    let sealed = repository
+        .seal_provider_cleanup(seal.clone())
+        .await
+        .expect("provider cleanup manifest seals atomically");
+    assert_eq!(sealed.status, AccountDeletionStatus::ProviderCleanup);
+    assert_eq!(sealed.revision, 4);
+    assert!(!sealed.replayed);
+    let replayed_seal = repository
+        .seal_provider_cleanup(seal)
+        .await
+        .expect("lost seal response replays exactly");
+    assert!(replayed_seal.replayed);
+    assert_eq!(replayed_seal.revision, 4);
+
+    let manifest: (i16, i32, Vec<u8>) = sqlx::query_as(
+        "SELECT provider_cleanup_policy_version, provider_cleanup_target_count, \
+         provider_cleanup_manifest_hash FROM account_deletion_lifecycles WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .fetch_one(pool)
+    .await
+    .expect("sealed provider cleanup manifest");
+    assert_eq!(manifest.0, 1);
+    assert_eq!(manifest.1, 1);
+    assert_eq!(manifest.2.len(), 32);
+    assert!(manifest.2.iter().any(|byte| *byte != 0));
+    let target_binding: (String, i64, i64, i32, Vec<u8>, String, i32) = sqlx::query_as(
+        "SELECT provider, provider_account_revision, credential_generation, \
+         credential_key_version, encrypted_credentials_hash, status, attempt_count \
+         FROM account_deletion_provider_cleanup_targets \
+         WHERE deletion_id = $1 AND provider_account_id = $2",
+    )
+    .bind(deletion_id)
+    .bind(provider_account_id)
+    .fetch_one(pool)
+    .await
+    .expect("content-free cleanup target");
+    assert_eq!(target_binding.0, "google");
+    assert_eq!(target_binding.1, 5);
+    assert_eq!(target_binding.2, 7);
+    assert_eq!(target_binding.3, 3);
+    assert_eq!(target_binding.4.len(), 32);
+    assert_eq!(target_binding.5, "pending");
+    assert_eq!(target_binding.6, 0);
+
+    let detached_unbounded_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = current_schema() \
+         AND table_name IN ('account_deletion_provider_cleanup_targets', \
+             'account_deletion_provider_cleanup_attempts') \
+         AND (data_type IN ('text', 'json', 'jsonb') OR udt_name = '_text')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect detached cleanup evidence columns");
+    assert_eq!(detached_unbounded_columns, 0);
+    let detached_bytea_columns: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() \
+         AND table_name IN ('account_deletion_provider_cleanup_targets', \
+             'account_deletion_provider_cleanup_attempts') AND data_type = 'bytea'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("inspect bounded detached evidence")
+    .into_iter()
+    .collect();
+    assert_eq!(
+        detached_bytea_columns,
+        [
+            "account_deletion_provider_cleanup_attempts.evidence_hash".to_owned(),
+            "account_deletion_provider_cleanup_targets.encrypted_credentials_hash".to_owned(),
+            "account_deletion_provider_cleanup_targets.outcome_evidence_hash".to_owned(),
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    let first_claim_id = Uuid::new_v4();
+    let first_claim = repository
+        .claim_provider_cleanup(deletion_id, first_claim_id)
+        .await
+        .expect("first cleanup claim")
+        .expect("one pending cleanup target");
+    assert_eq!(first_claim.provider_account_id, provider_account_id);
+    assert_eq!(first_claim.provider_account_revision, 5);
+    assert_eq!(first_claim.credential_generation, 7);
+    assert_eq!(first_claim.attempt, 1);
+    assert!(!first_claim.replayed);
+    let redacted_claim = format!("{first_claim:?}");
+    assert!(!redacted_claim.contains("Provider cleanup content must not escape"));
+    assert!(!redacted_claim.contains("provider-cleanup-external-identity"));
+    assert!(!redacted_claim.contains(&"71".repeat(16)));
+    let replayed_claim = repository
+        .claim_provider_cleanup(deletion_id, first_claim_id)
+        .await
+        .expect("lost claim response replays")
+        .expect("same claim remains available");
+    assert!(replayed_claim.replayed);
+    assert_eq!(replayed_claim.attempt, 1);
+    assert!(
+        repository
+            .claim_provider_cleanup(deletion_id, Uuid::new_v4())
+            .await
+            .expect("a competing claim is a clean empty result")
+            .is_none(),
+        "an unexpired target cannot be claimed twice"
+    );
+    let mut unconsumed_attempt = pool.begin().await.expect("unconsumed attempt transaction");
+    sqlx::query(
+        "INSERT INTO account_deletion_provider_cleanup_attempts (deletion_id, \
+         provider_account_id, attempt_number, claim_id, claimed_at, lease_expires_at, \
+         finished_at, outcome, failure_code) \
+         SELECT deletion_id, provider_account_id, attempt_count, claim_id, claimed_at, \
+         lease_expires_at, clock_timestamp(), 'retryable_failure', 'provider_unavailable' \
+         FROM account_deletion_provider_cleanup_targets \
+         WHERE deletion_id = $1 AND provider_account_id = $2 AND claim_id = $3",
+    )
+    .bind(deletion_id)
+    .bind(provider_account_id)
+    .bind(first_claim_id)
+    .execute(&mut *unconsumed_attempt)
+    .await
+    .expect("an exact attempt may be staged with its target resolution");
+    let unconsumed_error = unconsumed_attempt
+        .commit()
+        .await
+        .expect_err("an immutable attempt cannot commit without its matching target resolution");
+    assert_eq!(
+        postgres_error_code(&unconsumed_error).as_deref(),
+        Some("DWCON")
+    );
+
+    assert_eq!(
+        repository
+            .resolve_provider_cleanup(AccountDeletionProviderCleanupCompletion {
+                deletion_id,
+                provider_account_id,
+                claim_id: first_claim_id,
+                attempt: 1,
+                outcome: AccountDeletionProviderCleanupOutcome::OperatorRequired(
+                    AccountDeletionProviderCleanupFailure::ClaimLeaseExpired,
+                ),
+            })
+            .await,
+        Err(AccountDeletionRepositoryError::InvalidInput),
+        "worker input cannot forge repository-owned lease-expiry evidence"
+    );
+    let retry = AccountDeletionProviderCleanupCompletion {
+        deletion_id,
+        provider_account_id,
+        claim_id: first_claim_id,
+        attempt: 1,
+        outcome: AccountDeletionProviderCleanupOutcome::RetryableFailure,
+    };
+    let retry_wait = repository
+        .resolve_provider_cleanup(retry.clone())
+        .await
+        .expect("retryable provider failure is durably scheduled");
+    assert_eq!(
+        retry_wait.status,
+        AccountDeletionProviderCleanupStatus::RetryWait
+    );
+    assert_eq!(retry_wait.attempt, 1);
+    assert!(retry_wait.next_attempt_at.is_some());
+    assert!(!retry_wait.replayed);
+    let waiting = repository
+        .provider_cleanup_status(deletion_id)
+        .await
+        .expect("retrying cleanup summary")
+        .expect("sealed lifecycle");
+    assert!(waiting.manifest_sealed);
+    assert_eq!(waiting.target_count, 1);
+    assert_eq!(waiting.retry_wait_count, 1);
+    assert_eq!(waiting.next_attempt_at, retry_wait.next_attempt_at);
+    assert!(!waiting.all_provider_outcomes_recorded());
+    assert!(
+        repository
+            .resolve_provider_cleanup(retry.clone())
+            .await
+            .expect("lost retry resolution response replays")
+            .replayed
+    );
+    assert_eq!(
+        repository
+            .resolve_provider_cleanup(AccountDeletionProviderCleanupCompletion {
+                deletion_id,
+                provider_account_id,
+                claim_id: first_claim_id,
+                attempt: 1,
+                outcome: AccountDeletionProviderCleanupOutcome::Revoked {
+                    evidence_hash: [0x91; 32],
+                },
+            })
+            .await,
+        Err(AccountDeletionRepositoryError::Conflict),
+        "one claim id cannot be replayed with a different outcome"
+    );
+    assert!(
+        repository
+            .claim_provider_cleanup(deletion_id, Uuid::new_v4())
+            .await
+            .expect("an early retry claim is a clean empty result")
+            .is_none(),
+        "retry backoff is enforced by database time"
+    );
+
+    let retry_due_at = retry_wait.next_attempt_at.expect("retry timestamp");
+    let retry_delay = retry_due_at
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        .saturating_add(Duration::from_millis(100));
+    tokio::time::sleep(retry_delay).await;
+    let second_claim_id = Uuid::new_v4();
+    let second_claim = repository
+        .claim_provider_cleanup(deletion_id, second_claim_id)
+        .await
+        .expect("retry claim")
+        .expect("retry target is due");
+    assert_eq!(second_claim.attempt, 2);
+    let success = AccountDeletionProviderCleanupCompletion {
+        deletion_id,
+        provider_account_id,
+        claim_id: second_claim_id,
+        attempt: 2,
+        outcome: AccountDeletionProviderCleanupOutcome::Revoked {
+            evidence_hash: [0x92; 32],
+        },
+    };
+    let revoked = repository
+        .resolve_provider_cleanup(success.clone())
+        .await
+        .expect("provider revocation evidence resolves the target");
+    assert_eq!(
+        revoked.status,
+        AccountDeletionProviderCleanupStatus::Revoked
+    );
+    assert_eq!(revoked.attempt, 2);
+    assert!(!revoked.replayed);
+    assert!(
+        repository
+            .resolve_provider_cleanup(success)
+            .await
+            .expect("lost success response replays")
+            .replayed
+    );
+    let historical_retry = repository
+        .resolve_provider_cleanup(retry)
+        .await
+        .expect("an older completed attempt replays after a newer success");
+    assert!(historical_retry.replayed);
+    assert_eq!(
+        historical_retry.status,
+        AccountDeletionProviderCleanupStatus::RetryWait
+    );
+    assert_eq!(historical_retry.attempt, 1);
+    assert_eq!(historical_retry.next_attempt_at, retry_wait.next_attempt_at);
+    let current = repository
+        .provider_cleanup_status(deletion_id)
+        .await
+        .expect("current summary after a historical replay")
+        .expect("sealed lifecycle");
+    assert_eq!(current.revoked_count, 1);
+    assert_eq!(current.retry_wait_count, 0);
+    assert!(current.next_attempt_at.is_none());
+    assert!(current.all_provider_outcomes_recorded());
+    assert!(
+        repository
+            .claim_provider_cleanup(deletion_id, Uuid::new_v4())
+            .await
+            .expect("resolved manifest has no claimable target")
+            .is_none()
+    );
+    let attempts: Vec<(i32, String, Option<String>)> = sqlx::query_as(
+        "SELECT attempt_number, outcome, failure_code \
+         FROM account_deletion_provider_cleanup_attempts \
+         WHERE deletion_id = $1 AND provider_account_id = $2 ORDER BY attempt_number",
+    )
+    .bind(deletion_id)
+    .bind(provider_account_id)
+    .fetch_all(pool)
+    .await
+    .expect("immutable cleanup attempts");
+    assert_eq!(
+        attempts,
+        vec![
+            (
+                1,
+                "retryable_failure".to_owned(),
+                Some("provider_unavailable".to_owned()),
+            ),
+            (2, "revoked".to_owned(), None),
+        ]
+    );
+
+    let purge = AccountDeletionTransition {
+        deletion_id,
+        request_hash: [0x82; 32],
+        expected_revision: 4,
+        from: AccountDeletionStatus::ProviderCleanup,
+        to: AccountDeletionStatus::Purge,
+        failure_code: None,
+    };
+    assert_eq!(
+        repository.advance(purge).await,
+        Err(AccountDeletionRepositoryError::InvalidInput),
+        "the repository has no provider-cleanup-to-purge edge"
+    );
+    let direct_purge = sqlx::query(
+        "WITH operation AS (SELECT clock_timestamp() AS at) \
+         UPDATE account_deletion_lifecycles SET status = 'purge', revision = revision + 1, \
+         purge_at = operation.at, updated_at = operation.at FROM operation \
+         WHERE id = $1 AND status = 'provider_cleanup' AND revision = 4",
+    )
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect_err("even a resolved manifest requires a runtime-held restore permit");
+    assert_eq!(postgres_error_code(&direct_purge).as_deref(), Some("DWREQ"));
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // Each attack shares one isolated manifest fixture.
+async fn provider_cleanup_guards_reject_omitted_partial_and_unfenced_seals() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+
+    let owner_subject = format!("seal-guard-owner-{}", Uuid::new_v4().simple());
+    let scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    insert_scope(pool, scope, &owner_subject, "seal-guard-personal").await;
+    sqlx::query(
+        "INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation) \
+         VALUES ($1, $2, 9)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(pool)
+    .await
+    .expect("Google credential generation fixture");
+    let provider_account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+         external_account_id, display_label, encrypted_credentials, credential_key_version, \
+         status, sync_enabled, is_default, revision) VALUES ($1, $2, $3, 'google', $4, \
+         'Seal guard account', $5, 6, 'active', true, true, 8)",
+    )
+    .bind(provider_account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(format!("seal-guard-{provider_account_id}"))
+    .bind(vec![0x72_u8; 64])
+    .execute(pool)
+    .await
+    .expect("seal guard provider account");
+    let principal = AccountDeletionPrincipalKey::new(6, [0x44; 32])
+        .expect("valid external principal key")
+        .bind(&owner_subject)
+        .expect("canonical owner subject");
+    let deletion_id = seed_provider_cleanup_deletion_state(pool, scope, principal, true).await;
+
+    let mut omitted = pool.begin().await.expect("omitted seal transaction");
+    let omitted_at: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *omitted)
+        .await
+        .expect("database seal time");
+    stage_provider_cleanup_target(&mut omitted, deletion_id, provider_account_id, omitted_at).await;
+    let omitted_error = omitted
+        .commit()
+        .await
+        .expect_err("a target cannot commit without its lifecycle manifest seal");
+    assert_eq!(
+        postgres_error_code(&omitted_error).as_deref(),
+        Some("DWCON")
+    );
+
+    let mut partial = pool.begin().await.expect("partial seal transaction");
+    let partial_at: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *partial)
+        .await
+        .expect("database partial seal time");
+    stage_provider_cleanup_target(&mut partial, deletion_id, provider_account_id, partial_at).await;
+    let partial_error = sqlx::query(
+        "UPDATE account_deletion_lifecycles SET status = 'provider_cleanup', revision = 4, \
+         provider_cleanup_at = $2, provider_cleanup_policy_version = 1, \
+         provider_cleanup_target_count = 0, provider_cleanup_manifest_hash = $3, \
+         updated_at = $2 WHERE id = $1 AND status = 'fenced' AND revision = 3",
+    )
+    .bind(deletion_id)
+    .bind(partial_at)
+    .bind([0x99_u8; 32].as_slice())
+    .execute(&mut *partial)
+    .await
+    .expect_err("a partial target count cannot seal the lifecycle");
+    assert_eq!(
+        postgres_error_code(&partial_error).as_deref(),
+        Some("DWCON")
+    );
+    partial
+        .rollback()
+        .await
+        .expect("rollback rejected partial seal");
+    let persisted_targets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_deletion_provider_cleanup_targets WHERE deletion_id = $1",
+    )
+    .bind(deletion_id)
+    .fetch_one(pool)
+    .await
+    .expect("inspect rejected seal targets");
+    assert_eq!(persisted_targets, 0);
+
+    let unfenced_subject = format!("unfenced-cleanup-owner-{}", Uuid::new_v4().simple());
+    let unfenced_scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    insert_scope(
+        pool,
+        unfenced_scope,
+        &unfenced_subject,
+        "unfenced-provider-cleanup",
+    )
+    .await;
+    let unfenced_principal = AccountDeletionPrincipalKey::new(7, [0x45; 32])
+        .expect("valid external principal key")
+        .bind(&unfenced_subject)
+        .expect("canonical owner subject");
+    let unfenced_deletion_id =
+        seed_provider_cleanup_deletion_state(pool, unfenced_scope, unfenced_principal, false).await;
+    let unfenced_repository = PostgresAccountDeletionRepository::new(pool.clone(), unfenced_scope)
+        .with_safety_gate(
+            Arc::new(DisabledAccountDeletionSafetyGate),
+            unfenced_principal,
+        );
+    assert_eq!(
+        unfenced_repository
+            .seal_provider_cleanup(AccountDeletionTransition {
+                deletion_id: unfenced_deletion_id,
+                request_hash: [0x83; 32],
+                expected_revision: 3,
+                from: AccountDeletionStatus::Fenced,
+                to: AccountDeletionStatus::ProviderCleanup,
+                failure_code: None,
+            })
+            .await,
+        Err(AccountDeletionRepositoryError::Conflict),
+        "a lifecycle label without the permanent hard fence cannot seal cleanup"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+async fn provider_cleanup_migration_keeps_legacy_inflight_deletions_fail_closed() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 31) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-provider-cleanup migration applies");
+    }
+
+    let owner_subject = format!("legacy-cleanup-owner-{}", Uuid::new_v4().simple());
+    let scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    insert_scope(pool, scope, &owner_subject, "legacy-provider-cleanup").await;
+    let principal = AccountDeletionPrincipalKey::new(5, [0x43; 32])
+        .expect("valid external principal key")
+        .bind(&owner_subject)
+        .expect("canonical owner subject");
+    let deletion_id = seed_provider_cleanup_deletion_state(pool, scope, principal, true).await;
+    sqlx::query(
+        "WITH operation AS (SELECT clock_timestamp() AS at) \
+         UPDATE account_deletion_lifecycles SET status = 'provider_cleanup', revision = 4, \
+         provider_cleanup_at = operation.at, updated_at = operation.at FROM operation \
+         WHERE id = $1 AND status = 'fenced' AND revision = 3",
+    )
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect("legacy route-less provider-cleanup lifecycle fixture");
+
+    let provider_cleanup_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 31)
+        .expect("provider-cleanup migration is embedded");
+    pool.execute(AssertSqlSafe(
+        provider_cleanup_migration.sql.as_str().to_owned(),
+    ))
+    .await
+    .expect("legacy lifecycle upgrades to provider-cleanup persistence");
+    let legacy_manifest: (Option<i16>, Option<i32>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT provider_cleanup_policy_version, provider_cleanup_target_count, \
+         provider_cleanup_manifest_hash FROM account_deletion_lifecycles WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .fetch_one(pool)
+    .await
+    .expect("inspect legacy provider-cleanup lifecycle");
+    assert_eq!(legacy_manifest, (None, None, None));
+
+    let purge = sqlx::query(
+        "WITH operation AS (SELECT clock_timestamp() AS at) \
+         UPDATE account_deletion_lifecycles SET status = 'purge', revision = 5, \
+         purge_at = operation.at, updated_at = operation.at FROM operation \
+         WHERE id = $1 AND status = 'provider_cleanup' AND revision = 4",
+    )
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect_err("an unsealed legacy cleanup lifecycle cannot reach purge");
+    assert_eq!(postgres_error_code(&purge).as_deref(), Some("DWCON"));
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // One concurrent fixture covers claim allocation and summary evolution.
+async fn provider_cleanup_concurrent_claims_cover_distinct_targets_and_exact_replay() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let fixture = sealed_provider_cleanup_fixture(pool, 2).await;
+    let pending = fixture
+        .repository
+        .provider_cleanup_status(fixture.deletion_id)
+        .await
+        .expect("two-target pending summary")
+        .expect("sealed lifecycle");
+    assert_eq!(pending.target_count, 2);
+    assert_eq!(pending.pending_count, 2);
+    assert!(pending.next_attempt_at.is_some());
+    assert!(!pending.all_provider_outcomes_recorded());
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        let repository = Arc::clone(&fixture.repository);
+        let barrier = Arc::clone(&barrier);
+        let deletion_id = fixture.deletion_id;
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            repository
+                .claim_provider_cleanup(deletion_id, Uuid::new_v4())
+                .await
+        }));
+    }
+    barrier.wait().await;
+    let mut claims = Vec::new();
+    for worker in workers {
+        if let Some(claim) = worker
+            .await
+            .expect("concurrent worker completes")
+            .expect("concurrent claim transaction succeeds")
+        {
+            claims.push(claim);
+        }
+    }
+    assert_eq!(
+        claims.len(),
+        2,
+        "three simultaneous workers claim exactly two targets"
+    );
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| claim.provider_account_id)
+            .collect::<BTreeSet<_>>(),
+        fixture.provider_ids.iter().copied().collect()
+    );
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim.attempt == 1 && !claim.replayed)
+    );
+    let claimed = fixture
+        .repository
+        .provider_cleanup_status(fixture.deletion_id)
+        .await
+        .expect("two-target claimed summary")
+        .expect("sealed lifecycle");
+    assert_eq!(claimed.claimed_count, 2);
+    assert_eq!(claimed.pending_count, 0);
+    for claim in claims {
+        let completion = AccountDeletionProviderCleanupCompletion {
+            deletion_id: fixture.deletion_id,
+            provider_account_id: claim.provider_account_id,
+            claim_id: claim.claim_id,
+            attempt: claim.attempt,
+            outcome: AccountDeletionProviderCleanupOutcome::AlreadyAbsent {
+                evidence_hash: [0x93; 32],
+            },
+        };
+        let result = fixture
+            .repository
+            .resolve_provider_cleanup(completion.clone())
+            .await
+            .expect("already-absent is a definitive provider result");
+        assert_eq!(result.status, AccountDeletionProviderCleanupStatus::Revoked);
+        assert!(
+            fixture
+                .repository
+                .resolve_provider_cleanup(completion)
+                .await
+                .expect("already-absent completion replays")
+                .replayed
+        );
+    }
+    assert!(
+        fixture
+            .repository
+            .provider_cleanup_status(fixture.deletion_id)
+            .await
+            .expect("resolved multi-target summary")
+            .expect("sealed lifecycle")
+            .all_provider_outcomes_recorded()
+    );
+    let empty = sealed_provider_cleanup_fixture(pool, 0).await;
+    let empty_summary = empty
+        .repository
+        .provider_cleanup_status(empty.deletion_id)
+        .await
+        .expect("empty sealed manifest summary")
+        .expect("sealed lifecycle");
+    assert!(empty_summary.manifest_sealed);
+    assert_eq!(empty_summary.target_count, 0);
+    assert!(empty_summary.all_provider_outcomes_recorded());
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // Exercises all twelve real claims and the terminal lease boundary.
+async fn provider_cleanup_stale_leases_exhaust_at_twelve_and_reject_late_workers() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let fixture = sealed_provider_cleanup_fixture(pool, 1).await;
+    let mut claim = fixture
+        .repository
+        .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+        .await
+        .expect("first claim")
+        .expect("pending target");
+    for expected_attempt in 2..=12 {
+        shift_provider_cleanup_target_time(
+            pool,
+            fixture.deletion_id,
+            claim.provider_account_id,
+            960,
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repository
+                .claim_provider_cleanup(fixture.deletion_id, claim.claim_id)
+                .await
+                .expect_err("an expired claim cannot replay"),
+            AccountDeletionRepositoryError::Conflict
+        );
+        let late_completion = AccountDeletionProviderCleanupCompletion {
+            deletion_id: fixture.deletion_id,
+            provider_account_id: claim.provider_account_id,
+            claim_id: claim.claim_id,
+            attempt: claim.attempt,
+            outcome: AccountDeletionProviderCleanupOutcome::Revoked {
+                evidence_hash: [0x94; 32],
+            },
+        };
+        assert_eq!(
+            fixture
+                .repository
+                .resolve_provider_cleanup(late_completion.clone())
+                .await,
+            Err(AccountDeletionRepositoryError::Conflict),
+            "lease expiry rejects a late success before takeover"
+        );
+        claim = fixture
+            .repository
+            .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+            .await
+            .expect("stale claim can be taken over")
+            .expect("retry remains under the limit");
+        assert_eq!(claim.attempt, expected_attempt);
+        assert_eq!(
+            fixture
+                .repository
+                .resolve_provider_cleanup(late_completion)
+                .await,
+            Err(AccountDeletionRepositoryError::Conflict),
+            "a replaced worker cannot overwrite lease-expiry evidence"
+        );
+    }
+    shift_provider_cleanup_target_time(pool, fixture.deletion_id, claim.provider_account_id, 960)
+        .await;
+    assert!(
+        fixture
+            .repository
+            .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+            .await
+            .expect("exhausted lease is retired")
+            .is_none()
+    );
+    assert_provider_cleanup_operator(
+        pool,
+        fixture.deletion_id,
+        claim.provider_account_id,
+        12,
+        "retry_exhausted",
+    )
+    .await;
+    let attempts: (i64, i32, i64) = sqlx::query_as(
+        "SELECT count(*), max(attempt_number), count(*) FILTER \
+         (WHERE outcome = 'retryable_failure' AND failure_code = 'claim_lease_expired') \
+         FROM account_deletion_provider_cleanup_attempts WHERE deletion_id = $1",
+    )
+    .bind(fixture.deletion_id)
+    .fetch_one(pool)
+    .await
+    .expect("lease expiry evidence");
+    assert_eq!(attempts, (12, 12, 12));
+    assert!(
+        fixture
+            .repository
+            .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+            .await
+            .expect("exhaustion is terminal")
+            .is_none()
+    );
+
+    let retries = sealed_provider_cleanup_fixture(pool, 1).await;
+    let mut retry_claim = retries
+        .repository
+        .claim_provider_cleanup(retries.deletion_id, Uuid::new_v4())
+        .await
+        .expect("first retry fixture claim")
+        .expect("pending target");
+    for attempt in 1..=12 {
+        assert_eq!(retry_claim.attempt, attempt);
+        let completion = AccountDeletionProviderCleanupCompletion {
+            deletion_id: retries.deletion_id,
+            provider_account_id: retry_claim.provider_account_id,
+            claim_id: retry_claim.claim_id,
+            attempt,
+            outcome: AccountDeletionProviderCleanupOutcome::RetryableFailure,
+        };
+        let resolved = retries
+            .repository
+            .resolve_provider_cleanup(completion.clone())
+            .await
+            .expect("retryable provider outcome resolves");
+        if attempt == 12 {
+            assert_eq!(
+                resolved.status,
+                AccountDeletionProviderCleanupStatus::OperatorRequired
+            );
+            assert!(resolved.next_attempt_at.is_none());
+            assert!(
+                retries
+                    .repository
+                    .resolve_provider_cleanup(completion)
+                    .await
+                    .expect("terminal retry completion replays")
+                    .replayed
+            );
+        } else {
+            assert_eq!(
+                resolved.status,
+                AccountDeletionProviderCleanupStatus::RetryWait
+            );
+            let backoff_seconds = 1_i32 << (attempt - 1);
+            shift_provider_cleanup_target_time(
+                pool,
+                retries.deletion_id,
+                retry_claim.provider_account_id,
+                backoff_seconds + 1,
+            )
+            .await;
+            retry_claim = retries
+                .repository
+                .claim_provider_cleanup(retries.deletion_id, Uuid::new_v4())
+                .await
+                .expect("due retry can be claimed")
+                .expect("retry target remains claimable");
+        }
+    }
+    assert_provider_cleanup_operator(
+        pool,
+        retries.deletion_id,
+        retry_claim.provider_account_id,
+        12,
+        "retry_exhausted",
+    )
+    .await;
+    assert!(
+        retries
+            .repository
+            .claim_provider_cleanup(retries.deletion_id, Uuid::new_v4())
+            .await
+            .expect("the thirteenth claim is unavailable")
+            .is_none()
+    );
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+async fn provider_cleanup_deadlines_stop_pending_and_expired_claims() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    for claimed in [false, true] {
+        let fixture = sealed_provider_cleanup_fixture(pool, 1).await;
+        if claimed {
+            fixture
+                .repository
+                .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+                .await
+                .expect("claim before deadline")
+                .expect("pending target");
+        }
+        let provider_id = fixture.provider_ids[0];
+        shift_provider_cleanup_target_time(pool, fixture.deletion_id, provider_id, 86_401).await;
+        let backdated_error = if claimed {
+            sqlx::query(
+                "INSERT INTO account_deletion_provider_cleanup_attempts \
+                (deletion_id, provider_account_id, attempt_number, claim_id, claimed_at, \
+                lease_expires_at, finished_at, outcome, evidence_hash) \
+                SELECT deletion_id, provider_account_id, attempt_count, claim_id, claimed_at, \
+                lease_expires_at, lease_expires_at - interval '1 second', 'revoked', $3 \
+                FROM account_deletion_provider_cleanup_targets \
+                WHERE deletion_id = $1 AND provider_account_id = $2",
+            )
+            .bind(fixture.deletion_id)
+            .bind(provider_id)
+            .bind([0x95_u8; 32].as_slice())
+            .execute(pool)
+            .await
+            .expect_err("backdating success cannot revive an expired lease")
+        } else {
+            sqlx::query(
+                "UPDATE account_deletion_provider_cleanup_targets SET status = 'claimed', \
+                attempt_count = 1, claim_id = $3, claimed_at = deadline_at - interval '1 second', \
+                lease_expires_at = deadline_at + interval '14 minutes 59 seconds', \
+                updated_at = deadline_at - interval '1 second' \
+                WHERE deletion_id = $1 AND provider_account_id = $2",
+            )
+            .bind(fixture.deletion_id)
+            .bind(provider_id)
+            .bind(Uuid::new_v4())
+            .execute(pool)
+            .await
+            .expect_err("backdating a claim cannot bypass the live deadline")
+        };
+        assert_eq!(
+            postgres_error_code(&backdated_error).as_deref(),
+            Some("DWCON")
+        );
+        assert!(
+            fixture
+                .repository
+                .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+                .await
+                .expect("elapsed deadline becomes operator work")
+                .is_none()
+        );
+        assert_provider_cleanup_operator(
+            pool,
+            fixture.deletion_id,
+            provider_id,
+            i32::from(claimed),
+            "deadline_exceeded",
+        )
+        .await;
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_deletion_provider_cleanup_attempts WHERE deletion_id = $1",
+        ).bind(fixture.deletion_id).fetch_one(pool).await.expect("deadline receipt count");
+        assert_eq!(
+            receipt_count,
+            i64::from(claimed),
+            "only an actual claim has an attempt receipt"
+        );
+    }
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+async fn provider_cleanup_deadline_bounds_retry_but_honors_an_existing_live_lease() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    for definitive in [true, false] {
+        let fixture = sealed_provider_cleanup_fixture(pool, 1).await;
+        let mut claim = fixture
+            .repository
+            .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+            .await
+            .expect("initial live lease")
+            .expect("pending target");
+        if !definitive {
+            for _ in 0..3 {
+                shift_provider_cleanup_target_time(
+                    pool,
+                    fixture.deletion_id,
+                    claim.provider_account_id,
+                    960,
+                )
+                .await;
+                claim = fixture
+                    .repository
+                    .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+                    .await
+                    .expect("advance fixture to an eight-second retry backoff")
+                    .expect("claimable target");
+            }
+            assert_eq!(claim.attempt, 4);
+        }
+        let mut deadline_fixture = pool.begin().await.expect("isolated deadline fixture");
+        sqlx::query("ALTER TABLE account_deletion_provider_cleanup_targets DISABLE TRIGGER account_deletion_provider_cleanup_target_guard")
+            .execute(&mut *deadline_fixture).await.expect("disable isolated timestamp guard");
+        sqlx::query("WITH deadline AS (SELECT clock_timestamp() + make_interval(secs => $3) AS at) \
+            UPDATE account_deletion_provider_cleanup_targets SET deadline_at = deadline.at, \
+            created_at = deadline.at - interval '24 hours', next_attempt_at = LEAST(next_attempt_at, deadline.at) \
+            FROM deadline WHERE deletion_id = $1 AND provider_account_id = $2")
+            .bind(fixture.deletion_id).bind(claim.provider_account_id).bind(if definitive { -1_f64 } else { 2_f64 })
+            .execute(&mut *deadline_fixture).await.expect("place deadline beside live lease");
+        sqlx::query("ALTER TABLE account_deletion_provider_cleanup_targets ENABLE TRIGGER account_deletion_provider_cleanup_target_guard")
+            .execute(&mut *deadline_fixture).await.expect("restore timestamp guard");
+        deadline_fixture
+            .commit()
+            .await
+            .expect("deadline fixture commits");
+        // The deadline stops new attempts/retries. A lease granted before it
+        // remains valid for a definitive provider response until lease expiry.
+        let completion = AccountDeletionProviderCleanupCompletion {
+            deletion_id: fixture.deletion_id,
+            provider_account_id: claim.provider_account_id,
+            claim_id: claim.claim_id,
+            attempt: claim.attempt,
+            outcome: if definitive {
+                AccountDeletionProviderCleanupOutcome::AlreadyAbsent {
+                    evidence_hash: [0x96; 32],
+                }
+            } else {
+                AccountDeletionProviderCleanupOutcome::RetryableFailure
+            },
+        };
+        let result = fixture
+            .repository
+            .resolve_provider_cleanup(completion.clone())
+            .await
+            .expect("live lease outcome resolves at the deadline boundary");
+        assert_eq!(
+            result.status,
+            if definitive {
+                AccountDeletionProviderCleanupStatus::Revoked
+            } else {
+                AccountDeletionProviderCleanupStatus::OperatorRequired
+            }
+        );
+        assert!(result.next_attempt_at.is_none());
+        assert!(
+            fixture
+                .repository
+                .resolve_provider_cleanup(completion)
+                .await
+                .expect("deadline boundary outcome replays")
+                .replayed
+        );
+        if !definitive {
+            assert_provider_cleanup_operator(
+                pool,
+                fixture.deletion_id,
+                claim.provider_account_id,
+                4,
+                "deadline_exceeded",
+            )
+            .await;
+        }
+    }
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // The same source-fault matrix covers pending and stale claims.
+async fn provider_cleanup_source_drift_and_missing_credentials_require_operator() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    for (fault_kind, claimed) in [
+        ("missing", false),
+        ("revision", false),
+        ("generation", false),
+        ("key_version", false),
+        ("ciphertext", false),
+        ("missing", true),
+        ("revision", true),
+        ("generation", true),
+        ("key_version", true),
+        ("ciphertext", true),
+    ] {
+        let missing = fault_kind == "missing";
+        let fixture = sealed_provider_cleanup_fixture(pool, 1).await;
+        let provider_id = fixture.provider_ids[0];
+        let old_claim = if claimed {
+            fixture
+                .repository
+                .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+                .await
+                .expect("claim before source fault")
+        } else {
+            None
+        };
+        let mut fault = pool.begin().await.expect("isolated source-fault fixture");
+        sqlx::query("ALTER TABLE provider_accounts DISABLE TRIGGER account_deletion_fence_guard")
+            .execute(&mut *fault)
+            .await
+            .expect("disable only the isolated source fence");
+        if missing {
+            sqlx::query(
+                "UPDATE provider_accounts SET status = 'revoked', is_default = false, \
+                sync_enabled = false, encrypted_credentials = NULL, credential_key_version = NULL, \
+                disconnected_at = clock_timestamp() WHERE id = $1",
+            )
+            .bind(provider_id)
+            .execute(&mut *fault)
+            .await
+            .expect("simulate unavailable source envelope");
+        } else if fault_kind == "generation" {
+            sqlx::query(
+                "ALTER TABLE google_oauth_scope_state DISABLE TRIGGER account_deletion_fence_guard",
+            )
+            .execute(&mut *fault)
+            .await
+            .expect("disable isolated scope-state fence");
+            sqlx::query("UPDATE google_oauth_scope_state AS scope_state SET \
+                credential_generation = scope_state.credential_generation + 1 FROM provider_accounts AS account \
+                WHERE account.id = $1 AND scope_state.workspace_id = account.workspace_id \
+                AND scope_state.user_id = account.user_id")
+                .bind(provider_id).execute(&mut *fault).await.expect("simulate credential generation drift");
+            sqlx::query(
+                "ALTER TABLE google_oauth_scope_state ENABLE TRIGGER account_deletion_fence_guard",
+            )
+            .execute(&mut *fault)
+            .await
+            .expect("restore scope-state fence");
+        } else {
+            sqlx::query("UPDATE provider_accounts SET \
+                revision = revision + CASE WHEN $2 = 'revision' THEN 1 ELSE 0 END, \
+                credential_key_version = credential_key_version + CASE WHEN $2 = 'key_version' THEN 1 ELSE 0 END, \
+                encrypted_credentials = CASE WHEN $2 = 'ciphertext' THEN $3 ELSE encrypted_credentials END \
+                WHERE id = $1")
+                .bind(provider_id)
+                .bind(fault_kind)
+                .bind(vec![0x72_u8; 64])
+                .execute(&mut *fault)
+                .await
+                .expect("simulate one independently bound source field drifting");
+        }
+        sqlx::query("ALTER TABLE provider_accounts ENABLE TRIGGER account_deletion_fence_guard")
+            .execute(&mut *fault)
+            .await
+            .expect("restore source fence before repository work");
+        fault.commit().await.expect("source fault fixture commits");
+        if let Some(old_claim) = old_claim {
+            assert_eq!(
+                fixture
+                    .repository
+                    .claim_provider_cleanup(fixture.deletion_id, old_claim.claim_id)
+                    .await
+                    .expect_err("claim replay cannot expose a changed source"),
+                AccountDeletionRepositoryError::Conflict
+            );
+            shift_provider_cleanup_target_time(pool, fixture.deletion_id, provider_id, 960).await;
+        }
+        assert!(
+            fixture
+                .repository
+                .claim_provider_cleanup(fixture.deletion_id, Uuid::new_v4())
+                .await
+                .expect("source fault has a durable operator outcome")
+                .is_none()
+        );
+        let failure = if missing {
+            "credential_unavailable"
+        } else {
+            "credential_drift"
+        };
+        assert_provider_cleanup_operator(
+            pool,
+            fixture.deletion_id,
+            provider_id,
+            i32::from(claimed),
+            failure,
+        )
+        .await;
+        let operator = fixture
+            .repository
+            .provider_cleanup_status(fixture.deletion_id)
+            .await
+            .expect("source intervention summary")
+            .expect("sealed lifecycle");
+        assert_eq!(operator.operator_required_count, 1);
+        assert_eq!(
+            operator.operator_reasons,
+            vec![if missing {
+                AccountDeletionProviderCleanupFailure::CredentialUnavailable
+            } else {
+                AccountDeletionProviderCleanupFailure::CredentialDrift
+            }]
+        );
+        assert!(operator.next_attempt_at.is_none());
+        assert!(!operator.all_provider_outcomes_recorded());
+        let receipts: Vec<(String, String)> = sqlx::query_as(
+            "SELECT outcome, failure_code FROM account_deletion_provider_cleanup_attempts WHERE deletion_id = $1",
+        ).bind(fixture.deletion_id).fetch_all(pool).await.expect("source-fault evidence");
+        assert_eq!(
+            receipts,
+            if claimed {
+                vec![("operator_required".to_owned(), failure.to_owned())]
+            } else {
+                vec![]
+            }
+        );
+    }
+    test_database.destroy().await;
+}
+
+struct ProviderCleanupFixture {
+    repository: Arc<PostgresAccountDeletionRepository>,
+    deletion_id: Uuid,
+    provider_ids: Vec<Uuid>,
+}
+
+async fn sealed_provider_cleanup_fixture(
+    pool: &PgPool,
+    target_count: usize,
+) -> ProviderCleanupFixture {
+    let owner_subject = format!("provider-cleanup-fixture-{}", Uuid::new_v4().simple());
+    let scope = DatabaseScope {
+        user_id: Uuid::new_v4(),
+        workspace_id: Uuid::new_v4(),
+    };
+    insert_scope(pool, scope, &owner_subject, &owner_subject).await;
+    sqlx::query("INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation) VALUES ($1, $2, 7)")
+        .bind(scope.workspace_id).bind(scope.user_id).execute(pool).await.expect("credential generation fixture");
+    let mut provider_ids = Vec::new();
+    for index in 0..target_count {
+        let provider_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+            external_account_id, display_label, encrypted_credentials, credential_key_version, \
+            status, sync_enabled, is_default, revision) VALUES ($1, $2, $3, 'google', $4, \
+            'Test cleanup provider', $5, 3, 'active', true, $6, 5)",
+        )
+        .bind(provider_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(format!("provider-cleanup-external-{index}"))
+        .bind(vec![0x71_u8; 64])
+        .bind(index == 0)
+        .execute(pool)
+        .await
+        .expect("provider account fixture");
+        provider_ids.push(provider_id);
+    }
+    let principal = AccountDeletionPrincipalKey::new(4, [0x42; 32])
+        .expect("test principal key")
+        .bind(&owner_subject)
+        .expect("test principal binding");
+    let deletion_id = seed_provider_cleanup_deletion_state(pool, scope, principal, true).await;
+    let repository = Arc::new(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .with_safety_gate(Arc::new(DisabledAccountDeletionSafetyGate), principal),
+    );
+    repository
+        .seal_provider_cleanup(AccountDeletionTransition {
+            deletion_id,
+            request_hash: [0x81; 32],
+            expected_revision: 3,
+            from: AccountDeletionStatus::Fenced,
+            to: AccountDeletionStatus::ProviderCleanup,
+            failure_code: None,
+        })
+        .await
+        .expect("seal provider cleanup fixture");
+    ProviderCleanupFixture {
+        repository,
+        deletion_id,
+        provider_ids,
+    }
+}
+
+// Only test-owned schema data is aged. The production trigger is restored in
+// the same transaction before invoking any repository behavior under test.
+async fn shift_provider_cleanup_target_time(
+    pool: &PgPool,
+    deletion_id: Uuid,
+    provider_id: Uuid,
+    seconds: i32,
+) {
+    let mut fixture = pool.begin().await.expect("target-time fixture transaction");
+    sqlx::query("ALTER TABLE account_deletion_provider_cleanup_targets DISABLE TRIGGER account_deletion_provider_cleanup_target_guard")
+        .execute(&mut *fixture).await.expect("disable isolated target guard for clock fixture");
+    sqlx::query("UPDATE account_deletion_provider_cleanup_targets SET \
+        created_at = created_at - make_interval(secs => $3), updated_at = updated_at - make_interval(secs => $3), \
+        deadline_at = deadline_at - make_interval(secs => $3), next_attempt_at = next_attempt_at - make_interval(secs => $3), \
+        claimed_at = claimed_at - make_interval(secs => $3), lease_expires_at = lease_expires_at - make_interval(secs => $3) \
+        WHERE deletion_id = $1 AND provider_account_id = $2")
+        .bind(deletion_id).bind(provider_id).bind(f64::from(seconds)).execute(&mut *fixture).await.expect("age target timestamps together");
+    sqlx::query("ALTER TABLE account_deletion_provider_cleanup_targets ENABLE TRIGGER account_deletion_provider_cleanup_target_guard")
+        .execute(&mut *fixture).await.expect("restore target guard");
+    fixture.commit().await.expect("clock fixture commits");
+}
+
+async fn assert_provider_cleanup_operator(
+    pool: &PgPool,
+    deletion_id: Uuid,
+    provider_id: Uuid,
+    attempt: i32,
+    failure: &str,
+) {
+    let state: (String, i32, String, bool) = sqlx::query_as(
+        "SELECT status, attempt_count, last_failure_code, claim_id IS NULL AND claimed_at IS NULL \
+         AND lease_expires_at IS NULL AND operator_required_at IS NOT NULL \
+         FROM account_deletion_provider_cleanup_targets WHERE deletion_id = $1 AND provider_account_id = $2",
+    ).bind(deletion_id).bind(provider_id).fetch_one(pool).await.expect("operator target state");
+    assert_eq!(
+        state,
+        (
+            "operator_required".to_owned(),
+            attempt,
+            failure.to_owned(),
+            true
+        )
+    );
+}
+
+async fn seed_provider_cleanup_deletion_state(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    principal: AccountDeletionPrincipalBinding,
+    install_hard_fence: bool,
+) -> Uuid {
+    let deletion_id = Uuid::new_v4();
+    let owner_subject_hash = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT sha256(convert_to(auth_subject, 'UTF8')) FROM users WHERE id = $1",
+    )
+    .bind(scope.user_id)
+    .fetch_one(pool)
+    .await
+    .expect("owner subject hash");
+    let prepared_at = Utc::now() - ChronoDuration::hours(26);
+    let pseudonym = principal.pseudonym();
+    sqlx::query(
+        "INSERT INTO account_deletion_lifecycles (id, workspace_id, user_id, \
+         owner_subject_hash, prepare_request_hash, explicit_approval_digest, \
+         principal_rate_limit_evidence_hash, external_principal_key_version, \
+         external_principal_pseudonym, authorizing_session_id, \
+         authorizing_session_revision, authorizing_credential_issued_at, \
+         authorizing_recovery_code_id, authorizing_recovery_code_revision, \
+         authorizing_recovery_code_created_at, prepared_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, $11, $12, 1, $13, \
+         $14, $14, $14)",
+    )
+    .bind(deletion_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(&owner_subject_hash)
+    .bind([0x61_u8; 32].as_slice())
+    .bind([0x62_u8; 32].as_slice())
+    .bind([0x63_u8; 32].as_slice())
+    .bind(i32::try_from(pseudonym.key_version()).expect("bounded key version"))
+    .bind(pseudonym.digest().as_slice())
+    .bind(Uuid::new_v4())
+    .bind(prepared_at - ChronoDuration::minutes(1))
+    .bind(Uuid::new_v4())
+    .bind(prepared_at - ChronoDuration::hours(25))
+    .bind(prepared_at)
+    .execute(pool)
+    .await
+    .expect("prepared deletion lifecycle fixture");
+
+    let fenced_at = Utc::now();
+    sqlx::query(
+        "UPDATE account_deletion_lifecycles SET status = 'fence_committing', revision = 2, \
+         confirming_session_id = $2, confirming_session_revision = 1, \
+         confirming_credential_issued_at = $3, confirming_approval_digest = $4, \
+         confirmed_at = $3, fence_committing_at = $3, updated_at = $3 WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .bind(Uuid::new_v4())
+    .bind(fenced_at)
+    .bind([0x64_u8; 32].as_slice())
+    .execute(pool)
+    .await
+    .expect("fence-committing lifecycle fixture");
+    if install_hard_fence {
+        sqlx::query(
+            "INSERT INTO account_deletion_fences (deletion_id, workspace_id, user_id, \
+             owner_subject_hash, lifecycle_revision, fenced_at) VALUES ($1, $2, $3, $4, 2, $5)",
+        )
+        .bind(deletion_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(&owner_subject_hash)
+        .bind(fenced_at)
+        .execute(pool)
+        .await
+        .expect("account deletion fence fixture");
+    }
+    sqlx::query(
+        "UPDATE account_deletion_lifecycles SET status = 'fenced', revision = 3, \
+         external_tombstone_evidence_hash = $2, fenced_at = $3, updated_at = $3 \
+         WHERE id = $1",
+    )
+    .bind(deletion_id)
+    .bind([0x65_u8; 32].as_slice())
+    .bind(fenced_at)
+    .execute(pool)
+    .await
+    .expect("fenced lifecycle fixture");
+    deletion_id
+}
+
+async fn stage_provider_cleanup_target(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    deletion_id: Uuid,
+    provider_account_id: Uuid,
+    operation_at: chrono::DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO account_deletion_provider_cleanup_targets (deletion_id, \
+         provider_account_id, provider, provider_account_revision, credential_generation, \
+         credential_key_version, encrypted_credentials_hash, next_attempt_at, deadline_at, \
+         created_at, updated_at) \
+         SELECT $1, account.id, account.provider, account.revision, \
+                scope_state.credential_generation, account.credential_key_version, \
+                sha256(account.encrypted_credentials), $3, $3 + interval '24 hours', $3, $3 \
+         FROM provider_accounts AS account \
+         JOIN google_oauth_scope_state AS scope_state \
+           ON scope_state.workspace_id = account.workspace_id \
+          AND scope_state.user_id = account.user_id \
+         WHERE account.id = $2",
+    )
+    .bind(deletion_id)
+    .bind(provider_account_id)
+    .bind(operation_at)
+    .execute(&mut **transaction)
+    .await
+    .expect("stage exact provider cleanup target");
 }
 
 async fn insert_mcp_proposal(
