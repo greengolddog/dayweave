@@ -4014,6 +4014,15 @@ final class PlannerStore: ObservableObject {
             : .standard
     }
 
+    func canonicalSensitivityPresentationIndex() -> CanonicalSensitivityIndex {
+        CanonicalSensitivityIndex(
+            canonicalItems: canonicalItems,
+            sensitivityMutations: pendingCanonicalSensitivityMutations,
+            authoringMutations: pendingCanonicalAuthoringMutations,
+            trashEntries: canonicalTrash
+        )
+    }
+
     func canonicalSensitivityMutation(
         itemID: UUID
     ) -> PendingCanonicalSensitivityMutation? {

@@ -17,7 +17,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.decodeCanonicalFlexibleConstraints
-import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.CanonicalSensitivityIndex
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import java.time.Instant
 
@@ -91,6 +91,9 @@ internal data class CanonicalAuthoringRow(
     val dependencies: List<CanonicalDependencyPresentation> = emptyList(),
     val blockingDependencies: List<CanonicalDependencyPresentation> = emptyList(),
     val hasOpaqueDependencies: Boolean = false,
+    val siblingOrder: Long = 0,
+    val notes: String? = null,
+    val hasUnsafeAncestry: Boolean = false,
 ) {
     /** Opaque metadata blocks replacement, but a stable unfenced canonical row remains trashable. */
     val canTrash: Boolean
@@ -104,6 +107,8 @@ internal data class CanonicalAuthoringPresentation(
     val blocked: List<CanonicalAuthoringRow>,
     val conflicts: List<CanonicalAuthoringRow>,
     val recentlyDeleted: List<CanonicalAuthoringRow>,
+    /** Complete non-trash topology, independent of the Inbox's status sections. */
+    val hierarchyRows: List<CanonicalAuthoringRow> = emptyList(),
 ) {
     val itemCount: Int get() = (inbox + planned + blocked + recentlyDeleted)
         .distinctBy(CanonicalAuthoringRow::itemId)
@@ -114,20 +119,17 @@ internal data class CanonicalAuthoringPresentation(
 
     companion object {
         fun build(state: DayWeaveUiState): CanonicalAuthoringPresentation {
+            val sensitivity = CanonicalSensitivityIndex.build(
+                state.canonicalItems, state.pendingCanonicalMutation,
+                state.pendingCanonicalAuthoringMutations,
+            )
             val pendingByItem = state.pendingCanonicalAuthoringMutations.associateBy { it.itemId }
             val allActiveById = state.canonicalItems
                 .filter { it.deletedAt == null }
                 .associateBy(CanonicalItemSnapshot::id)
-            val activeById = allActiveById.filterValues {
-                it.status in setOf(
-                        CanonicalDraftPlacement.INBOX.wireValue,
-                        CanonicalDraftPlacement.PLANNED.wireValue,
-                        "blocked",
-                    )
-            }
             val nodes = linkedMapOf<String, AuthoringNode>()
 
-            activeById.values.forEach { item ->
+            allActiveById.values.forEach { item ->
                 val mutation = pendingByItem[item.id]
                 if (mutation?.operation != CanonicalAuthoringOperation.TRASH) {
                     nodes[item.id] = AuthoringNode.fromItem(item, mutation)
@@ -148,30 +150,26 @@ internal data class CanonicalAuthoringPresentation(
             }
 
             val hierarchy = AuthoringHierarchy(nodes)
-            val dependencyResolver = DependencyPresentationResolver(state)
+            val dependencyResolver = DependencyPresentationResolver(state, sensitivity, hierarchy.unsafeAncestryIds)
             val inbox = mutableListOf<CanonicalAuthoringRow>()
             val planned = mutableListOf<CanonicalAuthoringRow>()
             val blocked = mutableListOf<CanonicalAuthoringRow>()
             val conflicts = mutableListOf<CanonicalAuthoringRow>()
             val deleted = mutableListOf<CanonicalAuthoringRow>()
+            val hierarchyRows = mutableListOf<CanonicalAuthoringRow>()
 
             hierarchy.orderedIds.forEach { itemId ->
                 val node = nodes[itemId] ?: return@forEach
                 val row = node.toRow(
                     depth = hierarchy.depthById[itemId] ?: 0,
                     breadcrumb = hierarchy.breadcrumbById[itemId].orEmpty(),
-                    isSensitive = runCatching {
-                        effectiveCanonicalSensitivity(
-                            items = state.canonicalItems,
-                            itemId = itemId,
-                            pendingMutation = state.pendingCanonicalMutation,
-                            pendingAuthoringMutations = state.pendingCanonicalAuthoringMutations,
-                        )
-                    }.getOrDefault(true),
+                    isSensitive = sensitivity[itemId] || itemId in hierarchy.unsafeAncestryIds,
                     hasMissingParent = itemId in hierarchy.missingParentIds,
                     hasHierarchyCycle = itemId in hierarchy.cyclicIds,
+                    hasUnsafeAncestry = itemId in hierarchy.unsafeAncestryIds,
                     dependencyResolver = dependencyResolver,
                 )
+                hierarchyRows += row
                 when (row.status) {
                     CanonicalDraftPlacement.INBOX.wireValue -> inbox += row
                     CanonicalDraftPlacement.PLANNED.wireValue -> planned += row
@@ -194,7 +192,7 @@ internal data class CanonicalAuthoringPresentation(
                         parentId = item?.parentId,
                         depth = 0,
                         breadcrumb = emptyList(),
-                        isSensitive = sensitivityFor(state, mutation.itemId),
+                        isSensitive = sensitivity[mutation.itemId],
                         durationKind = item?.durationKind ?: inferredDurationKind(
                             item?.durationSeconds,
                         ),
@@ -308,24 +306,17 @@ internal data class CanonicalAuthoringPresentation(
                 blocked = blocked,
                 conflicts = conflicts.distinctBy(CanonicalAuthoringRow::itemId),
                 recentlyDeleted = deleted.distinctBy(CanonicalAuthoringRow::itemId),
+                hierarchyRows = hierarchyRows,
             )
         }
 
-        private fun sensitivityFor(state: DayWeaveUiState, itemId: String): Boolean =
-            runCatching {
-                effectiveCanonicalSensitivity(
-                    items = state.canonicalItems,
-                    itemId = itemId,
-                    pendingMutation = state.pendingCanonicalMutation,
-                    pendingAuthoringMutations = state.pendingCanonicalAuthoringMutations,
-                )
-            }.getOrDefault(true)
     }
 }
 
 private data class AuthoringNode(
     val itemId: String,
     val title: String,
+    val notes: String?,
     val kind: ItemKind,
     val status: String,
     val placement: CanonicalDraftPlacement,
@@ -358,6 +349,7 @@ private data class AuthoringNode(
         isSensitive: Boolean,
         hasMissingParent: Boolean,
         hasHierarchyCycle: Boolean,
+        hasUnsafeAncestry: Boolean,
         dependencyResolver: DependencyPresentationResolver,
     ): CanonicalAuthoringRow {
         val source = when (mutation?.operation) {
@@ -411,15 +403,19 @@ private data class AuthoringNode(
             diagnostic = mutation?.diagnostic ?: unsupportedDiagnostic,
             draft = draft,
             revision = revision,
-            isReadOnly = unsupported || mutation?.isSubmitted == true ||
+            isReadOnly = unsupported || kind == ItemKind.PROJECT ||
+                status !in setOf("inbox", "planned") || mutation?.isSubmitted == true ||
                 mutation?.disposition == CanonicalAuthoringDisposition.CONFLICTED ||
                 mutation?.operation == CanonicalAuthoringOperation.RESTORE ||
-                hasMissingParent || hasHierarchyCycle,
+                hasMissingParent || hasHierarchyCycle || hasUnsafeAncestry,
             hasMissingParent = hasMissingParent,
             hasHierarchyCycle = hasHierarchyCycle,
             dependencies = allDependencies,
             blockingDependencies = allDependencies.filter(CanonicalDependencyPresentation::isBlocking),
             hasOpaqueDependencies = hasOpaqueDependencies,
+            siblingOrder = siblingOrder,
+            notes = notes,
+            hasUnsafeAncestry = hasUnsafeAncestry,
         )
     }
 
@@ -453,6 +449,7 @@ private data class AuthoringNode(
             return AuthoringNode(
                 itemId = item.id,
                 title = decoded?.title ?: item.title,
+                notes = if (decoded != null) decoded.notes else item.notes,
                 kind = presentedKind,
                 status = if (usesPendingDraft) {
                     requireNotNull(decoded).placement.wireValue
@@ -460,7 +457,7 @@ private data class AuthoringNode(
                     item.status
                 },
                 placement = decoded?.placement ?: item.status.toPlacement(),
-                parentId = decoded?.parentId ?: item.parentId,
+                parentId = if (decoded != null) decoded.parentId else item.parentId,
                 siblingOrder = decoded?.siblingOrder ?: item.siblingOrder,
                 durationKind = if (usesPendingDraft) {
                     requireNotNull(decoded).durationKind
@@ -517,6 +514,7 @@ private data class AuthoringNode(
         ): AuthoringNode = AuthoringNode(
             itemId = mutation.itemId,
             title = draft.title,
+            notes = draft.notes,
             kind = draft.kind,
             status = draft.placement.wireValue,
             placement = draft.placement,
@@ -549,7 +547,11 @@ private data class AuthoringNode(
     }
 }
 
-private class DependencyPresentationResolver(state: DayWeaveUiState) {
+private class DependencyPresentationResolver(
+    state: DayWeaveUiState,
+    sensitivity: CanonicalSensitivityIndex,
+    unsafeAncestryIds: Set<String>,
+) {
     private data class Target(
         val id: String,
         val title: String,
@@ -588,19 +590,11 @@ private class DependencyPresentationResolver(state: DayWeaveUiState) {
             }
         }
         targets = projected.mapValues { (itemId, target) ->
-            val isSensitive = runCatching {
-                effectiveCanonicalSensitivity(
-                    items = state.canonicalItems,
-                    itemId = itemId,
-                    pendingMutation = state.pendingCanonicalMutation,
-                    pendingAuthoringMutations = state.pendingCanonicalAuthoringMutations,
-                )
-            }.getOrDefault(true)
             Target(
                 id = target.id,
                 title = target.title,
                 status = target.status,
-                isSensitive = isSensitive,
+                isSensitive = sensitivity[itemId] || itemId in unsafeAncestryIds,
             )
         }
     }
@@ -650,9 +644,10 @@ private class AuthoringHierarchy(nodes: Map<String, AuthoringNode>) {
     val breadcrumbById: Map<String, List<String>>
     val missingParentIds: Set<String>
     val cyclicIds: Set<String>
+    val unsafeAncestryIds: Set<String>
 
     init {
-        val order = compareBy<AuthoringNode>({ it.siblingOrder }, { it.title.lowercase() }, { it.itemId })
+        val order = compareBy<AuthoringNode>({ it.siblingOrder }, { it.itemId.lowercase() })
         val children = mutableMapOf<String, MutableList<AuthoringNode>>()
         val roots = mutableListOf<AuthoringNode>()
         val missing = mutableSetOf<String>()
@@ -688,7 +683,8 @@ private class AuthoringHierarchy(nodes: Map<String, AuthoringNode>) {
             }
         }
 
-        val cycles = mutableSetOf<String>()
+        val cycles = nodes.values.filter { it.parentId == it.itemId }
+            .mapTo(mutableSetOf(), AuthoringNode::itemId)
         nodes.values.sortedWith(order).forEach { start ->
             if (start.itemId in visited) return@forEach
             val chain = mutableListOf<AuthoringNode>()
@@ -718,6 +714,15 @@ private class AuthoringHierarchy(nodes: Map<String, AuthoringNode>) {
         breadcrumbById = breadcrumbs
         missingParentIds = missing
         cyclicIds = cycles
+        val unsafe = mutableSetOf<String>()
+        val unsafePending = ArrayDeque<String>()
+        (missing + cycles).forEach { unsafePending.addLast(it) }
+        while (unsafePending.isNotEmpty()) {
+            val id = unsafePending.removeLast()
+            if (!unsafe.add(id)) continue
+            children[id].orEmpty().forEach { unsafePending.addLast(it.itemId) }
+        }
+        unsafeAncestryIds = unsafe
     }
 
     private data class HierarchyFrame(

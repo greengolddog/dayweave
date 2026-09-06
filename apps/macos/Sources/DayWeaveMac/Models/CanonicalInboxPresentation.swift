@@ -60,6 +60,7 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         let isReadOnly: Bool
         let hasMissingParent: Bool
         let hasHierarchyCycle: Bool
+        let hasUnsafeAncestry: Bool
 
         var isSensitive: Bool { sensitivityPresentation != .standard }
 
@@ -173,6 +174,9 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         }
     }
 
+    /// Complete ordered active hierarchy, before lifecycle sectioning. Pending
+    /// trash stays in recovery; terminal and unknown states remain browsable.
+    let hierarchyRows: [Row]
     let inbox: [Row]
     let planned: [Row]
     let active: [Row]
@@ -191,7 +195,7 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             uniquingKeysWith: { first, _ in first }
         )
         var nodes: [UUID: Node] = Dictionary(
-            uniqueKeysWithValues: activeItems.map { item in
+            uniqueKeysWithValues: activeItems.filter { $0.deletedAt == nil }.map { item in
                 (item.id, Node(item: item, mutation: pendingByItem[item.id]))
             }
         )
@@ -207,12 +211,15 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             pendingMutations: pendingMutations,
             trashEntries: trashEntries,
             sensitivity: { id in
+                if hierarchy.unsafeAncestryIDs.contains(id) { return true }
                 if let sensitivityPresentation {
                     return sensitivityPresentation(id) != .standard
                 }
                 return hierarchy.sensitivityPresentationByID[id] != .standard
             }
         )
+        let dependencyReferencesByID = Dictionary(uniqueKeysWithValues: dependencyReferences.map { ($0.id, $0) })
+        var hierarchyRows: [Row] = []
         var inbox: [Row] = []
         var planned: [Row] = []
         var active: [Row] = []
@@ -222,16 +229,19 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
 
         for id in hierarchy.orderedIDs {
             guard let node = nodes[id], node.mutation?.operation != .trash else { continue }
+            let resolvedSensitivity = sensitivityPresentation?(id)
+                ?? hierarchy.sensitivityPresentationByID[id] ?? .inherited
             let row = node.row(
                 depth: hierarchy.depthByID[id] ?? 0,
                 breadcrumb: hierarchy.breadcrumbByID[id] ?? [],
-                sensitivityPresentation: sensitivityPresentation?(id)
-                    ?? hierarchy.sensitivityPresentationByID[id]
-                    ?? .inherited,
-                dependencyReferences: dependencyReferences,
+                sensitivityPresentation: hierarchy.unsafeAncestryIDs.contains(id)
+                    && resolvedSensitivity == .standard ? .inherited : resolvedSensitivity,
+                dependencyReferencesByID: dependencyReferencesByID,
                 hasMissingParent: hierarchy.missingParentIDs.contains(id),
-                hasHierarchyCycle: hierarchy.cyclicIDs.contains(id)
+                hasHierarchyCycle: hierarchy.cyclicIDs.contains(id),
+                hasUnsafeAncestry: hierarchy.unsafeAncestryIDs.contains(id)
             )
+            hierarchyRows.append(row)
             if case .conflicted = row.syncState { conflicts.append(row) }
             switch row.status {
             case .inbox: inbox.append(row)
@@ -287,7 +297,8 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 activeCanonicalItem: activeByID[mutation.itemID],
                 isReadOnly: true,
                 hasMissingParent: false,
-                hasHierarchyCycle: false
+                hasHierarchyCycle: false,
+                hasUnsafeAncestry: false
             )
             trash.append(row)
             if case .conflicted = row.syncState { conflicts.append(row) }
@@ -341,13 +352,15 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
                 activeCanonicalItem: nil,
                 isReadOnly: true,
                 hasMissingParent: false,
-                hasHierarchyCycle: false
+                hasHierarchyCycle: false,
+                hasUnsafeAncestry: false
             )
             trash.append(row)
             if case .conflicted = row.syncState { conflicts.append(row) }
         }
 
         return Self(
+            hierarchyRows: hierarchyRows,
             inbox: inbox,
             planned: planned,
             active: active,
@@ -401,6 +414,7 @@ private extension CanonicalInboxPresentation {
             readOnly = !item.supportsCanonicalAuthoringReplacement
                 || (item.status != .inbox && item.status != .planned)
                 || mutation?.hasBeenSubmitted == true
+                || mutation?.configurationIdentifier != nil
                 || mutation?.disposition == .conflicted
                 || mutation?.operation == .restore
         }
@@ -415,16 +429,19 @@ private extension CanonicalInboxPresentation {
             self.mutation = mutation
             revision = nil
             activeCanonicalItem = nil
-            readOnly = mutation.hasBeenSubmitted || mutation.disposition == .conflicted
+            readOnly = mutation.hasBeenSubmitted || mutation.configurationIdentifier != nil
+                || mutation.disposition == .conflicted || draft.kind == .project
+                || (draft.status != .inbox && draft.status != .planned)
         }
 
         func row(
             depth: Int,
             breadcrumb: [String],
             sensitivityPresentation: CanonicalSensitivityPresentation,
-            dependencyReferences: [CanonicalDependencyReference],
+            dependencyReferencesByID: [UUID: CanonicalDependencyReference],
             hasMissingParent: Bool,
-            hasHierarchyCycle: Bool
+            hasHierarchyCycle: Bool,
+            hasUnsafeAncestry: Bool
         ) -> Row {
             let source: Row.Source
             if mutation?.operation == .create {
@@ -474,7 +491,7 @@ private extension CanonicalInboxPresentation {
                 dependencyCauses: CanonicalDependencyCatalog.causes(
                     for: draft,
                     ownerIsSensitive: sensitivityPresentation != .standard,
-                    references: dependencyReferences,
+                    referencesByID: dependencyReferencesByID,
                     reportedBlockerID: structuralItem?.blockedReasonKind == .dependency
                         ? structuralItem?.blockedByItemID
                         : nil
@@ -486,9 +503,10 @@ private extension CanonicalInboxPresentation {
                 revision: revision,
                 activeCanonicalItem: activeCanonicalItem,
                 isReadOnly: readOnly || hasOpaqueDependencies
-                    || hasMissingParent || hasHierarchyCycle,
+                    || hasMissingParent || hasHierarchyCycle || hasUnsafeAncestry,
                 hasMissingParent: hasMissingParent,
-                hasHierarchyCycle: hasHierarchyCycle
+                hasHierarchyCycle: hasHierarchyCycle,
+                hasUnsafeAncestry: hasUnsafeAncestry
             )
         }
     }
@@ -500,20 +518,20 @@ private extension CanonicalInboxPresentation {
         let sensitivityPresentationByID: [UUID: CanonicalSensitivityPresentation]
         let missingParentIDs: Set<UUID>
         let cyclicIDs: Set<UUID>
+        let unsafeAncestryIDs: Set<UUID>
 
         init(nodes: [UUID: Node]) {
             func nodeOrder(_ left: Node, _ right: Node) -> Bool {
                 if left.draft.siblingOrder != right.draft.siblingOrder {
                     return left.draft.siblingOrder < right.draft.siblingOrder
                 }
-                let titleOrder = left.draft.title.localizedStandardCompare(right.draft.title)
-                if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
                 return left.itemID.uuidString < right.itemID.uuidString
             }
 
             var children: [UUID: [Node]] = [:]
             var roots: [Node] = []
             var missing = Set<UUID>()
+            var cycles = Set<UUID>()
             for node in nodes.values {
                 guard let parentID = node.draft.parentID else {
                     roots.append(node)
@@ -522,6 +540,7 @@ private extension CanonicalInboxPresentation {
                 if parentID == node.itemID || nodes[parentID] == nil {
                     roots.append(node)
                     if nodes[parentID] == nil { missing.insert(node.itemID) }
+                    if parentID == node.itemID { cycles.insert(node.itemID) }
                 } else {
                     children[parentID, default: []].append(node)
                 }
@@ -535,7 +554,7 @@ private extension CanonicalInboxPresentation {
             var sensitivities: [UUID: CanonicalSensitivityPresentation] = [:]
             var visited = Set<UUID>()
             var stack = roots.reversed().map {
-                ($0, 0, [String](), missing.contains($0.itemID))
+                ($0, 0, [String](), missing.contains($0.itemID) || cycles.contains($0.itemID))
             }
             while let (node, depth, ancestors, ancestorIsSensitive) = stack.popLast() {
                 guard visited.insert(node.itemID).inserted else { continue }
@@ -567,7 +586,6 @@ private extension CanonicalInboxPresentation {
                 }
             }
 
-            var cycles = Set<UUID>()
             for start in nodes.values.sorted(by: nodeOrder) where !visited.contains(start.itemID) {
                 var chain: [Node] = []
                 var chainIndex: [UUID: Int] = [:]
@@ -590,12 +608,25 @@ private extension CanonicalInboxPresentation {
                 }
             }
 
+            var unsafe = Set<UUID>()
+            var unsafePending = Array(missing.union(cycles))
+            unsafePending.append(contentsOf: nodes.values.compactMap { node in
+                guard let parent = node.draft.parentID,
+                      nodes[parent]?.mutation?.operation == .trash else { return nil }
+                return node.itemID
+            })
+            while let id = unsafePending.popLast() {
+                guard unsafe.insert(id).inserted else { continue }
+                unsafePending.append(contentsOf: (children[id] ?? []).map(\.itemID))
+            }
+
             orderedIDs = ordered
             depthByID = depths
             breadcrumbByID = breadcrumbs
             sensitivityPresentationByID = sensitivities
             missingParentIDs = missing
             cyclicIDs = cycles
+            unsafeAncestryIDs = unsafe
         }
     }
 }

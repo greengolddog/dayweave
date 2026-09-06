@@ -37,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -108,6 +109,7 @@ import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
 import com.greengolddog.dayweave.ui.screens.CalendarScreen
+import com.greengolddog.dayweave.ui.screens.CanonicalHierarchyBrowserScreen
 import com.greengolddog.dayweave.ui.screens.HabitStatisticsSection
 import com.greengolddog.dayweave.ui.screens.InboxScreen
 import com.greengolddog.dayweave.ui.screens.MoreScreen
@@ -520,7 +522,9 @@ private fun DayWeaveRoot(
     }
     var googleOutboundClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var plannerClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
+    var canonicalEditorRoute by remember(
+        state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId,
+    ) { mutableStateOf<CanonicalItemEditorRoute?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
     var authorizedNotificationBreakDigest by rememberSaveable {
         mutableStateOf<String?>(null)
@@ -782,8 +786,10 @@ private fun DayWeaveRoot(
                             Icon(Icons.Outlined.AutoAwesome, contentDescription = "Recompose schedule")
                         }
                     }
-                    val planningSurface = state.destination == AppDestination.TODAY ||
-                        state.destination == AppDestination.CALENDAR
+                    val planningSurface = state.destination in setOf(
+                        AppDestination.TODAY, AppDestination.CALENDAR,
+                        AppDestination.GOALS, AppDestination.PROJECTS,
+                    )
                     val syncIcon = when {
                         planningSurface && effectiveCanonicalSyncState.phase == CanonicalSyncPhase.CONNECTED ->
                             Icons.Outlined.CloudDone
@@ -1133,6 +1139,8 @@ private fun DayWeaveRoot(
             )
             AppDestination.MORE -> MoreScreen(
                 state = state,
+                onOpenGoals = { viewModel.navigate(AppDestination.GOALS) },
+                onOpenProjects = { viewModel.navigate(AppDestination.PROJECTS) },
                 onToggleCompleted = viewModel::toggleCompleted,
                 onToggleQuietSuggestions = viewModel::toggleQuietSuggestions,
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
@@ -1251,6 +1259,23 @@ private fun DayWeaveRoot(
                 },
                 modifier = Modifier.padding(innerPadding),
             )
+            AppDestination.GOALS, AppDestination.PROJECTS -> key(
+                state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId,
+            ) {
+                CanonicalHierarchyBrowserScreen(
+                    state = state,
+                    syncState = effectiveCanonicalSyncState,
+                    kind = if (state.destination == AppDestination.GOALS) {
+                        com.greengolddog.dayweave.model.ItemKind.GOAL
+                    } else {
+                        com.greengolddog.dayweave.model.ItemKind.PROJECT
+                    },
+                    actionsEnabled = canonicalAuthoringActionsEnabled,
+                    onOpenEditor = { canonicalEditorRoute = it },
+                    onBack = { viewModel.navigate(AppDestination.MORE) },
+                    modifier = Modifier.padding(innerPadding),
+                )
+            }
             }
         }
     }

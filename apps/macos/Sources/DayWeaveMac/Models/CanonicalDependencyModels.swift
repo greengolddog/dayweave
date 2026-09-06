@@ -403,10 +403,24 @@ enum CanonicalDependencyCatalog {
         references: [CanonicalDependencyReference],
         reportedBlockerID: UUID? = nil
     ) -> [CanonicalDependencyCause] {
+        causes(
+            for: draft, ownerIsSensitive: ownerIsSensitive,
+            referencesByID: Dictionary(uniqueKeysWithValues: references.map { ($0.id, $0) }),
+            reportedBlockerID: reportedBlockerID
+        )
+    }
+
+    /// List projections share one lookup instead of rebuilding the complete
+    /// reference catalog for every owner, including dependency-free owners.
+    static func causes(
+        for draft: DayWeaveCanonicalItemDraft,
+        ownerIsSensitive: Bool,
+        referencesByID byID: [UUID: CanonicalDependencyReference],
+        reportedBlockerID: UUID? = nil
+    ) -> [CanonicalDependencyCause] {
         let dependencies = CanonicalDependencyEdge.decode(
             fromFlexibleConstraints: draft.flexibleConstraints
         ) ?? []
-        let byID = Dictionary(uniqueKeysWithValues: references.map { ($0.id, $0) })
         var causes = dependencies.map { dependency in
             let reference = byID[dependency.predecessorID]
             let redact = reference?.isSensitive == true && !ownerIsSensitive

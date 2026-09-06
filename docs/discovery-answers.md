@@ -335,3 +335,16 @@ The conversation briefly reused question numbers 164 and 165 before returning to
      real-account fixture may ever be committed or pushed. Runtime and CI
      credentials must remain externally injected, project-scoped, and
      revocable.
+
+## Post-discovery implementation tracking
+
+- Keep a committed file describing current capabilities and features still to
+  add, and maintain it as implementation changes. The file is
+  [feature-status.md](feature-status.md).
+- Include an approximate completion percentage for every individual
+  in-progress feature, with its remaining checkpoint. These estimates describe
+  implemented scope, not elapsed time or a delivery promise.
+- Do not send repeated overall completion estimates in chat. The owner will
+  ask when an estimate is wanted.
+- Commit completed implementation parts and retain this discovery ledger for
+  rereading throughout the full-product build.

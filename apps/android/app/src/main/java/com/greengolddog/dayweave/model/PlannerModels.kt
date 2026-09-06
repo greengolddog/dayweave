@@ -38,6 +38,8 @@ enum class AppDestination(val label: String) {
     INBOX("Inbox"),
     ASSISTANT("Assistant"),
     MORE("More"),
+    GOALS("Goals"),
+    PROJECTS("Projects"),
 }
 
 @Serializable

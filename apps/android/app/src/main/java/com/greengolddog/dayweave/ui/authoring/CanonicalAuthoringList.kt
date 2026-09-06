@@ -898,10 +898,12 @@ internal fun canonicalDependencyDetail(
     add(dependency.status?.let(::canonicalStatusLabel) ?: "Unavailable")
 }.joinToString(" · ")
 
-private fun CanonicalAuthoringRow.editorRoute(): CanonicalItemEditorRoute? {
+internal fun CanonicalAuthoringRow.editorRoute(): CanonicalItemEditorRoute? {
     val value = draft ?: return null
     if (
-        isReadOnly || source !in setOf(
+        isReadOnly || kind == com.greengolddog.dayweave.model.ItemKind.PROJECT ||
+        status !in setOf("inbox", "planned") ||
+        source !in setOf(
             CanonicalAuthoringRowSource.CANONICAL,
             CanonicalAuthoringRowSource.LOCAL_CREATE,
             CanonicalAuthoringRowSource.PENDING_REPLACE,

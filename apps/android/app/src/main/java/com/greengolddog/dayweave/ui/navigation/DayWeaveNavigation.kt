@@ -22,9 +22,13 @@ fun DayWeaveNavigationBar(
     onSelect: (AppDestination) -> Unit,
 ) {
     NavigationBar {
-        AppDestination.entries.forEach { destination ->
+        listOf(
+            AppDestination.TODAY, AppDestination.CALENDAR, AppDestination.INBOX,
+            AppDestination.ASSISTANT, AppDestination.MORE,
+        ).forEach { destination ->
             NavigationBarItem(
-                selected = selected == destination,
+                selected = selected == destination || destination == AppDestination.MORE &&
+                    selected in setOf(AppDestination.GOALS, AppDestination.PROJECTS),
                 onClick = { onSelect(destination) },
                 icon = {
                     BadgedBox(
@@ -40,7 +44,8 @@ fun DayWeaveNavigationBar(
                                 AppDestination.CALENDAR -> Icons.Outlined.CalendarMonth
                                 AppDestination.INBOX -> Icons.Outlined.Inbox
                                 AppDestination.ASSISTANT -> Icons.Outlined.AutoAwesome
-                                AppDestination.MORE -> Icons.Outlined.MoreHoriz
+                                AppDestination.MORE, AppDestination.GOALS,
+                                AppDestination.PROJECTS -> Icons.Outlined.MoreHoriz
                             },
                             contentDescription = destination.label,
                         )

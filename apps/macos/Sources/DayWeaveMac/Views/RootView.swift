@@ -2676,7 +2676,7 @@ private struct InspectorView: View {
             Divider()
 
             if tab == 0 {
-                if destinationIsInbox {
+                if destinationUsesCanonicalItems {
                     CanonicalInboxInspector()
                 } else if let block = store.selectedBlock {
                     BlockInspector(block: block)
@@ -2689,15 +2689,18 @@ private struct InspectorView: View {
             }
         }
         .navigationTitle(inspectorTitle)
+        .onChange(of: store.selectedCanonicalItemID) { _, selectedID in
+            if selectedID != nil, (store.destination ?? .today).hierarchyScope != nil { tab = 0 }
+        }
     }
 
-    private var destinationIsInbox: Bool {
-        (store.destination ?? .today) == .inbox
+    private var destinationUsesCanonicalItems: Bool {
+        (store.destination ?? .today).usesCanonicalItemInspector
     }
 
     private var inspectorTitle: String {
         if tab == 1 { return "Assistant" }
-        return destinationIsInbox ? "Inbox Details" : "Inspector"
+        return destinationUsesCanonicalItems ? "Item Details" : "Inspector"
     }
 }
 
@@ -2771,27 +2774,39 @@ private struct CanonicalInboxInspector: View {
     @EnvironmentObject private var googleIntegration: GoogleIntegrationStore
     @EnvironmentObject private var googleOutbound: GoogleOutboundStore
     @State private var googleReviewIsPresented = false
+    @State private var hierarchySourceCache = CanonicalHierarchySourceCache()
 
     private var selectedRow: CanonicalInboxPresentation.Row? {
         guard let selectedID = store.selectedCanonicalItemID else { return nil }
+        if let scope = (store.destination ?? .today).hierarchyScope {
+            return hierarchySourceCache.selectedRow(itemID: selectedID, scope: scope, store: store)
+        }
+        let sensitivity = store.canonicalSensitivityPresentationIndex()
         let presentation = CanonicalInboxPresentation.build(
             activeItems: store.canonicalItems,
             pendingMutations: store.pendingCanonicalAuthoringMutations,
             trashEntries: store.canonicalTrash,
             sensitivityPresentation: {
-                store.canonicalSensitivityPresentation(itemID: $0)
+                sensitivity[$0]
             }
         )
-        return (presentation.conflicts
-            + presentation.inbox
-            + presentation.planned
-            + presentation.active
-            + presentation.completed
-            + presentation.trash)
+        return (presentation.hierarchyRows + presentation.trash)
             .first { $0.itemID == selectedID }
     }
 
     var body: some View {
+        content
+            .onDisappear { clearTransientReview() }
+            .onChange(of: store.canonicalConfigurationIdentifier) { _, _ in clearTransientReview() }
+    }
+
+    private func clearTransientReview() {
+        hierarchySourceCache.clear()
+        googleReviewIsPresented = false
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if let row = selectedRow {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -2999,9 +3014,9 @@ private struct CanonicalInboxInspector: View {
             }
         } else {
             ContentUnavailableView {
-                Label("Select an Inbox item", systemImage: "tray.full")
+                Label("Select an item", systemImage: "sidebar.right")
             } description: {
-                Text("Choose a captured, planned, conflicted, or recently deleted item to inspect it here.")
+                Text("Choose an available item to inspect its hierarchy, planning details, and sync state.")
             }
             .accessibilityIdentifier("canonical-inbox.inspector.empty")
         }

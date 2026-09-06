@@ -7,12 +7,13 @@ struct CanonicalCapturedInboxView: View {
     @State private var actionError: String?
 
     private var presentation: CanonicalInboxPresentation {
-        CanonicalInboxPresentation.build(
+        let sensitivity = store.canonicalSensitivityPresentationIndex()
+        return CanonicalInboxPresentation.build(
             activeItems: store.canonicalItems,
             pendingMutations: store.pendingCanonicalAuthoringMutations,
             trashEntries: store.canonicalTrash,
             sensitivityPresentation: {
-                store.canonicalSensitivityPresentation(itemID: $0)
+                sensitivity[$0]
             }
         )
     }
@@ -185,64 +186,8 @@ struct CanonicalCapturedInboxView: View {
 
     private func presentEditor(for row: CanonicalInboxPresentation.Row) {
         actionError = nil
-        if let mutationID = row.mutationID,
-           let mutation = store.canonicalAuthoringMutation(id: mutationID),
-           let draft = mutation.draft,
-           mutation.operation == .create || mutation.operation == .replace {
-            editorRoute = .init(
-                mode: .updatePending(
-                    mutationID: mutation.id,
-                    itemID: mutation.itemID,
-                    draft: draft
-                ),
-                readOnlyDiagnostic: readOnlyDiagnostic(for: row, mutation: mutation)
-            )
-            return
-        }
-        let mutation = row.mutationID.flatMap {
-            store.canonicalAuthoringMutation(id: $0)
-        }
-        guard let item = store.canonicalItems.first(where: { $0.id == row.itemID }) else {
-            actionError = "The selected item is no longer available."
-            return
-        }
-        editorRoute = .init(
-            mode: .replace(itemID: item.id, draft: DayWeaveCanonicalItemDraft(item: item)),
-            readOnlyDiagnostic: readOnlyDiagnostic(
-                for: row,
-                mutation: mutation,
-                item: item
-            )
-        )
-    }
-
-    private func readOnlyDiagnostic(
-        for row: CanonicalInboxPresentation.Row,
-        mutation: DayWeavePendingCanonicalAuthoringMutation? = nil,
-        item: DayWeaveCanonicalItem? = nil
-    ) -> String? {
-        if row.hasHierarchyCycle {
-            return "This item is part of a hierarchy cycle. Resolve the server hierarchy before editing it."
-        }
-        if row.hasMissingParent {
-            return "This item's parent is unavailable. Restore or synchronize the parent before editing it."
-        }
-        if mutation?.disposition == .conflicted {
-            if mutation?.operation == .restore {
-                return "This item was restored elsewhere with different content. The active version is shown read-only; choose Keep Active Version to discard the retained restore conflict."
-            }
-            return "This exact queued change conflicted with canonical state. Copy it as a new editable Inbox item to keep working without discarding this recovery record."
-        }
-        if mutation?.hasBeenSubmitted == true || mutation?.configurationIdentifier != nil {
-            return "This exact queued request is bound for synchronization and cannot be edited until recovery finishes."
-        }
-        if let diagnostic = item?.retainedUnrepresentableTimestampDiagnostic {
-            return diagnostic
-        }
-        if let item, !item.supportsCanonicalAuthoringReplacement {
-            return "This item contains fields that the typed editor cannot replace safely."
-        }
-        return nil
+        editorRoute = CanonicalInboxEditorRoute.review(row: row, store: store)
+        if editorRoute == nil { actionError = "The selected item is no longer available." }
     }
 
     private func enqueueTrash(_ itemID: UUID) {
@@ -294,7 +239,9 @@ struct CanonicalCapturedInboxView: View {
     }
 }
 
-private struct CanonicalInboxEditorRoute: Identifiable {
+/// Shared review routing preserves the same immutable-journal and lossless
+/// replacement fences in Inbox and hierarchy browsing.
+struct CanonicalInboxEditorRoute: Identifiable {
     let id = UUID()
     let mode: CanonicalItemEditorMode
     let readOnlyDiagnostic: String?
@@ -302,6 +249,69 @@ private struct CanonicalInboxEditorRoute: Identifiable {
     init(mode: CanonicalItemEditorMode, readOnlyDiagnostic: String? = nil) {
         self.mode = mode
         self.readOnlyDiagnostic = readOnlyDiagnostic
+    }
+
+    @MainActor
+    static func review(row: CanonicalInboxPresentation.Row, store: PlannerStore) -> Self? {
+        if let mutationID = row.mutationID,
+           let mutation = store.canonicalAuthoringMutation(id: mutationID),
+           let draft = mutation.draft,
+           mutation.operation == .create || mutation.operation == .replace {
+            return .init(
+                mode: .updatePending(
+                    mutationID: mutation.id,
+                    itemID: mutation.itemID,
+                    draft: draft
+                ),
+                readOnlyDiagnostic: readOnlyDiagnostic(for: row, mutation: mutation)
+            )
+        }
+        let mutation = row.mutationID.flatMap {
+            store.canonicalAuthoringMutation(id: $0)
+        }
+        guard let item = store.canonicalItems.first(where: { $0.id == row.itemID }) else {
+            return nil
+        }
+        return .init(
+            mode: .replace(itemID: item.id, draft: DayWeaveCanonicalItemDraft(item: item)),
+            readOnlyDiagnostic: readOnlyDiagnostic(
+                for: row,
+                mutation: mutation,
+                item: item
+            )
+        )
+    }
+
+    private static func readOnlyDiagnostic(
+        for row: CanonicalInboxPresentation.Row,
+        mutation: DayWeavePendingCanonicalAuthoringMutation? = nil,
+        item: DayWeaveCanonicalItem? = nil
+    ) -> String? {
+        if row.hasHierarchyCycle {
+            return "This item is part of a hierarchy cycle. Resolve the server hierarchy before editing it."
+        }
+        if row.hasMissingParent {
+            return "This item's parent is unavailable. Restore or synchronize the parent before editing it."
+        }
+        if mutation?.disposition == .conflicted {
+            if mutation?.operation == .restore {
+                return "This item was restored elsewhere with different content. The active version is shown read-only; choose Keep Active Version to discard the retained restore conflict."
+            }
+            return "This exact queued change conflicted with canonical state. Copy it as a new editable Inbox item to keep working without discarding this recovery record."
+        }
+        if mutation?.hasBeenSubmitted == true || mutation?.configurationIdentifier != nil {
+            return "This exact queued request is bound for synchronization and cannot be edited until recovery finishes."
+        }
+        if let diagnostic = item?.retainedUnrepresentableTimestampDiagnostic {
+            return diagnostic
+        }
+        if let item, !item.supportsCanonicalAuthoringReplacement {
+            return "This item contains fields that the typed editor cannot replace safely."
+        }
+        if row.isReadOnly {
+            return "This item's lifecycle or retained fields are read-only in the typed editor."
+        }
+        return nil
     }
 }
 

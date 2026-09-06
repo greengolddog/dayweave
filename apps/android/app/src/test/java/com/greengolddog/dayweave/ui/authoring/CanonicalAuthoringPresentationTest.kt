@@ -27,6 +27,49 @@ import org.junit.Test
 
 class CanonicalAuthoringPresentationTest {
     @Test
+    fun cycleAncestryCannotRegainEditingThroughExistingInboxRoute() {
+        val descendant = item(PARENT_ID, "Descendant first by UUID", "inbox", CHILD_ID)
+        val firstCycle = item(CHILD_ID, "Cycle one", "planned", CONFLICT_ITEM_ID)
+        val terminalCycle = item(CONFLICT_ITEM_ID, "Cycle two", "completed", CHILD_ID)
+        val presentation = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(descendant, firstCycle, terminalCycle)),
+        )
+        val row = presentation.inbox.single()
+        assertTrue(row.hasUnsafeAncestry)
+        assertTrue(row.isReadOnly)
+        assertTrue(row.isSensitive)
+        assertNull(row.editorRoute())
+    }
+
+    @Test
+    fun pendingTrashCreatesMissingAncestorDiagnosticsForItsEntireRetainedSubtree() {
+        val parent = item(PARENT_ID, "Queued trash", "inbox")
+        val child = item(CHILD_ID, "Child", "inbox", PARENT_ID)
+        val descendant = item(CONFLICT_ITEM_ID, "Grandchild", "planned", CHILD_ID)
+        val trash = PendingCanonicalAuthoringMutation(
+            id = REPLACE_MUTATION_ID,
+            itemId = parent.id,
+            operation = CanonicalAuthoringOperation.TRASH,
+            expectedRevision = parent.revision,
+            baseItem = parent,
+            createdAt = NOW,
+        )
+        trash.requireValid()
+        val presentation = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(
+                canonicalItems = listOf(parent, child, descendant),
+                pendingCanonicalAuthoringMutations = listOf(trash),
+            ),
+        )
+        assertTrue(presentation.inbox.single().hasMissingParent)
+        assertTrue(presentation.inbox.single().isSensitive)
+        assertTrue(presentation.planned.single().hasUnsafeAncestry)
+        assertTrue(presentation.planned.single().isSensitive)
+        assertTrue(presentation.planned.single().isReadOnly)
+        assertNull(presentation.planned.single().editorRoute())
+    }
+
+    @Test
     fun buildsInboxPlannedConflictAndRecentlyDeletedSectionsWithHierarchy() {
         val parent = item(PARENT_ID, "Project", "inbox")
         val child = item(CHILD_ID, "Next action", "planned", parentId = PARENT_ID)

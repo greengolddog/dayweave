@@ -175,6 +175,8 @@ fun MoreScreen(
     canonicalPrivacyActionsEnabled: Boolean,
     onSetCanonicalItemSensitive: (String, Long, Boolean) -> Unit,
     habitStatisticsContent: (@Composable () -> Unit)? = null,
+    onOpenGoals: () -> Unit = {},
+    onOpenProjects: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var pendingSensitivityRemoval by remember {
@@ -376,6 +378,28 @@ fun MoreScreen(
         }
 
         item { SettingsSectionTitle("Planning") }
+        item {
+            Card {
+                ListItem(
+                    headlineContent = { Text("Goals") },
+                    supportingContent = { Text("Unscheduled goals and their complete hierarchy") },
+                    trailingContent = {
+                        TextButton(onClick = onOpenGoals, modifier = Modifier.testTag("more_goals")) {
+                            Text("Open")
+                        }
+                    },
+                )
+                ListItem(
+                    headlineContent = { Text("Projects") },
+                    supportingContent = { Text("Projects and nested work, including unscheduled items") },
+                    trailingContent = {
+                        TextButton(onClick = onOpenProjects, modifier = Modifier.testTag("more_projects")) {
+                            Text("Open")
+                        }
+                    },
+                )
+            }
+        }
         item {
             PlanningProfileCard(
                 profile = state.scheduleCompositionProfile,

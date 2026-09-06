@@ -1,0 +1,29 @@
+{
+  "schema": "dayweave.hierarchy-browser-fixtures/1",
+  "nodes": [
+    {"id": "00000000-0000-0000-0000-000000000001", "parent_id": null, "sibling_order": 0, "title": "Launch", "kind": "project", "status": "planned"},
+    {"id": "00000000-0000-0000-0000-000000000002", "parent_id": "00000000-0000-0000-0000-000000000001", "sibling_order": 0, "title": "Learn music", "kind": "goal", "status": "inbox"},
+    {"id": "00000000-0000-0000-0000-000000000003", "parent_id": "00000000-0000-0000-0000-000000000002", "sibling_order": 0, "title": "Practice scales", "kind": "task", "status": "planned"},
+    {"id": "00000000-0000-0000-0000-000000000004", "parent_id": "00000000-0000-0000-0000-000000000002", "sibling_order": 1, "title": "Perform", "kind": "goal", "status": "planned"},
+    {"id": "00000000-0000-0000-0000-000000000005", "parent_id": "00000000-0000-0000-0000-000000000004", "sibling_order": 0, "title": "Record sample", "kind": "task", "status": "completed"},
+    {"id": "00000000-0000-0000-0000-000000000006", "parent_id": "00000000-0000-0000-0000-000000000002", "sibling_order": 2, "title": "Old drill", "kind": "task", "status": "skipped"},
+    {"id": "00000000-0000-0000-0000-000000000007", "parent_id": "00000000-0000-0000-0000-000000000002", "sibling_order": 3, "title": "Retired exercise", "kind": "task", "status": "cancelled"},
+    {"id": "00000000-0000-0000-0000-000000000008", "parent_id": null, "sibling_order": 2, "title": "Separate errand", "kind": "task", "status": "inbox"},
+    {"id": "00000000-0000-0000-0000-000000000009", "parent_id": null, "sibling_order": 1, "title": "Travel", "kind": "goal", "status": "inbox"},
+    {"id": "00000000-0000-0000-0000-000000000010", "parent_id": null, "sibling_order": 3, "title": "Personal collection", "kind": "task", "status": "planned"},
+    {"id": "00000000-0000-0000-0000-000000000011", "parent_id": "00000000-0000-0000-0000-000000000010", "sibling_order": 0, "title": "Garden", "kind": "project", "status": "inbox"},
+    {"id": "00000000-0000-0000-0000-000000000012", "parent_id": "00000000-0000-0000-0000-000000000011", "sibling_order": 0, "title": "Plant herbs", "kind": "task", "status": "blocked"}
+  ],
+  "cases": [
+    {"name": "goals_include_unscheduled_nested_and_terminal_rows", "scope": "goals", "query": "", "collapsed": [], "visible": [1, 2, 3, 4, 5, 6, 7, 9], "depths": [0, 1, 2, 2, 3, 2, 2, 0], "scope_context": [1], "search_matches": []},
+    {"name": "projects_include_task_ancestor_context", "scope": "projects", "query": "", "collapsed": [], "visible": [1, 2, 3, 4, 5, 6, 7, 10, 11, 12], "depths": [0, 1, 2, 2, 3, 2, 2, 0, 1, 2], "scope_context": [10], "search_matches": []},
+    {"name": "collapse_hides_nested_matching_goal_without_duplication", "scope": "goals", "query": "", "collapsed": [2], "visible": [1, 2, 9], "depths": [0, 1, 0], "scope_context": [1], "search_matches": []},
+    {"name": "collapse_ancestor_context_hides_entire_nested_scope", "scope": "goals", "query": "", "collapsed": [1], "visible": [1, 9], "depths": [0, 0], "scope_context": [1], "search_matches": []},
+    {"name": "search_reveals_matching_leaf_and_ancestors_through_collapse", "scope": "goals", "query": " RECORD ", "collapsed": [1, 2, 4], "visible": [1, 2, 4, 5], "depths": [0, 1, 2, 3], "scope_context": [1], "search_matches": [5]},
+    {"name": "matching_parent_does_not_match_nonmatching_descendants", "scope": "goals", "query": "learn", "collapsed": [], "visible": [1, 2], "depths": [0, 1], "scope_context": [1], "search_matches": [2]},
+    {"name": "outside_scope_context_is_not_searchable_as_an_independent_match", "scope": "goals", "query": "launch", "collapsed": [], "visible": [], "depths": [], "scope_context": [], "search_matches": []},
+    {"name": "unrelated_task_does_not_enter_goal_search", "scope": "goals", "query": "errand", "collapsed": [], "visible": [], "depths": [], "scope_context": [], "search_matches": []},
+    {"name": "nested_project_search_keeps_real_ancestry", "scope": "projects", "query": "herbs", "collapsed": [10, 11], "visible": [10, 11, 12], "depths": [0, 1, 2], "scope_context": [10], "search_matches": [12]},
+    {"name": "empty_query_restores_collapsed_branches", "scope": "goals", "query": "   ", "collapsed": [2], "visible": [1, 2, 9], "depths": [0, 1, 0], "scope_context": [1], "search_matches": []}
+  ]
+}

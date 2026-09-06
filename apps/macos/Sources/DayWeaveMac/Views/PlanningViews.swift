@@ -1144,96 +1144,14 @@ private struct HabitOutcomeEditor: View {
 }
 
 struct ProjectsDestinationView: View {
-    @EnvironmentObject private var store: PlannerStore
-
-    private var groups: [(String, [ScheduleBlock])] {
-        Dictionary(grouping: store.blocks.filter(\.contributesToExecutionPresentation)) {
-            $0.project ?? "Personal"
-        }
-            .map { ($0.key, $0.value.sorted { $0.start < $1.start }) }
-            .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
-    }
-
     var body: some View {
-        DestinationScroll(title: "Projects", subtitle: "Project progress rolls up from executable leaf work.") {
-            ForEach(groups, id: \.0) { name, blocks in
-                let completed = blocks.count(where: { $0.status == .completed })
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Image(systemName: "folder.fill").foregroundStyle(.blue)
-                        Text(name).font(.title3.weight(.semibold))
-                        Spacer()
-                        Text("\(completed)/\(blocks.count) done")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ProgressView(value: Double(completed), total: Double(max(blocks.count, 1)))
-                    ForEach(blocks.prefix(4)) { block in
-                        Button {
-                            store.select(block)
-                        } label: {
-                            HStack {
-                                Image(systemName: block.status == .completed ? "checkmark.circle.fill" : block.kind.symbol)
-                                    .foregroundStyle(block.status == .completed ? .green : block.kind.color)
-                                Text(block.title).lineLimit(1)
-                                Spacer()
-                                Text(block.timeRange(
-                                    timezoneName: store.schedulePresentationTimezoneName
-                                ))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .privacySensitive(block.isSensitive)
-                    }
-                }
-                .padding(16)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
-                .privacySensitive(blocks.contains(where: \ScheduleBlock.isSensitive))
-            }
-        }
-        .navigationTitle("Projects")
+        CanonicalHierarchyBrowserView(scope: .projects)
     }
 }
 
 struct GoalsDestinationView: View {
-    @EnvironmentObject private var store: PlannerStore
-
-    private var goals: [ScheduleBlock] {
-        store.blocks.filter { $0.kind == .goal }.sorted { $0.start < $1.start }
-    }
-
     var body: some View {
-        DestinationScroll(title: "Goals", subtitle: "Outcomes can remain unscheduled; only their executable leaf actions reserve time.") {
-            if goals.isEmpty {
-                DestinationEmpty(title: "No goals yet", symbol: "scope", action: "Capture a goal") {
-                    store.isQuickAddPresented = true
-                }
-            } else {
-                ForEach(goals) { goal in
-                    PlanningCard(
-                        block: goal,
-                        detail: goal.notes,
-                        timezoneName: store.schedulePresentationTimezoneName
-                    ) {
-                        Button("Open") { store.select(goal) }
-                        Button("Complete") { store.complete(goal.id) }
-                            .disabled(!store.canMutate(goal))
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                Label("Goal scheduling rule", systemImage: "info.circle")
-                    .font(.headline)
-                Text("A goal without a duration is an outcome. Add leaf tasks, milestones, routines, or habits to turn it into calendar demand.")
-                    .foregroundStyle(.secondary)
-            }
-            .padding(16)
-            .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-        }
-        .navigationTitle("Goals")
+        CanonicalHierarchyBrowserView(scope: .goals)
     }
 }
 
