@@ -674,6 +674,9 @@ async fn add_no_store(mut response: Response) -> Response {
 
 fn map_service_error(error: GoogleSyncServiceError) -> ApiError {
     match error {
+        GoogleSyncServiceError::AdmissionClosed => {
+            ApiError::unavailable("Google provider operations are temporarily unavailable")
+        }
         GoogleSyncServiceError::InvalidRequest => ApiError::validation("request is invalid"),
         GoogleSyncServiceError::MissingReadScope => {
             ApiError::conflict("Google read authorization is required")
@@ -959,6 +962,21 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+    }
+
+    #[tokio::test]
+    async fn closed_provider_admission_returns_bounded_unavailable_response() {
+        let response = map_service_error(GoogleSyncServiceError::AdmissionClosed).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded error body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON error");
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "Google provider operations are temporarily unavailable"
+        );
     }
 
     #[tokio::test]

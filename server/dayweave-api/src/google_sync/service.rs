@@ -39,6 +39,7 @@ use crate::{
         ItemServiceError, ItemStatus, NewItem, SplitPolicy,
     },
     proposals::Clock,
+    provider_admission::ProviderAdmission,
 };
 
 use super::{
@@ -304,6 +305,7 @@ fn map_oauth_transport_error(error: GoogleOAuthServiceError) -> GoogleError {
     match error {
         GoogleOAuthServiceError::Google(error) => error,
         GoogleOAuthServiceError::IntegrationTimeout => GoogleError::Temporary { status: 504 },
+        GoogleOAuthServiceError::AdmissionClosed => GoogleError::Temporary { status: 503 },
         _ => GoogleError::Unauthorized,
     }
 }
@@ -481,6 +483,7 @@ pub(crate) struct GoogleSyncService {
     repository: Arc<dyn GoogleSyncRepository>,
     provider: Arc<dyn GoogleSyncProvider>,
     oauth: Arc<GoogleOAuthService>,
+    admission: ProviderAdmission,
     items: Arc<ItemService>,
     cipher: SecretCipher,
     scope: OAuthScope,
@@ -522,6 +525,7 @@ impl GoogleSyncService {
         Self {
             repository,
             provider,
+            admission: oauth.admission().clone(),
             oauth,
             items,
             cipher,
@@ -533,9 +537,25 @@ impl GoogleSyncService {
         }
     }
 
+    async fn admitted<T>(
+        &self,
+        operation: impl Future<Output = Result<T, GoogleSyncServiceError>>,
+    ) -> Result<T, GoogleSyncServiceError> {
+        if self.admission.scope() != self.scope {
+            return Err(GoogleSyncServiceError::AdmissionClosed);
+        }
+        self.admission
+            .run(operation)
+            .await
+            .map_err(|_| GoogleSyncServiceError::AdmissionClosed)?
+    }
+
     pub(crate) async fn recover_startup(&self) -> Result<(), GoogleSyncServiceError> {
-        self.repository.recover_startup(self.clock.now()).await?;
-        Ok(())
+        self.admitted(async {
+            self.repository.recover_startup(self.clock.now()).await?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) fn spawn_worker(self: &Arc<Self>) {
@@ -549,6 +569,7 @@ impl GoogleSyncService {
                     match service.drain_one().await {
                         Ok(true) => tokio::task::yield_now().await,
                         Ok(false) => break,
+                        Err(GoogleSyncServiceError::AdmissionClosed) => return,
                         Err(error) => {
                             tracing::warn!(
                                 error_code = error.code(),
@@ -566,7 +587,7 @@ impl GoogleSyncService {
         &self,
         account_id: Uuid,
     ) -> Result<Vec<GoogleSyncCollection>, GoogleSyncServiceError> {
-        self.discover_inner(account_id, None).await
+        self.admitted(self.discover_inner(account_id, None)).await
     }
 
     async fn discover_inner(
@@ -609,8 +630,11 @@ impl GoogleSyncService {
         &self,
         account_id: Uuid,
     ) -> Result<Vec<GoogleSyncCollection>, GoogleSyncServiceError> {
-        self.oauth.account_for_sync(account_id).await?;
-        Ok(self.repository.collections(account_id).await?)
+        self.admitted(async {
+            self.oauth.account_for_sync(account_id).await?;
+            Ok(self.repository.collections(account_id).await?)
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -624,49 +648,52 @@ impl GoogleSyncService {
         role: GoogleSyncRole,
         calendar_policy: GoogleCalendarPolicy,
     ) -> Result<GoogleSyncCollection, GoogleSyncServiceError> {
-        if expected_revision == 0 {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let account = self.oauth.account_for_sync(account_id).await?;
-        let collection = self
-            .repository
-            .collection(account_id, collection_id)
-            .await?;
-        if selected {
-            let has_read_scope = match collection.kind {
-                GoogleCollectionKind::Calendar => has_calendar_read(&account.granted_scopes),
-                GoogleCollectionKind::TaskList => has_tasks_read(&account.granted_scopes),
-            };
-            if !has_read_scope {
-                return Err(GoogleSyncServiceError::MissingReadScope);
+        self.admitted(async {
+            if expected_revision == 0 {
+                return Err(GoogleSyncServiceError::InvalidRequest);
             }
-        }
-        match (collection.kind, role) {
-            (GoogleCollectionKind::Calendar, GoogleSyncRole::Writable)
-                if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) =>
-            {
-                return Err(GoogleSyncServiceError::MissingWriteScope);
+            let account = self.oauth.account_for_sync(account_id).await?;
+            let collection = self
+                .repository
+                .collection(account_id, collection_id)
+                .await?;
+            if selected {
+                let has_read_scope = match collection.kind {
+                    GoogleCollectionKind::Calendar => has_calendar_read(&account.granted_scopes),
+                    GoogleCollectionKind::TaskList => has_tasks_read(&account.granted_scopes),
+                };
+                if !has_read_scope {
+                    return Err(GoogleSyncServiceError::MissingReadScope);
+                }
             }
-            (GoogleCollectionKind::TaskList, GoogleSyncRole::Writable)
-                if !account.granted_scopes.contains(GOOGLE_TASKS_SCOPE) =>
-            {
-                return Err(GoogleSyncServiceError::MissingWriteScope);
+            match (collection.kind, role) {
+                (GoogleCollectionKind::Calendar, GoogleSyncRole::Writable)
+                    if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) =>
+                {
+                    return Err(GoogleSyncServiceError::MissingWriteScope);
+                }
+                (GoogleCollectionKind::TaskList, GoogleSyncRole::Writable)
+                    if !account.granted_scopes.contains(GOOGLE_TASKS_SCOPE) =>
+                {
+                    return Err(GoogleSyncServiceError::MissingWriteScope);
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(self
-            .repository
-            .configure_collection(
-                account_id,
-                collection_id,
-                expected_revision,
-                selected,
-                visible,
-                role,
-                calendar_policy,
-                self.clock.now(),
-            )
-            .await?)
+            Ok(self
+                .repository
+                .configure_collection(
+                    account_id,
+                    collection_id,
+                    expected_revision,
+                    selected,
+                    visible,
+                    role,
+                    calendar_policy,
+                    self.clock.now(),
+                )
+                .await?)
+        })
+        .await
     }
 
     pub(crate) async fn request_refresh(
@@ -674,27 +701,30 @@ impl GoogleSyncService {
         account_id: Uuid,
         request_id: Uuid,
     ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncServiceError> {
-        if request_id.is_nil() {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        replay_or_accept_refresh(
-            || async {
-                Ok(self
-                    .repository
-                    .refresh_request(account_id, request_id)
-                    .await?)
-            },
-            || async {
-                self.oauth.account_for_sync(account_id).await?;
-                Ok(())
-            },
-            || async {
-                Ok(self
-                    .repository
-                    .request_refresh(account_id, request_id, self.clock.now())
-                    .await?)
-            },
-        )
+        self.admitted(async {
+            if request_id.is_nil() {
+                return Err(GoogleSyncServiceError::InvalidRequest);
+            }
+            replay_or_accept_refresh(
+                || async {
+                    Ok(self
+                        .repository
+                        .refresh_request(account_id, request_id)
+                        .await?)
+                },
+                || async {
+                    self.oauth.account_for_sync(account_id).await?;
+                    Ok(())
+                },
+                || async {
+                    Ok(self
+                        .repository
+                        .request_refresh(account_id, request_id, self.clock.now())
+                        .await?)
+                },
+            )
+            .await
+        })
         .await
     }
 
@@ -702,21 +732,24 @@ impl GoogleSyncService {
         &self,
         account_id: Uuid,
     ) -> Result<GoogleSyncStatus, GoogleSyncServiceError> {
-        self.oauth.account_for_sync(account_id).await?;
-        let (run, outbox) = tokio::try_join!(
-            self.repository.run_status(account_id),
-            self.repository.outbox_counts(account_id)
-        )?;
-        Ok(GoogleSyncStatus {
-            run,
-            import_conflicts: outbox.import_conflicts,
-            pending_outbound: outbox.pending,
-            conflicted_outbound: outbox.conflicted,
-            failed_outbound: outbox.failed,
-            last_outbound_error_code: outbox.last_error_code,
-            last_outbound_error_at: outbox.last_error_at,
-            next_outbound_attempt_at: outbox.next_attempt_at,
+        self.admitted(async {
+            self.oauth.account_for_sync(account_id).await?;
+            let (run, outbox) = tokio::try_join!(
+                self.repository.run_status(account_id),
+                self.repository.outbox_counts(account_id)
+            )?;
+            Ok(GoogleSyncStatus {
+                run,
+                import_conflicts: outbox.import_conflicts,
+                pending_outbound: outbox.pending,
+                conflicted_outbound: outbox.conflicted,
+                failed_outbound: outbox.failed,
+                last_outbound_error_code: outbox.last_error_code,
+                last_outbound_error_at: outbox.last_error_at,
+                next_outbound_attempt_at: outbox.next_attempt_at,
+            })
         })
+        .await
     }
 
     pub(crate) async fn preview_outbound(
@@ -724,68 +757,71 @@ impl GoogleSyncService {
         account_id: Uuid,
         request: OutboundRequest,
     ) -> Result<GoogleOutboundPreview, GoogleSyncServiceError> {
-        self.require_outbound_enabled()?;
-        if request.expected_item_revision == 0 {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let account = self.oauth.account_for_sync(account_id).await?;
-        let collection = self
-            .repository
-            .collection(account_id, request.collection_id)
-            .await?;
-        let item = self.items.get_including_deleted(request.item_id).await?;
-        if item.revision != request.expected_item_revision {
-            return Err(GoogleSyncRepositoryError::RevisionConflict {
-                expected: request.expected_item_revision,
-                actual: item.revision,
+        self.admitted(async {
+            self.require_outbound_enabled()?;
+            if request.expected_item_revision == 0 {
+                return Err(GoogleSyncServiceError::InvalidRequest);
             }
-            .into());
-        }
-        let prepared = match collection.kind {
-            GoogleCollectionKind::Calendar => {
-                if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) {
-                    return Err(GoogleSyncServiceError::MissingWriteScope);
+            let account = self.oauth.account_for_sync(account_id).await?;
+            let collection = self
+                .repository
+                .collection(account_id, request.collection_id)
+                .await?;
+            let item = self.items.get_including_deleted(request.item_id).await?;
+            if item.revision != request.expected_item_revision {
+                return Err(GoogleSyncRepositoryError::RevisionConflict {
+                    expected: request.expected_item_revision,
+                    actual: item.revision,
                 }
-                prepare_calendar_outbound(
-                    item,
-                    request.operation,
-                    &collection,
-                    &self.cipher,
-                    self.scope,
-                )?
+                .into());
             }
-            GoogleCollectionKind::TaskList => {
-                if !account.granted_scopes.contains(GOOGLE_TASKS_SCOPE) {
-                    return Err(GoogleSyncServiceError::MissingWriteScope);
+            let prepared = match collection.kind {
+                GoogleCollectionKind::Calendar => {
+                    if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) {
+                        return Err(GoogleSyncServiceError::MissingWriteScope);
+                    }
+                    prepare_calendar_outbound(
+                        item,
+                        request.operation,
+                        &collection,
+                        &self.cipher,
+                        self.scope,
+                    )?
                 }
-                prepare_task_outbound(item, request.operation)?
-            }
-        };
-        let required_scope = match collection.kind {
-            GoogleCollectionKind::Calendar => GOOGLE_CALENDAR_SCOPE,
-            GoogleCollectionKind::TaskList => GOOGLE_TASKS_SCOPE,
-        };
-        let id = Uuid::new_v4();
-        let expires_at = self.clock.now()
-            + Duration::from_std(self.approval_ttl)
-                .map_err(|_| GoogleSyncServiceError::Internal)?;
-        self.repository
-            .create_outbound_preview(
-                OutboundPreviewSpec {
-                    id,
-                    account_id,
-                    collection_id: collection.id,
-                    collection_revision: collection.revision,
-                    collection_remote_id: collection.remote_collection_id.clone(),
-                    collection_display_name: collection.display_name,
-                    required_scope,
-                    prepared,
-                    expires_at,
-                },
-                self.clock.now(),
-            )
-            .await
-            .map_err(Into::into)
+                GoogleCollectionKind::TaskList => {
+                    if !account.granted_scopes.contains(GOOGLE_TASKS_SCOPE) {
+                        return Err(GoogleSyncServiceError::MissingWriteScope);
+                    }
+                    prepare_task_outbound(item, request.operation)?
+                }
+            };
+            let required_scope = match collection.kind {
+                GoogleCollectionKind::Calendar => GOOGLE_CALENDAR_SCOPE,
+                GoogleCollectionKind::TaskList => GOOGLE_TASKS_SCOPE,
+            };
+            let id = Uuid::new_v4();
+            let expires_at = self.clock.now()
+                + Duration::from_std(self.approval_ttl)
+                    .map_err(|_| GoogleSyncServiceError::Internal)?;
+            self.repository
+                .create_outbound_preview(
+                    OutboundPreviewSpec {
+                        id,
+                        account_id,
+                        collection_id: collection.id,
+                        collection_revision: collection.revision,
+                        collection_remote_id: collection.remote_collection_id.clone(),
+                        collection_display_name: collection.display_name,
+                        required_scope,
+                        prepared,
+                        expires_at,
+                    },
+                    self.clock.now(),
+                )
+                .await
+                .map_err(Into::into)
+        })
+        .await
     }
 
     pub(crate) async fn approve_outbound(
@@ -794,68 +830,75 @@ impl GoogleSyncService {
         preview_id: Uuid,
         expected_preview_hash: &str,
     ) -> Result<GoogleOutboundApproval, GoogleSyncServiceError> {
-        self.require_outbound_enabled()?;
-        let expected_preview_hash = decode_hash(expected_preview_hash)?;
-        let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
-        getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
-        let mut capability =
-            Zeroizing::new(String::with_capacity(APPROVAL_TOKEN_PREFIX.len() + 43));
-        capability.push_str(APPROVAL_TOKEN_PREFIX);
-        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
-        capability.push_str(encoded.as_str());
-        let capability_hash = Sha256::digest(capability.as_bytes()).into();
-        let expires_at = self
-            .repository
-            .approve_outbound(
-                OutboundApprovalSpec {
-                    account_id,
-                    preview_id,
-                    expected_preview_hash,
-                    capability_hash,
-                },
-                self.clock.now(),
-            )
-            .await?;
-        Ok(GoogleOutboundApproval {
-            preview_id,
-            approval_capability: std::mem::take(&mut *capability),
-            expires_at,
+        self.admitted(async {
+            self.require_outbound_enabled()?;
+            let expected_preview_hash = decode_hash(expected_preview_hash)?;
+            let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
+            getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
+            let mut capability =
+                Zeroizing::new(String::with_capacity(APPROVAL_TOKEN_PREFIX.len() + 43));
+            capability.push_str(APPROVAL_TOKEN_PREFIX);
+            let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
+            capability.push_str(encoded.as_str());
+            let capability_hash = Sha256::digest(capability.as_bytes()).into();
+            let expires_at = self
+                .repository
+                .approve_outbound(
+                    OutboundApprovalSpec {
+                        account_id,
+                        preview_id,
+                        expected_preview_hash,
+                        capability_hash,
+                    },
+                    self.clock.now(),
+                )
+                .await?;
+            Ok(GoogleOutboundApproval {
+                preview_id,
+                approval_capability: std::mem::take(&mut *capability),
+                expires_at,
+            })
         })
+        .await
     }
 
     pub(crate) async fn enqueue_outbound(
         &self,
         account_id: Uuid,
         request: OutboundRequest,
-        mut approval_capability: String,
+        approval_capability: String,
     ) -> Result<GoogleOutboundAccepted, GoogleSyncServiceError> {
-        if let Err(error) = self.require_outbound_enabled() {
-            approval_capability.zeroize();
-            return Err(error);
-        }
-        if request.expected_item_revision == 0 {
-            approval_capability.zeroize();
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let capability_hash = match approval_capability_hash(&approval_capability) {
-            Ok(hash) => hash,
-            Err(error) => {
+        let mut approval_capability = Zeroizing::new(approval_capability);
+        self.admitted(async {
+            if let Err(error) = self.require_outbound_enabled() {
                 approval_capability.zeroize();
                 return Err(error);
             }
-        };
-        approval_capability.zeroize();
-        Ok(self
-            .repository
-            .enqueue_outbound(
-                OutboundEnqueueSpec {
-                    account_id,
-                    request,
-                    capability_hash,
-                },
-                self.clock.now(),
-            )
-            .await?)
+            if request.expected_item_revision == 0 {
+                approval_capability.zeroize();
+                return Err(GoogleSyncServiceError::InvalidRequest);
+            }
+            let capability_hash = match approval_capability_hash(&approval_capability) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    approval_capability.zeroize();
+                    return Err(error);
+                }
+            };
+            approval_capability.zeroize();
+            Ok(self
+                .repository
+                .enqueue_outbound(
+                    OutboundEnqueueSpec {
+                        account_id,
+                        request,
+                        capability_hash,
+                    },
+                    self.clock.now(),
+                )
+                .await?)
+        })
+        .await
     }
 
     pub(crate) async fn preview_schedule_publication(
@@ -864,43 +907,49 @@ impl GoogleSyncService {
         collection_id: Uuid,
         expected_schedule_revision_id: Uuid,
     ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncServiceError> {
-        self.require_schedule_outbound_enabled()?;
-        if account_id.is_nil() || collection_id.is_nil() || expected_schedule_revision_id.is_nil() {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let account = self.oauth.account_for_sync(account_id).await?;
-        if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) {
-            return Err(GoogleSyncServiceError::MissingWriteScope);
-        }
-        let source = self
-            .repository
-            .load_schedule_publication_source(
-                account_id,
-                collection_id,
-                expected_schedule_revision_id,
-            )
-            .await?;
-        let changes = build_schedule_publication_changes(
-            &source,
-            &self.cipher,
-            self.scope,
-            self.clock.now(),
-        )?;
-        let expires_at = self.clock.now()
-            + Duration::from_std(self.approval_ttl)
-                .map_err(|_| GoogleSyncServiceError::Internal)?;
-        self.repository
-            .create_schedule_publication_preview(
-                SchedulePublicationPreviewSpec {
-                    id: Uuid::new_v4(),
-                    source,
-                    changes,
-                    expires_at,
-                },
+        self.admitted(async {
+            self.require_schedule_outbound_enabled()?;
+            if account_id.is_nil()
+                || collection_id.is_nil()
+                || expected_schedule_revision_id.is_nil()
+            {
+                return Err(GoogleSyncServiceError::InvalidRequest);
+            }
+            let account = self.oauth.account_for_sync(account_id).await?;
+            if !account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE) {
+                return Err(GoogleSyncServiceError::MissingWriteScope);
+            }
+            let source = self
+                .repository
+                .load_schedule_publication_source(
+                    account_id,
+                    collection_id,
+                    expected_schedule_revision_id,
+                )
+                .await?;
+            let changes = build_schedule_publication_changes(
+                &source,
+                &self.cipher,
+                self.scope,
                 self.clock.now(),
-            )
-            .await
-            .map_err(Into::into)
+            )?;
+            let expires_at = self.clock.now()
+                + Duration::from_std(self.approval_ttl)
+                    .map_err(|_| GoogleSyncServiceError::Internal)?;
+            self.repository
+                .create_schedule_publication_preview(
+                    SchedulePublicationPreviewSpec {
+                        id: Uuid::new_v4(),
+                        source,
+                        changes,
+                        expires_at,
+                    },
+                    self.clock.now(),
+                )
+                .await
+                .map_err(Into::into)
+        })
+        .await
     }
 
     pub(crate) async fn approve_schedule_publication(
@@ -909,37 +958,40 @@ impl GoogleSyncService {
         preview_id: Uuid,
         expected_preview_hash: &str,
     ) -> Result<ScheduleGooglePublicationApproval, GoogleSyncServiceError> {
-        self.require_schedule_outbound_enabled()?;
-        if account_id.is_nil() || preview_id.is_nil() {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let expected_preview_hash = decode_hash(expected_preview_hash)?;
-        let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
-        getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
-        let mut capability = Zeroizing::new(String::with_capacity(
-            SCHEDULE_APPROVAL_TOKEN_PREFIX.len() + 43,
-        ));
-        capability.push_str(SCHEDULE_APPROVAL_TOKEN_PREFIX);
-        let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
-        capability.push_str(encoded.as_str());
-        let capability_hash = Sha256::digest(capability.as_bytes()).into();
-        let expires_at = self
-            .repository
-            .approve_schedule_publication(
-                SchedulePublicationApprovalSpec {
-                    account_id,
-                    preview_id,
-                    expected_preview_hash,
-                    capability_hash,
-                },
-                self.clock.now(),
-            )
-            .await?;
-        Ok(ScheduleGooglePublicationApproval {
-            preview_id,
-            approval_capability: std::mem::take(&mut *capability),
-            expires_at,
+        self.admitted(async {
+            self.require_schedule_outbound_enabled()?;
+            if account_id.is_nil() || preview_id.is_nil() {
+                return Err(GoogleSyncServiceError::InvalidRequest);
+            }
+            let expected_preview_hash = decode_hash(expected_preview_hash)?;
+            let mut random = Zeroizing::new([0_u8; APPROVAL_TOKEN_RANDOM_BYTES]);
+            getrandom::fill(&mut *random).map_err(|_| GoogleSyncServiceError::Randomness)?;
+            let mut capability = Zeroizing::new(String::with_capacity(
+                SCHEDULE_APPROVAL_TOKEN_PREFIX.len() + 43,
+            ));
+            capability.push_str(SCHEDULE_APPROVAL_TOKEN_PREFIX);
+            let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
+            capability.push_str(encoded.as_str());
+            let capability_hash = Sha256::digest(capability.as_bytes()).into();
+            let expires_at = self
+                .repository
+                .approve_schedule_publication(
+                    SchedulePublicationApprovalSpec {
+                        account_id,
+                        preview_id,
+                        expected_preview_hash,
+                        capability_hash,
+                    },
+                    self.clock.now(),
+                )
+                .await?;
+            Ok(ScheduleGooglePublicationApproval {
+                preview_id,
+                approval_capability: std::mem::take(&mut *capability),
+                expires_at,
+            })
         })
+        .await
     }
 
     pub(crate) async fn enqueue_schedule_publication(
@@ -948,43 +1000,47 @@ impl GoogleSyncService {
         preview_id: Uuid,
         collection_id: Uuid,
         expected_schedule_revision_id: Uuid,
-        mut approval_capability: String,
+        approval_capability: String,
     ) -> Result<ScheduleGooglePublicationAccepted, GoogleSyncServiceError> {
-        if account_id.is_nil()
-            || preview_id.is_nil()
-            || collection_id.is_nil()
-            || expected_schedule_revision_id.is_nil()
-        {
-            approval_capability.zeroize();
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        let capability_hash = match schedule_approval_capability_hash(&approval_capability) {
-            Ok(hash) => hash,
-            Err(error) => {
+        let mut approval_capability = Zeroizing::new(approval_capability);
+        self.admitted(async {
+            if account_id.is_nil()
+                || preview_id.is_nil()
+                || collection_id.is_nil()
+                || expected_schedule_revision_id.is_nil()
+            {
                 approval_capability.zeroize();
-                return Err(error);
+                return Err(GoogleSyncServiceError::InvalidRequest);
             }
-        };
-        approval_capability.zeroize();
-        let spec = SchedulePublicationEnqueueSpec {
-            account_id,
-            preview_id,
-            collection_id,
-            expected_schedule_revision_id,
-            capability_hash,
-        };
-        if let Some(accepted) = self
-            .repository
-            .schedule_publication_acceptance(&spec)
-            .await?
-        {
-            return Ok(accepted);
-        }
-        self.require_schedule_outbound_enabled()?;
-        self.repository
-            .enqueue_schedule_publication(spec, self.clock.now())
-            .await
-            .map_err(Into::into)
+            let capability_hash = match schedule_approval_capability_hash(&approval_capability) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    approval_capability.zeroize();
+                    return Err(error);
+                }
+            };
+            approval_capability.zeroize();
+            let spec = SchedulePublicationEnqueueSpec {
+                account_id,
+                preview_id,
+                collection_id,
+                expected_schedule_revision_id,
+                capability_hash,
+            };
+            if let Some(accepted) = self
+                .repository
+                .schedule_publication_acceptance(&spec)
+                .await?
+            {
+                return Ok(accepted);
+            }
+            self.require_schedule_outbound_enabled()?;
+            self.repository
+                .enqueue_schedule_publication(spec, self.clock.now())
+                .await
+                .map_err(Into::into)
+        })
+        .await
     }
 
     pub(crate) async fn schedule_publication_status(
@@ -992,13 +1048,16 @@ impl GoogleSyncService {
         account_id: Uuid,
         publication_id: Uuid,
     ) -> Result<ScheduleGooglePublicationStatus, GoogleSyncServiceError> {
-        if account_id.is_nil() || publication_id.is_nil() {
-            return Err(GoogleSyncServiceError::InvalidRequest);
-        }
-        self.repository
-            .schedule_publication_status(account_id, publication_id)
-            .await
-            .map_err(Into::into)
+        self.admitted(async {
+            if account_id.is_nil() || publication_id.is_nil() {
+                return Err(GoogleSyncServiceError::InvalidRequest);
+            }
+            self.repository
+                .schedule_publication_status(account_id, publication_id)
+                .await
+                .map_err(Into::into)
+        })
+        .await
     }
 
     fn require_outbound_enabled(&self) -> Result<(), GoogleSyncServiceError> {
@@ -1105,6 +1164,12 @@ impl GoogleSyncService {
     }
 
     async fn drain_one(&self) -> Result<bool, GoogleSyncServiceError> {
+        // The shared OAuth operation spans durable claiming, every provider
+        // read/write and nested refresh, then the final success/failure record.
+        self.admitted(Box::pin(self.drain_one_admitted())).await
+    }
+
+    async fn drain_one_admitted(&self) -> Result<bool, GoogleSyncServiceError> {
         let now = self.clock.now();
         let claim = self
             .repository
@@ -5152,6 +5217,8 @@ struct FailureDisposition {
 
 #[derive(Debug, Error)]
 pub(crate) enum GoogleSyncServiceError {
+    #[error("Google provider operations are temporarily unavailable")]
+    AdmissionClosed,
     #[error("Google sync request is invalid")]
     InvalidRequest,
     #[error("Google read authorization is required")]
@@ -5205,8 +5272,12 @@ impl GoogleSyncServiceError {
         self.failure().code
     }
 
+    #[allow(clippy::too_many_lines)] // Keeps the fixed public failure policy in one exhaustive mapping.
     fn failure(&self) -> FailureDisposition {
         match self {
+            Self::AdmissionClosed | Self::OAuth(GoogleOAuthServiceError::AdmissionClosed) => {
+                short_backoff("provider_admission_closed")
+            }
             Self::Google(GoogleError::Unauthorized)
             | Self::MissingReadScope
             | Self::MissingWriteScope
@@ -5337,6 +5408,526 @@ mod tests {
     const REFRESH_ACCOUNT_ACTIVE: u8 = 0;
     const REFRESH_ACCOUNT_PAUSED: u8 = 1;
     const REFRESH_ACCOUNT_DISCONNECTED: u8 = 2;
+
+    async fn admission_test_service() -> Arc<GoogleSyncService> {
+        // No connection is established. Any accidental repository work fails
+        // with PoolClosed instead of the expected admission error.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/dayweave_admission_test")
+            .expect("lazy test pool");
+        pool.close().await;
+        make_admission_test_service(
+            pool,
+            OAuthScope {
+                workspace_id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+            },
+            Arc::new(crate::google_oauth::InMemoryGoogleOAuthRepository::default()),
+            None,
+        )
+    }
+
+    fn make_admission_test_service(
+        pool: sqlx::PgPool,
+        scope: OAuthScope,
+        oauth_repository: Arc<dyn crate::google_oauth::GoogleOAuthRepository>,
+        provider: Option<Arc<dyn GoogleSyncProvider>>,
+    ) -> Arc<GoogleSyncService> {
+        use crate::{
+            config::CredentialKey,
+            google_oauth::ProductionGoogleOAuthTransport,
+            items::InMemoryItemRepository,
+            persistence::{DatabaseScope, PostgresGoogleSyncRepository},
+            proposals::SystemClock,
+        };
+        use dayweave_google::oauth::{OAuthClient, OAuthConfig};
+
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let cipher = SecretCipher::new(
+            Arc::new(BTreeMap::from([(
+                1,
+                CredentialKey::from_test_bytes([19; 32]),
+            )])),
+            1,
+        );
+        let client = OAuthClient::new(
+            OAuthConfig::production(
+                "admission-test-client".to_owned(),
+                "admission-test-secret".to_owned(),
+                "https://example.test/oauth/callback",
+            )
+            .expect("test OAuth configuration"),
+        )
+        .expect("test OAuth client");
+        let oauth = Arc::new(GoogleOAuthService::new(
+            oauth_repository,
+            Arc::new(ProductionGoogleOAuthTransport::new(client).expect("OAuth transport")),
+            cipher.clone(),
+            scope,
+            clock.clone(),
+            StdDuration::from_mins(10),
+        ));
+        Arc::new(GoogleSyncService::new(
+            Arc::new(PostgresGoogleSyncRepository::new(
+                pool,
+                DatabaseScope {
+                    workspace_id: scope.workspace_id,
+                    user_id: scope.user_id,
+                },
+            )),
+            provider.unwrap_or_else(|| Arc::new(ProductionGoogleSyncProvider::new(oauth.clone()))),
+            oauth,
+            Arc::new(ItemService::new(
+                Arc::new(InMemoryItemRepository::default()),
+                clock.clone(),
+            )),
+            cipher,
+            scope,
+            clock,
+            true,
+            true,
+            StdDuration::from_mins(5),
+        ))
+    }
+
+    #[tokio::test]
+    async fn closed_oauth_admission_rejects_every_sync_entry_before_new_work() {
+        let service = admission_test_service().await;
+        let _drained = service
+            .oauth
+            .admission()
+            .close_and_drain(Uuid::new_v4())
+            .await
+            .expect("close shared controller");
+        assert!(service.admission.is_closed());
+        let account_id = Uuid::new_v4();
+        let collection_id = Uuid::new_v4();
+        let publication_id = Uuid::new_v4();
+        let request = OutboundRequest {
+            collection_id,
+            item_id: Uuid::new_v4(),
+            expected_item_revision: 1,
+            operation: OutboundOperation::Upsert,
+        };
+        macro_rules! assert_closed {
+            ($operation:expr) => {
+                assert!(matches!(
+                    $operation.await,
+                    Err(GoogleSyncServiceError::AdmissionClosed)
+                ));
+            };
+        }
+        assert_closed!(service.recover_startup());
+        assert_closed!(service.drain_one());
+        assert_closed!(service.discover(account_id));
+        assert_closed!(service.collections(account_id));
+        assert_closed!(service.status(account_id));
+        assert_closed!(service.request_refresh(account_id, Uuid::new_v4()));
+        assert_closed!(service.configure_collection(
+            account_id,
+            collection_id,
+            1,
+            true,
+            true,
+            GoogleSyncRole::Writable,
+            GoogleCalendarPolicy::default(),
+        ));
+        assert_closed!(service.preview_outbound(account_id, request.clone()));
+        assert_closed!(service.approve_outbound(account_id, publication_id, "invalid"));
+        assert_closed!(service.enqueue_outbound(account_id, request, "invalid".to_owned()));
+        assert_closed!(service.preview_schedule_publication(
+            account_id,
+            collection_id,
+            publication_id,
+        ));
+        assert_closed!(
+            service.approve_schedule_publication(account_id, publication_id, "invalid",)
+        );
+        assert_closed!(service.enqueue_schedule_publication(
+            account_id,
+            publication_id,
+            collection_id,
+            Uuid::new_v4(),
+            "invalid".to_owned(),
+        ));
+        assert_closed!(service.schedule_publication_status(account_id, publication_id));
+        assert_eq!(service.admission.active_operations(), 0);
+    }
+
+    #[tokio::test]
+    async fn sync_admission_waits_for_provider_sequence_and_final_recording() {
+        use tokio::sync::oneshot;
+
+        let service = admission_test_service().await;
+        let gate = service.oauth.admission().clone();
+        let recorded = Arc::new(AtomicBool::new(false));
+        let (provider_started, provider_ready) = oneshot::channel();
+        let (release_provider, provider_released) = oneshot::channel();
+        let (recording_started, recording_ready) = oneshot::channel();
+        let (release_recording, recording_released) = oneshot::channel();
+        let operation_recorded = recorded.clone();
+        let operation = tokio::spawn(async move {
+            service
+                .admitted(async {
+                    sequence_guarded_write(
+                        async {
+                            provider_started.send(()).expect("provider stage started");
+                            provider_released.await.expect("provider released");
+                            // This is the same nested boundary used by request
+                            // preparation to refresh an OAuth access token.
+                            service
+                                .oauth
+                                .admission()
+                                .run(async {
+                                    assert_eq!(service.admission.active_operations(), 1);
+                                })
+                                .await
+                                .expect("admitted OAuth preparation survives closure");
+                            Ok::<_, GoogleSyncServiceError>(())
+                        },
+                        || async { Ok(()) },
+                        |(), ()| async { Ok(()) },
+                    )
+                    .await?;
+                    recording_started.send(()).expect("recording stage started");
+                    recording_released.await.expect("recording released");
+                    operation_recorded.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        provider_ready.await.expect("provider stage observed");
+        let drain_gate = gate.clone();
+        let mut drain =
+            tokio::spawn(async move { drain_gate.close_and_drain(Uuid::new_v4()).await });
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while !gate.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain closes promptly");
+        assert_eq!(gate.active_operations(), 1);
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        release_provider.send(()).expect("release provider stage");
+        recording_ready.await.expect("recording stage observed");
+        assert!(!recorded.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        release_recording.send(()).expect("release final recording");
+        operation
+            .await
+            .expect("operation task")
+            .expect("operation succeeds");
+        let _drained = drain.await.expect("drain task").expect("drained");
+        assert!(recorded.load(Ordering::SeqCst));
+        assert_eq!(gate.active_operations(), 0);
+    }
+
+    #[test]
+    fn admission_closure_keeps_fixed_retry_and_transport_errors() {
+        assert_eq!(
+            GoogleSyncServiceError::AdmissionClosed.code(),
+            "provider_admission_closed"
+        );
+        assert_eq!(
+            GoogleSyncServiceError::OAuth(GoogleOAuthServiceError::AdmissionClosed).code(),
+            "provider_admission_closed"
+        );
+        assert!(matches!(
+            map_oauth_transport_error(GoogleOAuthServiceError::AdmissionClosed),
+            GoogleError::Temporary { status: 503 }
+        ));
+    }
+
+    struct PausedDiscoveryProvider {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl GoogleSyncProvider for PausedDiscoveryProvider {
+        async fn list_calendars(
+            &self,
+            _account_id: Uuid,
+            _page_token: Option<&str>,
+        ) -> Result<CalendarListPage, GoogleError> {
+            self.started
+                .lock()
+                .expect("provider start channel")
+                .take()
+                .expect("one discovery call")
+                .send(())
+                .expect("discovery started");
+            self.release
+                .lock()
+                .await
+                .take()
+                .expect("one provider release")
+                .await
+                .expect("provider released");
+            Ok(serde_json::from_value(json!({
+                "items": [{
+                    "id": "admission-calendar@example.test",
+                    "summary": "Admission test calendar",
+                    "accessRole": "owner",
+                    "primary": true,
+                    "selected": true
+                }]
+            }))
+            .expect("test calendar page"))
+        }
+
+        async fn list_task_lists(
+            &self,
+            _: Uuid,
+            _: Option<&str>,
+        ) -> Result<TaskListPage, GoogleError> {
+            panic!("unexpected task-list discovery")
+        }
+        async fn list_events(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &EventListOptions,
+        ) -> Result<EventListPage, GoogleError> {
+            panic!("unexpected event read")
+        }
+        async fn get_event(&self, _: Uuid, _: &str, _: &str) -> Result<GoogleEvent, GoogleError> {
+            panic!("unexpected event read")
+        }
+        async fn prepare_insert_event(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &GoogleEvent,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected event write")
+        }
+        async fn prepare_update_event(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &GoogleEvent,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected event write")
+        }
+        async fn prepare_delete_event(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected event write")
+        }
+        async fn list_tasks(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<TaskPage, GoogleError> {
+            panic!("unexpected task read")
+        }
+        async fn prepare_insert_task(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &GoogleTask,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected task write")
+        }
+        async fn prepare_update_task(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &GoogleTask,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected task write")
+        }
+        async fn prepare_delete_task(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Box<dyn PreparedGoogleSyncWrite>, GoogleError> {
+            panic!("unexpected task write")
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DAYWEAVE_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)] // One synthetic discovery and its two independent wait points.
+    async fn live_discovery_admission_waits_for_provider_and_durable_recording() {
+        use crate::persistence::{DatabaseScope, MIGRATOR, PostgresGoogleOAuthRepository};
+        use sqlx::{AssertSqlSafe, ConnectOptions, Executor};
+        use std::str::FromStr as _;
+        use tokio::sync::oneshot;
+
+        let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+            .expect("DAYWEAVE_TEST_DATABASE_URL for isolated test");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&database_url)
+            .expect("test database URL")
+            .disable_statement_logging();
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .expect("test admin pool");
+        let schema = format!("dayweave_admission_test_{}", Uuid::new_v4().simple());
+        admin
+            .execute(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .await
+            .expect("isolated test schema");
+        let connection_schema = schema.clone();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |connection, _| {
+                let statement = format!("SET search_path TO {connection_schema}");
+                Box::pin(async move {
+                    connection.execute(AssertSqlSafe(statement)).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .expect("isolated test pool");
+        MIGRATOR.run(&pool).await.expect("isolated migrations");
+        let scope = OAuthScope {
+            workspace_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+        };
+        sqlx::query("INSERT INTO users (id, auth_subject, display_name, timezone_name) VALUES ($1, $2, 'Admission fixture', 'UTC')")
+            .bind(scope.user_id).bind(format!("admission-fixture-{}", scope.user_id))
+            .execute(&pool).await.expect("fixture user");
+        sqlx::query("INSERT INTO workspaces (id, owner_user_id, slug, name, timezone_name) VALUES ($1, $2, $3, 'Admission fixture', 'UTC')")
+            .bind(scope.workspace_id).bind(scope.user_id).bind(format!("admission-{}", scope.workspace_id.simple()))
+            .execute(&pool).await.expect("fixture workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .execute(&pool)
+        .await
+        .expect("fixture membership");
+        sqlx::query("INSERT INTO google_oauth_scope_state (workspace_id, user_id) VALUES ($1, $2)")
+            .bind(scope.workspace_id)
+            .bind(scope.user_id)
+            .execute(&pool)
+            .await
+            .expect("fixture OAuth scope");
+        let account_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO provider_accounts (id, workspace_id, user_id, provider, external_account_id, display_label, encrypted_credentials, credential_key_version, granted_scopes, status, sync_enabled, is_default) VALUES ($1, $2, $3, 'google', $4, 'Admission fixture', $5, 1, ARRAY[$6], 'active', true, true)")
+            .bind(account_id).bind(scope.workspace_id).bind(scope.user_id)
+            .bind(format!("admission-account-{account_id}")).bind(vec![19_u8; 64])
+            .bind(GOOGLE_CALENDAR_READONLY_SCOPE).execute(&pool).await.expect("fixture account");
+        let (provider_started, provider_ready) = oneshot::channel();
+        let (release_provider, provider_released) = oneshot::channel();
+        let service = make_admission_test_service(
+            pool.clone(),
+            scope,
+            Arc::new(PostgresGoogleOAuthRepository::new(
+                pool.clone(),
+                DatabaseScope {
+                    workspace_id: scope.workspace_id,
+                    user_id: scope.user_id,
+                },
+            )),
+            Some(Arc::new(PausedDiscoveryProvider {
+                started: Mutex::new(Some(provider_started)),
+                release: tokio::sync::Mutex::new(Some(provider_released)),
+            })),
+        );
+        let gate = service.oauth.admission().clone();
+        let discovery = tokio::spawn(async move { service.discover(account_id).await });
+        tokio::time::timeout(StdDuration::from_secs(5), provider_ready)
+            .await
+            .expect("discovery reaches provider")
+            .expect("provider ready");
+
+        // Block only the final durable write, after account lookup/provider
+        // admission. The read-compatible lock still lets the test inspect it.
+        let mut recording_lock = pool.begin().await.expect("recording lock transaction");
+        recording_lock
+            .execute("LOCK TABLE google_sync_collections IN SHARE MODE")
+            .await
+            .expect("hold discovered-collection write");
+        let drain_gate = gate.clone();
+        let mut drain =
+            tokio::spawn(async move { drain_gate.close_and_drain(Uuid::new_v4()).await });
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while !gate.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain closes admission");
+        assert_eq!(gate.active_operations(), 1);
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        release_provider
+            .send(())
+            .expect("release provider response");
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks AS lock JOIN pg_class AS relation ON relation.oid = lock.relation JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = $1 AND relation.relname = 'google_sync_collections' AND NOT lock.granted)")
+                    .bind(&schema).fetch_one(&pool).await.expect("observe recording wait");
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("discovery reaches final durable write");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        recording_lock
+            .commit()
+            .await
+            .expect("release final recording");
+        let discovered = tokio::time::timeout(StdDuration::from_secs(5), discovery)
+            .await
+            .expect("discovery finishes")
+            .expect("discovery task")
+            .expect("discovery succeeds");
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].display_name, "Admission test calendar");
+        let _drained = tokio::time::timeout(StdDuration::from_secs(5), drain)
+            .await
+            .expect("drain finishes")
+            .expect("drain task")
+            .expect("provider admission drained");
+        assert_eq!(gate.active_operations(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM google_sync_collections WHERE provider_account_id = $1"
+            )
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("durable discovered collection"),
+            1
+        );
+        pool.close().await;
+        admin
+            .execute(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .await
+            .expect("remove isolated fixture schema");
+        admin.close().await;
+    }
 
     #[test]
     fn ambiguous_schedule_write_responses_stay_reconcilable() {

@@ -24,6 +24,7 @@ use crate::{
     credential_auth::{
         CredentialKind, DEVICE_CLIENT_CONTRACT_VERSION, OpaqueCredential, full_owner_device_scopes,
     },
+    provider_admission::{DrainedProviderAdmission, ProviderAdmission},
 };
 
 use super::DatabaseScope;
@@ -41,6 +42,7 @@ pub struct PostgresAccountDeletionRepository {
     scope: DatabaseScope,
     safety_gate: Arc<dyn AccountDeletionSafetyGate>,
     external_principal: Option<AccountDeletionPrincipalBinding>,
+    provider_admission: Option<ProviderAdmission>,
 }
 
 #[derive(Clone)]
@@ -1040,6 +1042,7 @@ impl PostgresAccountDeletionRepository {
             scope,
             safety_gate: Arc::new(DisabledAccountDeletionSafetyGate),
             external_principal: None,
+            provider_admission: None,
         }
     }
 
@@ -1054,6 +1057,16 @@ impl PostgresAccountDeletionRepository {
     ) -> Self {
         self.safety_gate = gate;
         self.external_principal = Some(principal);
+        self
+    }
+
+    /// Binds the exact process-local controller used by both Google services.
+    /// Matching scope alone is insufficient: a separately constructed, idle
+    /// controller cannot prove that the actual runtime has drained. This does
+    /// not activate deletion or supply deployment-wide admission safety.
+    #[must_use]
+    pub fn with_provider_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.provider_admission = Some(admission);
         self
     }
 }
@@ -1308,6 +1321,7 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
     async fn begin_fence(
         &self,
         confirmation: AccountDeletionFenceConfirmation,
+        drained: &DrainedProviderAdmission,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError> {
         let principal = self
             .external_principal
@@ -1315,6 +1329,19 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         let transition = confirmation.transition.clone();
         validate_transition(&transition)?;
         validate_fence_confirmation(&confirmation, &transition, self.scope)?;
+        let admission = self
+            .provider_admission
+            .as_ref()
+            .ok_or(AccountDeletionRepositoryError::Disabled)?;
+        if admission.scope().workspace_id != self.scope.workspace_id
+            || admission.scope().user_id != self.scope.user_id
+            || !drained.matches(admission, transition.deletion_id)
+        {
+            return Err(AccountDeletionRepositoryError::ProviderCleanupBlocked);
+        }
+        // The opaque proof stays borrowed across the entire transaction,
+        // including replay and ambiguous commit results. Its controller never
+        // reopens on drop, and draining occurred before any database lock.
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         let lifecycle =
             lock_lifecycle(&mut transaction, self.scope, transition.deletion_id).await?;

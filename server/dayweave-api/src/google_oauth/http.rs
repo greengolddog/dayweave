@@ -373,7 +373,7 @@ pub(crate) async fn acknowledge_recovery(
         (status = 200, description = "Google identity connected"),
         (status = 400, description = "Invalid, denied, expired, or replayed callback"),
         (status = 502, description = "Google token exchange failed"),
-        (status = 503, description = "Google OAuth is not configured")
+        (status = 503, description = "Google OAuth is unavailable")
     )
 )]
 pub(crate) async fn callback(
@@ -399,7 +399,15 @@ pub(crate) async fn callback(
         );
     };
     if query.error.is_some() || query.code.is_none() {
-        let _ = service.callback_denied(returned_state).await;
+        if matches!(
+            service.callback_denied(returned_state).await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ) {
+            return callback_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Google integration is temporarily unavailable.",
+            );
+        }
         return callback_page(
             StatusCode::BAD_REQUEST,
             "Google connection was cancelled or denied. You may close this window.",
@@ -410,6 +418,10 @@ pub(crate) async fn callback(
         .await
     {
         Ok(account) => callback_page(StatusCode::OK, callback_success_message(&account)),
+        Err(GoogleOAuthServiceError::AdmissionClosed) => callback_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Google integration is temporarily unavailable.",
+        ),
         Err(
             GoogleOAuthServiceError::InvalidCallback
             | GoogleOAuthServiceError::Repository(GoogleOAuthRepositoryError::InvalidCallbackState),
@@ -474,6 +486,9 @@ fn google_idempotency<T: Serialize>(
 #[allow(clippy::needless_pass_by_value)]
 fn map_service_error(error: GoogleOAuthServiceError) -> ApiError {
     match error {
+        GoogleOAuthServiceError::AdmissionClosed => {
+            ApiError::unavailable("Google integration is temporarily unavailable")
+        }
         GoogleOAuthServiceError::InvalidRequest => {
             ApiError::validation("invalid Google OAuth request")
         }
@@ -709,6 +724,16 @@ mod tests {
         Arc<HttpTransport>,
         Arc<InMemoryGoogleOAuthRepository>,
     ) {
+        let (app, transport, repository, _) = google_http_app_with_admission();
+        (app, transport, repository)
+    }
+
+    fn google_http_app_with_admission() -> (
+        Router,
+        Arc<HttpTransport>,
+        Arc<InMemoryGoogleOAuthRepository>,
+        crate::provider_admission::ProviderAdmission,
+    ) {
         let clock: Arc<dyn Clock> = Arc::new(FixedClock(
             "2026-08-29T10:00:00Z".parse().expect("test time"),
         ));
@@ -736,13 +761,14 @@ mod tests {
             clock,
             Duration::from_mins(10),
         ));
+        let admission = oauth.admission().clone();
         let state = AppState::new(
             proposals,
             Arc::new(StaticTokenAuthenticator::from_plaintext(&[TOKEN])),
             Readiness::default(),
         )
         .with_google_oauth(oauth);
-        (router(state), transport, repository)
+        (router(state), transport, repository, admission)
     }
 
     fn request(
@@ -774,6 +800,68 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&bytes).expect("JSON response")
+    }
+
+    #[tokio::test]
+    async fn closed_admission_rejects_public_callbacks_and_cleanup_status_with_503() {
+        let (app, transport, _, admission) = google_http_app_with_admission();
+        let _drained = admission
+            .close_and_drain(Uuid::new_v4())
+            .await
+            .expect("empty integration drains");
+        for query in [
+            "state=opaque-state-value-for-callback&code=private-code",
+            "state=opaque-state-value-for-callback&error=access_denied",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/integrations/google/oauth/callback?{query}"))
+                        .body(Body::empty())
+                        .expect("callback request"),
+                )
+                .await
+                .expect("callback response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("callback body")
+                .to_bytes();
+            let body = std::str::from_utf8(&body).expect("callback HTML");
+            assert!(body.contains("Google integration is temporarily unavailable."));
+            assert!(!body.contains("private-code"));
+            assert!(!body.contains("opaque-state"));
+        }
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/v1/integrations/google/accounts",
+                None,
+                None,
+            ))
+            .await
+            .expect("accounts response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let transport = transport.0.lock().expect("transport counters");
+        assert!(transport.revoked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_admission_has_a_fixed_unavailable_response_without_details() {
+        let response = map_service_error(GoogleOAuthServiceError::AdmissionClosed).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "Google integration is temporarily unavailable"
+        );
+        assert!(body["error"].get("details").is_none());
     }
 
     #[tokio::test]

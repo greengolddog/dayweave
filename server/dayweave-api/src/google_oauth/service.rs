@@ -24,6 +24,7 @@ use crate::{
         GOOGLE_OPENID_SCOPE, GOOGLE_TASKS_READONLY_SCOPE, GOOGLE_TASKS_SCOPE,
     },
     proposals::Clock,
+    provider_admission::ProviderAdmission,
     readiness::Readiness,
 };
 
@@ -374,6 +375,7 @@ impl std::fmt::Debug for AuthorizationStarted {
     }
 }
 
+#[derive(Clone)]
 pub struct GoogleOAuthService {
     repository: Arc<dyn GoogleOAuthRepository>,
     transport: Arc<dyn GoogleOAuthTransport>,
@@ -382,6 +384,7 @@ pub struct GoogleOAuthService {
     clock: Arc<dyn Clock>,
     session_ttl: TimeDelta,
     guardians: Arc<GuardianRegistry>,
+    admission: ProviderAdmission,
 }
 
 impl std::fmt::Debug for GoogleOAuthService {
@@ -419,6 +422,7 @@ impl GoogleOAuthService {
             session_ttl: TimeDelta::from_std(session_ttl)
                 .expect("configured OAuth session TTL fits chrono"),
             guardians: Arc::new(GuardianRegistry::default()),
+            admission: ProviderAdmission::new(scope),
         }
     }
 
@@ -428,7 +432,18 @@ impl GoogleOAuthService {
         self
     }
 
+    pub(crate) fn admission(&self) -> &ProviderAdmission {
+        &self.admission
+    }
+
     pub(crate) async fn recover_startup(&self) -> Result<(), GoogleOAuthServiceError> {
+        self.admission
+            .run(self.recover_startup_admitted())
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn recover_startup_admitted(&self) -> Result<(), GoogleOAuthServiceError> {
         let now = self.clock.now();
         self.repository
             .recover_startup(now, now - GUARDIAN_LEASE)
@@ -470,6 +485,16 @@ impl GoogleOAuthService {
         &self,
         project_grants_revoked: bool,
     ) -> Result<OperatorRecoveryResult, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.acknowledge_operator_recovery_admitted(project_grants_revoked))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn acknowledge_operator_recovery_admitted(
+        &self,
+        project_grants_revoked: bool,
+    ) -> Result<OperatorRecoveryResult, GoogleOAuthServiceError> {
         if !project_grants_revoked {
             return Err(GoogleOAuthServiceError::OperatorConfirmationRequired);
         }
@@ -480,8 +505,19 @@ impl GoogleOAuthService {
         Ok(self.repository.acknowledge_operator_recovery(now).await?)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn begin(
+        &self,
+        input: BeginAuthorization,
+        idempotency_key: OAuthIdempotencyKey,
+    ) -> Result<AuthorizationStarted, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.begin_admitted(input, idempotency_key))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn begin_admitted(
         &self,
         input: BeginAuthorization,
         idempotency_key: OAuthIdempotencyKey,
@@ -615,8 +651,19 @@ impl GoogleOAuthService {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn callback(
+        &self,
+        returned_state: &str,
+        code: &str,
+    ) -> Result<GoogleAccount, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.callback_admitted(returned_state, code))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn callback_admitted(
         &self,
         returned_state: &str,
         code: &str,
@@ -755,6 +802,16 @@ impl GoogleOAuthService {
         &self,
         returned_state: &str,
     ) -> Result<(), GoogleOAuthServiceError> {
+        self.admission
+            .run(self.callback_denied_admitted(returned_state))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn callback_denied_admitted(
+        &self,
+        returned_state: &str,
+    ) -> Result<(), GoogleOAuthServiceError> {
         if !(20..=512).contains(&returned_state.len()) {
             return Err(GoogleOAuthServiceError::InvalidCallback);
         }
@@ -773,6 +830,15 @@ impl GoogleOAuthService {
     }
 
     pub(crate) async fn accounts_with_cleanup(
+        &self,
+    ) -> Result<(Vec<GoogleAccount>, GoogleOAuthCleanupStatus), GoogleOAuthServiceError> {
+        self.admission
+            .run(self.accounts_with_cleanup_admitted())
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn accounts_with_cleanup_admitted(
         &self,
     ) -> Result<(Vec<GoogleAccount>, GoogleOAuthCleanupStatus), GoogleOAuthServiceError> {
         self.reconcile_cleanup(None).await?;
@@ -799,6 +865,16 @@ impl GoogleOAuthService {
     }
 
     pub(crate) async fn access_token_for_sync(
+        &self,
+        account_id: Uuid,
+    ) -> Result<SecretString, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.access_token_for_sync_admitted(account_id))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn access_token_for_sync_admitted(
         &self,
         account_id: Uuid,
     ) -> Result<SecretString, GoogleOAuthServiceError> {
@@ -875,6 +951,16 @@ impl GoogleOAuthService {
         &self,
         account_id: Uuid,
     ) -> Result<GoogleAccount, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.account_for_sync_admitted(account_id))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn account_for_sync_admitted(
+        &self,
+        account_id: Uuid,
+    ) -> Result<GoogleAccount, GoogleOAuthServiceError> {
         let snapshot = self
             .repository
             .account_by_id(account_id)
@@ -888,6 +974,19 @@ impl GoogleOAuthService {
     }
 
     pub(crate) async fn set_paused(
+        &self,
+        account_id: Uuid,
+        expected_revision: u64,
+        paused: bool,
+        idempotency_key: OAuthIdempotencyKey,
+    ) -> Result<GoogleAccountMutation, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.set_paused_admitted(account_id, expected_revision, paused, idempotency_key))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn set_paused_admitted(
         &self,
         account_id: Uuid,
         expected_revision: u64,
@@ -917,8 +1016,20 @@ impl GoogleOAuthService {
             .await?)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn disconnect(
+        &self,
+        account_id: Uuid,
+        expected_revision: u64,
+        idempotency_key: OAuthIdempotencyKey,
+    ) -> Result<GoogleAccountMutation, GoogleOAuthServiceError> {
+        self.admission
+            .run(self.disconnect_admitted(account_id, expected_revision, idempotency_key))
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn disconnect_admitted(
         &self,
         account_id: Uuid,
         expected_revision: u64,
@@ -1033,14 +1144,48 @@ impl GoogleOAuthService {
         refresh_token: &SecretString,
         now: DateTime<Utc>,
     ) -> Result<(), GoogleOAuthServiceError> {
+        self.admission
+            .run(async {
+                let operation = self
+                    .admission
+                    .current_operation()
+                    .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?;
+                let service = self.clone();
+                let token = SecretString::from(refresh_token.expose_secret().to_owned());
+                // Transfer the only non-durable token into a task that survives
+                // callback cancellation before awaiting any storage or retry.
+                tokio::spawn(async move {
+                    operation
+                        .run(service.hold_new_refresh_token_admitted(session_id, &token, now))
+                        .await
+                })
+                .await
+                .map_err(|_| GoogleOAuthServiceError::CredentialDurabilityPending)?
+            })
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    async fn hold_new_refresh_token_admitted(
+        &self,
+        session_id: Uuid,
+        refresh_token: &SecretString,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleOAuthServiceError> {
+        // Detached guardians must retain this operation's ownership even after
+        // the originating callback returns, including when admission has closed.
+        let operation = self
+            .admission
+            .current_operation()
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?;
         let token_hash = hash_secret(refresh_token.expose_secret());
         let owns_registration = match self.guardians.register(session_id, token_hash) {
             GuardianRegistration::Registered => true,
             GuardianRegistration::AlreadyOwned => false,
             GuardianRegistration::Rejected => {
                 // Scoped repositories allow only one exchange, so capacity
-                // rejection is defensive. Keep ownership in this request and
-                // do not return while the sole credential is volatile.
+                // rejection is defensive. The detached custody task retains
+                // ownership until the sole credential is no longer volatile.
                 let payload = self.guardian_payload(session_id, refresh_token);
                 guardian_loop(
                     Arc::downgrade(&self.guardians),
@@ -1087,7 +1232,9 @@ impl GoogleOAuthService {
             };
             let registry = Arc::downgrade(&self.guardians);
             tokio::spawn(async move {
-                guardian_loop(registry, context, session_id, payload, true).await;
+                operation
+                    .run(guardian_loop(registry, context, session_id, payload, true))
+                    .await;
             });
         }
         Err(GoogleOAuthServiceError::CredentialDurabilityPending)
@@ -1787,6 +1934,8 @@ impl Drop for CredentialWire {
 
 #[derive(Debug, Error)]
 pub(crate) enum GoogleOAuthServiceError {
+    #[error("Google integration is temporarily unavailable")]
+    AdmissionClosed,
     #[error("Google OAuth request is invalid")]
     InvalidRequest,
     #[error("Idempotency-Key must be 8-128 URL-safe ASCII characters")]
@@ -1873,6 +2022,7 @@ mod tests {
     struct FakeTransport(
         Mutex<FakeTransportState>,
         Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     );
 
     impl FakeTransport {
@@ -1887,6 +2037,7 @@ mod tests {
                     ..FakeTransportState::default()
                 }),
                 Mutex::default(),
+                Mutex::default(),
             )
         }
 
@@ -1894,6 +2045,14 @@ mod tests {
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
             *self.1.lock().expect("revoke barrier lock") = Some((entered.clone(), release.clone()));
+            (entered, release)
+        }
+
+        fn pause_next_exchange(&self) -> (Arc<Notify>, Arc<Notify>) {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *self.2.lock().expect("exchange barrier lock") =
+                Some((entered.clone(), release.clone()));
             (entered, release)
         }
 
@@ -1933,6 +2092,11 @@ mod tests {
             _verifier: &SecretString,
             _code: &SecretString,
         ) -> Result<OAuthTokenSet, GoogleError> {
+            let barrier = self.2.lock().expect("exchange barrier lock").take();
+            if let Some((entered, release)) = barrier {
+                entered.notify_one();
+                release.notified().await;
+            }
             let mut state = self.0.lock().expect("transport lock");
             state.exchanges += 1;
             if state.temporary_exchange_next {
@@ -3891,6 +4055,257 @@ mod tests {
                 .expect("cleanup status")
                 .revocation_fenced
         );
+    }
+
+    #[tokio::test]
+    async fn admission_drains_exchange_and_rejects_new_google_work() {
+        let (service, repository, transport, _) = fixture([Some("admission-exchange-token")]);
+        let started = service
+            .begin(begin_input(), idempotency("admission-exchange-start"))
+            .await
+            .expect("begin before admission closes");
+        let state = FakeTransport::state_from_url(&started.authorization_url);
+        let (entered, release) = transport.pause_next_exchange();
+        let callback_service = Arc::clone(&service);
+        let callback_state = state.clone();
+        let callback =
+            tokio::spawn(async move { callback_service.callback(&callback_state, "code").await });
+        tokio::time::timeout(StdDuration::from_secs(2), entered.notified())
+            .await
+            .expect("exchange reaches its response barrier");
+        let admission = service.admission().clone();
+        let mut drain =
+            tokio::spawn(async move { admission.close_and_drain(Uuid::new_v4()).await });
+        wait_for_closed_admission(&service).await;
+        assert_closed_google_entrypoints(&service, &state).await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "an exchange that has not returned remains an admitted operation"
+        );
+        {
+            let transport_state = transport.0.lock().expect("transport counters");
+            assert_eq!(transport_state.begins.len(), 1);
+            assert_eq!(transport_state.exchanges, 0);
+            assert_eq!(transport_state.refreshes, 0);
+            assert!(transport_state.revoked_tokens.is_empty());
+        }
+        release.notify_one();
+        let account = callback
+            .await
+            .expect("callback task survives draining")
+            .expect("already admitted callback can finish nested durable custody");
+        let _drained = tokio::time::timeout(StdDuration::from_secs(2), drain)
+            .await
+            .expect("drain follows callback persistence")
+            .expect("drain task")
+            .expect("drained admission");
+        assert_eq!(
+            repository.accounts().await.expect("persisted accounts")[0]
+                .account
+                .id,
+            account.id
+        );
+        assert_eq!(service.guardians.count(), 0);
+        assert_eq!(
+            repository
+                .cleanup_status()
+                .await
+                .expect("settled cleanup")
+                .pending,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_drains_detached_guardian_through_definitive_cleanup() {
+        let (service, repository, transport, _) = fixture([Some("admission-guardian-token")]);
+        let started = service
+            .begin(begin_input(), idempotency("admission-guardian-start"))
+            .await
+            .expect("begin before admission closes");
+        repository.fail_next_holds(100).await;
+        let (entered, release) = transport.pause_next_revoke();
+        assert!(matches!(
+            service
+                .callback(
+                    &FakeTransport::state_from_url(&started.authorization_url),
+                    "code"
+                )
+                .await,
+            Err(GoogleOAuthServiceError::CredentialDurabilityPending)
+        ));
+        tokio::time::timeout(StdDuration::from_secs(2), entered.notified())
+            .await
+            .expect("detached guardian reaches provider barrier");
+        let admission = service.admission().clone();
+        let mut drain =
+            tokio::spawn(async move { admission.close_and_drain(Uuid::new_v4()).await });
+        wait_for_closed_admission(&service).await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "a returned callback does not surrender its guardian's operation ownership"
+        );
+        assert_eq!(service.guardians.count(), 1);
+        assert!(
+            repository
+                .cleanup_status()
+                .await
+                .expect("guardian scope fence")
+                .revocation_fenced
+        );
+        release.notify_one();
+        let _drained = tokio::time::timeout(StdDuration::from_secs(2), drain)
+            .await
+            .expect("guardian can complete durable cleanup while admission is closed")
+            .expect("drain task")
+            .expect("drained admission");
+        assert_eq!(service.guardians.count(), 0);
+        assert!(
+            !repository
+                .cleanup_status()
+                .await
+                .expect("cleared guardian fence")
+                .revocation_fenced
+        );
+        assert_eq!(
+            transport.0.lock().expect("transport state").revoked_tokens,
+            vec!["admission-guardian-token"]
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_cancellation_during_failing_hold_preserves_token_custody_and_drain() {
+        let (service, repository, transport, _) = fixture([Some("cancelled-custody-token")]);
+        let started = service
+            .begin(begin_input(), idempotency("cancelled-custody-start"))
+            .await
+            .expect("begin custody callback");
+        repository.fail_next_holds(100).await;
+        repository.fail_next_volatile_claims(100).await;
+        let callback_service = Arc::clone(&service);
+        let state = FakeTransport::state_from_url(&started.authorization_url);
+        let callback = tokio::spawn(async move { callback_service.callback(&state, "code").await });
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while service.guardians.count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("token custody registers before storage retry sleeps");
+        callback.abort();
+        assert!(
+            callback
+                .await
+                .expect_err("callback task is cancelled")
+                .is_cancelled()
+        );
+        let admission = service.admission().clone();
+        let mut drain =
+            tokio::spawn(async move { admission.close_and_drain(Uuid::new_v4()).await });
+        wait_for_closed_admission(&service).await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut drain)
+                .await
+                .is_err(),
+            "cancelling the callback cannot drop a still-volatile token or its admission ownership"
+        );
+        assert_eq!(service.guardians.count(), 1);
+        repository.fail_next_holds(0).await;
+        let _drained = tokio::time::timeout(StdDuration::from_secs(2), drain)
+            .await
+            .expect("custody task persists its token independently of the cancelled callback")
+            .expect("drain task")
+            .expect("drained admission");
+        assert_eq!(service.guardians.count(), 0);
+        let cleanup = repository
+            .cleanup_status()
+            .await
+            .expect("retained durable token");
+        assert_eq!(cleanup.held, 1);
+        assert_eq!(
+            cleanup.uncertain_authorizations, 1,
+            "the cancelled exchange remains visible for durable recovery before fencing"
+        );
+        assert!(
+            transport
+                .0
+                .lock()
+                .expect("transport state")
+                .revoked_tokens
+                .is_empty()
+        );
+    }
+
+    async fn wait_for_closed_admission(service: &GoogleOAuthService) {
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while !service.admission().is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain request closes new admission");
+    }
+
+    async fn assert_closed_google_entrypoints(service: &GoogleOAuthService, state: &str) {
+        assert!(matches!(
+            service
+                .begin(begin_input(), idempotency("closed-admission-start"))
+                .await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.callback(state, "new-code").await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.callback_denied(state).await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.access_token_for_sync(Uuid::new_v4()).await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.account_for_sync(Uuid::new_v4()).await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.accounts_with_cleanup().await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.recover_startup().await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service.acknowledge_operator_recovery(true).await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service
+                .set_paused(
+                    Uuid::new_v4(),
+                    1,
+                    true,
+                    idempotency("closed-admission-pause")
+                )
+                .await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(matches!(
+            service
+                .disconnect(
+                    Uuid::new_v4(),
+                    1,
+                    idempotency("closed-admission-disconnect")
+                )
+                .await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
     }
 
     #[tokio::test]

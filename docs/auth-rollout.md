@@ -200,18 +200,40 @@ claim result alone does not establish completion.
 This substrate does not call Google or scrub source credentials. Even a target
 with a recorded successful outcome retains its source ciphertext behind the
 tenant fence. Durable OAuth/sync/outbox checks reject unsettled database work
-before fencing/sealing; they do not prove that runtime or distributed provider
-I/O has drained. Both Rust and PostgreSQL block advancement into purge, even
-when every target has a definitive outcome. Legacy unsealed cleanup rows and
-legacy purge rows likewise cannot advance into destructive completion after
+before fencing/sealing. Both Rust and PostgreSQL block advancement into purge,
+even when every target has a definitive outcome. Legacy unsealed cleanup rows
+and legacy purge rows likewise cannot advance into destructive completion after
 the migration.
+
+Production Google OAuth and sync services now share one process-local operation
+admission controller. Closing it rejects new operations and waits for existing
+operations to finish, including nested token refresh, provider response
+handling, durable settlement, and detached credential guardians. Worker loops
+acquire admission per iteration. A newly received refresh token and its operation
+ownership move into a detached custody task before the first storage await, so
+cancelling the callback cannot abandon a still-volatile token. Same-controller
+nested calls inherit ownership; different controllers cannot reuse it. Closure
+is sticky for the exact deletion UUID in that process, including when a drain
+wait is cancelled or its proof is dropped. Draining from inside provider work
+is rejected.
+
+The low-level `begin_fence` operation now requires opaque drained proof bound to
+its explicitly configured controller, user/workspace, and deletion UUID before
+opening a database transaction or returning a replay. It holds that proof
+through the transaction; an unconfigured repository stays disabled. This proves
+only local operation ownership. Pending OAuth sessions and deferred cleanup can
+remain after local draining and still block the database fence. The future
+deletion service must settle that work before sticky closure and implement an
+authoritative recovery/reopening policy for failed or ambiguous fence attempts.
+There is no automatic reopen, distributed admission proof, or runtime activation
+path yet.
 
 Activation requires all of the following to be wired and reviewed together:
 an append-only external tombstone authority outside PostgreSQL and its backups,
 using the pinned deployment-keyed identity and an exclusive permit retained for
-the service runtime's admission lifetime; a runtime guardian and distributed
-admission gate that closes new provider I/O and drains existing work before
-fencing; proof of the Google OAuth project-and-subject grant identity before
+the service runtime's admission lifetime; deployment-wide provider admission
+and draining, pre-close durable-work settlement, and reviewed recovery/reopening
+orchestration; proof of the Google OAuth project-and-subject grant identity before
 revocation; a real provider worker that records verified outcomes and scrubs
 credentials; a credential-only HTTP service with the full
 fresh-owner/recovery/confirmation policy; secure native journals, teardown, and
@@ -307,11 +329,12 @@ their automated gates and independent code audits pass. A controlled
 two-client/service recovery run, owner-device UI acceptance, and a real-device
 credential-only cutover rehearsal remain in progress.
 Account deletion remains unavailable: its route-less foundation must stay
-default-disabled until the external tombstone/restore authority, runtime
-provider-I/O gate, Google grant proof, actual provider revocation and credential
-scrubbing, credential-only HTTP/native flows, database role split, and
-backup-expiry evidence are implemented and independently rehearsed. The durable
-cleanup ledger alone cannot authorize purge.
+default-disabled until the external tombstone/restore authority, distributed
+provider-I/O gate and pre-close/recovery orchestration, Google grant proof,
+actual provider revocation and credential scrubbing, credential-only HTTP/native
+flows, database role split, and backup-expiry evidence are implemented and
+independently rehearsed. The durable cleanup ledger and process-local admission
+proof alone cannot authorize purge.
 Published ChatGPT/Codex account linking remains
 blocked until the documented Auth0/tunnel activation preflight, a
 deployed end-to-end schedule read and simulation rehearsal, and an independent

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::credential_auth::OpaqueCredential;
+use crate::{credential_auth::OpaqueCredential, provider_admission::DrainedProviderAdmission};
 
 use super::{
     AccountDeletionFenceConfirmation, AccountDeletionFenceSafetyEvidence, AccountDeletionLifecycle,
@@ -106,10 +106,14 @@ pub trait AccountDeletionRepository: Send + Sync {
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError>;
 
     /// Atomically installs the hard scope fence and advances the lifecycle to
-    /// `fence_committing`. Once this succeeds cancellation is forbidden.
+    /// `fence_committing`. Once this succeeds cancellation is forbidden. The
+    /// caller must first close and drain the exact configured Google runtime
+    /// controller, without holding database mutation locks. This local proof
+    /// does not replace distributed admission or the external restore permit.
     async fn begin_fence(
         &self,
         confirmation: AccountDeletionFenceConfirmation,
+        drained: &DrainedProviderAdmission,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError>;
 
     /// Atomically seals the supported provider credential source coordinates

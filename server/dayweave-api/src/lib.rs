@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod mcp_oauth;
 pub mod persistence;
 pub mod proposals;
+pub mod provider_admission;
 pub mod readiness;
 pub mod scheduling;
 

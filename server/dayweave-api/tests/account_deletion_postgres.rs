@@ -23,9 +23,11 @@ use dayweave_api::{
         DEVICE_CLIENT_CONTRACT_VERSION, DeviceClientKind, DeviceEnrollmentSpec, OpaqueCredential,
         full_owner_device_scopes,
     },
+    google_oauth::OAuthScope,
     persistence::{
         DatabaseScope, MIGRATOR, PostgresAccountDeletionRepository, PostgresCredentialRepository,
     },
+    provider_admission::{ProviderAdmission, ProviderAdmissionError},
     readiness::Readiness,
 };
 use sqlx::{
@@ -362,8 +364,13 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .unwrap()
         .bind("account-deletion-owner")
         .unwrap();
+    let admission = ProviderAdmission::new(OAuthScope {
+        workspace_id: scope.workspace_id,
+        user_id: scope.user_id,
+    });
     let repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
-        .with_safety_gate(safety_gate.clone(), external_principal);
+        .with_safety_gate(safety_gate.clone(), external_principal)
+        .with_provider_admission(admission.clone());
     let mut unauthorized_preparation = preparation.clone();
     unauthorized_preparation.id = Uuid::new_v4();
     unauthorized_preparation.request_hash = [0x7f; 32];
@@ -532,8 +539,9 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
             scope.user_id,
         ),
     };
+    let drained = admission.close_and_drain(deletion_id).await.unwrap();
     assert_eq!(
-        repository.begin_fence(early_confirmation).await,
+        repository.begin_fence(early_confirmation, &drained).await,
         Err(AccountDeletionRepositoryError::CooldownPending),
         "the server clock enforces the 24-hour prepare-to-fence cooldown"
     );
@@ -568,10 +576,61 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     };
     assert_eq!(
         PostgresAccountDeletionRepository::new(pool.clone(), scope)
-            .begin_fence(confirmation.clone())
+            .begin_fence(confirmation.clone(), &drained)
             .await,
         Err(AccountDeletionRepositoryError::Disabled),
         "removing external configuration disables a prepared lifecycle"
+    );
+    assert_eq!(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .with_safety_gate(safety_gate.clone(), external_principal)
+            .begin_fence(confirmation.clone(), &drained)
+            .await,
+        Err(AccountDeletionRepositoryError::Disabled),
+        "the exact Google runtime controller must be configured before fencing"
+    );
+    let unrelated_controller = ProviderAdmission::new(admission.scope());
+    let unrelated_proof = unrelated_controller
+        .close_and_drain(deletion_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .begin_fence(confirmation.clone(), &unrelated_proof)
+            .await,
+        Err(AccountDeletionRepositoryError::ProviderCleanupBlocked),
+        "an idle controller with identical scope is not proof of this runtime's drain"
+    );
+    let wrong_scope_controller = ProviderAdmission::new(OAuthScope {
+        workspace_id: unrelated_scope.workspace_id,
+        user_id: unrelated_scope.user_id,
+    });
+    let wrong_scope_proof = wrong_scope_controller
+        .close_and_drain(deletion_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .with_safety_gate(safety_gate.clone(), external_principal)
+            .with_provider_admission(wrong_scope_controller)
+            .begin_fence(confirmation.clone(), &wrong_scope_proof)
+            .await,
+        Err(AccountDeletionRepositoryError::ProviderCleanupBlocked),
+        "a correctly matched controller/proof still cannot drain a different scope"
+    );
+    let mut wrong_deletion_confirmation = confirmation.clone();
+    wrong_deletion_confirmation.transition.deletion_id = Uuid::new_v4();
+    wrong_deletion_confirmation.explicit_approval_digest = account_deletion_approval_digest(
+        wrong_deletion_confirmation.transition.deletion_id,
+        scope.workspace_id,
+        scope.user_id,
+    );
+    assert_eq!(
+        repository
+            .begin_fence(wrong_deletion_confirmation, &drained)
+            .await,
+        Err(AccountDeletionRepositoryError::ProviderCleanupBlocked),
+        "a drain proof cannot authorize another deletion"
     );
     sqlx::query(
         "INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation, \
@@ -586,7 +645,7 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     .await
     .expect("durable Google revocation still in progress");
     assert_eq!(
-        repository.begin_fence(confirmation.clone()).await,
+        repository.begin_fence(confirmation.clone(), &drained).await,
         Err(AccountDeletionRepositoryError::ProviderCleanupBlocked),
         "a durable provider operation must quiesce before the hard fence commits"
     );
@@ -607,14 +666,14 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     .await
     .expect("durable revocation is settled before retrying the fence");
     let fenced = repository
-        .begin_fence(confirmation.clone())
+        .begin_fence(confirmation.clone(), &drained)
         .await
         .expect("hard fence commits atomically");
     assert_eq!(fenced.revision, 2);
     assert!(!fenced.replayed);
     assert!(
         repository
-            .begin_fence(confirmation.clone())
+            .begin_fence(confirmation.clone(), &drained)
             .await
             .expect("lost fence response replays")
             .replayed
@@ -622,8 +681,16 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     let mut conflicting_confirmation = confirmation;
     conflicting_confirmation.confirming_session_revision += 1;
     assert_eq!(
-        repository.begin_fence(conflicting_confirmation).await,
+        repository
+            .begin_fence(conflicting_confirmation, &drained)
+            .await,
         Err(AccountDeletionRepositoryError::Conflict)
+    );
+    drop(drained);
+    assert_eq!(
+        admission.run(async {}).await,
+        Err(ProviderAdmissionError::Closed),
+        "neither a successful fence, exact replay, nor a failed retry reopens provider I/O"
     );
 
     assert!(
