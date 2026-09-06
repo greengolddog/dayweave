@@ -108,6 +108,18 @@ impl ProviderAdmission {
         self.inner.durable.is_some()
     }
 
+    pub(crate) fn same_controller(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn ensure_outside_operation() -> Result<(), ProviderAdmissionError> {
+        if CURRENT_OPERATION.try_with(|_| ()).is_ok() {
+            Err(ProviderAdmissionError::ReentrantDrain)
+        } else {
+            Ok(())
+        }
+    }
+
     #[must_use]
     pub fn scope(&self) -> OAuthScope {
         self.inner.scope
@@ -234,9 +246,7 @@ impl ProviderAdmission {
         // Any provider context may mask an outer owner of this controller.
         // For example A -> B -> drain(A) must not wait for A's own stack frame.
         // Deletion drain belongs outside provider operations altogether.
-        if CURRENT_OPERATION.try_with(|_| ()).is_ok() {
-            return Err(ProviderAdmissionError::ReentrantDrain);
-        }
+        Self::ensure_outside_operation()?;
         {
             let mut state = self.inner.state.lock().expect("provider admission state");
             match state.deletion_id {

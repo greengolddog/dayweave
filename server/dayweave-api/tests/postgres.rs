@@ -2823,6 +2823,191 @@ async fn postgres_expired_disconnect_idempotency_recovers_only_the_same_key() {
 #[tokio::test]
 #[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
 #[allow(clippy::too_many_lines)]
+async fn deletion_pending_authorization_cancellation_serializes_with_callback_claims() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL").expect("test database URL");
+    for cancel_first in [true, false] {
+        let database = TestDatabase::create(&database_url).await;
+        let pool = &database.pool;
+        MIGRATOR.run(pool).await.expect("migrations apply");
+        let scope = seed_scope(pool).await;
+        let other_scope = seed_other_scope(pool).await;
+        let repository = PostgresGoogleOAuthRepository::new(pool.clone(), scope);
+        let other = PostgresGoogleOAuthRepository::new(pool.clone(), other_scope);
+        let now = Utc::now();
+        let session_id = Uuid::new_v4();
+        let stale_before = now - ChronoDuration::minutes(2);
+        repository
+            .create_session(
+                google_session(session_id, 121, 122, now),
+                google_idempotency("google_oauth_start", 121, 122, now),
+                stale_before,
+            )
+            .await
+            .expect("pending authorization");
+        other
+            .create_session(
+                google_session(Uuid::new_v4(), 123, 124, now),
+                google_idempotency("google_oauth_start", 123, 124, now),
+                stale_before,
+            )
+            .await
+            .expect("unrelated pending authorization");
+        // Arrange retained cleanup custody alongside pending authorization to
+        // prove cancellation never drops ciphertext, even for unusual durable state.
+        sqlx::query(
+            "INSERT INTO google_oauth_cleanup_tokens (session_id, workspace_id, user_id, \
+            encrypted_refresh_token, key_version, created_at, updated_at, next_attempt_at) \
+            VALUES ($1, $2, $3, $4, 1, $5, $5, $5)",
+        )
+        .bind(session_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(vec![125_u8; 64])
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("retained cleanup custody fixture");
+        let mut blocker = pool.begin().await.expect("OAuth scope blocker");
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .expect("blocker backend");
+        sqlx::query(
+            "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold OAuth admission scope");
+        let cancelling = repository.clone();
+        let cancellation = async move {
+            cancelling
+                .cancel_pending_authorizations_for_deletion(now)
+                .await
+        };
+        let claiming = repository.clone();
+        let callback = async move {
+            claiming
+                .claim_callback([121_u8; 32], now, stale_before)
+                .await
+        };
+        let (cancel, claim) = if cancel_first {
+            let cancel = tokio::spawn(cancellation);
+            wait_for_postgres_blocker(pool, blocker_pid).await;
+            (cancel, tokio::spawn(callback))
+        } else {
+            let claim = tokio::spawn(callback);
+            wait_for_postgres_blocker(pool, blocker_pid).await;
+            (tokio::spawn(cancellation), claim)
+        };
+        wait_for_postgres_blocked_count(pool, blocker_pid, 2).await;
+        blocker
+            .commit()
+            .await
+            .expect("release ordered OAuth scope waiters");
+        let cancelled = cancel
+            .await
+            .expect("cancellation task")
+            .expect("cancel pending authorizations");
+        let claimed = claim.await.expect("callback task");
+        let cleanup: (String, Vec<u8>) = sqlx::query_as(
+            "SELECT status, encrypted_refresh_token FROM google_oauth_cleanup_tokens WHERE session_id = $1")
+            .bind(session_id).fetch_one(pool).await.expect("cleanup custody is retained");
+        assert_eq!(cleanup.1, vec![125_u8; 64]);
+        if cancel_first {
+            assert_eq!(cancelled, 1);
+            assert!(matches!(
+                claimed,
+                Err(GoogleOAuthRepositoryError::InvalidCallbackState)
+            ));
+            assert_eq!(cleanup.0, "pending");
+            let scrubbed: bool = sqlx::query_scalar(
+                "SELECT status = 'failed' AND failed_at IS NOT NULL \
+                AND encrypted_pkce_verifier IS NULL AND verifier_key_version IS NULL \
+                AND encrypted_authorization_url IS NULL AND authorization_url_key_version IS NULL \
+                FROM google_oauth_sessions WHERE id = $1",
+            )
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .expect("cancelled authorization state");
+            assert!(scrubbed);
+            assert!(
+                matches!(
+                    repository
+                        .create_session(
+                            google_session(session_id, 121, 122, now),
+                            google_idempotency("google_oauth_start", 121, 122, now),
+                            stale_before,
+                        )
+                        .await,
+                    Err(GoogleOAuthRepositoryError::InvalidCallbackState)
+                ),
+                "a cancelled begin replay cannot recover its scrubbed authorization URL"
+            );
+        } else {
+            assert_eq!(cancelled, 0);
+            assert_eq!(cleanup.0, "held");
+            let CallbackClaim::Exchange(claimed) = claimed.expect("callback owns the exchange")
+            else {
+                panic!("pending callback must claim exchange");
+            };
+            repository
+                .stage_authorization(AuthorizationCompletion {
+                    session_id,
+                    owner_subject_hash: claimed.owner_subject_hash,
+                    expected_account_revision: None,
+                    account_id: Uuid::new_v4(),
+                    make_default: false,
+                    external_account_id: "deletion-race-google".to_owned(),
+                    display_label: "Fixture".to_owned(),
+                    credentials: EncryptedCredentials {
+                        sealed: SealedSecret {
+                            key_version: 1,
+                            ciphertext: vec![126_u8; 64],
+                        },
+                    },
+                    granted_scopes: claimed.requested_scopes,
+                    token_expires_at: now + ChronoDuration::hours(1),
+                    now,
+                })
+                .await
+                .expect("admitted exchange can finish staging after cancellation loses");
+            assert_eq!(
+                repository
+                    .cancel_pending_authorizations_for_deletion(now)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let staged: (String, Vec<u8>) = sqlx::query_as(
+                "SELECT status, staged_encrypted_credentials FROM google_oauth_sessions WHERE id = $1")
+                .bind(session_id).fetch_one(pool).await.expect("staged credentials survive cancellation");
+            assert_eq!(staged, ("staged".to_owned(), vec![126_u8; 64]));
+        }
+        assert_eq!(
+            repository
+                .cancel_pending_authorizations_for_deletion(now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            other
+                .cancel_pending_authorizations_for_deletion(now)
+                .await
+                .unwrap(),
+            1,
+            "cancelling this scope did not alter an unrelated pending flow"
+        );
+        database.destroy().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)]
 async fn postgres_google_oauth_is_fenced_recoverable_scoped_and_idempotent() {
     let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
         .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
@@ -5901,6 +6086,30 @@ impl TestDatabase {
             .expect("drop isolated test schema");
         self.admin.close().await;
     }
+}
+
+async fn wait_for_postgres_blocked_count(pool: &PgPool, blocker_pid: i32, expected: i64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "WITH RECURSIVE blocked(pid) AS (\
+                    SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                    UNION SELECT activity.pid FROM pg_stat_activity AS activity \
+                    JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))) \
+                 SELECT count(*) FROM blocked",
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .expect("ordered database wait graph");
+            if count >= expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both OAuth operations enter the database scope-lock queue");
 }
 
 async fn wait_for_postgres_blocker(pool: &PgPool, blocker_pid: i32) {

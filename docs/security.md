@@ -145,8 +145,8 @@ effects must flow through an auditable proposal or outbox boundary.
   never substitutes for current status. Detached cleanup evidence contains no
   ciphertext, raw provider identities, or error payloads. Claims expose only an
   exact encrypted source envelope in a redacted, zeroizing in-memory value.
-  The implementation makes no provider calls and does not scrub credentials;
-  source ciphertext remains behind the fence even after a recorded success.
+  This cleanup persistence substrate makes no provider calls and does not scrub
+  source credentials; ciphertext remains behind the fence even after a recorded success.
   Production OAuth and sync share operation admission that closes new work and
   drains nested calls, durable settlement, and detached guardians. Migration
   0032 adds a content-free registry of active ownership across PostgreSQL
@@ -164,16 +164,28 @@ effects must flow through an auditable proposal or outbox boundary.
   under the exclusive mutation barrier before replay or mutation. A database
   trigger independently requires that condition. Closure and drain checks cover
   every registration sharing either the workspace or user, including retained
-  ownership from an earlier scope. Pending OAuth sessions/deferred
-  cleanup still need pre-close settlement, and interrupted runtimes or
-  failed/ambiguous fence attempts need an authoritative recovery/reopening
-  policy. These recovery paths remain unimplemented. Rust and PostgreSQL block purge
-  even with all successful outcomes and prevent
+  ownership from an earlier scope. Internal pre-close orchestration binds the
+  exact durable controller and validates current deletion/owner/recovery
+  authority before any cancellation or recovery. At most four admitted recovery
+  passes cancel only pending OAuth sessions, scrub their encrypted PKCE verifier
+  and authorization URL/key versions, and preserve existing cleanup custody;
+  exchanging/staged credentials retain normal reconciliation. Existing OAuth
+  cleanup may call Google under its retained-grant protection, without bypassing
+  stored backoff or attempt limits. Before each pass and after the last, a fresh
+  authority check and complete content-free readiness snapshot precede sticky
+  closure in one exclusive-barrier transaction. Blocked work returns waiting;
+  retry metadata never authorizes cleanup or expiration. An exact committed
+  closure can be adopted after an ambiguous response without admitting new
+  recovery work; cancellation does not reopen it. This internal flow has unit
+  and live PostgreSQL coverage. It does not activate deletion or recover
+  retained interrupted operations. Those operations and failed/ambiguous fence
+  attempts still require authoritative recovery and safe reopening. Rust and
+  PostgreSQL block purge even with all successful outcomes and prevent
   legacy cleanup/purge rows from advancing into destructive completion.
   Activation still requires a tombstone authority outside PostgreSQL/backups
   with an exclusive permit held throughout service admission and runtime;
-  pre-close settlement and authoritative interrupted-runtime recovery/reopening
-  orchestration; Google
+  verified pre-close integration and authoritative interrupted-runtime
+  recovery/reopening orchestration; Google
   project-and-subject grant proof; real provider revocation and credential
   scrubbing; credential-only HTTP/native approval and teardown; separate
   migration/runtime database roles; and proven backup expiry. A one-shot
@@ -365,8 +377,8 @@ ready:
   unrelated role can write canonical execution, assessment, or claim tables;
 - keep account deletion disabled while implementing and rehearsing its external
   tombstone authority with a runtime-held exclusive admission permit,
-  authoritative interrupted-runtime and pre-close/recovery orchestration,
-  Google grant proof, actual revocation and credential scrubbing, credential-only
+  authoritative interrupted-runtime recovery and safe reopening, verified
+  pre-close integration, Google grant proof, actual revocation and credential scrubbing, credential-only
   HTTP/native confirmation and teardown, scoped database grants, and
   backup-expiry evidence;
 - provision least-privilege Nebius identities, private versioned storage,

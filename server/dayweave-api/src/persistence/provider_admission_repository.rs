@@ -282,6 +282,112 @@ impl PostgresProviderAdmissionRepository {
     }
 }
 
+/// Serializes an authorized deletion-preparation transaction with every
+/// provider registration and tenant mutation, before examining closure state.
+/// Callers lock the lifecycle with NO KEY UPDATE first, as the final fence does.
+pub(super) async fn lock_provider_admission_for_deletion(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    deletion_id: Uuid,
+) -> Result<bool, AccountDeletionRepositoryError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.account-deletion.global-mutation-barrier.v1', 0))",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| AccountDeletionRepositoryError::Internal)?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.provider-admission.global-registry.v1', 0))",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| AccountDeletionRepositoryError::Internal)?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(\
+         'dayweave.provider-admission.scope.v1:' || $1::uuid::text || ':' || $2::uuid::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| AccountDeletionRepositoryError::Internal)?;
+    let row = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM provider_admission_scopes \
+             WHERE workspace_id = $1 AND user_id = $2 \
+                 AND closed_for_deletion_id = $3) AS closed, \
+         EXISTS(SELECT 1 FROM provider_admission_scopes \
+             WHERE (workspace_id = $1 OR user_id = $2) \
+                 AND closed_for_deletion_id <> $3) AS conflicting",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(deletion_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| AccountDeletionRepositoryError::Internal)?;
+    if row
+        .try_get::<bool, _>("conflicting")
+        .map_err(|_| AccountDeletionRepositoryError::Internal)?
+    {
+        return Err(AccountDeletionRepositoryError::Conflict);
+    }
+    row.try_get("closed")
+        .map_err(|_| AccountDeletionRepositoryError::Internal)
+}
+
+/// Persists closure in the same short transaction as the caller's complete
+/// provider-readiness and fresh-authority checks. This never closes a local
+/// controller, waits for provider work, or settles an operation registration.
+pub(super) async fn close_provider_admission_for_deletion(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    deletion_id: Uuid,
+) -> Result<(), AccountDeletionRepositoryError> {
+    let closed = lock_provider_admission_for_deletion(transaction, scope, deletion_id).await?;
+    let unsettled = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM provider_admission_operations \
+         WHERE workspace_id = $1 OR user_id = $2)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| AccountDeletionRepositoryError::Internal)?;
+    if unsettled {
+        return Err(AccountDeletionRepositoryError::ProviderCleanupBlocked);
+    }
+    if !closed {
+        sqlx::query(
+            "INSERT INTO provider_admission_scopes (workspace_id, user_id) \
+             SELECT $1, $2 WHERE NOT EXISTS(SELECT 1 FROM provider_admission_scopes \
+                 WHERE workspace_id = $1 AND user_id = $2)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(deletion_error)?;
+        let changed = sqlx::query(
+            "UPDATE provider_admission_scopes \
+             SET closed_for_deletion_id = $3, closed_at = clock_timestamp() \
+             WHERE workspace_id = $1 AND user_id = $2 AND closed_for_deletion_id IS NULL",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(deletion_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(deletion_error)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(AccountDeletionRepositoryError::Conflict);
+        }
+    }
+    Ok(())
+}
+
 /// Rechecks the authoritative registry in the final, short fence transaction.
 /// Acquiring the existing exclusive barrier also protects callers that have not
 /// acquired it yet. This function never waits for an active provider to finish.
@@ -355,4 +461,14 @@ fn map_error(error: sqlx::Error) -> ProviderAdmissionError {
     };
     drop(error);
     mapped
+}
+
+fn deletion_error(error: sqlx::Error) -> AccountDeletionRepositoryError {
+    match map_error(error) {
+        ProviderAdmissionError::Closed | ProviderAdmissionError::ConflictingDeletion => {
+            AccountDeletionRepositoryError::Conflict
+        }
+        ProviderAdmissionError::InvalidScope => AccountDeletionRepositoryError::InvalidAuthority,
+        _ => AccountDeletionRepositoryError::Internal,
+    }
 }

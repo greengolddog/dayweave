@@ -542,12 +542,21 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
             scope.user_id,
         ),
     };
-    let drained = admission.close_and_drain(deletion_id).await.unwrap();
     assert_eq!(
-        repository.begin_fence(early_confirmation, &drained).await,
+        repository
+            .authorize_provider_preparation(&early_confirmation)
+            .await,
         Err(AccountDeletionRepositoryError::CooldownPending),
         "the server clock enforces the 24-hour prepare-to-fence cooldown"
     );
+    assert_eq!(
+        repository
+            .close_provider_admission_if_ready(&early_confirmation)
+            .await,
+        Err(AccountDeletionRepositoryError::CooldownPending),
+        "an early confirmation must not close recoverable provider admission"
+    );
+    assert!(admission.run(async {}).await.is_ok());
     sqlx::query("ALTER TABLE account_deletion_lifecycles DISABLE TRIGGER USER")
         .execute(pool)
         .await
@@ -577,6 +586,8 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
             scope.user_id,
         ),
     };
+    assert_provider_preparation_gates(pool, scope, &repository, &admission, &confirmation).await;
+    let drained = admission.close_and_drain(deletion_id).await.unwrap();
     assert_eq!(
         PostgresAccountDeletionRepository::new(pool.clone(), scope)
             .begin_fence(confirmation.clone(), &drained)
@@ -647,7 +658,10 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     sqlx::query(
         "INSERT INTO google_oauth_scope_state (workspace_id, user_id, credential_generation, \
          revocation_kind, revocation_owner_id, revocation_claim_id, revocation_claimed_at, \
-         revocation_generation) VALUES ($1, $2, 0, 'guardian', $3, $4, clock_timestamp(), 0)",
+         revocation_generation) VALUES ($1, $2, 0, 'guardian', $3, $4, clock_timestamp(), 0) \
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET revocation_kind = 'guardian', \
+         revocation_owner_id = $3, revocation_claim_id = $4, revocation_claimed_at = clock_timestamp(), \
+         revocation_generation = google_oauth_scope_state.credential_generation",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -941,6 +955,288 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     assert_detached_evidence_is_content_free(pool).await;
 
     test_database.destroy().await;
+}
+
+async fn assert_provider_preparation_gates(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    repository: &PostgresAccountDeletionRepository,
+    admission: &ProviderAdmission,
+    confirmation: &AccountDeletionFenceConfirmation,
+) {
+    let mut unauthorized = confirmation.clone();
+    unauthorized.confirming_session_id = Uuid::new_v4();
+    assert_eq!(
+        repository
+            .authorize_provider_preparation(&unauthorized)
+            .await,
+        Err(AccountDeletionRepositoryError::InvalidAuthority)
+    );
+    assert_eq!(
+        repository
+            .close_provider_admission_if_ready(&unauthorized)
+            .await,
+        Err(AccountDeletionRepositoryError::InvalidAuthority)
+    );
+    let mut stale = confirmation.clone();
+    stale.transition.expected_revision += 1;
+    assert_eq!(
+        repository.close_provider_admission_if_ready(&stale).await,
+        Err(AccountDeletionRepositoryError::Conflict)
+    );
+    let closed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM provider_admission_scopes \
+        WHERE workspace_id = $1 AND user_id = $2 AND closed_for_deletion_id IS NOT NULL)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!closed, "invalid authority must not close admission");
+    repository
+        .authorize_provider_preparation(confirmation)
+        .await
+        .expect("fresh confirming authority");
+    assert_preparation_oauth_blockers(pool, scope, repository, admission, confirmation).await;
+    assert_conditional_closure_registration_orders(pool, repository, admission, confirmation).await;
+    let replay = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .expect("exact conditional closure replays");
+    assert!(replay.is_ready() && replay.admission_closed);
+}
+
+#[allow(clippy::too_many_lines)] // Exercise each OAuth custody category before allowing closure.
+async fn assert_preparation_oauth_blockers(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    repository: &PostgresAccountDeletionRepository,
+    admission: &ProviderAdmission,
+    confirmation: &AccountDeletionFenceConfirmation,
+) {
+    let session_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO google_oauth_sessions (id, workspace_id, user_id, owner_subject_hash, \
+        state_hash, encrypted_pkce_verifier, verifier_key_version, encrypted_authorization_url, \
+        authorization_url_key_version, requested_scopes, created_at, expires_at) \
+        VALUES ($1, $2, $3, $4, $5, $6, 1, $6, 1, ARRAY['openid'], clock_timestamp(), clock_timestamp() + interval '10 minutes')")
+        .bind(session_id).bind(scope.workspace_id).bind(scope.user_id).bind([0xa1_u8; 32].as_slice())
+        .bind([0xa2_u8; 32].as_slice()).bind(vec![0xa3_u8; 64]).execute(pool).await.expect("pending readiness fixture");
+    let pending = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .unwrap();
+    assert_eq!(pending.pending_authorizations, 1);
+    assert!(!pending.is_ready() && !pending.admission_closed);
+    sqlx::query("UPDATE google_oauth_sessions SET status = 'exchanging', exchange_started_at = clock_timestamp() WHERE id = $1")
+        .bind(session_id).execute(pool).await.expect("exchange readiness fixture");
+    let exchanging = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .unwrap();
+    assert_eq!(exchanging.exchanging_authorizations, 1);
+    assert_eq!(exchanging.pending_authorizations, 0);
+    sqlx::query("UPDATE google_oauth_sessions SET status = 'staged', encrypted_pkce_verifier = NULL, \
+        verifier_key_version = NULL, staged_account_id = $2, staged_external_account_id = 'fixture', \
+        staged_display_label = 'Fixture', staged_encrypted_credentials = $3, staged_credential_key_version = 1, \
+        staged_granted_scopes = ARRAY['openid'], staged_token_expires_at = clock_timestamp() + interval '1 hour', \
+        staged_at = clock_timestamp() WHERE id = $1")
+        .bind(session_id).bind(Uuid::new_v4()).bind(vec![0xa5_u8; 64]).execute(pool).await.expect("staged readiness fixture");
+    let staged = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .unwrap();
+    assert_eq!(staged.staged_authorizations, 1);
+    assert_eq!(staged.exchanging_authorizations, 0);
+    assert!(!staged.is_ready() && !staged.admission_closed);
+    sqlx::query("UPDATE google_oauth_sessions SET status = 'failed', failed_at = clock_timestamp(), \
+        encrypted_pkce_verifier = NULL, verifier_key_version = NULL, encrypted_authorization_url = NULL, \
+        authorization_url_key_version = NULL, staged_account_id = NULL, staged_external_account_id = NULL, \
+        staged_display_label = NULL, staged_encrypted_credentials = NULL, staged_credential_key_version = NULL, \
+        staged_granted_scopes = NULL, staged_token_expires_at = NULL, staged_at = NULL WHERE id = $1")
+        .bind(session_id).execute(pool).await.expect("terminal authorization fixture");
+    sqlx::query("INSERT INTO google_oauth_cleanup_tokens (session_id, workspace_id, user_id, encrypted_refresh_token, \
+        key_version, created_at, updated_at, next_attempt_at) VALUES ($1, $2, $3, $4, 1, clock_timestamp(), clock_timestamp(), clock_timestamp())")
+        .bind(session_id).bind(scope.workspace_id).bind(scope.user_id).bind(vec![0xa4_u8; 64])
+        .execute(pool).await.expect("cleanup readiness fixture");
+    for status in ["held", "pending", "revoking", "operator_required"] {
+        sqlx::query("UPDATE google_oauth_cleanup_tokens SET status = $2, \
+            claim_id = CASE WHEN $2 = 'revoking' THEN $3 ELSE NULL END, \
+            claimed_at = CASE WHEN $2 = 'revoking' THEN clock_timestamp() ELSE NULL END WHERE session_id = $1")
+            .bind(session_id).bind(status).bind(Uuid::new_v4()).execute(pool).await.expect("cleanup custody category");
+        let readiness = repository
+            .close_provider_admission_if_ready(confirmation)
+            .await
+            .unwrap();
+        assert_eq!(readiness.cleanup_tokens, 1);
+        assert_eq!(
+            [
+                readiness.held_cleanup_tokens,
+                readiness.pending_cleanup_tokens,
+                readiness.revoking_cleanup_tokens,
+                readiness.operator_required_cleanup_tokens
+            ],
+            [
+                u64::from(status == "held"),
+                u64::from(status == "pending"),
+                u64::from(status == "revoking"),
+                u64::from(status == "operator_required")
+            ]
+        );
+        assert!(!readiness.is_ready() && !readiness.admission_closed);
+        assert_eq!(
+            readiness.next_cleanup_attempt_at.is_some(),
+            status == "pending"
+        );
+        assert!(
+            admission.run(async {}).await.is_ok(),
+            "busy preparation leaves recovery admission open"
+        );
+    }
+    sqlx::query("UPDATE google_oauth_cleanup_tokens SET status = 'pending', attempt_count = 12 WHERE session_id = $1")
+        .bind(session_id).execute(pool).await.expect("exhausted retained cleanup fixture");
+    let exhausted = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .unwrap();
+    assert_eq!(exhausted.exhausted_cleanup_tokens, 1);
+    assert!(exhausted.next_cleanup_attempt_at.is_none());
+    sqlx::query("DELETE FROM google_oauth_cleanup_tokens WHERE session_id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("test fixture explicitly settles cleanup custody");
+    sqlx::query("DELETE FROM google_oauth_sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("remove terminal authorization fixture");
+    sqlx::query(
+        "INSERT INTO google_oauth_scope_state (workspace_id, user_id, revocation_kind, \
+        revocation_owner_id, revocation_claim_id, revocation_claimed_at, revocation_generation) \
+        VALUES ($1, $2, 'guardian', $3, $4, clock_timestamp(), 0)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("active provider revocation fixture");
+    let busy = repository
+        .close_provider_admission_if_ready(confirmation)
+        .await
+        .unwrap();
+    assert_eq!(busy.revocation_fences, 1);
+    assert!(!busy.is_ready() && !busy.admission_closed);
+    admission.run(async {
+        sqlx::query("UPDATE google_oauth_scope_state SET revocation_kind = NULL, revocation_owner_id = NULL, \
+            revocation_claim_id = NULL, revocation_claimed_at = NULL, revocation_generation = NULL \
+            WHERE workspace_id = $1 AND user_id = $2")
+            .bind(scope.workspace_id).bind(scope.user_id).execute(pool).await.expect("admitted recovery can still settle");
+    }).await.expect("busy preparation preserves recovery access");
+    wait_for_preparation_operations_to_settle(pool).await;
+}
+
+async fn assert_conditional_closure_registration_orders(
+    pool: &PgPool,
+    repository: &PostgresAccountDeletionRepository,
+    admission: &ProviderAdmission,
+    confirmation: &AccountDeletionFenceConfirmation,
+) {
+    for register_first in [true, false] {
+        let mut blocker = pool.begin().await.expect("conditional-close race blocker");
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('dayweave.account-deletion.global-mutation-barrier.v1', 0))")
+            .execute(&mut *blocker).await.expect("hold global admission ordering barrier");
+        let registering = admission.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            registering
+                .run(async {
+                    let _ = released.await;
+                })
+                .await
+        };
+        let closing = repository.clone();
+        let confirmation = confirmation.clone();
+        let closure = async move {
+            closing
+                .close_provider_admission_if_ready(&confirmation)
+                .await
+        };
+        let (work, close) = if register_first {
+            let work = tokio::spawn(operation);
+            wait_for_preparation_lock_queue(pool, blocker_pid, 1).await;
+            (work, tokio::spawn(closure))
+        } else {
+            let close = tokio::spawn(closure);
+            wait_for_preparation_lock_queue(pool, blocker_pid, 1).await;
+            (tokio::spawn(operation), close)
+        };
+        wait_for_preparation_lock_queue(pool, blocker_pid, 2).await;
+        blocker
+            .commit()
+            .await
+            .expect("release ordered conditional-close race");
+        let readiness = close
+            .await
+            .expect("conditional-close task")
+            .expect("authorized readiness");
+        if register_first {
+            assert_eq!(readiness.unsettled_provider_operations, 1);
+            assert!(!readiness.is_ready() && !readiness.admission_closed);
+            release
+                .send(())
+                .expect("complete the winning admitted provider work");
+            work.await
+                .expect("provider task")
+                .expect("winning registration completes");
+            wait_for_preparation_operations_to_settle(pool).await;
+        } else {
+            assert!(readiness.is_ready() && readiness.admission_closed);
+            assert_eq!(
+                work.await.expect("losing registration"),
+                Err(ProviderAdmissionError::Closed)
+            );
+            drop(release);
+        }
+    }
+}
+
+async fn wait_for_preparation_lock_queue(pool: &PgPool, blocker_pid: i32, expected: i64) {
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("WITH RECURSIVE blocked(pid) AS (\
+                SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                UNION SELECT activity.pid FROM pg_stat_activity AS activity \
+                JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))) SELECT count(*) FROM blocked")
+                .bind(blocker_pid).fetch_one(pool).await.unwrap();
+            if count >= expected { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("conditional-close participants reach ordered lock queue");
+}
+
+async fn wait_for_preparation_operations_to_settle(pool: &PgPool) {
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM provider_admission_operations")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if count == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed fixture operations explicitly settle");
 }
 
 #[allow(clippy::too_many_lines)] // One catalog inventory verifies all deletion guards together.

@@ -432,6 +432,10 @@ impl GoogleOAuthService {
         self
     }
 
+    /// Installs the shared controller before any clone or recovery task exists.
+    ///
+    /// # Errors
+    /// Rejects a controller bound to a different user or workspace.
     pub(crate) fn new_with_admission(
         repository: Arc<dyn GoogleOAuthRepository>,
         transport: Arc<dyn GoogleOAuthTransport>,
@@ -457,6 +461,25 @@ impl GoogleOAuthService {
     pub(crate) async fn recover_startup(&self) -> Result<(), GoogleOAuthServiceError> {
         self.admission
             .run(self.recover_startup_admitted())
+            .await
+            .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
+    }
+
+    /// One bounded preparation pass, called only after deletion authorization.
+    /// Pending sessions can be cancelled; exchanging/staged credentials retain
+    /// their normal custody and reconciliation rules. Success is not readiness.
+    pub(crate) async fn prepare_for_account_deletion(
+        &self,
+    ) -> Result<u64, GoogleOAuthServiceError> {
+        self.admission
+            .run(async {
+                let cancelled = self
+                    .repository
+                    .cancel_pending_authorizations_for_deletion(self.clock.now())
+                    .await?;
+                self.recover_startup_admitted().await?;
+                Ok(cancelled)
+            })
             .await
             .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
     }
@@ -2298,6 +2321,91 @@ mod tests {
             .await
             .expect("promote cleanup token");
         claimed.id
+    }
+
+    #[tokio::test]
+    async fn deletion_preparation_cancels_pending_without_closing_recovery() {
+        let (service, _, transport, _) = fixture([Some("unused-preparation-refresh")]);
+        let started = service
+            .begin(begin_input(), idempotency("deletion-pending"))
+            .await
+            .expect("pending authorization");
+        assert_eq!(service.prepare_for_account_deletion().await.unwrap(), 1);
+        assert_eq!(service.prepare_for_account_deletion().await.unwrap(), 0);
+        assert!(!service.admission().is_closed());
+        assert!(matches!(
+            service
+                .callback(
+                    &FakeTransport::state_from_url(&started.authorization_url),
+                    "unused-code"
+                )
+                .await,
+            Err(GoogleOAuthServiceError::Repository(
+                GoogleOAuthRepositoryError::InvalidCallbackState
+            ))
+        ));
+        assert_eq!(transport.0.lock().unwrap().exchanges, 0);
+        assert!(transport.0.lock().unwrap().revoked_tokens.is_empty());
+        service
+            .begin(begin_input(), idempotency("deletion-still-open"))
+            .await
+            .expect("preparation alone does not close provider admission");
+    }
+
+    #[tokio::test]
+    async fn deletion_preparation_retains_backoff_and_does_not_invent_revocation() {
+        let (service, repository, transport, _) = fixture([]);
+        pending_cleanup(
+            &service,
+            &repository,
+            "deletion-retry",
+            "cleanup-for-preparation",
+        )
+        .await;
+        transport.0.lock().unwrap().fail_next_revoke = true;
+        assert_eq!(service.prepare_for_account_deletion().await.unwrap(), 0);
+        let first = repository.cleanup_status().await.unwrap();
+        assert_eq!(first.pending, 1);
+        assert_eq!(service.prepare_for_account_deletion().await.unwrap(), 0);
+        assert_eq!(repository.cleanup_status().await.unwrap().pending, 1);
+        assert_eq!(
+            transport.0.lock().unwrap().revoked_tokens.len(),
+            1,
+            "another pass respects durable provider backoff"
+        );
+        assert!(!service.admission().is_closed());
+    }
+
+    #[tokio::test]
+    async fn closed_admission_rejects_preparation_before_pending_session_mutation() {
+        let (service, repository, _, clock) = fixture([]);
+        let started = service
+            .begin(begin_input(), idempotency("deletion-already-closed"))
+            .await
+            .expect("pending authorization");
+        let _proof = service
+            .admission()
+            .close_and_drain(Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.prepare_for_account_deletion().await,
+            Err(GoogleOAuthServiceError::AdmissionClosed)
+        ));
+        assert!(
+            matches!(
+                repository
+                    .claim_callback(
+                        hash_secret(&FakeTransport::state_from_url(&started.authorization_url)),
+                        clock.now(),
+                        clock.now() - EXCHANGE_LEASE,
+                    )
+                    .await
+                    .unwrap(),
+                CallbackClaim::Exchange(_)
+            ),
+            "rejected preparation never cancelled the existing authorization"
+        );
     }
 
     #[tokio::test]

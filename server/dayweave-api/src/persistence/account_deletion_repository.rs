@@ -16,18 +16,25 @@ use crate::{
         AccountDeletionProviderCleanupFailure, AccountDeletionProviderCleanupMutation,
         AccountDeletionProviderCleanupOutcome, AccountDeletionProviderCleanupStatus,
         AccountDeletionProviderCleanupSummary, AccountDeletionProviderCleanupTargetBinding,
-        AccountDeletionProviderCredentialEnvelope, AccountDeletionRepository,
-        AccountDeletionRepositoryError, AccountDeletionSafetyGate, AccountDeletionSafetyGateError,
-        AccountDeletionStatus, AccountDeletionTransition, DisabledAccountDeletionSafetyGate,
-        account_deletion_approval_digest, account_deletion_provider_cleanup_manifest_digest,
+        AccountDeletionProviderCredentialEnvelope, AccountDeletionProviderReadiness,
+        AccountDeletionRepository, AccountDeletionRepositoryError, AccountDeletionSafetyGate,
+        AccountDeletionSafetyGateError, AccountDeletionStatus, AccountDeletionTransition,
+        DisabledAccountDeletionSafetyGate, account_deletion_approval_digest,
+        account_deletion_provider_cleanup_manifest_digest,
     },
     credential_auth::{
         CredentialKind, DEVICE_CLIENT_CONTRACT_VERSION, OpaqueCredential, full_owner_device_scopes,
     },
+    google_oauth::MAX_CLEANUP_ATTEMPTS,
     provider_admission::{DrainedProviderAdmission, ProviderAdmission},
 };
 
-use super::DatabaseScope;
+use super::{
+    DatabaseScope,
+    provider_admission_repository::{
+        close_provider_admission_for_deletion, lock_provider_admission_for_deletion,
+    },
+};
 
 const FRESH_AUTHORITY_WINDOW: Duration = Duration::minutes(5);
 const RECOVERY_CODE_MINIMUM_AGE: Duration = Duration::days(1);
@@ -1070,11 +1077,106 @@ impl PostgresAccountDeletionRepository {
         self.provider_admission = Some(admission);
         self
     }
+
+    pub(crate) fn matches_provider_admission(&self, admission: &ProviderAdmission) -> bool {
+        self.configured_provider_admission()
+            .is_ok_and(|configured| configured.same_controller(admission))
+    }
+
+    fn configured_provider_admission(
+        &self,
+    ) -> Result<&ProviderAdmission, AccountDeletionRepositoryError> {
+        let admission = self
+            .provider_admission
+            .as_ref()
+            .ok_or(AccountDeletionRepositoryError::Disabled)?;
+        if !admission.is_durable() {
+            return Err(AccountDeletionRepositoryError::Disabled);
+        }
+        if admission.scope().workspace_id != self.scope.workspace_id
+            || admission.scope().user_id != self.scope.user_id
+        {
+            return Err(AccountDeletionRepositoryError::ProviderCleanupBlocked);
+        }
+        Ok(admission)
+    }
+
+    async fn begin_authorized_provider_preparation(
+        &self,
+        confirmation: &AccountDeletionFenceConfirmation,
+    ) -> Result<Transaction<'_, Postgres>, AccountDeletionRepositoryError> {
+        self.configured_provider_admission()?;
+        let principal = self
+            .external_principal
+            .ok_or(AccountDeletionRepositoryError::Disabled)?;
+        let transition = &confirmation.transition;
+        validate_transition(transition)?;
+        validate_fence_confirmation(confirmation, transition, self.scope)?;
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        // Readiness must observe commits that finished while the barrier was
+        // being acquired, even if the pool's configured default is stronger.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        let lifecycle =
+            lock_lifecycle(&mut transaction, self.scope, transition.deletion_id).await?;
+        validate_lifecycle_principal(&lifecycle, principal)?;
+        lock_deletion_scope(
+            &mut transaction,
+            self.scope,
+            lifecycle.owner_subject_hash.as_slice(),
+        )
+        .await?;
+        validate_current_fence_authority(&mut transaction, self.scope, &lifecycle, confirmation)
+            .await?;
+        Ok(transaction)
+    }
 }
 
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl AccountDeletionRepository for PostgresAccountDeletionRepository {
+    async fn authorize_provider_preparation(
+        &self,
+        confirmation: &AccountDeletionFenceConfirmation,
+    ) -> Result<(), AccountDeletionRepositoryError> {
+        let mut transaction = self
+            .begin_authorized_provider_preparation(confirmation)
+            .await?;
+        lock_provider_admission_for_deletion(
+            &mut transaction,
+            self.scope,
+            confirmation.transition.deletion_id,
+        )
+        .await?;
+        transaction.commit().await.map_err(internal)
+    }
+
+    async fn close_provider_admission_if_ready(
+        &self,
+        confirmation: &AccountDeletionFenceConfirmation,
+    ) -> Result<AccountDeletionProviderReadiness, AccountDeletionRepositoryError> {
+        let mut transaction = self
+            .begin_authorized_provider_preparation(confirmation)
+            .await?;
+        let deletion_id = confirmation.transition.deletion_id;
+        let closed =
+            lock_provider_admission_for_deletion(&mut transaction, self.scope, deletion_id).await?;
+        let mut readiness = provider_readiness_snapshot(&mut transaction, self.scope).await?;
+        readiness.admission_closed = closed;
+        if readiness.is_ready() {
+            // The exclusive barrier stays held from authority validation and
+            // the single readiness snapshot through this guarded write. No
+            // admitted operation can appear or leave durable work in between.
+            close_provider_admission_for_deletion(&mut transaction, self.scope, deletion_id)
+                .await?;
+            readiness.admission_closed = true;
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(readiness)
+    }
+
     async fn provider_cleanup_status(
         &self,
         deletion_id: Uuid,
@@ -1349,11 +1451,7 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         let lifecycle =
             lock_lifecycle(&mut transaction, self.scope, transition.deletion_id).await?;
-        if !principal.matches_local_subject_hash(&lifecycle.owner_subject_hash)
-            || !lifecycle.matches_external_principal(principal)
-        {
-            return Err(AccountDeletionRepositoryError::InvalidAuthority);
-        }
+        validate_lifecycle_principal(&lifecycle, principal)?;
         lock_deletion_scope(
             &mut transaction,
             self.scope,
@@ -1372,49 +1470,14 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
             transaction.commit().await.map_err(internal)?;
             return Ok(replay);
         }
-        validate_locked_transition(&lifecycle, &transition)?;
-        let current_subject_hash = fetch_subject_hash(&mut transaction, self.scope).await?;
-        if current_subject_hash != lifecycle.owner_subject_hash {
-            return Err(AccountDeletionRepositoryError::InvalidAuthority);
-        }
-        let operation_at = database_now(&mut transaction).await?;
-        let ready_at = lifecycle
-            .prepared_at
-            .checked_add_signed(DELETION_COOLING_OFF_PERIOD)
-            .ok_or(AccountDeletionRepositoryError::Internal)?;
-        if operation_at < ready_at {
-            return Err(AccountDeletionRepositoryError::CooldownPending);
-        }
-        if confirmation.confirming_session_id == lifecycle.authorizing_session_id
-            && confirmation.confirming_session_revision <= lifecycle.authorizing_session_revision
-        {
-            return Err(AccountDeletionRepositoryError::InvalidAuthority);
-        }
-        let credential_issued_at = validate_fresh_full_owner_session(
+        let (operation_at, credential_issued_at) = validate_current_fence_authority(
             &mut transaction,
             self.scope,
-            confirmation.confirming_session_id,
-            confirmation.confirming_session_revision,
-            operation_at,
+            &lifecycle,
+            &confirmation,
         )
         .await?;
-        validate_stored_current_recovery_code(
-            &mut transaction,
-            self.scope,
-            lifecycle.authorizing_recovery_code_id,
-            lifecycle.authorizing_recovery_code_revision,
-            lifecycle.authorizing_recovery_code_created_at,
-            operation_at,
-        )
-        .await?;
-        ensure_personal_scope(&mut transaction, self.scope).await?;
         ensure_provider_cleanup_quiescent(&mut transaction, self.scope).await?;
-        ensure_no_fence(
-            &mut transaction,
-            self.scope,
-            lifecycle.owner_subject_hash.as_slice(),
-        )
-        .await?;
         let result_revision = transition
             .expected_revision
             .checked_add(1)
@@ -1818,6 +1881,68 @@ impl LockedLifecycle {
     }
 }
 
+fn validate_lifecycle_principal(
+    lifecycle: &LockedLifecycle,
+    principal: AccountDeletionPrincipalBinding,
+) -> Result<(), AccountDeletionRepositoryError> {
+    if principal.matches_local_subject_hash(&lifecycle.owner_subject_hash)
+        && lifecycle.matches_external_principal(principal)
+    {
+        Ok(())
+    } else {
+        Err(AccountDeletionRepositoryError::InvalidAuthority)
+    }
+}
+
+/// The same current authority is required before provider preparation, before
+/// committing sticky admission closure, and before a new final fence. Final
+/// fence receipt replay remains separate and retains its existing semantics.
+async fn validate_current_fence_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    lifecycle: &LockedLifecycle,
+    confirmation: &AccountDeletionFenceConfirmation,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), AccountDeletionRepositoryError> {
+    validate_locked_transition(lifecycle, &confirmation.transition)?;
+    let current_subject_hash = fetch_subject_hash(transaction, scope).await?;
+    if current_subject_hash != lifecycle.owner_subject_hash {
+        return Err(AccountDeletionRepositoryError::InvalidAuthority);
+    }
+    let operation_at = database_now(transaction).await?;
+    let ready_at = lifecycle
+        .prepared_at
+        .checked_add_signed(DELETION_COOLING_OFF_PERIOD)
+        .ok_or(AccountDeletionRepositoryError::Internal)?;
+    if operation_at < ready_at {
+        return Err(AccountDeletionRepositoryError::CooldownPending);
+    }
+    if confirmation.confirming_session_id == lifecycle.authorizing_session_id
+        && confirmation.confirming_session_revision <= lifecycle.authorizing_session_revision
+    {
+        return Err(AccountDeletionRepositoryError::InvalidAuthority);
+    }
+    let credential_issued_at = validate_fresh_full_owner_session(
+        transaction,
+        scope,
+        confirmation.confirming_session_id,
+        confirmation.confirming_session_revision,
+        operation_at,
+    )
+    .await?;
+    validate_stored_current_recovery_code(
+        transaction,
+        scope,
+        lifecycle.authorizing_recovery_code_id,
+        lifecycle.authorizing_recovery_code_revision,
+        lifecycle.authorizing_recovery_code_created_at,
+        operation_at,
+    )
+    .await?;
+    ensure_personal_scope(transaction, scope).await?;
+    ensure_no_fence(transaction, scope, lifecycle.owner_subject_hash.as_slice()).await?;
+    Ok((operation_at, credential_issued_at))
+}
+
 async fn lookup_preparation<'e, E>(
     executor: E,
     scope: DatabaseScope,
@@ -2182,54 +2307,117 @@ async fn ensure_provider_cleanup_quiescent(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
 ) -> Result<(), AccountDeletionRepositoryError> {
-    let quiescent = sqlx::query_scalar::<_, bool>(
-        "SELECT NOT ( \
-             EXISTS(SELECT 1 FROM google_oauth_sessions \
-                 WHERE workspace_id = $1 AND user_id = $2 \
-                 AND status IN ('pending', 'exchanging', 'staged')) \
-          OR EXISTS(SELECT 1 FROM google_oauth_cleanup_tokens \
-                 WHERE workspace_id = $1 AND user_id = $2) \
-          OR EXISTS(SELECT 1 FROM google_oauth_legacy_credential_quarantine \
-                 WHERE workspace_id = $1 AND user_id = $2 \
-                 AND recovery_confirmed_at IS NULL) \
-          OR EXISTS(SELECT 1 FROM google_oauth_scope_state \
-                 WHERE workspace_id = $1 AND user_id = $2 \
-                 AND revocation_kind IS NOT NULL) \
-          OR EXISTS(SELECT 1 FROM provider_accounts \
-                 WHERE workspace_id = $1 AND user_id = $2 AND status <> 'revoked' \
-                 AND (id = '00000000-0000-0000-0000-000000000000'::uuid \
-                     OR provider <> 'google' OR status IN ( \
-                     'disconnecting', 'revocation_failed', 'operator_recovery_required'))) \
-          OR (SELECT count(*) FROM provider_accounts \
-                 WHERE workspace_id = $1 AND user_id = $2 AND status <> 'revoked') > $3 \
-          OR EXISTS(SELECT 1 FROM provider_accounts AS account \
-                 WHERE account.workspace_id = $1 AND account.user_id = $2 \
-                 AND account.status <> 'revoked' \
-                 AND NOT EXISTS(SELECT 1 FROM google_oauth_scope_state AS scope_state \
-                     WHERE scope_state.workspace_id = account.workspace_id \
-                     AND scope_state.user_id = account.user_id)) \
-          OR EXISTS(SELECT 1 FROM google_sync_runs \
-                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'running') \
-          OR EXISTS(SELECT 1 FROM google_sync_outbox \
-                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering') \
-          OR EXISTS(SELECT 1 FROM google_schedule_publication_outbox \
-                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering') \
-          OR EXISTS(SELECT 1 FROM google_schedule_publication_batches \
-                 WHERE workspace_id = $1 AND user_id = $2 \
-                 AND (state = 'delivering' OR delivering_count > 0)) \
-        )",
-    )
-    .bind(scope.workspace_id)
-    .bind(scope.user_id)
-    .bind(i64::try_from(ACCOUNT_DELETION_PROVIDER_CLEANUP_MAX_TARGETS).map_err(internal)?)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(internal)?;
-    if quiescent {
+    if provider_readiness_snapshot(transaction, scope)
+        .await?
+        .is_ready()
+    {
         Ok(())
     } else {
         Err(AccountDeletionRepositoryError::ProviderCleanupBlocked)
     }
+}
+
+/// One snapshot supplies both preparation diagnostics and the unchanged final
+/// provider-work predicate, including all retained cleanup custody states.
+/// Closure state is filled by the caller under its registry serialization.
+#[allow(clippy::too_many_lines)]
+async fn provider_readiness_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<AccountDeletionProviderReadiness, AccountDeletionRepositoryError> {
+    let row = sqlx::query(
+        "WITH authorization_counts AS ( \
+             SELECT count(*) FILTER (WHERE status = 'pending') AS pending_authorizations, \
+                 count(*) FILTER (WHERE status = 'exchanging') AS exchanging_authorizations, \
+                 count(*) FILTER (WHERE status = 'staged') AS staged_authorizations \
+             FROM google_oauth_sessions WHERE workspace_id = $1 AND user_id = $2 \
+         ), cleanup_counts AS ( \
+             SELECT count(*) AS cleanup_tokens, \
+                 count(*) FILTER (WHERE status = 'held') AS held_cleanup_tokens, \
+                 count(*) FILTER (WHERE status = 'pending') AS pending_cleanup_tokens, \
+                 count(*) FILTER (WHERE status = 'revoking') AS revoking_cleanup_tokens, \
+                 count(*) FILTER (WHERE status = 'operator_required') \
+                     AS operator_required_cleanup_tokens, \
+                 count(*) FILTER (WHERE attempt_count >= $4) AS exhausted_cleanup_tokens, \
+                 min(next_attempt_at) FILTER (WHERE status = 'pending' AND attempt_count < $4) \
+                     AS next_cleanup_attempt_at \
+             FROM google_oauth_cleanup_tokens WHERE workspace_id = $1 AND user_id = $2 \
+         ), account_counts AS ( \
+             SELECT count(*) FILTER (WHERE provider <> 'google' \
+                     OR id = '00000000-0000-0000-0000-000000000000'::uuid) \
+                     AS unsupported_provider_accounts, \
+                 count(*) FILTER (WHERE status = 'disconnecting') \
+                     AS disconnecting_provider_accounts, \
+                 count(*) FILTER (WHERE status = 'revocation_failed') \
+                     AS revocation_failed_provider_accounts, \
+                 count(*) FILTER (WHERE status = 'operator_recovery_required') \
+                     AS operator_recovery_provider_accounts, \
+                 GREATEST(count(*) - $3::bigint, 0::bigint) AS excess_provider_accounts, \
+                 count(*) FILTER (WHERE NOT EXISTS(SELECT 1 FROM google_oauth_scope_state \
+                     WHERE workspace_id = $1 AND user_id = $2)) \
+                     AS provider_accounts_missing_oauth_scope \
+             FROM provider_accounts \
+             WHERE workspace_id = $1 AND user_id = $2 AND status <> 'revoked' \
+         ) SELECT authorization_counts.*, cleanup_counts.*, account_counts.*, \
+             (SELECT count(*) FROM google_oauth_legacy_credential_quarantine \
+                 WHERE workspace_id = $1 AND user_id = $2 \
+                     AND recovery_confirmed_at IS NULL) AS unresolved_legacy_credentials, \
+             (SELECT count(*) FROM google_oauth_scope_state \
+                 WHERE workspace_id = $1 AND user_id = $2 \
+                     AND revocation_kind IS NOT NULL) AS revocation_fences, \
+             (SELECT count(*) FROM google_sync_runs \
+                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'running') \
+                 AS running_sync_runs, \
+             (SELECT count(*) FROM google_sync_outbox \
+                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering') \
+                 AS delivering_sync_outbox, \
+             (SELECT count(*) FROM google_schedule_publication_outbox \
+                 WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering') \
+                 AS delivering_schedule_outbox, \
+             (SELECT count(*) FROM google_schedule_publication_batches \
+                 WHERE workspace_id = $1 AND user_id = $2 \
+                     AND (state = 'delivering' OR delivering_count > 0)) \
+                 AS delivering_schedule_batches, \
+             (SELECT count(*) FROM provider_admission_operations \
+                 WHERE workspace_id = $1 OR user_id = $2) AS unsettled_provider_operations \
+         FROM authorization_counts CROSS JOIN cleanup_counts CROSS JOIN account_counts",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(i64::try_from(ACCOUNT_DELETION_PROVIDER_CLEANUP_MAX_TARGETS).map_err(internal)?)
+    .bind(i32::try_from(MAX_CLEANUP_ATTEMPTS).map_err(internal)?)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let count = |column: &str| -> Result<u64, AccountDeletionRepositoryError> {
+        u64::try_from(row.try_get::<i64, _>(column).map_err(internal)?).map_err(internal)
+    };
+    Ok(AccountDeletionProviderReadiness {
+        pending_authorizations: count("pending_authorizations")?,
+        exchanging_authorizations: count("exchanging_authorizations")?,
+        staged_authorizations: count("staged_authorizations")?,
+        cleanup_tokens: count("cleanup_tokens")?,
+        held_cleanup_tokens: count("held_cleanup_tokens")?,
+        pending_cleanup_tokens: count("pending_cleanup_tokens")?,
+        revoking_cleanup_tokens: count("revoking_cleanup_tokens")?,
+        operator_required_cleanup_tokens: count("operator_required_cleanup_tokens")?,
+        exhausted_cleanup_tokens: count("exhausted_cleanup_tokens")?,
+        unresolved_legacy_credentials: count("unresolved_legacy_credentials")?,
+        revocation_fences: count("revocation_fences")?,
+        unsupported_provider_accounts: count("unsupported_provider_accounts")?,
+        disconnecting_provider_accounts: count("disconnecting_provider_accounts")?,
+        revocation_failed_provider_accounts: count("revocation_failed_provider_accounts")?,
+        operator_recovery_provider_accounts: count("operator_recovery_provider_accounts")?,
+        excess_provider_accounts: count("excess_provider_accounts")?,
+        provider_accounts_missing_oauth_scope: count("provider_accounts_missing_oauth_scope")?,
+        running_sync_runs: count("running_sync_runs")?,
+        delivering_sync_outbox: count("delivering_sync_outbox")?,
+        delivering_schedule_outbox: count("delivering_schedule_outbox")?,
+        delivering_schedule_batches: count("delivering_schedule_batches")?,
+        unsettled_provider_operations: count("unsettled_provider_operations")?,
+        next_cleanup_attempt_at: row.try_get("next_cleanup_attempt_at").map_err(internal)?,
+        admission_closed: false,
+    })
 }
 
 async fn ensure_no_fence(

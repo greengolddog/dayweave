@@ -9,7 +9,8 @@ use super::{
     AccountDeletionMutation, AccountDeletionPreparation, AccountDeletionPreparationSafetyEvidence,
     AccountDeletionPrincipalPseudonym, AccountDeletionProviderCleanupClaim,
     AccountDeletionProviderCleanupCompletion, AccountDeletionProviderCleanupMutation,
-    AccountDeletionProviderCleanupSummary, AccountDeletionTransition,
+    AccountDeletionProviderCleanupSummary, AccountDeletionProviderReadiness,
+    AccountDeletionTransition,
 };
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -104,6 +105,24 @@ pub trait AccountDeletionRepository: Send + Sync {
         preparation: AccountDeletionPreparation,
         recovery_code: &OpaqueCredential<'_>,
     ) -> Result<AccountDeletionMutation, AccountDeletionRepositoryError>;
+
+    /// Revalidates the prepared lifecycle, fresh confirming owner, cooldown,
+    /// recovery continuity, personal scope, and configured durable controller
+    /// before any pending authorization is cancelled or recovery is attempted.
+    /// This does not install a fence or authorize an external grant revocation.
+    async fn authorize_provider_preparation(
+        &self,
+        confirmation: &AccountDeletionFenceConfirmation,
+    ) -> Result<(), AccountDeletionRepositoryError>;
+
+    /// Revalidates authority and atomically snapshots all provider blockers and
+    /// overlapping operations before conditional durable closure. A blocked
+    /// result leaves open admission open; a ready result has committed exact
+    /// closure. No provider call or provider wait occurs under database locks.
+    async fn close_provider_admission_if_ready(
+        &self,
+        confirmation: &AccountDeletionFenceConfirmation,
+    ) -> Result<AccountDeletionProviderReadiness, AccountDeletionRepositoryError>;
 
     /// Atomically installs the hard scope fence and advances the lifecycle to
     /// `fence_committing`. Once this succeeds cancellation is forbidden. The

@@ -70,6 +70,15 @@ pub trait GoogleOAuthRepository: Send + Sync {
         exchange_stale_before: DateTime<Utc>,
     ) -> Result<OAuthSessionStart, GoogleOAuthRepositoryError>;
 
+    /// Cancels only authorizations that have not started exchanging credentials.
+    /// The deletion service must validate its owner confirmation and retain
+    /// provider admission before calling this internal preparation primitive.
+    /// Existing exchange/staging and cleanup custody are never discarded.
+    async fn cancel_pending_authorizations_for_deletion(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, GoogleOAuthRepositoryError>;
+
     async fn claim_callback(
         &self,
         state_hash: SecretHash,
@@ -357,6 +366,7 @@ struct MemoryIdempotency {
 #[derive(Clone, Debug)]
 enum MemoryReplay {
     Session(OAuthSessionStart),
+    CancelledSession,
     Account(GoogleAccount),
     DisconnectPending { account_id: Uuid },
 }
@@ -422,6 +432,9 @@ impl GoogleOAuthRepository for InMemoryGoogleOAuthRepository {
                     started.replayed = true;
                     Ok(started)
                 }
+                MemoryReplay::CancelledSession => {
+                    Err(GoogleOAuthRepositoryError::InvalidCallbackState)
+                }
                 _ => Err(GoogleOAuthRepositoryError::IdempotencyConflict),
             };
         }
@@ -478,6 +491,44 @@ impl GoogleOAuthRepository for InMemoryGoogleOAuthRepository {
             Some(MemoryReplay::Session(started.clone())),
         );
         Ok(started)
+    }
+
+    async fn cancel_pending_authorizations_for_deletion(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, GoogleOAuthRepositoryError> {
+        let mut state = self.state.lock().await;
+        let cancelled: Vec<Uuid> = state
+            .sessions
+            .values_mut()
+            .filter(|session| session.status == MemorySessionStatus::Pending)
+            .map(|session| {
+                fail_memory_session(session);
+                session.value.encrypted_verifier.key_version = 0;
+                session
+                    .value
+                    .encrypted_authorization_url
+                    .ciphertext
+                    .zeroize();
+                session.value.encrypted_authorization_url.ciphertext.clear();
+                session.value.encrypted_authorization_url.key_version = 0;
+                session.value.id
+            })
+            .collect();
+        for entry in state.idempotency.values_mut() {
+            if let Some(MemoryReplay::Session(started)) = entry.response.as_mut()
+                && cancelled.contains(&started.id)
+            {
+                // The in-memory adapter retains a response copy, unlike the
+                // PostgreSQL adapter's resource-only idempotency receipt.
+                started.encrypted_authorization_url.ciphertext.zeroize();
+                entry.response = Some(MemoryReplay::CancelledSession);
+            }
+        }
+        for session_id in &cancelled {
+            promote_memory_cleanup(&mut state, *session_id, now);
+        }
+        u64::try_from(cancelled.len()).map_err(|_| GoogleOAuthRepositoryError::Internal)
     }
 
     async fn claim_callback(
@@ -1850,4 +1901,263 @@ fn bump(account: &mut GoogleAccount, now: DateTime<Utc>) -> Result<(), GoogleOAu
         .ok_or(GoogleOAuthRepositoryError::Internal)?;
     account.updated_at = now;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::google_oauth::SealedSecret;
+    use chrono::Duration;
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_788_739_200, 0).expect("synthetic test time")
+    }
+
+    fn session() -> NewOAuthSession {
+        NewOAuthSession {
+            id: Uuid::new_v4(),
+            owner_subject_hash: [81; 32],
+            state_hash: [82; 32],
+            encrypted_verifier: SealedSecret {
+                key_version: 9,
+                ciphertext: vec![83; 48],
+            },
+            encrypted_authorization_url: SealedSecret {
+                key_version: 10,
+                ciphertext: vec![84; 48],
+            },
+            requested_scopes: ["openid".to_owned()].into_iter().collect(),
+            expected_account_id: None,
+            expected_account_revision: None,
+            make_default: false,
+            created_at: now(),
+            expires_at: now() + Duration::minutes(15),
+        }
+    }
+
+    fn idempotency() -> OAuthIdempotency {
+        OAuthIdempotency {
+            namespace: "deletion_pending_cancellation_test",
+            key_hash: [85; 32],
+            request_fingerprint: [86; 32],
+            expires_at: now() + Duration::hours(1),
+        }
+    }
+
+    fn cleanup_credential() -> SealedSecret {
+        SealedSecret {
+            key_version: 11,
+            ciphertext: vec![87; 48],
+        }
+    }
+
+    async fn start(repository: &InMemoryGoogleOAuthRepository, session: &NewOAuthSession) {
+        repository
+            .create_session(session.clone(), idempotency(), now() - Duration::minutes(5))
+            .await
+            .expect("pending authorization fixture");
+    }
+
+    #[tokio::test]
+    async fn deletion_cancellation_scrubs_pending_and_cached_url_without_discarding_cleanup() {
+        let repository = InMemoryGoogleOAuthRepository::default();
+        let session = session();
+        start(&repository, &session).await;
+        // A retained legacy/defensive custody row must survive even if its
+        // associated session is still pending rather than exchanging.
+        repository.state.lock().await.cleanup.insert(
+            session.id,
+            MemoryCleanup {
+                encrypted_refresh_token: cleanup_credential(),
+                external_account_id: Some("synthetic-google-subject".to_owned()),
+                status: MemoryCleanupStatus::Held,
+                attempt_count: 3,
+                created_at: now(),
+                last_failure_at: Some(now()),
+                next_attempt_at: now() + Duration::hours(1),
+            },
+        );
+        let cancelled_at = now() + Duration::seconds(10);
+        assert_eq!(
+            repository
+                .cancel_pending_authorizations_for_deletion(cancelled_at)
+                .await
+                .expect("cancel pending authorization"),
+            1
+        );
+        assert_eq!(
+            repository
+                .clone()
+                .cancel_pending_authorizations_for_deletion(cancelled_at + Duration::seconds(10))
+                .await
+                .expect("repeat cancellation"),
+            0
+        );
+        {
+            let state = repository.state.lock().await;
+            let retained = &state.sessions[&session.state_hash];
+            assert_eq!(retained.status, MemorySessionStatus::Failed);
+            assert!(retained.value.encrypted_verifier.ciphertext.is_empty());
+            assert_eq!(retained.value.encrypted_verifier.key_version, 0);
+            assert!(
+                retained
+                    .value
+                    .encrypted_authorization_url
+                    .ciphertext
+                    .is_empty()
+            );
+            assert_eq!(retained.value.encrypted_authorization_url.key_version, 0);
+            assert!(retained.exchange_started_at.is_none());
+            assert!(retained.staged.is_none());
+            assert!(matches!(
+                state
+                    .idempotency
+                    .values()
+                    .next()
+                    .expect("retained request identity")
+                    .response,
+                Some(MemoryReplay::CancelledSession)
+            ));
+            let cleanup = &state.cleanup[&session.id];
+            assert_eq!(cleanup.encrypted_refresh_token, cleanup_credential());
+            assert_eq!(
+                cleanup.external_account_id.as_deref(),
+                Some("synthetic-google-subject")
+            );
+            assert!(matches!(cleanup.status, MemoryCleanupStatus::Pending));
+            assert_eq!(cleanup.next_attempt_at, cancelled_at);
+            assert_eq!(cleanup.attempt_count, 3);
+            assert_eq!(cleanup.created_at, now());
+            assert_eq!(cleanup.last_failure_at, Some(now()));
+        }
+        assert!(matches!(
+            repository
+                .claim_callback(session.state_hash, cancelled_at, now())
+                .await,
+            Err(GoogleOAuthRepositoryError::InvalidCallbackState)
+        ));
+        assert!(matches!(
+            repository
+                .create_session(session.clone(), idempotency(), now())
+                .await,
+            Err(GoogleOAuthRepositoryError::InvalidCallbackState)
+        ));
+        let mut conflicting = idempotency();
+        conflicting.request_fingerprint = [88; 32];
+        assert!(matches!(
+            repository.create_session(session, conflicting, now()).await,
+            Err(GoogleOAuthRepositoryError::IdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletion_cancellation_is_isolated_to_its_repository_scope() {
+        let selected = InMemoryGoogleOAuthRepository::default();
+        let other = InMemoryGoogleOAuthRepository::default();
+        let session = session();
+        start(&selected, &session).await;
+        start(&other, &session).await;
+        assert_eq!(
+            selected
+                .cancel_pending_authorizations_for_deletion(now())
+                .await
+                .unwrap(),
+            1
+        );
+        {
+            let state = other.state.lock().await;
+            let retained = &state.sessions[&session.state_hash];
+            assert_eq!(retained.status, MemorySessionStatus::Pending);
+            assert_eq!(
+                retained.value.encrypted_verifier,
+                session.encrypted_verifier
+            );
+            assert_eq!(
+                retained.value.encrypted_authorization_url,
+                session.encrypted_authorization_url
+            );
+        }
+        assert!(matches!(
+            other
+                .claim_callback(session.state_hash, now(), now())
+                .await
+                .unwrap(),
+            CallbackClaim::Exchange(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletion_cancellation_preserves_exchanging_and_staged_credentials() {
+        for staged in [false, true] {
+            let repository = InMemoryGoogleOAuthRepository::default();
+            let session = session();
+            start(&repository, &session).await;
+            repository
+                .claim_callback(session.state_hash, now(), now())
+                .await
+                .unwrap();
+            repository
+                .hold_cleanup_token(session.id, cleanup_credential(), now())
+                .await
+                .unwrap();
+            let staged_credentials = EncryptedCredentials {
+                sealed: SealedSecret {
+                    key_version: 12,
+                    ciphertext: vec![89; 48],
+                },
+            };
+            if staged {
+                repository
+                    .stage_authorization(AuthorizationCompletion {
+                        session_id: session.id,
+                        owner_subject_hash: session.owner_subject_hash,
+                        expected_account_revision: None,
+                        account_id: Uuid::new_v4(),
+                        make_default: session.make_default,
+                        external_account_id: "synthetic-google-subject".to_owned(),
+                        display_label: "Synthetic account".to_owned(),
+                        credentials: staged_credentials.clone(),
+                        granted_scopes: session.requested_scopes.clone(),
+                        token_expires_at: now() + Duration::hours(1),
+                        now: now(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                repository
+                    .cancel_pending_authorizations_for_deletion(now() + Duration::days(1))
+                    .await
+                    .unwrap(),
+                0
+            );
+            let state = repository.state.lock().await;
+            let retained = &state.sessions[&session.state_hash];
+            assert_eq!(
+                retained.value.encrypted_authorization_url,
+                session.encrypted_authorization_url
+            );
+            assert_eq!(retained.exchange_started_at, Some(now()));
+            if staged {
+                assert_eq!(retained.status, MemorySessionStatus::Staged);
+                assert_eq!(
+                    retained.staged.as_ref().unwrap().credentials.sealed,
+                    staged_credentials.sealed
+                );
+            } else {
+                assert_eq!(retained.status, MemorySessionStatus::Exchanging);
+                assert_eq!(
+                    retained.value.encrypted_verifier,
+                    session.encrypted_verifier
+                );
+                assert!(retained.staged.is_none());
+            }
+            let cleanup = &state.cleanup[&session.id];
+            assert!(matches!(cleanup.status, MemoryCleanupStatus::Held));
+            assert_eq!(cleanup.encrypted_refresh_token, cleanup_credential());
+            assert_eq!(cleanup.next_attempt_at, now());
+            assert_eq!(state.credential_generation, 0);
+            assert!(state.revocation_fence.is_none());
+        }
+    }
 }

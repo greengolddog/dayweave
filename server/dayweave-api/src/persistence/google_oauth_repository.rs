@@ -119,16 +119,20 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
                 .await
                 .map_err(internal)?
                 .ok_or(GoogleOAuthRepositoryError::Internal)?;
+                let key_version: Option<i32> = row
+                    .try_get("authorization_url_key_version")
+                    .map_err(internal)?;
+                let ciphertext: Option<Vec<u8>> = row
+                    .try_get("encrypted_authorization_url")
+                    .map_err(internal)?;
+                let (Some(key_version), Some(ciphertext)) = (key_version, ciphertext) else {
+                    return Err(GoogleOAuthRepositoryError::InvalidCallbackState);
+                };
                 let started = OAuthSessionStart {
                     id: session_id,
                     encrypted_authorization_url: SealedSecret {
-                        key_version: version_from_i32(
-                            row.try_get("authorization_url_key_version")
-                                .map_err(internal)?,
-                        )?,
-                        ciphertext: row
-                            .try_get("encrypted_authorization_url")
-                            .map_err(internal)?,
+                        key_version: version_from_i32(key_version)?,
+                        ciphertext,
                     },
                     expires_at: row.try_get("expires_at").map_err(internal)?,
                     replayed: true,
@@ -239,6 +243,38 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .await?;
         transaction.commit().await.map_err(internal)?;
         Ok(started)
+    }
+
+    async fn cancel_pending_authorizations_for_deletion(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, GoogleOAuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_scope(&mut transaction, self.scope).await?;
+        let cancelled: i64 = sqlx::query_scalar(
+            "WITH cancelled AS ( \
+                 UPDATE google_oauth_sessions SET status = 'failed', failed_at = $3, \
+                     encrypted_pkce_verifier = NULL, verifier_key_version = NULL, \
+                     encrypted_authorization_url = NULL, authorization_url_key_version = NULL \
+                 WHERE workspace_id = $1 AND user_id = $2 AND status = 'pending' \
+                 RETURNING id \
+             ), promoted AS ( \
+                 UPDATE google_oauth_cleanup_tokens SET status = 'pending', claim_id = NULL, \
+                     claimed_at = NULL, updated_at = $3, next_attempt_at = $3 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND status = 'held' \
+                     AND session_id IN (SELECT id FROM cancelled) \
+                 RETURNING session_id \
+             ) SELECT count(*) FROM cancelled",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let cancelled = u64::try_from(cancelled).map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(cancelled)
     }
 
     async fn claim_callback(

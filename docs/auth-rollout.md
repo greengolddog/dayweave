@@ -250,19 +250,46 @@ fencing. The repository independently rechecks exact persisted closure and no
 unresolved operations under its exclusive database barrier before replay or
 mutation, and the fence insertion trigger enforces the same condition. This
 registry does not prove safe recovery of an interrupted runtime or safe backup
-restore. Pending OAuth sessions and deferred cleanup can still block the fence
-after local work drains. The future deletion service must settle that work before
-sticky closure and provide authoritative recovery for retained interrupted work
-and failed or ambiguous fence attempts. There is no automatic reap, reopen, or
-runtime activation path yet.
+restore.
+
+The internal pre-close preparation service binds that exact durable OAuth/sync
+controller. It validates the prepared lifecycle, pinned principal, cooling-off
+period, fresh full-owner confirmation, and current recovery-code authority
+before cancellation or recovery. It performs at most four admitted passes of
+existing OAuth recovery while admission remains open. Each pass atomically
+cancels only still-pending authorizations in its scope, scrubs their encrypted
+PKCE verifier and authorization URL plus key versions, and promotes any held
+cleanup to due-pending without discarding its custody. Exchanging/staged sessions
+are not cancelled; their credentials remain subject to existing reconciliation.
+Existing cleanup can call Google's revoke endpoint under its retained-grant
+protection and stored retry/attempt limits. This is not the account-deletion
+grant-revocation worker or proof of its required project-and-subject identity.
+
+Before each pass and after the final pass, a fresh-authority transaction checks
+a single content-free readiness snapshot under the exclusive mutation barrier.
+It includes pending/exchanging/staged authorizations, every retained cleanup
+token, unresolved recovery/fence/account states, delivering sync/publication
+work, and all overlapping unresolved operation registrations. The earliest
+stored cleanup retry time is diagnostic, not permission to bypass backoff.
+Only a blocker-free snapshot can commit sticky admission closure in that same
+transaction. Busy or already-closed-but-blocked work returns a waiting result;
+it is not reaped or waited on under database locks. A retry can adopt the exact
+committed closure and obtain local/durable drained proof without starting more
+recovery work, including after a lost closure response. Cancellation never
+reopens admission. The internal pre-close flow has live PostgreSQL coverage for
+pending cancellation through accepted fence proof, invalid/reentrant authority,
+and already-closed unfinished work. It does not advance the deletion lifecycle
+or activate an HTTP route.
+Authoritative recovery for retained interrupted operations and failed/ambiguous
+fence attempts, and safe reopening, remain unimplemented.
 
 Activation requires all of the following to be wired and reviewed together:
 an append-only external tombstone authority outside PostgreSQL and its backups,
 using the pinned deployment-keyed identity and an exclusive permit retained for
-the service runtime's admission lifetime; pre-close durable-work settlement and
-reviewed recovery/reopening orchestration for interrupted runtimes and ambiguous
-fence attempts; proof of the Google OAuth project-and-subject grant identity before
-revocation; a real provider worker that records verified outcomes and scrubs
+the service runtime's admission lifetime; verified pre-close integration and
+authoritative recovery/reopening orchestration for interrupted runtimes and
+ambiguous fence attempts; proof of the Google OAuth project-and-subject grant
+identity before revocation; a real provider worker that records verified outcomes and scrubs
 credentials; a credential-only HTTP service with the full
 fresh-owner/recovery/confirmation policy; secure native journals, teardown, and
 explicit owner approval; separate least-privilege migration and runtime database
@@ -358,8 +385,8 @@ two-client/service recovery run, owner-device UI acceptance, and a real-device
 credential-only cutover rehearsal remain in progress.
 Account deletion remains unavailable: its route-less foundation must stay
 default-disabled until the external tombstone/restore authority, authoritative
-interrupted-runtime and pre-close/recovery orchestration, Google grant proof,
-actual provider revocation and credential scrubbing, credential-only HTTP/native
+interrupted-runtime recovery and safe reopening, verified pre-close integration,
+Google grant proof, actual provider revocation and credential scrubbing, credential-only HTTP/native
 flows, database role split, and backup-expiry evidence are implemented and
 independently rehearsed. The durable cleanup ledger and multi-runtime admission
 registry alone cannot authorize purge.
