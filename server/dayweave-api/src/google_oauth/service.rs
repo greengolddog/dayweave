@@ -432,6 +432,24 @@ impl GoogleOAuthService {
         self
     }
 
+    pub(crate) fn new_with_admission(
+        repository: Arc<dyn GoogleOAuthRepository>,
+        transport: Arc<dyn GoogleOAuthTransport>,
+        cipher: SecretCipher,
+        scope: OAuthScope,
+        clock: Arc<dyn Clock>,
+        session_ttl: StdDuration,
+        admission: ProviderAdmission,
+    ) -> Result<Self, GoogleOAuthServiceError> {
+        if admission.scope() != scope {
+            return Err(GoogleOAuthServiceError::AdmissionClosed);
+        }
+        // Bind once, before this service can be cloned or start recovery work.
+        let mut service = Self::new(repository, transport, cipher, scope, clock, session_ttl);
+        service.admission = admission;
+        Ok(service)
+    }
+
     pub(crate) fn admission(&self) -> &ProviderAdmission {
         &self.admission
     }
@@ -1154,13 +1172,14 @@ impl GoogleOAuthService {
                 let token = SecretString::from(refresh_token.expose_secret().to_owned());
                 // Transfer the only non-durable token into a task that survives
                 // callback cancellation before awaiting any storage or retry.
-                tokio::spawn(async move {
-                    operation
-                        .run(service.hold_new_refresh_token_admitted(session_id, &token, now))
-                        .await
-                })
-                .await
-                .map_err(|_| GoogleOAuthServiceError::CredentialDurabilityPending)?
+                operation
+                    .spawn(async move {
+                        service
+                            .hold_new_refresh_token_admitted(session_id, &token, now)
+                            .await
+                    })
+                    .await
+                    .map_err(|_| GoogleOAuthServiceError::CredentialDurabilityPending)?
             })
             .await
             .map_err(|_| GoogleOAuthServiceError::AdmissionClosed)?
@@ -1231,11 +1250,7 @@ impl GoogleOAuthService {
                 clock: self.clock.clone(),
             };
             let registry = Arc::downgrade(&self.guardians);
-            tokio::spawn(async move {
-                operation
-                    .run(guardian_loop(registry, context, session_id, payload, true))
-                    .await;
-            });
+            operation.spawn(guardian_loop(registry, context, session_id, payload, true));
         }
         Err(GoogleOAuthServiceError::CredentialDurabilityPending)
     }

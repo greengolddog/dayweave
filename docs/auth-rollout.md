@@ -168,8 +168,9 @@ suspicious-authentication alerts remain required defense in depth.
 ### Account deletion foundation (not active)
 
 Migrations `0029_account_deletion_lifecycle.sql`,
-`0030_account_deletion_external_principal.sql`, and
-`0031_account_deletion_provider_cleanup.sql`, together with the PostgreSQL
+`0030_account_deletion_external_principal.sql`,
+`0031_account_deletion_provider_cleanup.sql`, and
+`0032_provider_operation_admission.sql`, together with the PostgreSQL
 repository, are a route-less, default-disabled foundation. They provide
 content-free lifecycle evidence, exact transition receipts, a hard
 tenant/identity mutation fence, anti-resurrection checks, a narrowly tested
@@ -205,35 +206,62 @@ even when every target has a definitive outcome. Legacy unsealed cleanup rows
 and legacy purge rows likewise cannot advance into destructive completion after
 the migration.
 
-Production Google OAuth and sync services now share one process-local operation
-admission controller. Closing it rejects new operations and waits for existing
+Production Google OAuth and sync services share one operation admission
+controller. PostgreSQL deployments bind its durable backend before OAuth startup
+recovery, with no local-only fallback when registration fails. Closing the
+controller rejects new operations and waits for existing
 operations to finish, including nested token refresh, provider response
 handling, durable settlement, and detached credential guardians. Worker loops
 acquire admission per iteration. A newly received refresh token and its operation
 ownership move into a detached custody task before the first storage await, so
 cancelling the callback cannot abandon a still-volatile token. Same-controller
 nested calls inherit ownership; different controllers cannot reuse it. Closure
-is sticky for the exact deletion UUID in that process, including when a drain
-wait is cancelled or its proof is dropped. Draining from inside provider work
-is rejected.
+is sticky for the exact deletion UUID, including when a drain wait is cancelled
+or its proof is dropped. Draining from inside provider work is rejected.
+
+Migration 0032 extends that ownership across runtimes sharing PostgreSQL. Before
+polling provider work, each outer operation commits a content-free registry row
+bound to its scope, runtime UUID, and operation UUID. Nested work and detached
+guardians retain that same ownership. A completion guard is constructed before
+a child task can be scheduled, so even cancellation before its first poll marks
+the operation interrupted. Only confirmed registration followed by normal
+completion of every operation context permits exact asynchronous settlement;
+known normal settlement retries while its runtime remains available. Cancelled,
+panicked, or ambiguously registered operations are not silently retired. Database
+connection loss, elapsed time, and runtime restart never erase unresolved rows.
+
+Scope closure commits before waiting and blocks registration in every runtime,
+including after restart. Waiting holds no database locks. Registration, closure,
+and settlement use short transactions with the shared mutation barrier; fence
+installation checks the registry under the exclusive barrier. A short registry
+mutex serializes overlapping scopes: closure blocks new registrations sharing
+either the user or workspace, and drainage includes earlier ownership scopes.
+The detached
+registry contains only ownership UUIDs and timestamps, with no provider identity,
+payload, secret, expiry, or tenant foreign key.
+These are trusted internal repository operations, not client capabilities;
+least-privilege database role separation remains an activation requirement.
 
 The low-level `begin_fence` operation now requires opaque drained proof bound to
 its explicitly configured controller, user/workspace, and deletion UUID before
 opening a database transaction or returning a replay. It holds that proof
-through the transaction; an unconfigured repository stays disabled. This proves
-only local operation ownership. Pending OAuth sessions and deferred cleanup can
-remain after local draining and still block the database fence. The future
-deletion service must settle that work before sticky closure and implement an
-authoritative recovery/reopening policy for failed or ambiguous fence attempts.
-There is no automatic reopen, distributed admission proof, or runtime activation
-path yet.
+through the transaction; an unconfigured or local-only controller cannot enable
+fencing. The repository independently rechecks exact persisted closure and no
+unresolved operations under its exclusive database barrier before replay or
+mutation, and the fence insertion trigger enforces the same condition. This
+registry does not prove safe recovery of an interrupted runtime or safe backup
+restore. Pending OAuth sessions and deferred cleanup can still block the fence
+after local work drains. The future deletion service must settle that work before
+sticky closure and provide authoritative recovery for retained interrupted work
+and failed or ambiguous fence attempts. There is no automatic reap, reopen, or
+runtime activation path yet.
 
 Activation requires all of the following to be wired and reviewed together:
 an append-only external tombstone authority outside PostgreSQL and its backups,
 using the pinned deployment-keyed identity and an exclusive permit retained for
-the service runtime's admission lifetime; deployment-wide provider admission
-and draining, pre-close durable-work settlement, and reviewed recovery/reopening
-orchestration; proof of the Google OAuth project-and-subject grant identity before
+the service runtime's admission lifetime; pre-close durable-work settlement and
+reviewed recovery/reopening orchestration for interrupted runtimes and ambiguous
+fence attempts; proof of the Google OAuth project-and-subject grant identity before
 revocation; a real provider worker that records verified outcomes and scrubs
 credentials; a credential-only HTTP service with the full
 fresh-owner/recovery/confirmation policy; secure native journals, teardown, and
@@ -263,8 +291,8 @@ is never retried against the static-token authenticator.
 ## Cutover checklist
 
 1. Back up PostgreSQL, restore it in isolation, and apply migrations through
-   `0031_account_deletion_provider_cleanup.sql` before changing authentication
-   mode. Applying migrations 0029–0031 does not activate account deletion.
+   `0032_provider_operation_admission.sql` before changing authentication
+   mode. Applying migrations 0029–0032 does not activate account deletion.
 2. Deploy in `legacy_static`; verify existing clients and inspect migration and
    audit health.
 3. Set `DAYWEAVE_AUTH_MODE=hybrid` while retaining the existing static token.
@@ -329,12 +357,12 @@ their automated gates and independent code audits pass. A controlled
 two-client/service recovery run, owner-device UI acceptance, and a real-device
 credential-only cutover rehearsal remain in progress.
 Account deletion remains unavailable: its route-less foundation must stay
-default-disabled until the external tombstone/restore authority, distributed
-provider-I/O gate and pre-close/recovery orchestration, Google grant proof,
+default-disabled until the external tombstone/restore authority, authoritative
+interrupted-runtime and pre-close/recovery orchestration, Google grant proof,
 actual provider revocation and credential scrubbing, credential-only HTTP/native
 flows, database role split, and backup-expiry evidence are implemented and
-independently rehearsed. The durable cleanup ledger and process-local admission
-proof alone cannot authorize purge.
+independently rehearsed. The durable cleanup ledger and multi-runtime admission
+registry alone cannot authorize purge.
 Published ChatGPT/Codex account linking remains
 blocked until the documented Auth0/tunnel activation preflight, a
 deployed end-to-end schedule read and simulation rehearsal, and an independent

@@ -52,6 +52,7 @@ use persistence::{
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
 };
+use provider_admission::ProviderAdmission;
 use readiness::Readiness;
 use scheduling::{
     PlanningSimulationPort, PostgresSchedulingRepository, ScheduleQueryPort,
@@ -73,12 +74,17 @@ type Repositories = (
     Option<Arc<PostgresProposalApplicationRepository>>,
     Option<Arc<PostgresSchedulingRepository>>,
     OAuthScope,
+    ProviderAdmission,
     Readiness,
 );
 
 async fn repositories(config: &Config) -> Result<Repositories, PersistenceError> {
     if let Some(database_config) = &config.database {
         let database = Database::connect(database_config).await?;
+        let oauth_scope = OAuthScope {
+            workspace_id: database.scope().workspace_id,
+            user_id: database.scope().user_id,
+        };
         let scheduling = Arc::new(PostgresSchedulingRepository::new(
             database.pool().clone(),
             database.scope(),
@@ -133,10 +139,8 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             ))),
             Some(proposal_applications),
             Some(scheduling),
-            OAuthScope {
-                workspace_id: database.scope().workspace_id,
-                user_id: database.scope().user_id,
-            },
+            oauth_scope,
+            ProviderAdmission::postgres(database.pool().clone(), oauth_scope),
             Readiness::with_database(
                 database.pool().clone(),
                 database.scope().workspace_id,
@@ -152,6 +156,10 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             execution_repository.clone(),
             execution_item_gate.clone(),
         ));
+    let oauth_scope = OAuthScope {
+        workspace_id: Uuid::from_u128(2),
+        user_id: Uuid::from_u128(1),
+    };
     Ok((
         Arc::new(InMemoryProposalRepository::default()),
         item_repository,
@@ -164,10 +172,8 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         None,
         None,
         None,
-        OAuthScope {
-            workspace_id: Uuid::from_u128(2),
-            user_id: Uuid::from_u128(1),
-        },
+        oauth_scope,
+        ProviderAdmission::new(oauth_scope),
         Readiness::default(),
     ))
 }
@@ -219,6 +225,7 @@ impl AppState {
             proposal_applications,
             scheduling,
             oauth_scope,
+            provider_admission,
             readiness,
         ): Repositories = repositories(config).await?;
         let proposals = Arc::new(ProposalService::new(
@@ -311,7 +318,7 @@ impl AppState {
                     })?;
             }
             let service = Arc::new(
-                GoogleOAuthService::new(
+                GoogleOAuthService::new_with_admission(
                     google_oauth_repository,
                     Arc::new(
                         ProductionGoogleOAuthTransport::new(client)
@@ -321,7 +328,9 @@ impl AppState {
                     oauth_scope,
                     clock.clone(),
                     google.session_ttl,
+                    provider_admission,
                 )
+                .map_err(|_| PersistenceError::IntegrationInitializationFailed)?
                 .with_readiness(readiness.clone()),
             );
             service

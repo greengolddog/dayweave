@@ -108,8 +108,9 @@ pub trait AccountDeletionRepository: Send + Sync {
     /// Atomically installs the hard scope fence and advances the lifecycle to
     /// `fence_committing`. Once this succeeds cancellation is forbidden. The
     /// caller must first close and drain the exact configured Google runtime
-    /// controller, without holding database mutation locks. This local proof
-    /// does not replace distributed admission or the external restore permit.
+    /// controller, without holding database mutation locks. It must have a
+    /// durable registration backend; closure and zero unsettled operations are
+    /// rechecked inside the fence transaction. This is not a restore permit.
     async fn begin_fence(
         &self,
         confirmation: AccountDeletionFenceConfirmation,

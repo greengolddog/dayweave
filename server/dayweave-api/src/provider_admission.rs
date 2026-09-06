@@ -1,20 +1,26 @@
-//! Process-local ownership of complete Google operations during account deletion.
+//! Local and durable ownership of complete Google operations during deletion.
 //!
 //! Closing is deliberately sticky, including when its caller is cancelled or a
-//! fence commit response is lost. This is not a distributed admission proof or
-//! an external restore permit. Account deletion must remain unavailable until
-//! those additional runtime boundaries are implemented and rehearsed.
+//! fence commit response is lost. PostgreSQL-backed controllers also register
+//! ownership before provider work, and never reap interrupted work on a timer.
+//! This is not an external restore permit. Account deletion remains unavailable
+//! until interruption recovery and the remaining external boundaries are ready.
 
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
+use sqlx::PgPool;
 use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::google_oauth::OAuthScope;
+use crate::{google_oauth::OAuthScope, persistence::PostgresProviderAdmissionRepository};
 
 tokio::task_local! {
     static CURRENT_OPERATION: ProviderOperation;
@@ -32,6 +38,8 @@ pub enum ProviderAdmissionError {
     ConflictingDeletion,
     #[error("an active provider operation cannot drain itself")]
     ReentrantDrain,
+    #[error("durable provider admission is unavailable")]
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -42,6 +50,8 @@ struct State {
 
 struct Inner {
     scope: OAuthScope,
+    runtime_id: Uuid,
+    durable: Option<PostgresProviderAdmissionRepository>,
     state: Mutex<State>,
     drained: Notify,
 }
@@ -70,10 +80,32 @@ impl ProviderAdmission {
         Self {
             inner: Arc::new(Inner {
                 scope,
+                runtime_id: Uuid::new_v4(),
+                durable: None,
                 state: Mutex::new(State::default()),
                 drained: Notify::new(),
             }),
         }
+    }
+
+    /// Creates an independently registered runtime for a `PostgreSQL` scope.
+    /// No provider work is polled until its operation record commits. There is
+    /// no local-only fallback if the database is unavailable.
+    #[must_use]
+    pub fn postgres(pool: PgPool, scope: OAuthScope) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                scope,
+                runtime_id: Uuid::new_v4(),
+                durable: Some(PostgresProviderAdmissionRepository::new(pool, scope)),
+                state: Mutex::new(State::default()),
+                drained: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn is_durable(&self) -> bool {
+        self.inner.durable.is_some()
     }
 
     #[must_use]
@@ -110,7 +142,9 @@ impl ProviderAdmission {
     ///
     /// # Errors
     /// Rejects new work when admission is closed, its scope is invalid, or the
-    /// operation counter cannot represent another owner. The future is not
+    /// operation counter cannot represent another owner, or durable registration
+    /// fails. An ambiguous registration is retained, not silently retired.
+    /// The future is not
     /// polled on rejection; its own result remains nested in the success value.
     ///
     /// # Panics
@@ -118,7 +152,9 @@ impl ProviderAdmission {
     pub async fn run<F: Future>(&self, future: F) -> Result<F::Output, ProviderAdmissionError> {
         let operation = match self.current_operation() {
             Ok(operation) => operation,
-            Err(_) => self.enter()?,
+            // Keep the database registration state machine off every nested
+            // OAuth/sync caller's stack without boxing the provider body.
+            Err(_) => Box::pin(self.enter()).await?,
         };
         Ok(operation.run(future).await)
     }
@@ -135,7 +171,18 @@ impl ProviderAdmission {
             .unwrap_or(Err(ProviderAdmissionError::WrongOperation))
     }
 
-    fn enter(&self) -> Result<ProviderOperation, ProviderAdmissionError> {
+    async fn enter(&self) -> Result<ProviderOperation, ProviderAdmissionError> {
+        let operation = self.enter_local()?;
+        if let Some(durable) = self.inner.durable.as_ref() {
+            durable
+                .register(self.inner.runtime_id, operation.owner.operation_id)
+                .await?;
+            operation.owner.registered.store(true, Ordering::Release);
+        }
+        Ok(operation)
+    }
+
+    fn enter_local(&self) -> Result<ProviderOperation, ProviderAdmissionError> {
         if self.inner.scope.workspace_id.is_nil() || self.inner.scope.user_id.is_nil() {
             return Err(ProviderAdmissionError::InvalidScope);
         }
@@ -150,11 +197,15 @@ impl ProviderAdmission {
         Ok(ProviderOperation {
             owner: Arc::new(OperationOwner {
                 inner: self.inner.clone(),
+                operation_id: Uuid::new_v4(),
+                registered: AtomicBool::new(false),
+                interrupted: AtomicBool::new(false),
             }),
         })
     }
 
-    /// Closes new admission before waiting, without holding a database lock.
+    /// Closes new admission before waiting. Durable closure commits before
+    /// draining, and no database transaction or lock is held while waiting.
     /// Cancellation leaves admission closed. Retrying the same deletion is
     /// allowed; another deletion cannot reuse or replace this closure.
     ///
@@ -164,7 +215,9 @@ impl ProviderAdmission {
     ///
     /// # Errors
     /// Rejects nil scope/deletion IDs, a closure belonging to another deletion,
-    /// or a drain attempted from within any admitted provider operation.
+    /// a drain attempted from within any admitted provider operation, or a
+    /// database failure. Interrupted/crashed operation records never expire;
+    /// waiting may require cancellation and authoritative recovery.
     ///
     /// # Panics
     /// Panics if an earlier panic poisoned the admission state lock.
@@ -194,6 +247,9 @@ impl ProviderAdmission {
                 None => state.deletion_id = Some(deletion_id),
             }
         }
+        if let Some(durable) = self.inner.durable.as_ref() {
+            Box::pin(durable.close(deletion_id)).await?;
+        }
         loop {
             let notified = self.inner.drained.notified();
             tokio::pin!(notified);
@@ -208,18 +264,35 @@ impl ProviderAdmission {
                 .active
                 == 0
             {
-                return Ok(DrainedProviderAdmission {
-                    inner: self.inner.clone(),
-                    deletion_id,
-                });
+                match self.inner.durable.as_ref() {
+                    Some(durable) if !Box::pin(durable.is_drained(deletion_id)).await? => {}
+                    _ => {
+                        return Ok(DrainedProviderAdmission {
+                            inner: self.inner.clone(),
+                            deletion_id,
+                        });
+                    }
+                }
             }
-            notified.await;
+            if self.inner.durable.is_some() {
+                // Other runtimes cannot notify this process. Polling observes
+                // durable settlement, never authorizes timeout-based reaping.
+                tokio::select! {
+                    () = &mut notified => {}
+                    () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            } else {
+                notified.await;
+            }
         }
     }
 }
 
 struct OperationOwner {
     inner: Arc<Inner>,
+    operation_id: Uuid,
+    registered: AtomicBool,
+    interrupted: AtomicBool,
 }
 
 impl Drop for OperationOwner {
@@ -228,6 +301,63 @@ impl Drop for OperationOwner {
         state.active = state.active.checked_sub(1).expect("one operation owner");
         if state.active == 0 {
             self.inner.drained.notify_waiters();
+        }
+        drop(state);
+        // Drop alone is never settlement. Every polled or handed-off context
+        // must have returned normally, and registration must be confirmed.
+        if self.registered.load(Ordering::Acquire)
+            && !self.interrupted.load(Ordering::Acquire)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let owner = Arc::downgrade(&self.inner);
+            let operation_id = self.operation_id;
+            let durable = self
+                .inner
+                .durable
+                .clone()
+                .expect("registered durable operation");
+            let runtime_id = self.inner.runtime_id;
+            runtime.spawn(async move {
+                let mut delay = Duration::from_millis(100);
+                loop {
+                    match durable.settle(runtime_id, operation_id).await {
+                        Ok(()) => {
+                            if let Some(inner) = owner.upgrade() {
+                                inner.drained.notify_waiters();
+                            }
+                            return;
+                        }
+                        Err(ProviderAdmissionError::Unavailable) => {}
+                        Err(_) => return,
+                    }
+                    if owner.upgrade().is_none() {
+                        return;
+                    }
+                    // Retry a known normal completion only while its runtime
+                    // exists. Loss of this memory leaves its durable row intact.
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(5));
+                }
+            });
+        }
+    }
+}
+
+struct OperationCompletion {
+    owner: Arc<OperationOwner>,
+    completed: bool,
+}
+
+impl OperationCompletion {
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for OperationCompletion {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.owner.interrupted.store(true, Ordering::Release);
         }
     }
 }
@@ -240,13 +370,35 @@ pub(crate) struct ProviderOperation {
 }
 
 impl ProviderOperation {
-    pub(crate) async fn run<F: Future>(self, future: F) -> F::Output {
-        CURRENT_OPERATION.scope(self, future).await
+    pub(crate) fn run<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
+        // Construct this guard synchronously, before a detached future can be
+        // dropped without even its first poll (it may already own a token).
+        let completion = OperationCompletion {
+            owner: self.owner.clone(),
+            completed: false,
+        };
+        async move {
+            let output = CURRENT_OPERATION.scope(self, future).await;
+            // Consume the whole guard, not only its flag: disjoint async
+            // capture must not drop the owning Arc before the future runs.
+            completion.complete();
+            output
+        }
+    }
+
+    pub(crate) fn spawn<F>(self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(self.run(future))
     }
 }
 
 /// Opaque proof of a particular controller's sticky, fully drained closure.
-/// This proves only this process's operations, never deployment-wide safety.
+/// With a durable controller this also observes its persisted closure and no
+/// unresolved registrations. Fencing must independently recheck that database
+/// state under its exclusive mutation barrier. It is not a restore permit.
 pub struct DrainedProviderAdmission {
     inner: Arc<Inner>,
     deletion_id: Uuid,
@@ -282,6 +434,42 @@ mod tests {
             workspace_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
         })
+    }
+
+    #[tokio::test]
+    async fn normal_completion_keeps_ownership_until_the_future_finishes() {
+        let gate = admission();
+        let operation = gate.enter_local().unwrap();
+        let owner = operation.owner.clone();
+        let future = operation.run(async { 7 });
+        assert!(!owner.interrupted.load(Ordering::Acquire));
+        assert_eq!(future.await, 7);
+        assert!(!owner.interrupted.load(Ordering::Acquire));
+        assert_eq!(gate.active_operations(), 1);
+        drop(owner);
+        assert_eq!(gate.active_operations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_child_marks_its_entire_operation_interrupted() {
+        let gate = admission();
+        let operation = gate.enter_local().unwrap();
+        let owner = operation.owner.clone();
+        let future = operation.run(async {});
+        assert!(!owner.interrupted.load(Ordering::Acquire));
+        drop(future);
+        assert!(owner.interrupted.load(Ordering::Acquire));
+        drop(owner);
+        assert_eq!(gate.active_operations(), 0);
+
+        let operation = gate.enter_local().unwrap();
+        let owner = operation.owner.clone();
+        // The current-thread test runtime cannot poll the new task until this
+        // test yields, so abort-before-first-poll is deterministic.
+        let child = operation.spawn(std::future::pending::<()>());
+        child.abort();
+        assert!(child.await.unwrap_err().is_cancelled());
+        assert!(owner.interrupted.load(Ordering::Acquire));
     }
 
     #[tokio::test]

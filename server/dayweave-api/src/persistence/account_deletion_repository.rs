@@ -1060,10 +1060,11 @@ impl PostgresAccountDeletionRepository {
         self
     }
 
-    /// Binds the exact process-local controller used by both Google services.
+    /// Binds the exact controller used by both Google services in this runtime.
     /// Matching scope alone is insufficient: a separately constructed, idle
-    /// controller cannot prove that the actual runtime has drained. This does
-    /// not activate deletion or supply deployment-wide admission safety.
+    /// controller cannot prove that the actual runtime has drained. Fencing
+    /// additionally requires its durable backend and rechecks all overlapping
+    /// registrations. This does not activate deletion or supply restore safety.
     #[must_use]
     pub fn with_provider_admission(mut self, admission: ProviderAdmission) -> Self {
         self.provider_admission = Some(admission);
@@ -1339,6 +1340,9 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
         {
             return Err(AccountDeletionRepositoryError::ProviderCleanupBlocked);
         }
+        if !admission.is_durable() {
+            return Err(AccountDeletionRepositoryError::Disabled);
+        }
         // The opaque proof stays borrowed across the entire transaction,
         // including replay and ambiguous commit results. Its controller never
         // reopens on drop, and draining occurred before any database lock.
@@ -1354,6 +1358,12 @@ impl AccountDeletionRepository for PostgresAccountDeletionRepository {
             &mut transaction,
             self.scope,
             lifecycle.owner_subject_hash.as_slice(),
+        )
+        .await?;
+        super::ensure_provider_admission_drained(
+            &mut transaction,
+            self.scope,
+            transition.deletion_id,
         )
         .await?;
         if let Some(replay) =
@@ -1883,6 +1893,10 @@ async fn lock_lifecycle(
     scope: DatabaseScope,
     deletion_id: Uuid,
 ) -> Result<LockedLifecycle, AccountDeletionRepositoryError> {
+    // Lifecycle keys are immutable. Exclude competing lifecycle writers while
+    // allowing KEY SHARE acquired by provider-closure foreign keys: closing
+    // holds the shared global barrier, which this transaction later upgrades.
+    // FOR UPDATE here would invert that implicit FK/barrier lock ordering.
     let row = sqlx::query(
         "SELECT status, revision, prepared_at, owner_subject_hash, \
          external_tombstone_evidence_hash, external_principal_key_version, \
@@ -1891,7 +1905,7 @@ async fn lock_lifecycle(
          authorizing_recovery_code_id, authorizing_recovery_code_revision, \
          authorizing_recovery_code_created_at \
          FROM account_deletion_lifecycles WHERE id = $1 AND workspace_id = $2 AND user_id = $3 \
-         FOR UPDATE",
+         FOR NO KEY UPDATE",
     )
     .bind(deletion_id)
     .bind(scope.workspace_id)

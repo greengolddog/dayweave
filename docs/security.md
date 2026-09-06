@@ -147,23 +147,33 @@ effects must flow through an auditable proposal or outbox boundary.
   exact encrypted source envelope in a redacted, zeroizing in-memory value.
   The implementation makes no provider calls and does not scrub credentials;
   source ciphertext remains behind the fence even after a recorded success.
-  Production OAuth and sync now share process-local operation admission that
-  closes new work and drains nested calls, durable settlement, and detached
-  guardians. Refresh-token custody and operation ownership transfer to a
-  detached task before storage awaits, surviving callback cancellation. The
-  low-level fence operation requires an opaque proof of the exact configured
-  controller, scope, and deletion before database access or replay. Closure
-  remains sticky in that process after cancellation or proof drop; provider
-  operations cannot drain themselves. Pending OAuth sessions/deferred cleanup
-  still require pre-close settlement, and failed/ambiguous fence attempts need
-  an authoritative recovery/reopening policy. These service paths and
-  distributed admission remain unimplemented. Rust and PostgreSQL block purge
+  Production OAuth and sync share operation admission that closes new work and
+  drains nested calls, durable settlement, and detached guardians. Migration
+  0032 adds a content-free registry of active ownership across PostgreSQL
+  runtimes. The durable backend is installed before OAuth startup, and every
+  outer operation must commit registration before provider work is polled;
+  registration failure has no local-only fallback. Refresh-token custody and
+  operation ownership transfer to a detached task before storage awaits, with
+  completion tracking installed before even its first poll. Only confirmed,
+  normally completed ownership permits exact settlement retries. Interrupted
+  or ambiguously registered rows remain unresolved; connection loss, elapsed
+  time, and runtime restart never reap them. Persisted closure remains bound
+  to the exact deletion, and provider operations cannot drain themselves.
+  The low-level fence requires exact configured durable-controller proof before
+  database access, then rechecks persisted closure and zero unresolved work
+  under the exclusive mutation barrier before replay or mutation. A database
+  trigger independently requires that condition. Closure and drain checks cover
+  every registration sharing either the workspace or user, including retained
+  ownership from an earlier scope. Pending OAuth sessions/deferred
+  cleanup still need pre-close settlement, and interrupted runtimes or
+  failed/ambiguous fence attempts need an authoritative recovery/reopening
+  policy. These recovery paths remain unimplemented. Rust and PostgreSQL block purge
   even with all successful outcomes and prevent
   legacy cleanup/purge rows from advancing into destructive completion.
   Activation still requires a tombstone authority outside PostgreSQL/backups
   with an exclusive permit held throughout service admission and runtime;
-  distributed provider-I/O admission and draining with pre-close settlement and
-  recovery/reopening orchestration; Google
+  pre-close settlement and authoritative interrupted-runtime recovery/reopening
+  orchestration; Google
   project-and-subject grant proof; real provider revocation and credential
   scrubbing; credential-only HTTP/native approval and teardown; separate
   migration/runtime database roles; and proven backup expiry. A one-shot
@@ -355,8 +365,8 @@ ready:
   unrelated role can write canonical execution, assessment, or claim tables;
 - keep account deletion disabled while implementing and rehearsing its external
   tombstone authority with a runtime-held exclusive admission permit,
-  distributed provider-I/O draining, pre-close/recovery orchestration and Google
-  grant proof, actual revocation and credential scrubbing, credential-only
+  authoritative interrupted-runtime and pre-close/recovery orchestration,
+  Google grant proof, actual revocation and credential scrubbing, credential-only
   HTTP/native confirmation and teardown, scoped database grants, and
   backup-expiry evidence;
 - provision least-privilege Nebius identities, private versioned storage,

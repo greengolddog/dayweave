@@ -364,10 +364,13 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .unwrap()
         .bind("account-deletion-owner")
         .unwrap();
-    let admission = ProviderAdmission::new(OAuthScope {
-        workspace_id: scope.workspace_id,
-        user_id: scope.user_id,
-    });
+    let admission = ProviderAdmission::postgres(
+        pool.clone(),
+        OAuthScope {
+            workspace_id: scope.workspace_id,
+            user_id: scope.user_id,
+        },
+    );
     let repository = PostgresAccountDeletionRepository::new(pool.clone(), scope)
         .with_safety_gate(safety_gate.clone(), external_principal)
         .with_provider_admission(admission.clone());
@@ -594,6 +597,15 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .close_and_drain(deletion_id)
         .await
         .unwrap();
+    assert_eq!(
+        PostgresAccountDeletionRepository::new(pool.clone(), scope)
+            .with_safety_gate(safety_gate.clone(), external_principal)
+            .with_provider_admission(unrelated_controller.clone())
+            .begin_fence(confirmation.clone(), &unrelated_proof)
+            .await,
+        Err(AccountDeletionRepositoryError::Disabled),
+        "a matching local controller/proof cannot substitute for distributed admission"
+    );
     assert_eq!(
         repository
             .begin_fence(confirmation.clone(), &unrelated_proof)
@@ -913,6 +925,19 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         1,
         "the anti-resurrection fence survives local content purge"
     );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM provider_admission_scopes \
+             WHERE workspace_id = $1 AND user_id = $2 AND closed_for_deletion_id = $3)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(deletion_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        "durable provider admission closure survives tenant purge"
+    );
     assert_detached_evidence_is_content_free(pool).await;
 
     test_database.destroy().await;
@@ -999,11 +1024,13 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
         provider_cleanup_functions_hardened,
         "every provider-cleanup function must pin its search path and revoke PUBLIC execution"
     );
+    assert_provider_admission_catalog_coverage(pool).await;
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
          WHERE table_schema = current_schema() AND column_name = 'workspace_id' \
-         AND table_name NOT IN ('account_deletion_lifecycles', 'account_deletion_fences') \
+         AND table_name NOT IN ('account_deletion_lifecycles', 'account_deletion_fences', \
+             'provider_admission_scopes', 'provider_admission_operations') \
          ORDER BY table_name",
     )
     .fetch_all(pool)
@@ -1033,6 +1060,86 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     }
 
     assert_user_reference_guards(pool).await;
+}
+
+async fn assert_provider_admission_catalog_coverage(pool: &PgPool) {
+    let triggers: Vec<(String, String, i16)> = sqlx::query_as(
+        "SELECT relation.relname::text, trigger.tgname::text, trigger.tgtype \
+         FROM pg_trigger AS trigger JOIN pg_class AS relation ON relation.oid = trigger.tgrelid \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         WHERE namespace.nspname = current_schema() AND NOT trigger.tgisinternal \
+         AND (relation.relname IN ('provider_admission_scopes', 'provider_admission_operations') \
+             OR trigger.tgname = 'account_deletion_fences_provider_admission_validate') ORDER BY 1, 2",
+    ).fetch_all(pool).await.expect("durable admission trigger inventory");
+    assert_eq!(
+        triggers,
+        vec![
+            (
+                "account_deletion_fences".to_owned(),
+                "account_deletion_fences_provider_admission_validate".to_owned(),
+                7
+            ),
+            (
+                "provider_admission_operations".to_owned(),
+                "provider_admission_operations_guard".to_owned(),
+                31
+            ),
+            (
+                "provider_admission_operations".to_owned(),
+                "provider_admission_operations_mutation_barrier".to_owned(),
+                30
+            ),
+            (
+                "provider_admission_operations".to_owned(),
+                "provider_admission_operations_no_truncate".to_owned(),
+                34
+            ),
+            (
+                "provider_admission_scopes".to_owned(),
+                "provider_admission_scopes_guard".to_owned(),
+                31
+            ),
+            (
+                "provider_admission_scopes".to_owned(),
+                "provider_admission_scopes_mutation_barrier".to_owned(),
+                30
+            ),
+            (
+                "provider_admission_scopes".to_owned(),
+                "provider_admission_scopes_no_truncate".to_owned(),
+                34
+            ),
+        ]
+    );
+    let hardened: bool = sqlx::query_scalar(
+        "SELECT count(*) = 5 AND bool_and(function.proconfig IS NOT NULL \
+            AND array_to_string(function.proconfig, ',') = 'search_path=' || current_schema() || ', pg_catalog, pg_temp' \
+            AND NOT has_function_privilege('public', function.oid, 'EXECUTE')) \
+         FROM pg_proc AS function JOIN pg_namespace AS namespace ON namespace.oid = function.pronamespace \
+         WHERE namespace.nspname = current_schema() AND function.proname IN (\
+            'lock_provider_admission_mutation', 'guard_provider_admission_scope', \
+            'guard_provider_admission_operation', 'require_provider_admission_drained_for_fence', \
+            'reject_provider_admission_truncation')",
+    ).fetch_one(pool).await.expect("admission function privilege and search-path inventory");
+    assert!(hardened);
+    let tenant_foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint AS foreign_key \
+         JOIN pg_class AS source ON source.oid = foreign_key.conrelid \
+         JOIN pg_class AS target ON target.oid = foreign_key.confrelid \
+         WHERE foreign_key.contype = 'f' AND foreign_key.connamespace = current_schema()::regnamespace \
+         AND source.relname IN ('provider_admission_scopes', 'provider_admission_operations') \
+         AND target.relname NOT IN ('provider_admission_scopes', 'account_deletion_lifecycles')",
+    ).fetch_one(pool).await.expect("admission evidence has no tenant content foreign keys");
+    assert_eq!(tenant_foreign_keys, 0);
+    let expiry_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() \
+         AND table_name IN ('provider_admission_scopes', 'provider_admission_operations') \
+         AND (column_name LIKE '%expire%' OR column_name LIKE '%lease%')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("admission has no automatic expiry metadata");
+    assert_eq!(expiry_columns, 0);
 }
 
 async fn assert_account_deletion_barrier_modes(pool: &PgPool) {
@@ -1153,7 +1260,8 @@ async fn assert_all_current_tenant_tables_empty_and_guarded(pool: &PgPool, works
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
          WHERE table_schema = current_schema() AND column_name = 'workspace_id' \
-         AND table_name NOT IN ('account_deletion_lifecycles', 'account_deletion_fences') \
+         AND table_name NOT IN ('account_deletion_lifecycles', 'account_deletion_fences', \
+             'provider_admission_scopes', 'provider_admission_operations') \
          ORDER BY table_name",
     )
     .fetch_all(pool)
@@ -1208,7 +1316,8 @@ async fn assert_detached_evidence_is_content_free(pool: &PgPool) {
          AND table_name IN ('account_deletion_lifecycles', \
              'account_deletion_transition_receipts', 'account_deletion_fences', \
              'account_deletion_provider_cleanup_targets', \
-             'account_deletion_provider_cleanup_attempts') \
+             'account_deletion_provider_cleanup_attempts', \
+             'provider_admission_scopes', 'provider_admission_operations') \
          AND (data_type IN ('json', 'jsonb', 'text') OR column_name IN (\
              'title', 'name', 'display_name', 'auth_subject', 'payload', 'metadata', \
              'notes', 'token', 'credential')) ORDER BY 1",
@@ -1227,7 +1336,8 @@ async fn assert_detached_evidence_is_content_free(pool: &PgPool) {
          AND table_name IN ('account_deletion_lifecycles', \
              'account_deletion_transition_receipts', 'account_deletion_fences', \
              'account_deletion_provider_cleanup_targets', \
-             'account_deletion_provider_cleanup_attempts') \
+             'account_deletion_provider_cleanup_attempts', \
+             'provider_admission_scopes', 'provider_admission_operations') \
          AND data_type = 'character varying' ORDER BY 1",
     )
     .fetch_all(pool)
@@ -1329,6 +1439,7 @@ async fn prepare_test_fence(pool: &PgPool, scope: DatabaseScope) -> TestFence {
     .execute(pool)
     .await
     .expect("fence-committing lifecycle fixture");
+    close_provider_admission_fixture(pool, scope, deletion_id).await;
     TestFence {
         deletion_id,
         owner_subject_hash,
@@ -1350,6 +1461,28 @@ async fn install_test_fence(pool: &PgPool, scope: DatabaseScope) {
     .execute(pool)
     .await
     .expect("account deletion fence fixture");
+}
+
+async fn close_provider_admission_fixture(pool: &PgPool, scope: DatabaseScope, deletion_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO provider_admission_scopes (workspace_id, user_id) \
+        VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(pool)
+    .await
+    .expect("provider admission scope fixture");
+    sqlx::query(
+        "UPDATE provider_admission_scopes SET closed_for_deletion_id = $3, \
+        closed_at = clock_timestamp() WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(deletion_id)
+    .execute(pool)
+    .await
+    .expect("provider admission closure before direct fence fixture");
 }
 
 async fn wait_until_backend_waits_on_advisory_lock(pool: &PgPool, backend_pid: i32) {

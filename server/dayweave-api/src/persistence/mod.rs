@@ -10,6 +10,7 @@ mod item_repository;
 mod outbox;
 mod proposal_application_repository;
 mod proposal_repository;
+mod provider_admission_repository;
 
 pub use account_deletion_repository::PostgresAccountDeletionRepository;
 pub use credential_auth_repository::PostgresCredentialRepository;
@@ -38,3 +39,6 @@ pub use proposal_application_repository::{
 };
 pub use proposal_repository::PostgresProposalRepository;
 pub(crate) use proposal_repository::{insert_proposal_tx, proposal_from_row};
+pub(crate) use provider_admission_repository::{
+    PostgresProviderAdmissionRepository, ensure_provider_admission_drained,
+};

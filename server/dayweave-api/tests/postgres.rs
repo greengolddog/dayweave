@@ -39,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31
+            25, 26, 27, 28, 29, 30, 31, 32
         ]
     );
 
@@ -75,6 +75,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0029_account_deletion_lifecycle.sql"),
         include_str!("../migrations/0030_account_deletion_external_principal.sql"),
         include_str!("../migrations/0031_account_deletion_provider_cleanup.sql"),
+        include_str!("../migrations/0032_provider_operation_admission.sql"),
     ]
     .join("\n");
     for table in [
@@ -104,6 +105,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "account_deletion_fences",
         "account_deletion_provider_cleanup_targets",
         "account_deletion_provider_cleanup_attempts",
+        "provider_admission_scopes",
+        "provider_admission_operations",
         "idempotency_keys",
         "item_changes",
         "execution_sessions",
@@ -5637,6 +5640,20 @@ async fn seed_provider_cleanup_deletion_state(
     .await
     .expect("fence-committing lifecycle fixture");
     if install_hard_fence {
+        // The legacy0030-to0031 migration test deliberately predates durable
+        // admission. Current schemas must establish the real closure first.
+        let has_admission: bool =
+            sqlx::query_scalar("SELECT to_regclass('provider_admission_scopes') IS NOT NULL")
+                .fetch_one(pool)
+                .await
+                .expect("provider admission migration presence");
+        if has_admission {
+            sqlx::query("INSERT INTO provider_admission_scopes (workspace_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                .bind(scope.workspace_id).bind(scope.user_id).execute(pool).await.expect("provider admission scope fixture");
+            sqlx::query("UPDATE provider_admission_scopes SET closed_for_deletion_id = $3, closed_at = clock_timestamp() \
+                WHERE workspace_id = $1 AND user_id = $2")
+                .bind(scope.workspace_id).bind(scope.user_id).bind(deletion_id).execute(pool).await.expect("closed admission before direct fence");
+        }
         sqlx::query(
             "INSERT INTO account_deletion_fences (deletion_id, workspace_id, user_id, \
              owner_subject_hash, lifecycle_revision, fenced_at) VALUES ($1, $2, $3, $4, 2, $5)",
