@@ -671,6 +671,9 @@ struct CodexConversationControllerTests {
         #expect(prompt.contains("never emit IDs, status, sensitivity"))
         #expect(prompt.contains("unambiguous whole minute"))
         #expect(prompt.contains("start and end at local midnight"))
+        #expect(prompt.contains("Only leaf items contribute flexible calendar time"))
+        #expect(prompt.contains("it never adds parent time alongside subtasks"))
+        #expect(prompt.contains("Fixed events retain their own intervals regardless of children"))
         #expect(!prompt.contains("dayweave-proposals-v1"))
     }
 

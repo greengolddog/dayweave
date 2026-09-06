@@ -931,6 +931,36 @@ mod tests {
     }
 
     #[test]
+    fn omitted_child_topology_can_only_suppress_direct_plan_demand() {
+        let mut value: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+        value["request"]["items"][0]["has_children_outside_plan"] = false.into();
+        assert_eq!(
+            process_bytes(&serde_json::to_vec(&value).unwrap()),
+            process_bytes(GOLDEN_REQUEST)
+        );
+        value["request"]["items"][0]["has_children_outside_plan"] = true.into();
+        value["request"]["items"][0]["has_own_effort"] = true.into();
+        let output = process_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(output.exit_code, SUCCESS_EXIT_CODE);
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            response["result"]["plan"]["blocks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            response["result"]["plan"]["decisions"][0]["kind"],
+            "container_rolled_up"
+        );
+        for invalid in [serde_json::Value::Null, "true".into(), 1.into()] {
+            assert_schema_rejected(|request| {
+                request["request"]["items"][0]["has_children_outside_plan"] = invalid;
+            });
+        }
+    }
+
+    #[test]
     fn accepts_omitted_optional_core_fields() {
         let mut basic: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
         for field in ["parent_id", "sibling_order", "energy"] {

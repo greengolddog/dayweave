@@ -27,7 +27,7 @@ struct OnboardingFirstItemAnchorTests {
 
         var parentWithOwnEffort = plannedTask
         parentWithOwnEffort.flexibleConstraints = .object(["has_own_effort": .bool(true)])
-        #expect(parentWithOwnEffort.createsPlanningDemand(
+        #expect(!parentWithOwnEffort.createsPlanningDemand(
             itemID: itemID,
             hasActiveChildren: true
         ))
@@ -40,11 +40,18 @@ struct OnboardingFirstItemAnchorTests {
         missingDuration.durationSeconds = nil
         #expect(!missingDuration.createsPlanningDemand(itemID: itemID))
 
-        var goal = plannedTask
-        goal.kind = .goal
-        #expect(!goal.createsPlanningDemand(itemID: itemID))
-        goal.flexibleConstraints = .object(["has_own_effort": .bool(true)])
-        #expect(goal.createsPlanningDemand(itemID: itemID))
+        for kind in [DayWeaveCanonicalItemKind.goal, .project, .routine] {
+            var container = plannedTask
+            container.kind = kind
+            #expect(!container.createsPlanningDemand(itemID: itemID))
+            container.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+            #expect(container.createsPlanningDemand(itemID: itemID))
+            #expect(!container.createsPlanningDemand(
+                itemID: itemID,
+                hasActiveChildren: true
+            ))
+            #expect(container.flexibleConstraints == .object(["has_own_effort": .bool(true)]))
+        }
 
         var invalid = plannedTask
         invalid.title = ""
@@ -56,13 +63,19 @@ struct OnboardingFirstItemAnchorTests {
         var leaf = try Self.canonicalItem(id: UUID(), revision: 1)
         #expect(leaf.createsPlanningDemand)
 
-        var goalLeaf = leaf
-        goalLeaf.kind = .goal
-        goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(false)])
-        #expect(!goalLeaf.createsPlanningDemand)
-        goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(true)])
-        goalLeaf.hasOwnEffort = true
-        #expect(goalLeaf.createsPlanningDemand)
+        for kind in [DayWeaveCanonicalItemKind.goal, .project, .routine] {
+            var containerLeaf = leaf
+            containerLeaf.kind = kind
+            containerLeaf.flexibleConstraints = .object(["has_own_effort": .bool(false)])
+            #expect(!containerLeaf.createsPlanningDemand)
+            containerLeaf.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+            containerLeaf.hasOwnEffort = true
+            #expect(containerLeaf.createsPlanningDemand)
+            #expect(!containerLeaf.createsPlanningDemand(
+                canonicalItems: [containerLeaf],
+                hasPendingChildren: true
+            ))
+        }
 
         let parent = try Self.canonicalItem(
             id: UUID(),
@@ -78,6 +91,7 @@ struct OnboardingFirstItemAnchorTests {
             .habit,
             .breakTime,
             .goal,
+            .project,
             .routine,
         ] {
             var independentParent = parent
@@ -86,9 +100,17 @@ struct OnboardingFirstItemAnchorTests {
                 "has_own_effort": .bool(true),
             ])
             independentParent.hasOwnEffort = true
-            #expect(independentParent.createsPlanningDemand(
+            #expect(!independentParent.createsPlanningDemand(
                 canonicalItems: [independentParent, child]
             ))
+            independentParent = try Self.canonicalItem(id: parent.id, revision: parent.revision)
+            independentParent.kind = kind
+            independentParent.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+            independentParent.hasOwnEffort = true
+            #expect(!independentParent.createsPlanningDemand(
+                canonicalItems: [independentParent, child]
+            ), "A stale executable flag cannot override known children")
+            #expect(independentParent.hasOwnEffort)
         }
 
         var eventParent = parent
@@ -97,6 +119,77 @@ struct OnboardingFirstItemAnchorTests {
 
         leaf = try Self.canonicalItem(id: UUID(), revision: 3, isExecutable: false)
         #expect(!leaf.createsPlanningDemand(canonicalItems: [leaf]))
+    }
+
+    @Test("fixed event demand keeps its interval independently of children")
+    func testFixedEventDemandRetainsInterval() throws {
+        let eventID = UUID()
+        let timing: JSONValue = .object([
+            "dayweave_firm_block": .object([
+                "owned": .bool(true),
+                "starts_at": .string("2027-01-15T10:00:00Z"),
+                "ends_at": .string("2027-01-15T10:30:00Z"),
+                "all_day": .bool(false),
+                "tentative": .bool(false),
+                "busy": .bool(true),
+            ]),
+        ])
+        let draft = DayWeaveCanonicalItemDraft(
+            kind: .event,
+            status: .planned,
+            title: "Fixed interval",
+            timezoneName: "UTC",
+            durationSeconds: 1_800,
+            flexibleConstraints: timing
+        )
+        #expect(draft.createsPlanningDemand(itemID: eventID, hasActiveChildren: true))
+        #expect(draft.flexibleConstraints == timing)
+
+        var child = try Self.canonicalItem(id: UUID(), revision: 1)
+        child.parentID = eventID
+        for executable in [false, true] {
+            var event = try Self.canonicalItem(id: eventID, revision: 1, isExecutable: executable)
+            event.kind = .event
+            event.flexibleConstraints = timing
+            #expect(event.createsPlanningDemand(
+                canonicalItems: [event, child],
+                hasPendingChildren: true
+            ))
+            #expect(event.flexibleConstraints == timing)
+        }
+    }
+
+    @Test("adding a child preserves encrypted anchor designation without proving parent demand")
+    func testParentAnchorRemainsReadableAfterChildCreation() throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID()
+        var draft = Self.plannedDraft(title: "Reviewed goal")
+        draft.kind = .goal
+        draft.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Self.now }
+        )
+        _ = try store.enqueueOnboardingFirstItemCreate(itemID: itemID, draft: draft)
+        var child = Self.plannedDraft(title: "Leaf action")
+        child.parentID = itemID
+        _ = try store.enqueueCanonicalCreate(draft: child)
+        #expect(store.persistenceError == nil)
+
+        let restored = PlannerStore(persistence: context.persistence, now: { Self.now })
+        #expect(restored.persistenceError == nil)
+        #expect(restored.onboardingFirstItemAnchor == store.onboardingFirstItemAnchor)
+        #expect(restored.pendingCanonicalAuthoringMutations.count == 2)
+        let restoredDraft = try #require(restored.canonicalAuthoringMutation(itemID: itemID)?.draft)
+        #expect(restoredDraft.flexibleConstraints == draft.flexibleConstraints)
+        #expect(!restoredDraft.createsPlanningDemand(
+            itemID: itemID,
+            hasActiveChildren: restored.pendingCanonicalAuthoringMutations
+                .containsPendingCanonicalChild(of: itemID)
+        ))
+        #expect(!restored.hasExactOnboardingFirstPlanProof)
     }
 
     @Test("prepared create and anchor commit together and promote on exact response")
@@ -247,8 +340,21 @@ struct OnboardingFirstItemAnchorTests {
         var ownEffortItem = parentItem
         ownEffortItem.flexibleConstraints = .object(["has_own_effort": .bool(true)])
         ownEffortItem.hasOwnEffort = true
-        #expect(canonicalAnchor.hasExactPublishedPlanProof(
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
             canonicalItems: [ownEffortItem, child],
+            pendingAuthoringMutations: [pendingChild],
+            publishedScheduleProof: proof
+        ))
+        ownEffortItem = item
+        ownEffortItem.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        ownEffortItem.hasOwnEffort = true
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [ownEffortItem, child],
+            pendingAuthoringMutations: [],
+            publishedScheduleProof: proof
+        ))
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [ownEffortItem],
             pendingAuthoringMutations: [pendingChild],
             publishedScheduleProof: proof
         ))

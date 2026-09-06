@@ -725,13 +725,26 @@ fn validate_execution_context(
             "snapshot revision must be positive when work-unit evidence is present",
         ));
     }
-    let item_ids: BTreeSet<_> = request.items.iter().map(|item| item.id).collect();
+    let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
+    let children = child_map(&request.items);
     let mut identities = BTreeSet::new();
     for unit in &execution.work_units {
-        if !item_ids.contains(&unit.item_id) {
+        let Some(item) = items.get(&unit.item_id) else {
             return Err(invalid_execution(
                 unit.item_id,
                 format!("work unit references missing item {}", unit.item_id),
+            ));
+        };
+        // Retain past execution evidence when an item gains children, but do
+        // not let a stale live reservation bypass leaf-only flexible demand.
+        // Fixed events already reserve their source interval independently.
+        if !unit.reservations.is_empty()
+            && (matches!(item.kind, ItemKind::CalendarEvent(_))
+                || !item.occupies_time(children.contains_key(&item.id)))
+        {
+            return Err(invalid_execution(
+                unit.item_id,
+                "reservations must identify a flexible leaf execution component",
             ));
         }
         if !identities.insert((unit.item_id, unit.occurrence_id)) {
@@ -1940,6 +1953,8 @@ fn manual_placement_environment_base_digest(request: &PlanRequest) -> [u8; 32] {
         parent_id: Option<ItemId>,
         sibling_order: Option<u32>,
         has_own_effort: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        has_children_outside_plan: bool,
         duration: Option<crate::DurationEstimate>,
         constraints: &'a SchedulingConstraints,
         split_policy: &'a SplitPolicy,
@@ -1963,6 +1978,7 @@ fn manual_placement_environment_base_digest(request: &PlanRequest) -> [u8; 32] {
             parent_id: item.parent_id,
             sibling_order: item.sibling_order,
             has_own_effort: item.has_own_effort,
+            has_children_outside_plan: item.has_children_outside_plan,
             duration: item.duration,
             constraints: &item.constraints,
             split_policy: &item.split_policy,

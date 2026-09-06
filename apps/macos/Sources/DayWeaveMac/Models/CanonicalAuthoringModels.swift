@@ -534,7 +534,9 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         } else {
             hasOwnEffort = false
         }
-        guard !hasActiveChildren || hasOwnEffort else { return false }
+        // Own effort makes a leaf container executable; it never reserves
+        // additional flexible time on a node that already has children.
+        guard !hasActiveChildren else { return false }
         guard value.durationSeconds.map({ $0 > 0 }) == true else { return false }
         switch value.kind {
         case .goal, .project, .routine:
@@ -858,10 +860,16 @@ extension Collection where Element == DayWeavePendingCanonicalAuthoringMutation 
     }
 }
 
+extension Collection where Element == DayWeaveCanonicalItem {
+    func containsActiveCanonicalChild(of parentID: UUID) -> Bool {
+        contains { $0.id != parentID && $0.parentID == parentID && $0.deletedAt == nil }
+    }
+}
+
 extension DayWeaveCanonicalItem {
     /// Mirrors the draft-side onboarding predicate after the server has
-    /// assigned canonical execution state. Goal and routine containers count
-    /// only when their visible `has_own_effort` flag is explicitly true.
+    /// assigned canonical execution state. Only flexible leaves contribute;
+    /// a leaf goal, project, or routine also needs explicit own effort.
     var createsPlanningDemand: Bool {
         createsPlanningDemand(canonicalItems: [self])
     }
@@ -872,17 +880,13 @@ extension DayWeaveCanonicalItem {
     ) -> Bool {
         guard deletedAt == nil,
               status == .planned || status == .scheduled else { return false }
-        let hasCanonicalChildren = canonicalItems.contains { child in
-            child.id != id && child.parentID == id && child.deletedAt == nil
-        }
-        // The API's execution flag is a leaf marker, not an own-effort marker.
-        // Validate that authoritative relationship, then apply core occupancy
-        // semantics below instead of suppressing eligible parents wholesale.
-        guard isExecutable == !hasCanonicalChildren else { return false }
+        // Fixed events retain their own interval independently of descendants.
         if kind == .event { return true }
-        let hasOwnEffort = self.hasOwnEffort
-        let hasActiveChildren = hasPendingChildren || hasCanonicalChildren
-        guard !hasActiveChildren || hasOwnEffort else { return false }
+        // A stale server leaf flag cannot override locally known children,
+        // including a child that exists only in the encrypted authoring journal.
+        guard isExecutable,
+              !canonicalItems.containsActiveCanonicalChild(of: id),
+              !hasPendingChildren else { return false }
         guard durationSeconds.map({ $0 > 0 }) == true else { return false }
         switch kind {
         case .goal, .project, .routine:

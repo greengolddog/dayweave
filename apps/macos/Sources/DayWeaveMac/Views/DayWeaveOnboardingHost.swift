@@ -393,8 +393,10 @@ struct DayWeaveOnboardingHost: View {
                   let draft = mutation.draft,
                   draft.createsPlanningDemand(
                       itemID: mutation.itemID,
-                      hasActiveChildren: store.pendingCanonicalAuthoringMutations
-                          .containsPendingCanonicalChild(of: mutation.itemID)
+                      hasActiveChildren: store.canonicalItems
+                          .containsActiveCanonicalChild(of: mutation.itemID)
+                          || store.pendingCanonicalAuthoringMutations
+                              .containsPendingCanonicalChild(of: mutation.itemID)
                   ) else {
                 return nil
             }

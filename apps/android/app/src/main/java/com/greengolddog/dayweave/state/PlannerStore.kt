@@ -2418,10 +2418,16 @@ class PlannerStore(
         mutationId = mutationId,
         operation = CanonicalAuthoringOperation.CREATE,
         designateOnboardingFirstItem = true,
-    ) { _ ->
+    ) { current ->
         val normalized = draft.normalized()
-        require(normalized.createsPlanningDemand(itemId)) {
-            "The onboarding item must have planned independent schedulable effort"
+        val hasChildren = hasEffectiveCanonicalChild(
+            itemId = itemId,
+            canonicalItems = current.canonicalItems,
+            pendingAuthoringMutations = current.pendingCanonicalAuthoringMutations,
+            recentlyDeleted = current.canonicalRecentlyDeleted,
+        )
+        require(normalized.createsPlanningDemand(itemId, hasChildren)) {
+            "The onboarding item must be a planned leaf with duration or a fully timed event"
         }
         PendingCanonicalAuthoringMutation(
             id = mutationId,
@@ -2679,7 +2685,13 @@ class PlannerStore(
             validateCanonicalAuthoringCurrentState(current, mutation)
             validateCanonicalAuthoringHierarchy(current, mutation)
             if (designateOnboardingFirstItem) {
-                require(mutation.draft?.createsPlanningDemand(itemId) == true)
+                val hasChildren = hasEffectiveCanonicalChild(
+                    itemId = itemId,
+                    canonicalItems = current.canonicalItems,
+                    pendingAuthoringMutations = current.pendingCanonicalAuthoringMutations + mutation,
+                    recentlyDeleted = current.canonicalRecentlyDeleted,
+                )
+                require(mutation.draft?.createsPlanningDemand(itemId, hasChildren) == true)
             }
             current.copy(
                 inbox = if (consumeInboxId == null) {

@@ -553,6 +553,29 @@ dependency item or a bounded manual/external explanation. Other statuses carry
 no blocker fields, and blocked or terminal items cannot start, reserve new
 flexible work, or retain an actionable deferred replacement.
 
+Only leaf execution components create flexible demand, including in direct
+shared-core requests. Setting `has_own_effort` on a node with children does not
+schedule that parent's estimate or add it to descendant duration roll-ups.
+Separate schedulable work needs an explicit leaf item; an independent parent
+progress measure is not a second calendar block. Stored own-effort flags are
+preserved, so a semantic container can regain its own demand when it becomes a
+leaf again. Fixed events keep their source intervals independently of children.
+When Inbox or rejected child items are omitted from the planning input, the
+composer preserves their existence as `has_children_outside_plan` on the core
+parent. An incomplete planning projection therefore cannot turn a canonical
+parent into a leaf. The field defaults to false in older direct-core payloads;
+it can only suppress flexible demand, never override children that are present.
+Duration roll-up is iterative, with duplicate-ID, missing-parent, cycle, and
+saturating-total checks; it does not impose a recursive call-stack depth limit.
+
+Pinned/manual assignments and live execution reservations cannot authorize
+flexible parent work. Historical execution evidence without reservations remains
+valid after a former leaf gains children. Both native clients check known
+canonical and queued children before claiming flexible first-plan readiness or
+allowing a published parent block to start. A persisted onboarding anchor remains
+a reviewed-item designation, not scheduling proof: adding a child invalidates
+live readiness without making the encrypted snapshot unreadable.
+
 Optional advanced data lives in `flexible_constraints`. Its top-level schema is
 strict. New and replacement `/v1/items` writes validate it before persistence.
 Unknown,

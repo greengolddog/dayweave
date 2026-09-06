@@ -574,8 +574,13 @@ pub struct WorkItem {
     pub status: WorkStatus,
     pub parent_id: Option<ItemId>,
     pub sibling_order: Option<u32>,
-    /// Lets a parent reserve independent work in addition to rolled-up children.
+    /// Enables independent work on a leaf project, goal, or routine. This flag
+    /// never adds flexible demand to a parent; separate work needs a leaf item.
     pub has_own_effort: bool,
+    /// The complete source hierarchy has children omitted from this planning
+    /// input (for example, Inbox-only work). Omission must not create a leaf.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_children_outside_plan: bool,
     pub goal_ids: BTreeSet<ItemId>,
     pub priority: Priority,
     pub duration: Option<DurationEstimate>,
@@ -590,17 +595,18 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
-    /// Calendar events always occupy time. Other parents roll their child work
-    /// up and occupy no time unless they explicitly carry independent effort.
+    /// Calendar events retain their fixed interval. Flexible demand belongs
+    /// only to leaves; parent estimates never duplicate descendant work.
     #[must_use]
     pub fn occupies_time(&self, has_children: bool) -> bool {
         match self.kind {
             ItemKind::CalendarEvent(_) => true,
+            _ if has_children || self.has_children_outside_plan => false,
             // Projects, goals, and routines are semantic containers even
-            // before their first child is created. An explicit independent
-            // effort component remains schedulable alongside their roll-up.
+            // before their first child is created. A leaf container needs
+            // explicit independent effort to become schedulable.
             ItemKind::Project | ItemKind::Goal(_) | ItemKind::Routine(_) => self.has_own_effort,
-            _ => !has_children || self.has_own_effort,
+            _ => true,
         }
     }
 
@@ -1417,11 +1423,12 @@ pub enum HierarchyError {
     Cycle(ItemId),
 }
 
-/// Calculates expected duration for every parent without scheduling parents as
-/// extra work. A parent's own estimate is included only when `has_own_effort`
-/// is true. Actionable leaves include their own estimate, while semantic
-/// project, goal, and routine containers require explicit own effort even when
-/// they have no children yet.
+/// Calculates expected duration for every parent without duplicating its
+/// descendants' flexible demand. Actionable leaves include their own estimate;
+/// leaf project, goal, and routine containers require explicit own effort.
+/// Fixed events retain their own duration even when they have children.
+/// Traversal is iterative, so logical hierarchy depth does not consume the
+/// call stack.
 ///
 /// # Errors
 ///
@@ -1442,7 +1449,7 @@ pub fn roll_up_expected_durations(
         }
     }
 
-    let mut children: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
+    let mut remaining_children: BTreeMap<ItemId, usize> = by_id.keys().map(|id| (*id, 0)).collect();
     for item in items {
         if let Some(parent) = item.parent_id {
             if !by_id.contains_key(&parent) {
@@ -1451,44 +1458,47 @@ pub fn roll_up_expected_durations(
                     parent,
                 });
             }
-            children.entry(parent).or_default().push(item.id);
+            *remaining_children.entry(parent).or_default() += 1;
         }
     }
 
-    let mut result = BTreeMap::new();
-    for id in by_id.keys() {
-        let mut visiting = BTreeSet::new();
-        visit_rollup(*id, &by_id, &children, &mut visiting, &mut result)?;
+    let mut ready = Vec::new();
+    let mut result: BTreeMap<ItemId, Minutes> = BTreeMap::new();
+    for (id, item) in &by_id {
+        let has_children = remaining_children[id] != 0;
+        if !has_children {
+            ready.push(*id);
+        }
+        let own_minutes = if item.occupies_time(has_children) {
+            item.duration
+                .map_or(0, |duration| duration.planning_minutes().get())
+        } else {
+            0
+        };
+        result.insert(*id, Minutes(own_minutes));
+    }
+
+    // Reduce each completed subtree into its parent exactly once. A parent
+    // becomes ready only after all its descendants' totals have reached it.
+    while let Some(id) = ready.pop() {
+        remaining_children.remove(&id);
+        if let Some(parent) = by_id[&id].parent_id {
+            let child_minutes = result[&id].get();
+            let parent_minutes = result.entry(parent).or_insert(Minutes::ZERO);
+            *parent_minutes = Minutes(parent_minutes.get().saturating_add(child_minutes));
+            remaining_children.entry(parent).and_modify(|pending| {
+                *pending -= 1;
+                if *pending == 0 {
+                    ready.push(parent);
+                }
+            });
+        }
+    }
+
+    // Each node has at most one parent, so after removing every acyclic
+    // subtree only cycle members remain. Report one deterministically.
+    if let Some((id, _)) = remaining_children.first_key_value() {
+        return Err(HierarchyError::Cycle(*id));
     }
     Ok(result)
-}
-
-fn visit_rollup(
-    id: ItemId,
-    by_id: &BTreeMap<ItemId, &WorkItem>,
-    children: &BTreeMap<ItemId, Vec<ItemId>>,
-    visiting: &mut BTreeSet<ItemId>,
-    result: &mut BTreeMap<ItemId, Minutes>,
-) -> Result<u32, HierarchyError> {
-    if let Some(value) = result.get(&id) {
-        return Ok(value.get());
-    }
-    if !visiting.insert(id) {
-        return Err(HierarchyError::Cycle(id));
-    }
-
-    let item = by_id[&id];
-    let child_ids = children.get(&id).map_or(&[][..], Vec::as_slice);
-    let mut total = 0_u32;
-    if item.occupies_time(!child_ids.is_empty()) {
-        total = item
-            .duration
-            .map_or(0, |duration| duration.planning_minutes().get());
-    }
-    for child in child_ids {
-        total = total.saturating_add(visit_rollup(*child, by_id, children, visiting, result)?);
-    }
-    visiting.remove(&id);
-    result.insert(id, Minutes(total));
-    Ok(total)
 }

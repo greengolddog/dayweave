@@ -11,10 +11,12 @@ use dayweave_compose::{
     validate_schedule_request,
 };
 use dayweave_core::{
-    ConstraintStrength, DayOfWeek, EnergyLevel, FixedBlockSource, HabitMissedPolicy, ItemId,
+    ConstraintStrength, DayOfWeek, EnergyLevel, ExecutionPlanningContext, ExecutionReservation,
+    ExecutionReservationKind, ExecutionWorkUnit, FixedBlockSource, HabitMissedPolicy, ItemId,
     ItemKind, Minutes, Recurrence, RecurrenceCalendar, RecurrenceException,
     RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceMoveSource,
-    RecurrenceOccurrenceIdentity, SplitPolicy, WorkStatus, ZonedDayBoundary, expand_occurrences,
+    RecurrenceOccurrenceIdentity, ScheduleBlockKind, ScheduleError, Scheduler, SplitPolicy,
+    WorkStatus, ZonedDayBoundary, expand_occurrences, roll_up_expected_durations,
 };
 use serde_json::json;
 use time::{Duration as TimeDuration, macros::datetime};
@@ -80,6 +82,47 @@ fn preview_request() -> ComposeScheduleRequest {
         config: SchedulerConfigInput::default(),
         recurrence_context: dayweave_core::RecurrenceContext::default(),
     }
+}
+
+fn calendar_context_item(value: u128) -> CanonicalItem {
+    let mut context = canonical_item(value);
+    context.kind = CanonicalItemKind::Event;
+    context.duration_kind = Some(CanonicalDurationKind::Unknown);
+    context.duration_seconds = None;
+    context.duration_min_seconds = None;
+    context.duration_max_seconds = None;
+    context.duration_source = None;
+    context.deadline_kind = Some(CanonicalDeadlineKind::None);
+    context.deadline_at = None;
+    context.deadline_strength = None;
+    context.flexible_constraints = json!({
+        "calendar_context": {
+            "start": "2026-09-01T10:00:00+02:00",
+            "end": "2026-09-01T11:00:00+02:00",
+            "all_day": false
+        }
+    });
+    context
+}
+
+fn omitted_children(parent_id: Uuid) -> [CanonicalItem; 4] {
+    let mut inbox = canonical_item(111);
+    inbox.parent_id = Some(parent_id);
+    inbox.status = CanonicalItemStatus::Inbox;
+    inbox.flexible_constraints = json!({"unparsed_inbox_metadata": true});
+    let mut unsupported = canonical_item(112);
+    unsupported.parent_id = Some(parent_id);
+    unsupported.flexible_constraints = json!({"unsupported_metadata": true});
+    let mut cross_timezone = canonical_item(113);
+    cross_timezone.parent_id = Some(parent_id);
+    cross_timezone.kind = CanonicalItemKind::Habit;
+    cross_timezone.timezone_name = "UTC".into();
+    cross_timezone.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+    // Valid context-only events must be roots. A legacy context child is
+    // rejected, but its omitted source edge must still preserve its parent.
+    let mut context = calendar_context_item(114);
+    context.parent_id = Some(parent_id);
+    [inbox, unsupported, cross_timezone, context]
 }
 
 fn manual_blocks(count: usize) -> Vec<PreviousBlockInput> {
@@ -292,6 +335,202 @@ fn inbox_subtree_is_accepted_without_parsing_scheduling_metadata() {
             .completion_anchors
             .is_empty()
     );
+}
+
+#[test]
+fn omitted_children_never_turn_task_parents_into_executable_leaves() {
+    let mut parent = canonical_item(110);
+    parent.is_executable = false;
+    parent.has_own_effort = Some(true);
+    for child in omitted_children(parent.id) {
+        for retain_sibling in [false, true] {
+            let mut source = vec![parent.clone(), child.clone()];
+            let mut sibling = canonical_item(115);
+            sibling.parent_id = Some(parent.id);
+            sibling.duration_seconds = Some(1_800);
+            sibling.duration_min_seconds = Some(1_800);
+            sibling.duration_max_seconds = Some(1_800);
+            if retain_sibling {
+                source.push(sibling.clone());
+            }
+            let prepared = prepare_canonical_schedule(source.clone(), preview_request()).unwrap();
+            source.reverse();
+            assert_eq!(
+                prepared,
+                prepare_canonical_schedule(source, preview_request()).unwrap()
+            );
+            let inbox = child.status == CanonicalItemStatus::Inbox;
+            assert_eq!(prepared.source_item_count, 2 + usize::from(retain_sibling));
+            assert_eq!(
+                prepared.accepted_item_count,
+                1 + usize::from(inbox) + usize::from(retain_sibling)
+            );
+            assert_eq!(prepared.rejected_items.len(), usize::from(!inbox));
+            assert_eq!(
+                prepared.plan_request.items.len(),
+                1 + usize::from(retain_sibling)
+            );
+            let projected = &prepared.plan_request.items[0];
+            assert_eq!(projected.id, ItemId(parent.id));
+            assert_eq!(projected.kind, ItemKind::Task);
+            assert!(projected.has_children_outside_plan);
+            assert!(!projected.occupies_time(retain_sibling));
+            let encoded = serde_json::to_value(projected).unwrap();
+            assert_eq!(encoded["has_children_outside_plan"], json!(true));
+            assert_eq!(
+                serde_json::from_value::<dayweave_core::WorkItem>(encoded).unwrap(),
+                *projected
+            );
+            let rollup = roll_up_expected_durations(&prepared.plan_request.items).unwrap();
+            assert_eq!(
+                rollup[&ItemId(parent.id)],
+                Minutes(if retain_sibling { 30 } else { 0 })
+            );
+            let plan = Scheduler.plan(&prepared.plan_request).unwrap();
+            assert!(plan.blocks_for(ItemId(parent.id)).next().is_none());
+            assert_eq!(plan.blocks.len(), usize::from(retain_sibling));
+            assert!(
+                plan.blocks
+                    .iter()
+                    .all(|block| block.item_id == Some(ItemId(sibling.id)))
+            );
+            assert!(plan.unscheduled.is_empty());
+            if retain_sibling {
+                let projected_sibling = &prepared.plan_request.items[1];
+                assert!(!projected_sibling.has_children_outside_plan);
+                assert!(projected_sibling.occupies_time(false));
+                assert!(
+                    serde_json::to_value(projected_sibling)
+                        .unwrap()
+                        .get("has_children_outside_plan")
+                        .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn parents_with_omitted_children_reject_pins_and_manual_placements() {
+    let mut parent = canonical_item(110);
+    parent.is_executable = false;
+    let child = omitted_children(parent.id)[0].clone();
+    for manual in [false, true] {
+        let mut request = preview_request();
+        let blocks = vec![PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            session_index: 0,
+        }];
+        if manual {
+            request.manual_placements.push(manual_placement(
+                116,
+                vec![ManualPlacementAssignmentInput {
+                    item_id: parent.id,
+                    item_revision: parent.revision,
+                    occurrence_id: None,
+                    blocks,
+                }],
+            ));
+        } else {
+            request.previous_assignments.push(PreviousAssignmentInput {
+                item_id: parent.id,
+                item_revision: parent.revision,
+                occurrence_id: None,
+                blocks,
+                pinned: true,
+            });
+        }
+        let prepared =
+            prepare_canonical_schedule(vec![parent.clone(), child.clone()], request).unwrap();
+        assert_eq!(prepared.plan_request.previous_assignments.len(), 1);
+        assert!(matches!(
+            Scheduler.plan(&prepared.plan_request),
+            Err(ScheduleError::InvalidItem { item_id, .. }) if item_id == ItemId(parent.id)
+        ));
+    }
+}
+
+#[test]
+fn omitted_child_topology_rejects_live_reservations_but_accepts_parent_history() {
+    let mut parent = canonical_item(110);
+    parent.is_executable = false;
+    let child = omitted_children(parent.id)[0].clone();
+    let independent = canonical_item(117);
+    let prepared = prepare_canonical_schedule(
+        vec![parent.clone(), child, independent.clone()],
+        preview_request(),
+    )
+    .unwrap();
+    let history = ExecutionWorkUnit {
+        item_id: ItemId(parent.id),
+        occurrence_id: None,
+        progress_epoch: 1,
+        credited_seconds: 600,
+        disposition: None,
+        used_session_indices: vec![0],
+        reservations: Vec::new(),
+    };
+    let mut execution = ExecutionPlanningContext {
+        snapshot_revision: 1,
+        work_units: vec![history],
+    };
+    let plan = Scheduler
+        .plan_with_execution(&prepared.plan_request, &execution)
+        .unwrap();
+    assert!(plan.blocks_for(ItemId(parent.id)).next().is_none());
+    assert_eq!(plan.blocks.len(), 1);
+    assert_eq!(plan.blocks[0].item_id, Some(ItemId(independent.id)));
+    assert_eq!(
+        plan.blocks[0].end - plan.blocks[0].start,
+        TimeDuration::hours(1)
+    );
+    for kind in [
+        ExecutionReservationKind::InFlight,
+        ExecutionReservationKind::DeferredReplacement {
+            source_session_index: 0,
+        },
+    ] {
+        execution.work_units[0].reservations = vec![ExecutionReservation {
+            session_index: u16::from(!matches!(kind, ExecutionReservationKind::InFlight)),
+            start: datetime!(2026-09-01 8:00 UTC),
+            end: datetime!(2026-09-01 8:30 UTC),
+            kind,
+        }];
+        assert!(matches!(
+            Scheduler.plan_with_execution(&prepared.plan_request, &execution),
+            Err(ScheduleError::InvalidItem { item_id, message })
+                if item_id == ItemId(parent.id)
+                    && message.contains("reservations must identify a flexible leaf execution component")
+        ));
+    }
+}
+
+#[test]
+fn omitted_child_topology_preserves_the_fixed_event_exception() {
+    let mut event = calendar_context_item(110);
+    event.is_executable = false;
+    event.flexible_constraints = json!({
+        "calendar_event": {
+            "start": "2026-09-01T10:00:00+02:00",
+            "end": "2026-09-01T11:00:00+02:00",
+            "immutable": true,
+            "all_day": false,
+            "source_calendar_id": null
+        }
+    });
+    let child = omitted_children(event.id)[0].clone();
+    let prepared =
+        prepare_canonical_schedule(vec![event.clone(), child], preview_request()).unwrap();
+    let projected = &prepared.plan_request.items[0];
+    assert!(projected.has_children_outside_plan);
+    assert!(projected.occupies_time(false));
+    let plan = Scheduler.plan(&prepared.plan_request).unwrap();
+    assert_eq!(plan.blocks.len(), 1);
+    assert_eq!(plan.blocks[0].item_id, Some(ItemId(event.id)));
+    assert_eq!(plan.blocks[0].kind, ScheduleBlockKind::CalendarEvent);
+    assert_eq!(plan.blocks[0].start, datetime!(2026-09-01 8:00 UTC));
+    assert_eq!(plan.blocks[0].end, datetime!(2026-09-01 9:00 UTC));
 }
 
 #[test]
@@ -596,23 +835,7 @@ fn generated_calendar_extends_to_authoritatively_prove_a_bounded_move_source() {
 
 #[test]
 fn calendar_context_counts_as_accepted_without_becoming_work() {
-    let mut context = canonical_item(600);
-    context.kind = CanonicalItemKind::Event;
-    context.duration_kind = Some(CanonicalDurationKind::Unknown);
-    context.duration_seconds = None;
-    context.duration_min_seconds = None;
-    context.duration_max_seconds = None;
-    context.duration_source = None;
-    context.deadline_kind = Some(CanonicalDeadlineKind::None);
-    context.deadline_at = None;
-    context.deadline_strength = None;
-    context.flexible_constraints = json!({
-        "calendar_context": {
-            "start": "2026-09-01T10:00:00+02:00",
-            "end": "2026-09-01T11:00:00+02:00",
-            "all_day": false
-        }
-    });
+    let context = calendar_context_item(600);
     let task = canonical_item(601);
 
     let prepared = prepare_canonical_schedule(vec![context, task], preview_request()).unwrap();
@@ -623,6 +846,10 @@ fn calendar_context_counts_as_accepted_without_becoming_work() {
         prepared.plan_request.items[0].id,
         ItemId(Uuid::from_u128(601))
     );
+    assert!(!prepared.plan_request.items[0].has_children_outside_plan);
+    let plan = Scheduler.plan(&prepared.plan_request).unwrap();
+    assert_eq!(plan.blocks.len(), 1);
+    assert_eq!(plan.blocks[0].item_id, Some(ItemId(Uuid::from_u128(601))));
 }
 
 #[test]

@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.OnboardingFirstItemAnchorSnapshot
 import com.greengolddog.dayweave.model.OnboardingFirstItemCheck
+import com.greengolddog.dayweave.model.hasValidOnboardingFirstItemAnchorRelationship
 import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -191,10 +192,16 @@ class OnboardingFirstItemStoreTest {
     }
 
     @Test
-    fun reviewedTaskWithQueuedChildMustRetainExplicitIndependentEffort() {
+    fun reviewedTaskWithQueuedChildCannotRegainDemandThroughOwnEffort() {
         val store = PlannerStore(boundState())
         requireNotNull(
-            store.enqueueOnboardingFirstItemCreate(plannedDraft(), ITEM_ID, MUTATION_ID),
+            store.enqueueOnboardingFirstItemCreate(
+                plannedDraft().copy(
+                    constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                ),
+                ITEM_ID,
+                MUTATION_ID,
+            ),
         )
         requireNotNull(
             store.enqueueCanonicalCreate(
@@ -216,19 +223,18 @@ class OnboardingFirstItemStoreTest {
             store.canonicalAuthoringMutation(MUTATION_ID)?.draft?.title,
         )
 
-        requireNotNull(
+        assertThrows(IllegalArgumentException::class.java) {
             store.updateCanonicalAuthoringDraft(
                 MUTATION_ID,
                 plannedDraft().copy(
                     title = "Independent parent work",
                     constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
                 ),
-            ),
-        )
-        assertEquals(
-            OnboardingFirstItemCheck.PENDING_CREATE,
-            store.state.value.validatedOnboardingFirstItemCheck(),
-        )
+            )
+        }
+        assertNull(store.state.value.validatedOnboardingFirstItemCheck())
+        assertTrue(store.state.value.hasValidOnboardingFirstItemAnchorRelationship())
+        assertEquals(true, store.canonicalAuthoringMutation(MUTATION_ID)?.draft?.constraints?.hasOwnEffort)
     }
 
     private suspend fun restoredStore(

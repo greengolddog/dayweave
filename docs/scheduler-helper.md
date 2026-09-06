@@ -33,6 +33,15 @@ For `operation: "plan"`, `request` is the complete `dayweave-core`
 checked-in synthetic golden fixtures remain the byte-for-byte executable
 reference request and response.
 
+Core items may include the optional boolean `has_children_outside_plan` when
+their complete source hierarchy contains children omitted from the request.
+It defaults to false and is omitted when false by core serialization, preserving
+existing golden payloads. A true value prevents flexible parent demand even if
+no child remains in `items`; it cannot override actual children or suppress a
+fixed event's own interval. The `compose` operation derives this metadata from
+the complete canonical snapshot after Inbox/rejection pruning. Callers must not
+prefilter that snapshot and thereby erase the topology evidence.
+
 A successful response has a tagged result:
 
 ```json

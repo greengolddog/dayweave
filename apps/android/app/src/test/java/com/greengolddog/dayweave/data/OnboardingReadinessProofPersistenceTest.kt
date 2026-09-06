@@ -2,12 +2,15 @@ package com.greengolddog.dayweave.data
 
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.OnboardingFirstItemAnchorSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
+import com.greengolddog.dayweave.model.hasValidOnboardingFirstItemAnchorRelationship
+import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -39,6 +42,33 @@ class OnboardingReadinessProofPersistenceTest {
         assertEquals(ITEM_ID, anchor.getValue("itemId").let { (it as JsonPrimitive).content })
         assertTrue(anchor.getValue("canonicalRevision") is JsonNull)
         assertTrue(anchor.values.none { it.toString().contains("First private task") })
+    }
+
+    @Test
+    fun parentDesignationAndStoredOwnEffortSurviveRestartWithoutRestoringDemandProof() = runBlocking {
+        val repository = RoomPlannerStateRepository(OnboardingProofFakeDao())
+        val original = pendingAnchorState()
+        val parent = original.pendingCanonicalAuthoringMutations.single().copy(
+            draft = plannedDraft().copy(
+                kind = ItemKind.GOAL,
+                constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            ),
+        )
+        val child = parent.copy(
+            id = "33333333-3333-4333-8333-333333333333",
+            idempotencyKey = "android-item-33333333-3333-4333-8333-333333333333",
+            itemId = "44444444-4444-4444-8444-444444444444",
+            draft = plannedDraft().copy(parentId = ITEM_ID),
+        )
+        val state = original.copy(pendingCanonicalAuthoringMutations = listOf(parent, child))
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(state.onboardingFirstItemAnchor, restored.onboardingFirstItemAnchor)
+        assertEquals(state.pendingCanonicalAuthoringMutations, restored.pendingCanonicalAuthoringMutations)
+        assertTrue(restored.hasValidOnboardingFirstItemAnchorRelationship())
+        assertNull(restored.validatedOnboardingFirstItemCheck())
+        assertEquals(true, restored.pendingCanonicalAuthoringMutations.first().draft?.constraints?.hasOwnEffort)
     }
 
     @Test

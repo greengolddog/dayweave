@@ -21,6 +21,7 @@ fn item(value: u128, title: &str, minutes: u32) -> WorkItem {
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority {
             importance: 5,
@@ -58,6 +59,7 @@ fn calendar_event(
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority::NONE,
         duration: None,
@@ -120,6 +122,18 @@ fn execution_work(
         disposition: None,
         used_session_indices,
         reservations: Vec::new(),
+    }
+}
+
+fn hierarchy_reservation(kind: ExecutionReservationKind) -> ExecutionReservation {
+    ExecutionReservation {
+        session_index: match kind {
+            ExecutionReservationKind::InFlight => 0,
+            ExecutionReservationKind::DeferredReplacement { .. } => 1,
+        },
+        start: DAY + Duration::hours(8),
+        end: DAY + Duration::hours(8) + Duration::minutes(30),
+        kind,
     }
 }
 
@@ -259,6 +273,7 @@ fn fixed_meeting_splits_flexible_work_into_valid_sessions() {
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority::NONE,
         duration: None,
@@ -293,7 +308,7 @@ fn fixed_meeting_splits_flexible_work_into_valid_sessions() {
 }
 
 #[test]
-fn hierarchy_rollup_counts_only_leaf_work_plus_explicit_parent_effort() {
+fn hierarchy_rollup_and_schedule_never_duplicate_parent_effort() {
     let mut goal = item(20, "Ship product", 15);
     goal.kind = ItemKind::Goal(GoalSpec {
         measures: Vec::new(),
@@ -303,6 +318,7 @@ fn hierarchy_rollup_counts_only_leaf_work_plus_explicit_parent_effort() {
 
     let mut project = item(21, "Project container", 500);
     project.parent_id = Some(goal.id);
+    project.has_own_effort = true;
 
     let mut leaf_a = item(22, "Leaf A", 30);
     leaf_a.parent_id = Some(project.id);
@@ -317,16 +333,20 @@ fn hierarchy_rollup_counts_only_leaf_work_plus_explicit_parent_effort() {
     ];
     let totals = roll_up_expected_durations(&items).unwrap();
     assert_eq!(totals[&project.id], Minutes(75));
-    assert_eq!(totals[&goal.id], Minutes(90));
+    assert_eq!(totals[&goal.id], Minutes(75));
 
     let plan = Scheduler.plan(&request(items)).unwrap();
     assert!(planned(&plan, &project).is_empty());
-    assert_eq!(planned(&plan, &goal).len(), 1);
+    assert!(planned(&plan, &goal).is_empty());
     assert_eq!(planned(&plan, &leaf_a).len(), 1);
     assert_eq!(planned(&plan, &leaf_b).len(), 1);
-    assert!(plan.decisions.iter().any(|decision| {
-        decision.item_id == project.id && decision.kind == DecisionKind::ContainerRolledUp
-    }));
+    assert_eq!(plan.blocks.len(), 2);
+    assert!(plan.unscheduled.is_empty());
+    for parent in [&project, &goal] {
+        assert!(plan.decisions.iter().any(|decision| {
+            decision.item_id == parent.id && decision.kind == DecisionKind::ContainerRolledUp
+        }));
+    }
 }
 
 #[test]
@@ -346,45 +366,312 @@ fn empty_goal_is_a_container_until_independent_effort_is_enabled() {
 }
 
 #[test]
-fn project_is_a_container_until_independent_effort_is_enabled() {
-    let mut project = item(25, "Project", 60);
-    project.kind = ItemKind::Project;
+fn semantic_containers_require_own_effort_and_leaf_identity_for_demand() {
+    for kind in [
+        ItemKind::Project,
+        ItemKind::Goal(GoalSpec {
+            measures: Vec::new(),
+            weekly_allocation: None,
+        }),
+        ItemKind::Routine(RoutineSpec {
+            ordered: false,
+            recurrence: None,
+        }),
+    ] {
+        let mut container = item(25, "Semantic container", 60);
+        container.kind = kind;
 
-    let container_plan = Scheduler.plan(&request(vec![project.clone()])).unwrap();
-    assert!(planned(&container_plan, &project).is_empty());
-    assert_eq!(
-        roll_up_expected_durations(&[project.clone()]).unwrap()[&project.id],
-        Minutes::ZERO
-    );
+        let container_plan = Scheduler.plan(&request(vec![container.clone()])).unwrap();
+        assert!(container_plan.blocks.is_empty());
+        assert!(container_plan.unscheduled.is_empty());
+        assert_eq!(
+            roll_up_expected_durations(&[container.clone()]).unwrap()[&container.id],
+            Minutes::ZERO
+        );
 
-    project.has_own_effort = true;
-    let own_effort_plan = Scheduler.plan(&request(vec![project.clone()])).unwrap();
-    assert_eq!(planned(&own_effort_plan, &project).len(), 1);
-    assert_eq!(
-        roll_up_expected_durations(&[project.clone()]).unwrap()[&project.id],
-        Minutes(60)
-    );
+        container.has_own_effort = true;
+        let own_effort_plan = Scheduler.plan(&request(vec![container.clone()])).unwrap();
+        let own_blocks = planned(&own_effort_plan, &container);
+        assert_eq!(own_blocks.len(), 1);
+        assert_eq!(
+            own_blocks[0].end - own_blocks[0].start,
+            Duration::minutes(60)
+        );
+        assert_eq!(
+            roll_up_expected_durations(&[container.clone()]).unwrap()[&container.id],
+            Minutes(60)
+        );
 
-    let mut child = item(26, "Project action", 30);
-    child.parent_id = Some(project.id);
-    let items = vec![project.clone(), child.clone()];
-    assert_eq!(
-        roll_up_expected_durations(&items).unwrap()[&project.id],
-        Minutes(90)
-    );
-    let combined_plan = Scheduler.plan(&request(items)).unwrap();
-    assert_eq!(planned(&combined_plan, &project).len(), 1);
-    assert_eq!(planned(&combined_plan, &child).len(), 1);
+        let mut child = item(26, "Executable action", 30);
+        child.parent_id = Some(container.id);
+        let items = vec![container.clone(), child.clone()];
+        assert_eq!(
+            roll_up_expected_durations(&items).unwrap()[&container.id],
+            Minutes(30)
+        );
+        let combined_plan = Scheduler.plan(&request(items)).unwrap();
+        assert!(combined_plan.blocks_for(container.id).next().is_none());
+        assert_eq!(planned(&combined_plan, &child).len(), 1);
+        assert_eq!(combined_plan.blocks.len(), 1);
+        assert!(combined_plan.unscheduled.is_empty());
+    }
+}
+
+#[test]
+fn every_non_event_parent_leaves_calendar_demand_to_its_leaf() {
+    for kind in [
+        ItemKind::Task,
+        ItemKind::Project,
+        ItemKind::Goal(GoalSpec {
+            measures: Vec::new(),
+            weekly_allocation: None,
+        }),
+        ItemKind::Routine(RoutineSpec {
+            ordered: false,
+            recurrence: None,
+        }),
+        ItemKind::RecurringTask(RecurringTaskSpec {
+            recurrence: Recurrence::Daily { times_per_day: 1 },
+        }),
+        ItemKind::Habit(HabitSpec {
+            recurrence: Recurrence::Daily { times_per_day: 1 },
+            target: None,
+            preserves_streak_when_paused: true,
+            missed_policy: HabitMissedPolicy::Ask,
+            minimum_spacing: Minutes::ZERO,
+        }),
+        ItemKind::Break(BreakSpec {
+            category: BreakCategory::Rest,
+            mandatory: false,
+            prompt_to_resume: true,
+        }),
+    ] {
+        for has_own_effort in [false, true] {
+            let mut parent = item(27, "Never directly scheduled", 600);
+            parent.kind = kind.clone();
+            parent.has_own_effort = has_own_effort;
+            let mut child = item(28, "Only leaf demand", 30);
+            child.parent_id = Some(parent.id);
+            let mut input = request(vec![parent.clone(), child.clone()]);
+            input.horizon_end = DAY + Duration::days(1);
+
+            let plan = Scheduler.plan(&input).unwrap();
+            assert!(plan.blocks_for(parent.id).next().is_none(), "{kind:?}");
+            let child_blocks = planned(&plan, &child);
+            assert_eq!(child_blocks.len(), 1, "{kind:?}");
+            assert_eq!(
+                child_blocks[0].end - child_blocks[0].start,
+                Duration::minutes(30)
+            );
+            assert_eq!(plan.blocks.len(), 1, "{kind:?}");
+            assert!(plan.unscheduled.is_empty(), "{kind:?}");
+        }
+    }
+}
+
+#[test]
+fn fixed_event_parent_keeps_its_interval_without_duplicate_flexible_demand() {
+    for has_own_effort in [false, true] {
+        let mut event = calendar_event(
+            29_001,
+            "Fixed parent event",
+            DAY + Duration::hours(8),
+            DAY + Duration::hours(9),
+        );
+        event.has_own_effort = has_own_effort;
+        let mut child = item(29_002, "Action after the event", 30);
+        child.parent_id = Some(event.id);
+        child.constraints.dependencies.push(Dependency {
+            item_id: event.id,
+            relation: DependencyRelation::FinishToStart,
+            minimum_lag: Minutes(15),
+            strength: ConstraintStrength::Hard,
+        });
+
+        let plan = Scheduler
+            .plan(&request(vec![event.clone(), child.clone()]))
+            .unwrap();
+        let event_blocks: Vec<_> = plan.blocks_for(event.id).collect();
+        assert_eq!(event_blocks.len(), 1);
+        assert_eq!(event_blocks[0].kind, ScheduleBlockKind::CalendarEvent);
+        assert_eq!(event_blocks[0].start, DAY + Duration::hours(8));
+        assert_eq!(event_blocks[0].end, DAY + Duration::hours(9));
+        let child_blocks = planned(&plan, &child);
+        assert_eq!(child_blocks.len(), 1);
+        assert!(child_blocks[0].start >= event_blocks[0].end + Duration::minutes(15));
+        assert_eq!(plan.blocks.len(), 2);
+        assert!(plan.unscheduled.is_empty());
+    }
+}
+
+#[test]
+fn stale_parent_reservations_fail_but_parent_history_does_not_consume_leaf_effort() {
+    for kind in [
+        ItemKind::Task,
+        ItemKind::Project,
+        ItemKind::Goal(GoalSpec {
+            measures: Vec::new(),
+            weekly_allocation: None,
+        }),
+        ItemKind::Routine(RoutineSpec {
+            ordered: false,
+            recurrence: None,
+        }),
+    ] {
+        let mut parent = item(29_101, "Former executable leaf", 60);
+        parent.kind = kind;
+        parent.has_own_effort = true;
+        let mut child = item(29_102, "Independent new leaf", 30);
+        child.parent_id = Some(parent.id);
+        let input = request(vec![parent.clone(), child.clone()]);
+        let history = execution_work(parent.id, 10 * 60, vec![0]);
+
+        let historical_plan = Scheduler
+            .plan_with_execution(&input, &execution_context(vec![history.clone()]))
+            .unwrap();
+        assert!(historical_plan.blocks_for(parent.id).next().is_none());
+        let child_blocks = planned(&historical_plan, &child);
+        assert_eq!(child_blocks.len(), 1);
+        assert_eq!(
+            child_blocks[0].end - child_blocks[0].start,
+            Duration::minutes(30)
+        );
+        assert_eq!(child_blocks[0].session_index, 0);
+        assert_eq!(historical_plan.blocks.len(), 1);
+        assert!(historical_plan.unscheduled.is_empty());
+
+        for reservation_kind in [
+            ExecutionReservationKind::InFlight,
+            ExecutionReservationKind::DeferredReplacement {
+                source_session_index: 0,
+            },
+        ] {
+            let mut live = history.clone();
+            live.reservations
+                .push(hierarchy_reservation(reservation_kind));
+            assert!(matches!(
+                Scheduler.plan_with_execution(&input, &execution_context(vec![live])),
+                Err(ScheduleError::InvalidItem { item_id, message })
+                    if item_id == parent.id
+                        && message.contains("reservations must identify a flexible leaf execution component")
+            ));
+        }
+    }
+}
+
+#[test]
+fn fixed_events_and_effortless_containers_cannot_acquire_flexible_reservations() {
+    for kind in [
+        ItemKind::Project,
+        ItemKind::Goal(GoalSpec {
+            measures: Vec::new(),
+            weekly_allocation: None,
+        }),
+        ItemKind::Routine(RoutineSpec {
+            ordered: false,
+            recurrence: None,
+        }),
+        ItemKind::CalendarEvent(CalendarEventSpec {
+            start: DAY + Duration::hours(8),
+            end: DAY + Duration::hours(9),
+            immutable: true,
+            all_day: false,
+            source_calendar_id: None,
+        }),
+    ] {
+        let mut target = item(29_201, "No flexible execution component", 60);
+        target.kind = kind;
+        let fixed_event = matches!(target.kind, ItemKind::CalendarEvent(_));
+        let input = request(vec![target.clone()]);
+        let history = execution_work(target.id, 0, vec![0]);
+        let historical_plan = Scheduler
+            .plan_with_execution(&input, &execution_context(vec![history.clone()]))
+            .unwrap();
+        assert_eq!(historical_plan.blocks.len(), usize::from(fixed_event));
+        assert!(historical_plan.blocks.iter().all(|block| {
+            block.item_id == Some(target.id) && block.kind == ScheduleBlockKind::CalendarEvent
+        }));
+
+        for reservation_kind in [
+            ExecutionReservationKind::InFlight,
+            ExecutionReservationKind::DeferredReplacement {
+                source_session_index: 0,
+            },
+        ] {
+            let mut live = history.clone();
+            live.reservations
+                .push(hierarchy_reservation(reservation_kind));
+            let context = execution_context(vec![live]);
+            assert!(matches!(
+                Scheduler.plan_with_execution(&input, &context),
+                Err(ScheduleError::InvalidItem { item_id, message })
+                    if item_id == target.id
+                        && message.contains("reservations must identify a flexible leaf execution component")
+            ));
+            if !fixed_event {
+                target.has_own_effort = true;
+                let executable = request(vec![target.clone()]);
+                let plan = Scheduler
+                    .plan_with_execution(&executable, &context)
+                    .unwrap();
+                assert!(
+                    plan.blocks_for(target.id)
+                        .any(|block| block.kind == ScheduleBlockKind::Pinned)
+                );
+                target.has_own_effort = false;
+            }
+        }
+    }
+}
+
+#[test]
+fn parents_reject_manual_and_ordinary_pins_but_ignore_old_stability_hints() {
+    let mut parent = item(29_301, "Parent with old placement", 60);
+    parent.has_own_effort = true;
+    let mut child = item(29_302, "Schedulable child", 30);
+    child.parent_id = Some(parent.id);
+    let mut input = request(vec![parent.clone(), child.clone()]);
+    let assignment = PreviousAssignment {
+        item_id: parent.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(11),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: None,
+    };
+    for manual_placement_id in [None, Some(Uuid::from_u128(29_303))] {
+        input.previous_assignments = vec![PreviousAssignment {
+            manual_placement_id,
+            ..assignment.clone()
+        }];
+        assert!(matches!(
+            Scheduler.plan(&input),
+            Err(ScheduleError::InvalidItem { item_id, .. }) if item_id == parent.id
+        ));
+    }
+
+    input.previous_assignments = vec![PreviousAssignment {
+        pinned: false,
+        ..assignment
+    }];
+    let plan = Scheduler.plan(&input).unwrap();
+    assert!(plan.blocks_for(parent.id).next().is_none());
+    assert_eq!(planned(&plan, &child).len(), 1);
+    assert_eq!(plan.blocks.len(), 1);
+    assert!(plan.unscheduled.is_empty());
 }
 
 #[test]
 fn ordered_routine_children_follow_their_declared_order() {
-    let mut routine = item(30, "Morning routine", 1);
+    let mut routine = item(30, "Morning routine", 180);
     routine.kind = ItemKind::Routine(RoutineSpec {
         ordered: true,
         recurrence: Some(Recurrence::Daily { times_per_day: 1 }),
     });
-    routine.duration = None;
+    routine.has_own_effort = true;
 
     let mut second = item(32, "Second", 20);
     second.parent_id = Some(routine.id);
@@ -401,9 +688,22 @@ fn ordered_routine_children_follow_their_declared_order() {
         urgency: 1,
     };
 
-    let plan = Scheduler
-        .plan(&request(vec![routine, second.clone(), first.clone()]))
-        .unwrap();
+    let mut input = request(vec![routine.clone(), second.clone(), first.clone()]);
+    input.horizon_end = DAY + Duration::days(1);
+    let plan = Scheduler.plan(&input).unwrap();
+    assert!(plan.blocks_for(routine.id).next().is_none());
+    assert_eq!(plan.blocks.len(), 2);
+    assert!(plan.unscheduled.is_empty());
+    assert_eq!(plan.occurrences.len(), 1);
+    assert_eq!(plan.occurrences[0].series_item_id, routine.id);
+    assert_eq!(
+        planned(&plan, &first)[0].occurrence_id,
+        Some(plan.occurrences[0].id)
+    );
+    assert_eq!(
+        planned(&plan, &second)[0].occurrence_id,
+        Some(plan.occurrences[0].id)
+    );
     assert!(planned(&plan, &first)[0].end <= planned(&plan, &second)[0].start);
     assert!(
         planned(&plan, &second)[0]
@@ -603,6 +903,7 @@ fn inactive_calendar_events_do_not_reserve_time_and_dependency_assessments_agree
             parent_id: None,
             sibling_order: None,
             has_own_effort: false,
+            has_children_outside_plan: false,
             goal_ids: BTreeSet::new(),
             priority: Priority::NONE,
             duration: None,
@@ -677,6 +978,7 @@ fn fixed_calendar_event_remains_a_valid_hard_dependency_predecessor() {
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority::NONE,
         duration: None,
@@ -1222,6 +1524,7 @@ fn out_of_horizon_calendar_event_dependency_uses_its_authoritative_interval() {
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority::NONE,
         duration: None,

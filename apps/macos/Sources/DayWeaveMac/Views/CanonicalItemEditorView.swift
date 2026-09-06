@@ -304,11 +304,11 @@ struct CanonicalItemEditorView: View {
                     .accessibilityIdentifier("canonical-editor.duration.maximum")
                 }
                 if state.kind == .goal || state.kind == .routine {
-                    Toggle("Schedule this container's own effort", isOn: $state.hasOwnEffort)
+                    Toggle("Schedule own effort when this is a leaf", isOn: $state.hasOwnEffort)
                         .accessibilityIdentifier("canonical-editor.own-effort")
                     Text(state.hasOwnEffort
-                        ? "Its duration is calendar demand in addition to any subtasks."
-                        : "Only its schedulable subtasks contribute calendar demand.")
+                        ? "Its duration contributes only while it has no subtasks. Put separate effort in a leaf task when it has children."
+                        : "This container contributes no time of its own; schedulable leaf subtasks provide its calendar demand.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

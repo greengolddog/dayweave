@@ -331,7 +331,9 @@ struct LocalCompositionStoreTests {
             includeSourceIdentity: Bool = true,
             useMatchingPolicyFingerprint: Bool = true
         ) async throws -> String? {
-            let context = try Self.makePlanner(now: now, item: habit)
+            // Both sides of the boundary assertion must use the same profile,
+            // independent of the development machine's local timezone.
+            let context = try Self.makePlanner(now: now, item: habit, scheduleProfile: profile)
             defer { try? FileManager.default.removeItem(at: context.directory) }
             let checkpoint = Self.missedCheckpoint(
                 item: habit,
@@ -1955,7 +1957,8 @@ struct LocalCompositionStoreTests {
         pendingCanonicalMutations: [PendingCanonicalMutation] = [],
         pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation] = [],
         pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation] = [],
-        googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil
+        googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
+        scheduleProfile: ScheduleProfile? = nil
     ) throws -> (directory: URL, persistence: EncryptedPlannerPersistence, planner: PlannerStore) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "DayWeaveLocalComposition-\(UUID().uuidString)",
@@ -2025,6 +2028,7 @@ struct LocalCompositionStoreTests {
             pendingProposalApplicationMutation: pendingProposalApplicationMutation,
             pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
             googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+            scheduleProfile: scheduleProfile,
             persistence: persistence,
             restoreFromPersistence: false,
             autosaveDelay: .seconds(60),

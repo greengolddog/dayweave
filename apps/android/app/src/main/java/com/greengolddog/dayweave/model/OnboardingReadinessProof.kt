@@ -28,6 +28,17 @@ data class OnboardingFirstItemAnchorSnapshot(
         if (state.validatedOnboardingFirstItemCheck() != OnboardingFirstItemCheck.CANONICAL_ITEM) {
             return false
         }
+        val canonicalItem = state.canonicalItems.singleOrNull {
+            it.id == itemId && it.revision == revision && it.deletedAt == null
+        } ?: return false
+        // A queued move can make a prospective draft a leaf, but cannot turn an
+        // already-published parent block into authoritative work before sync.
+        if (canonicalItem.kind != "event" && (
+                !canonicalItem.isExecutable || state.canonicalItems.any {
+                    it.parentId == itemId && it.deletedAt == null
+                }
+            )
+        ) return false
         if (state.pendingSchedulePublication != null) return false
         if (state.pendingCanonicalAuthoringMutations.any { it.itemId == itemId }) return false
         val proof = state.publishedScheduleProof ?: return false
@@ -49,9 +60,9 @@ enum class OnboardingFirstItemCheck {
 /**
  * Pure minimum-demand predicate for a locally reviewed create.
  *
- * Event validation already proves exact fixed timing. Goal and Routine always need explicit
- * `has_own_effort=true`; other kinds need it only when they have children. Every non-event demand
- * also needs a positive duration.
+ * Event validation already proves exact fixed timing. Every other kind must be a leaf with a
+ * positive duration. Goal and Routine leaves additionally need explicit `has_own_effort=true`;
+ * that stored flag never gives a parent its own calendar block.
  */
 fun CanonicalItemDraft.createsPlanningDemand(
     itemId: String,
@@ -60,14 +71,14 @@ fun CanonicalItemDraft.createsPlanningDemand(
     val value = normalized()
     value.requireValid(itemId)
     require(value.placement == CanonicalDraftPlacement.PLANNED)
+    require(value.kind == ItemKind.EVENT || !hasChildren)
     when (value.kind) {
         ItemKind.EVENT -> true
         ItemKind.PROJECT -> false
         ItemKind.TASK,
         ItemKind.HABIT,
         ItemKind.BREAK,
-        -> value.durationSeconds?.let { it > 0 } == true &&
-            (!hasChildren || value.constraints.hasOwnEffort == true)
+        -> value.durationSeconds?.let { it > 0 } == true
         ItemKind.GOAL,
         ItemKind.ROUTINE,
         -> value.durationSeconds?.let { it > 0 } == true &&
@@ -86,8 +97,9 @@ fun CanonicalItemSnapshot.createsPlanningDemand(
     val hasCanonicalChildren = canonicalItems.any { child ->
         child.id != id && child.parentId == id && child.deletedAt == null
     }
-    // The server's legacy field describes canonical leaf shape, not core planning occupancy.
-    require(isExecutable == !hasCanonicalChildren)
+    // Fixed events retain their interval even when they also organize child work.
+    // For flexible work, an inconsistent cached execution flag must fail closed.
+    if (kind != "event") require(isExecutable == !hasCanonicalChildren)
     val hasChildren = hasEffectiveCanonicalChild(
         itemId = id,
         canonicalItems = canonicalItems,

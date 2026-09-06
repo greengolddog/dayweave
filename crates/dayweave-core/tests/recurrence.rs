@@ -22,6 +22,7 @@ fn recurring_item(value: u128, recurrence: Recurrence) -> WorkItem {
         parent_id: None,
         sibling_order: None,
         has_own_effort: false,
+        has_children_outside_plan: false,
         goal_ids: BTreeSet::new(),
         priority: Priority {
             importance: 5,

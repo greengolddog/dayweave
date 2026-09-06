@@ -235,6 +235,45 @@ struct ExecutionSyncStoreTests {
         #expect(await unprovenTransport.receivedCommands().isEmpty)
     }
 
+    @Test("Start rejects known children even when the parent retains an executable flag and own effort")
+    func startRejectsCanonicalAndQueuedChildren() async throws {
+        for queued in [false, true] {
+            let context = try Self.persistenceContext()
+            defer { try? FileManager.default.removeItem(at: context.directory) }
+            var parent = try Self.canonicalItem()
+            parent.status = .planned
+            parent.hasOwnEffort = true
+            parent.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+            let child = try Self.canonicalItem(id: Self.uuid(8_901), parentID: parent.id)
+            var childDraft = DayWeaveCanonicalItemDraft(item: child)
+            childDraft.status = .planned
+            let pendingChild = DayWeavePendingCanonicalAuthoringMutation(
+                itemID: child.id,
+                operation: .create,
+                draft: childDraft,
+                createdAt: Self.baseDate
+            )
+            let block = Self.block()
+            let planner = Self.planner(
+                persistence: context.persistence,
+                blocks: [block],
+                canonicalItems: queued ? [parent] : [parent, child],
+                pendingCanonicalAuthoringMutations: queued ? [pendingChild] : []
+            )
+            #expect(planner.persistenceError == nil)
+            #expect(planner.currentPublishedScheduleProofAuthority != nil)
+            #expect(planner.canonicalPreviewFreshnessIssue == nil)
+            #expect(planner.canonicalScheduleBlockActionabilityIssue(block)
+                == "Only leaf items can start flexible work. This item has canonical or queued subtasks.")
+            let transport = Self.emptyReadTransport()
+            #expect(await Self.controller(planner: planner, transport: transport).start(block.id)
+                == .invalidLocalState)
+            #expect(await transport.receivedCommands().isEmpty)
+            #expect(planner.canonicalItem(id: parent.id)?.hasOwnEffort == true)
+            #expect(planner.pendingCanonicalAuthoringMutations.count == (queued ? 1 : 0))
+        }
+    }
+
     @Test("A newer durable schedule head revokes old block actions across offline restart")
     func newerScheduleHintRevokesPublishedBlockActions() async throws {
         let context = try Self.persistenceContext()
@@ -4163,6 +4202,7 @@ struct ExecutionSyncStoreTests {
         persistence: EncryptedPlannerPersistence,
         blocks: [ScheduleBlock] = [],
         canonicalItems: [DayWeaveCanonicalItem] = [],
+        pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation] = [],
         completedOccurrenceIDs: Set<UUID> = [],
         pendingCanonicalMutations: [PendingCanonicalMutation] = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
@@ -4209,6 +4249,7 @@ struct ExecutionSyncStoreTests {
             canonicalConfigurationIdentifier: canonicalConfiguration,
             schedulePreviewProvenance: provenance,
             publishedScheduleProof: proof,
+            pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
             executionState: executionState,
             previewValidatedForCurrentLaunch: true,
             persistence: persistence,
@@ -4308,17 +4349,21 @@ struct ExecutionSyncStoreTests {
         )
     }
 
-    private static func canonicalItem(splittable: Bool = false) throws -> DayWeaveCanonicalItem {
+    private static func canonicalItem(
+        splittable: Bool = false,
+        id: UUID? = nil,
+        parentID: UUID? = nil
+    ) throws -> DayWeaveCanonicalItem {
         let split = splittable
             ? #"{"type":"splittable","minimum_chunk_seconds":300,"maximum_chunk_seconds":1800}"#
             : #"{"type":"indivisible"}"#
         let json = #"""
         {
-          "id":"\#(itemID.uuidString.lowercased())","is_sensitive":false,"kind":"task","status":"scheduled",
+          "id":"\#((id ?? itemID).uuidString.lowercased())","is_sensitive":false,"kind":"task","status":"scheduled",
           "title":"Write plan","notes":null,"timezone_name":"UTC","duration_seconds":1800,
           "deadline_at":null,"earliest_start_at":null,"recurrence":null,
           "flexible_constraints":{},"split_policy":\#(split),"importance":50,"urgency":50,
-          "parent_id":null,"sibling_order":0,"is_executable":true,"revision":1,
+          "parent_id":\#(parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"),"sibling_order":0,"is_executable":true,"revision":1,
           "created_at":"2027-01-15T08:00:00Z","updated_at":"2027-01-15T08:00:00Z",
           "completed_at":null,"deleted_at":null
         }

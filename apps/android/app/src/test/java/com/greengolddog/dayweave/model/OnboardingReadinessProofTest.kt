@@ -17,7 +17,7 @@ class OnboardingReadinessProofTest {
             ).createsPlanningDemand(ITEM_ID),
         )
         assertFalse(task.createsPlanningDemand(ITEM_ID, hasChildren = true))
-        assertTrue(
+        assertFalse(
             task.copy(
                 constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
             ).createsPlanningDemand(ITEM_ID, hasChildren = true),
@@ -33,7 +33,7 @@ class OnboardingReadinessProofTest {
         listOf(habit, breakItem).forEach { leaf ->
             assertTrue(leaf.createsPlanningDemand(ITEM_ID))
             assertFalse(leaf.createsPlanningDemand(ITEM_ID, hasChildren = true))
-            assertTrue(
+            assertFalse(
                 leaf.copy(
                     constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
                 ).createsPlanningDemand(ITEM_ID, hasChildren = true),
@@ -56,6 +56,8 @@ class OnboardingReadinessProofTest {
         )
         assertTrue(goalWithOwnEffort.createsPlanningDemand(ITEM_ID))
         assertTrue(routineWithOwnEffort.createsPlanningDemand(ITEM_ID))
+        assertFalse(goalWithOwnEffort.createsPlanningDemand(ITEM_ID, hasChildren = true))
+        assertFalse(routineWithOwnEffort.createsPlanningDemand(ITEM_ID, hasChildren = true))
         assertFalse(
             goalWithOwnEffort.copy(durationSeconds = null).createsPlanningDemand(ITEM_ID),
         )
@@ -82,7 +84,7 @@ class OnboardingReadinessProofTest {
     }
 
     @Test
-    fun canonicalDemandMatchesCoreOwnEffortHierarchySemantics() {
+    fun canonicalDemandRequiresFlexibleLeavesButRetainsFixedEventIntervals() {
         val item = canonicalItem()
         assertTrue(item.createsPlanningDemand(listOf(item)))
         assertTrue(
@@ -121,13 +123,26 @@ class OnboardingReadinessProofTest {
             flexibleConstraintsJson = """{"has_own_effort":true}""",
             hasOwnEffort = true,
         )
-        assertTrue(taskWithOwnEffort.createsPlanningDemand(listOf(taskWithOwnEffort, child)))
+        assertFalse(taskWithOwnEffort.createsPlanningDemand(listOf(taskWithOwnEffort, child)))
         val goalParent = goalWithOwnEffort.copy(isExecutable = false)
         val routineParent = routineWithOwnEffort.copy(isExecutable = false)
-        assertTrue(goalParent.createsPlanningDemand(listOf(goalParent, child)))
-        assertTrue(routineParent.createsPlanningDemand(listOf(routineParent, child)))
+        assertFalse(goalParent.createsPlanningDemand(listOf(goalParent, child)))
+        assertFalse(routineParent.createsPlanningDemand(listOf(routineParent, child)))
+        listOf(taskWithOwnEffort, goalParent, routineParent).forEach { parent ->
+            val staleExecutableParent = parent.copy(isExecutable = true)
+            listOf("planned", "inbox", "blocked", "completed", "cancelled").forEach { childStatus ->
+                assertFalse(
+                    staleExecutableParent.createsPlanningDemand(
+                        listOf(staleExecutableParent, child.copy(status = childStatus)),
+                    ),
+                )
+            }
+        }
         val event = canonicalEvent().copy(isExecutable = false)
         assertTrue(event.createsPlanningDemand(listOf(event, child)))
+        assertTrue(event.copy(isExecutable = true).createsPlanningDemand(listOf(event, child)))
+        assertEquals("2026-09-03T09:00:00Z", event.earliestStartAt)
+        assertEquals("2026-09-03T09:30:00Z", event.deadlineAt)
     }
 
     @Test
@@ -153,8 +168,7 @@ class OnboardingReadinessProofTest {
                 pendingCanonicalAuthoringMutations = listOf(create, childCreate),
             ).validatedOnboardingFirstItemCheck(),
         )
-        assertEquals(
-            OnboardingFirstItemCheck.PENDING_CREATE,
+        assertNull(
             pending.copy(
                 pendingCanonicalAuthoringMutations = listOf(
                     create.copy(
@@ -195,8 +209,7 @@ class OnboardingReadinessProofTest {
                 pendingCanonicalAuthoringMutations = listOf(childCreate),
             ).validatedOnboardingFirstItemCheck(),
         )
-        assertEquals(
-            OnboardingFirstItemCheck.CANONICAL_ITEM,
+        assertNull(
             canonical.copy(
                 canonicalItems = listOf(
                     item.copy(
@@ -261,8 +274,7 @@ class OnboardingReadinessProofTest {
                 pendingCanonicalAuthoringMutations = listOf(moveIntoParent),
             ).validatedOnboardingFirstItemCheck(),
         )
-        assertEquals(
-            OnboardingFirstItemCheck.CANONICAL_ITEM,
+        assertNull(
             anchored.copy(
                 canonicalItems = listOf(
                     leafParent.copy(
@@ -373,6 +385,108 @@ class OnboardingReadinessProofTest {
             state.copy(scheduleInputDigest = "sha256:${"b".repeat(64)}")
                 .hasExactOnboardingFirstPlanProof(),
         )
+    }
+
+    @Test
+    fun staleExecutableParentCannotUsePublishedOrQueuedHierarchyAsLeafProof() {
+        val published = publishedState()
+        val parent = published.canonicalItems.single().copy(
+            flexibleConstraintsJson = """{"has_own_effort":true}""",
+            hasOwnEffort = true,
+        )
+        val leaf = published.copy(canonicalItems = listOf(parent))
+        val block = leaf.schedule.single()
+        assertTrue(leaf.hasExactOnboardingFirstPlanProof())
+        assertTrue(leaf.hasPublishedExecutionAuthority(block))
+
+        val child = canonicalItem(id = CHILD_ID, parentId = ITEM_ID)
+        val staleParent = leaf.copy(canonicalItems = listOf(parent, child))
+        assertFalse(staleParent.hasExactOnboardingFirstPlanProof())
+        assertFalse(staleParent.hasPublishedExecutionAuthority(block))
+        assertTrue(staleParent.hasValidOnboardingFirstItemAnchorRelationship())
+
+        val pendingMoveAway = staleParent.copy(
+            canonicalItems = listOf(parent.copy(isExecutable = false), child),
+            pendingCanonicalAuthoringMutations = listOf(pendingReplace(
+                item = child,
+                draft = child.toCanonicalDraft().copy(parentId = null),
+            )),
+        )
+        assertEquals(
+            OnboardingFirstItemCheck.CANONICAL_ITEM,
+            pendingMoveAway.validatedOnboardingFirstItemCheck(),
+        )
+        assertFalse(pendingMoveAway.hasExactOnboardingFirstPlanProof())
+        assertFalse(pendingMoveAway.hasPublishedExecutionAuthority(block))
+
+        val queuedChild = pendingCreate(
+            itemId = CHILD_ID,
+            mutationId = CHILD_MUTATION_ID,
+            draft = plannedTask().copy(parentId = ITEM_ID),
+        )
+        val queuedParent = leaf.copy(pendingCanonicalAuthoringMutations = listOf(queuedChild))
+        assertFalse(queuedParent.hasExactOnboardingFirstPlanProof())
+        assertFalse(queuedParent.hasPublishedExecutionAuthority(block))
+        assertTrue(queuedParent.hasValidOnboardingFirstItemAnchorRelationship())
+    }
+
+    @Test
+    fun localDesignationSurvivesChildAdditionWithoutRemainingLiveDemandProof() {
+        val parentCreate = pendingCreate(draft = plannedTask().copy(
+            kind = ItemKind.GOAL,
+            constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+        ))
+        val childCreate = pendingCreate(
+            itemId = CHILD_ID,
+            mutationId = CHILD_MUTATION_ID,
+            draft = plannedTask().copy(
+                parentId = ITEM_ID,
+                placement = CanonicalDraftPlacement.INBOX,
+            ),
+        )
+        val parent = DayWeaveUiState(
+            onboardingFirstItemAnchor = OnboardingFirstItemAnchorSnapshot(ITEM_ID),
+            pendingCanonicalAuthoringMutations = listOf(parentCreate, childCreate),
+        )
+        assertTrue(parent.hasValidOnboardingFirstItemAnchorRelationship())
+        assertNull(parent.validatedOnboardingFirstItemCheck())
+        assertEquals(true, parentCreate.draft?.constraints?.hasOwnEffort)
+        val event = canonicalEvent().toCanonicalDraft()
+        assertEquals(
+            OnboardingFirstItemCheck.PENDING_CREATE,
+            parent.copy(pendingCanonicalAuthoringMutations = listOf(
+                parentCreate.copy(draft = event), childCreate,
+            )).validatedOnboardingFirstItemCheck(),
+        )
+    }
+
+    @Test
+    fun fixedEventParentKeepsPublishedIntervalProofWithoutGainingExecutionAuthority() {
+        val base = publishedState()
+        val event = canonicalEvent()
+        val block = base.schedule.single().copy(
+            kind = ItemKind.EVENT,
+            canonicalBlockKind = "calendar_event",
+            isFlexible = false,
+            isHardConstraint = true,
+        )
+        val proof = requireNotNull(base.publishedScheduleProof).copy(
+            blocks = listOf(PublishedScheduleBlockProofSnapshot.from(block)),
+        )
+        val leaf = base.copy(
+            canonicalItems = listOf(event),
+            schedule = listOf(block),
+            publishedScheduleProof = proof,
+        )
+        assertTrue(leaf.hasExactOnboardingFirstPlanProof())
+        assertTrue(leaf.hasPublishedExecutionAuthority(block))
+
+        val child = canonicalItem(id = CHILD_ID, parentId = ITEM_ID)
+        val parent = leaf.copy(canonicalItems = listOf(event.copy(isExecutable = false), child))
+        assertTrue(parent.hasExactOnboardingFirstPlanProof())
+        assertFalse(parent.hasPublishedExecutionAuthority(block))
+        assertEquals(block.absoluteStartAt, parent.schedule.single().absoluteStartAt)
+        assertEquals(block.absoluteEndAt, parent.schedule.single().absoluteEndAt)
     }
 
     private fun publishedState(): DayWeaveUiState {

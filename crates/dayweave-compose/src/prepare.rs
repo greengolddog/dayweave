@@ -478,6 +478,7 @@ pub fn prepare_canonical_schedule(
         }
     }
     prune_orphaned_items(&mut accepted, &mut rejected_items);
+    preserve_omitted_child_topology(&mut accepted, &source_items);
     accepted.sort_by_key(|item| item.id);
     rejected_items.sort_by_key(|item| item.item_id);
 
@@ -957,15 +958,15 @@ fn classify_item(
         status: map_status(item.status),
         parent_id: item.parent_id.map(ItemId),
         sibling_order: Some(item.sibling_order),
-        // A non-leaf parent's independent component needs its own durable
-        // work-unit identity before execution can complete that component
-        // without completing the parent. Until that graph slice exists, the
-        // repository's `is_executable=false` projection suppresses only the
-        // parent's own demand while retaining it for hierarchy roll-up.
+        // Only leaf execution components create flexible demand. Separate
+        // work under a parent must have its own durable leaf item identity;
+        // a parent's own-effort flag never authorizes an extra parent block.
+        // Retain non-executable containers for hierarchy roll-up.
         has_own_effort: item.is_executable
             && item
                 .has_own_effort
                 .expect("structural fields are normalized before mapping"),
+        has_children_outside_plan: false,
         goal_ids: metadata.goal_ids.into_iter().map(ItemId).collect(),
         priority: Priority {
             importance: normalize_priority(item.importance),
@@ -1258,6 +1259,18 @@ fn inbox_subtree_item_ids(items: &[CanonicalItem]) -> BTreeSet<Uuid> {
     }
     debug_assert!(frontier.is_empty());
     excluded
+}
+
+fn preserve_omitted_child_topology(items: &mut [WorkItem], source: &[CanonicalItem]) {
+    let included: BTreeSet<_> = items.iter().map(|item| item.id.0).collect();
+    let omitted_child_parents: BTreeSet<_> = source
+        .iter()
+        .filter(|child| !included.contains(&child.id))
+        .filter_map(|child| child.parent_id)
+        .collect();
+    for item in items {
+        item.has_children_outside_plan = omitted_child_parents.contains(&item.id.0);
+    }
 }
 
 fn prune_orphaned_items(items: &mut Vec<WorkItem>, rejected: &mut Vec<RejectedScheduleItem>) {

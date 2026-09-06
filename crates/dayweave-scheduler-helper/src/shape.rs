@@ -38,6 +38,7 @@ struct WorkItemShape {
     parent_id: Option<IgnoredAny>,
     sibling_order: Option<IgnoredAny>,
     has_own_effort: IgnoredAny,
+    has_children_outside_plan: Option<IgnoredAny>,
     goal_ids: IgnoredAny,
     priority: PriorityShape,
     duration: Option<DurationEstimateShape>,

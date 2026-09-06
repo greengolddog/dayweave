@@ -1555,8 +1555,9 @@ internal fun CanonicalItemEditorSheet(
                         testTag = "canonical_editor_routine_ordered",
                     )
                     LabeledSwitch(
-                        title = "Routine has its own effort",
-                        detail = "Reserve the routine duration in addition to its child steps.",
+                        title = "Routine has leaf work",
+                        detail = "Schedule this routine's duration only while it has no child steps. " +
+                            "With children, schedule their leaf work instead.",
                         checked = form.hasOwnEffort,
                         onCheckedChange = {
                             form = form.copy(hasOwnEffort = it, hasOwnEffortSpecified = true)
@@ -1566,8 +1567,9 @@ internal fun CanonicalItemEditorSheet(
                 }
                 ItemKind.GOAL -> EditorSection("Goal tracking") {
                     LabeledSwitch(
-                        title = "Goal has its own effort",
-                        detail = "Reserve the goal duration in addition to child work.",
+                        title = "Goal has leaf work",
+                        detail = "Schedule this goal's duration only while it has no children. " +
+                            "With children, schedule their leaf work instead.",
                         checked = form.hasOwnEffort,
                         onCheckedChange = {
                             form = form.copy(hasOwnEffort = it, hasOwnEffortSpecified = true)

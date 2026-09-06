@@ -2681,7 +2681,16 @@ data class DayWeaveUiState(
         val itemId = block.canonicalItemId ?: return false
         val itemRevision = block.canonicalRevision ?: return false
         return canonicalItems.singleOrNull { it.id == itemId }?.let { item ->
-            item.revision == itemRevision && item.isExecutable && item.deletedAt == null
+            item.revision == itemRevision && item.isExecutable && item.deletedAt == null &&
+                (item.kind == "event" || (
+                    canonicalItems.none { it.deletedAt == null && it.parentId == itemId } &&
+                        !hasEffectiveCanonicalChild(
+                            itemId = itemId,
+                            canonicalItems = canonicalItems,
+                            pendingAuthoringMutations = pendingCanonicalAuthoringMutations,
+                            recentlyDeleted = canonicalRecentlyDeleted,
+                        )
+                    ))
         } == true
     }
 

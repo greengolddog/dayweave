@@ -729,6 +729,9 @@ final class PlannerStore: ObservableObject {
                         && $0.deletedAt == nil
                 }
             }
+            // This is a durable reviewed-item designation, not current
+            // scheduling proof. Children added later must not invalidate the
+            // encrypted snapshot; live readiness checks the complete graph.
             return !boundedCanonicalAuthoringMutations.contains { mutation in
                 mutation.itemID == anchor.itemID
                     && mutation.operation == .create
@@ -1439,6 +1442,9 @@ final class PlannerStore: ObservableObject {
               revision == item.revision,
               item.isExecutable else {
             return "The scheduled block no longer matches its canonical item revision."
+        }
+        guard item.kind == .event || !hasKnownCanonicalChildren(of: itemID) else {
+            return "Only leaf items can start flexible work. This item has canonical or queued subtasks."
         }
         return nil
     }
@@ -2159,7 +2165,10 @@ final class PlannerStore: ObservableObject {
         itemID: UUID,
         draft: DayWeaveCanonicalItemDraft
     ) throws -> DayWeavePendingCanonicalAuthoringMutation {
-        guard draft.createsPlanningDemand(itemID: itemID),
+        guard draft.createsPlanningDemand(
+                  itemID: itemID,
+                  hasActiveChildren: hasKnownCanonicalChildren(of: itemID)
+              ),
               onboardingFirstItemAnchor == nil
                 || onboardingFirstItemAnchor == .init(
                     itemID: itemID,
@@ -2430,6 +2439,8 @@ final class PlannerStore: ObservableObject {
         if prior.operation == .create,
            onboardingFirstItemAnchor?.itemID == prior.itemID,
            onboardingFirstItemAnchor?.canonicalRevision == nil,
+           // Retain the designation's intrinsic draft contract. Actual
+           // onboarding readiness separately rejects a node with children.
            !draft.createsPlanningDemand(itemID: prior.itemID) {
             throw PlannerCanonicalAuthoringError.invalidDraft
         }
@@ -3845,6 +3856,11 @@ final class PlannerStore: ObservableObject {
         canonicalItems.first(where: { $0.id == id })
     }
 
+    private func hasKnownCanonicalChildren(of itemID: UUID) -> Bool {
+        canonicalItems.containsActiveCanonicalChild(of: itemID)
+            || pendingCanonicalAuthoringMutations.containsPendingCanonicalChild(of: itemID)
+    }
+
     var hasExactOnboardingFirstPlanProof: Bool {
         onboardingFirstItemAnchor?.hasExactPublishedPlanProof(
             canonicalItems: canonicalItems,
@@ -3867,7 +3883,10 @@ final class PlannerStore: ObservableObject {
                         ? mutation.operation == .create
                         : mutation.operation == .create || mutation.operation == .replace)
                     && mutation.draft.map {
-                        $0.createsPlanningDemand(itemID: anchor.itemID)
+                        $0.createsPlanningDemand(
+                            itemID: anchor.itemID,
+                            hasActiveChildren: hasKnownCanonicalChildren(of: anchor.itemID)
+                        )
                             && $0.matches(item)
                     } == true
             }
@@ -3896,7 +3915,10 @@ final class PlannerStore: ObservableObject {
             mutation.itemID == anchor.itemID
                 && mutation.operation == .create
                 && mutation.draft.map {
-                    $0.createsPlanningDemand(itemID: anchor.itemID)
+                    $0.createsPlanningDemand(
+                        itemID: anchor.itemID,
+                        hasActiveChildren: hasKnownCanonicalChildren(of: anchor.itemID)
+                    )
                 } == true
         }) {
             let replacement = DayWeaveOnboardingFirstItemAnchor(

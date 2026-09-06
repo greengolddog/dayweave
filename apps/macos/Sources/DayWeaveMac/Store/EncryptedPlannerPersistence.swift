@@ -711,6 +711,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                                   && $0.deletedAt == nil
                           }
                       }
+                      // Anchor storage records the reviewed draft, not proof
+                      // that it still schedules. A later child must not make
+                      // valid encrypted content unreadable; live readiness
+                      // and publication proof inspect the full hierarchy.
                       return pendingCanonicalAuthoringMutations.contains { mutation in
                           mutation.itemID == anchor.itemID
                               && mutation.operation == .create
