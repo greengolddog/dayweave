@@ -8,11 +8,13 @@
 mod custom_recurrence;
 mod domain;
 mod habits;
+mod hierarchy_progress;
 mod recurrence;
 mod scheduler;
 
 pub use custom_recurrence::*;
 pub use domain::*;
 pub use habits::*;
+pub use hierarchy_progress::*;
 pub use recurrence::*;
 pub use scheduler::*;

@@ -144,6 +144,7 @@ final class CanonicalHierarchySourceCache {
 
     private var key: Key?
     private var cached: CanonicalInboxPresentation?
+    private var cachedParentIDs: Set<UUID> = []
     private(set) var buildCount = 0
 
     func presentation(for store: PlannerStore) -> CanonicalInboxPresentation {
@@ -169,6 +170,7 @@ final class CanonicalHierarchySourceCache {
         )
         key = next
         cached = result
+        cachedParentIDs = Set(result.hierarchyRows.compactMap(\.parentID))
         buildCount += 1
         return result
     }
@@ -176,6 +178,12 @@ final class CanonicalHierarchySourceCache {
     func clear() {
         key = nil
         cached = nil
+        cachedParentIDs = []
+    }
+
+    func parentIDs(for store: PlannerStore) -> Set<UUID> {
+        _ = presentation(for: store)
+        return cachedParentIDs
     }
 
     func selectedRow(itemID: UUID?, scope: CanonicalHierarchyPresentation.Scope,

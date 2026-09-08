@@ -41,6 +41,10 @@ import com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringPresentation
 import com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringRow
 import com.greengolddog.dayweave.ui.authoring.CanonicalHierarchyBrowserPresentation
 import com.greengolddog.dayweave.ui.authoring.CanonicalHierarchyBrowserRow
+import com.greengolddog.dayweave.ui.authoring.CanonicalHierarchyRollupPresentation
+import com.greengolddog.dayweave.ui.authoring.HierarchyRollupDisplay
+import com.greengolddog.dayweave.ui.authoring.summaryLabel
+import com.greengolddog.dayweave.ui.authoring.detailLabels
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
 import com.greengolddog.dayweave.ui.authoring.editorRoute
 import com.greengolddog.dayweave.ui.authoring.canonicalDurationLabel
@@ -64,12 +68,7 @@ internal fun CanonicalHierarchyBrowserScreen(
     var query by remember(kind) { mutableStateOf("") }
     var collapsedIds by remember(kind) { mutableStateOf(emptySet<String>()) }
     var selectedId by remember(kind) { mutableStateOf<String?>(null) }
-    val sourceState = remember(
-        state.canonicalConfigurationId, state.canonicalItems, state.pendingCanonicalAuthoringMutations,
-        state.canonicalRecentlyDeleted, state.pendingCanonicalMutation,
-        state.scheduleCompositionProfile,
-        state.canonicalExecutionSession,
-    ) { hierarchyAdmittedState(state) }
+    val sourceState = remember(hierarchySourceKey(state)) { hierarchyAdmittedState(state) }
     val built by produceState<HierarchyBuildResult?>(null, sourceState) {
         // Full metadata/privacy admission can be expensive for very deep retained hierarchies.
         // Never do it on the UI thread, and never attach an old result to new source inputs.
@@ -78,11 +77,12 @@ internal fun CanonicalHierarchyBrowserScreen(
                 CanonicalAuthoringPresentation.build(sourceState)
             }.getOrNull(), runCatching {
                 com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority.build(sourceState)
-            }.getOrNull())
+            }.getOrNull(), CanonicalHierarchyRollupPresentation.build(sourceState))
         }
     }
     val currentBuild = built?.takeIf { it.source == sourceState }
     val authoring = currentBuild?.presentation
+    val parentIds = remember(authoring) { authoring?.hierarchyRows.orEmpty().mapNotNull { it.parentId }.toSet() }
     val presentation = remember(authoring, kind, query, collapsedIds) {
         CanonicalHierarchyBrowserPresentation.build(authoring?.hierarchyRows.orEmpty(), kind, query, collapsedIds)
     }
@@ -142,6 +142,8 @@ internal fun CanonicalHierarchyBrowserScreen(
             items(presentation.rows, key = { it.item.itemId }) { row ->
                 HierarchyRowCard(
                     row = row,
+                    isStructuralParent = row.item.itemId in parentIds,
+                    rollup = currentBuild?.rollups?.get(row.item.itemId) ?: HierarchyRollupDisplay.Incomplete,
                     onInspect = { selectedId = row.item.itemId },
                     onToggle = {
                         collapsedIds = if (row.item.itemId in collapsedIds) {
@@ -158,6 +160,8 @@ internal fun CanonicalHierarchyBrowserScreen(
     if (selected != null) {
         HierarchyItemDetails(
             row = selected,
+            isStructuralParent = selected.itemId in parentIds,
+            rollup = currentBuild?.rollups?.get(selected.itemId) ?: HierarchyRollupDisplay.Incomplete,
             actionsEnabled = actionsEnabled,
             canAddChild = currentBuild?.parentAuthority?.let {
                 it.issue(selected.itemId, "00000000-0000-4000-8000-000000000000") == null
@@ -181,6 +185,15 @@ private data class HierarchyBuildResult(
     val source: DayWeaveUiState,
     val presentation: CanonicalAuthoringPresentation?,
     val parentAuthority: com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority?,
+    val rollups: CanonicalHierarchyRollupPresentation,
+)
+
+/** No wall clock, schedule, search, disclosure, selection, or connection phase in forest inputs. */
+internal fun hierarchySourceKey(state: DayWeaveUiState): List<Any?> = listOf(
+    state.canonicalConfigurationId, state.canonicalSyncOrigin, state.canonicalDeltaCursor,
+    state.canonicalItems, state.pendingCanonicalAuthoringMutations, state.canonicalRecentlyDeleted,
+    state.pendingCanonicalMutation, state.scheduleCompositionProfile, state.canonicalExecutionSession,
+    state.terminalExecutionOutcomes, state.pendingProposalApplicationMutation, state.pendingExecutionCommand,
 )
 
 /** Never promote an unbound legacy canonical cache into an admitted hierarchy. */
@@ -209,6 +222,8 @@ internal fun hierarchyCacheMessage(state: DayWeaveUiState, phase: CanonicalSyncP
 @Composable
 private fun HierarchyRowCard(
     row: CanonicalHierarchyBrowserRow,
+    isStructuralParent: Boolean,
+    rollup: HierarchyRollupDisplay,
     onInspect: () -> Unit,
     onToggle: () -> Unit,
     disclosureEnabled: Boolean,
@@ -245,8 +260,10 @@ private fun HierarchyRowCard(
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                Text(canonicalDurationLabel(item), style = MaterialTheme.typography.bodySmall)
+                Text(hierarchyStoredDurationLabel(item, isStructuralParent), style = MaterialTheme.typography.bodySmall)
                 canonicalTimingLabel(item)?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                Text(rollup.summaryLabel(), style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("hierarchy_rollup_${item.itemId}"))
                 if (item.hasMissingParent) Text("Parent unavailable · read-only")
                 if (item.hasHierarchyCycle) Text("Hierarchy cycle · read-only")
                 if (item.hasUnsafeAncestry && !item.hasMissingParent && !item.hasHierarchyCycle) {
@@ -271,9 +288,16 @@ private fun hierarchyStateLabel(row: CanonicalAuthoringRow): String =
     "${row.kind.label} · ${canonicalStatusLabel(row.status)} · " +
         row.syncState.name.lowercase().replaceFirstChar(Char::uppercase)
 
+internal fun hierarchyStoredDurationLabel(row: CanonicalAuthoringRow, isStructuralParent: Boolean): String =
+    if (isStructuralParent && row.kind != ItemKind.EVENT) {
+        "Stored item estimate · ${canonicalDurationLabel(row)} · excluded from leaf totals"
+    } else canonicalDurationLabel(row)
+
 @Composable
 private fun HierarchyItemDetails(
     row: CanonicalAuthoringRow,
+    isStructuralParent: Boolean,
+    rollup: HierarchyRollupDisplay,
     actionsEnabled: Boolean,
     canAddChild: Boolean,
     onAddChild: () -> Unit,
@@ -292,8 +316,12 @@ private fun HierarchyItemDetails(
                 Text(hierarchyStateLabel(row))
                 if (row.isSensitive) Text("Sensitive · protected by the current and pending hierarchy")
                 if (row.breadcrumb.isNotEmpty()) Text(row.breadcrumb.takeLast(8).joinToString(" › "))
-                Text(canonicalDurationLabel(row))
+                Text(hierarchyStoredDurationLabel(row, isStructuralParent))
                 canonicalTimingLabel(row)?.let { Text(it) }
+                Text(rollup.summaryLabel(), modifier = Modifier.testTag("hierarchy_rollup_detail"))
+                if (rollup is HierarchyRollupDisplay.Available) {
+                    rollup.totals.detailLabels().forEach { Text(it) }
+                }
                 canonicalBlockedReasonLabel(row)?.let { Text(it) }
                 row.notes?.takeIf(String::isNotBlank)?.let { Text(it) }
                 if (row.hasMissingParent) Text("Parent unavailable. Hierarchy editing is read-only.")

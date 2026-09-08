@@ -9,6 +9,7 @@ struct CanonicalHierarchyBrowserView: View {
     @State private var editorRoute: CanonicalInboxEditorRoute?
     @State private var sourceCache = CanonicalHierarchySourceCache()
     @State private var authoringCache = CanonicalHierarchyAuthoringCache()
+    @State private var rollupCache = CanonicalHierarchyRollupCache()
 
     var body: some View {
         let source = sourceCache.presentation(for: store)
@@ -22,6 +23,7 @@ struct CanonicalHierarchyBrowserView: View {
             hasPersistenceError: store.persistenceError != nil
         )
         let eligibleParents = authoringCache.eligibleParentIDs(for: store)
+        let rollups = rollupCache.presentation(for: store)
         CanonicalHierarchyBrowserContent(
             scope: scope,
             presentation: presentation,
@@ -37,7 +39,9 @@ struct CanonicalHierarchyBrowserView: View {
             review: { editorRoute = CanonicalInboxEditorRoute.review(row: $0, store: store) },
             create: { editorRoute = CanonicalHierarchyAuthoring.route(kind: $0, store: store) },
             eligibleParentIDs: eligibleParents,
-            addSubtask: { editorRoute = CanonicalHierarchyAuthoring.route(kind: .task, parentID: $0, store: store) }
+            addSubtask: { editorRoute = CanonicalHierarchyAuthoring.route(kind: .task, parentID: $0, store: store) },
+            rollups: rollups,
+            parentIDs: sourceCache.parentIDs(for: store)
         )
         .navigationTitle(scope.title)
         .sheet(item: $editorRoute) { route in
@@ -58,6 +62,7 @@ struct CanonicalHierarchyBrowserView: View {
         editorRoute = nil
         sourceCache.clear()
         authoringCache.clear()
+        rollupCache.clear()
     }
 }
 
@@ -77,6 +82,8 @@ struct CanonicalHierarchyBrowserContent: View {
     var create: (DayWeaveCanonicalItemKind) -> Void = { _ in }
     var eligibleParentIDs: Set<UUID> = []
     var addSubtask: (UUID) -> Void = { _ in }
+    var rollups: CanonicalHierarchyRollup?
+    var parentIDs: Set<UUID> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -157,7 +164,9 @@ struct CanonicalHierarchyBrowserContent: View {
                                 toggle: { toggle(entry.id) },
                                 review: { review(entry.row) },
                                 canAddSubtask: eligibleParentIDs.contains(entry.id),
-                                addSubtask: { addSubtask(entry.id) }
+                                addSubtask: { addSubtask(entry.id) },
+                                rollup: rollups?[entry.id],
+                                hasCanonicalChildren: parentIDs.contains(entry.id)
                             )
                         }
                     }
@@ -186,6 +195,8 @@ struct CanonicalHierarchyBrowserRow: View {
     let review: () -> Void
     var canAddSubtask: Bool = false
     var addSubtask: () -> Void = {}
+    var rollup: CanonicalHierarchyRollup.Presentation?
+    var hasCanonicalChildren = false
 
     private var row: CanonicalInboxPresentation.Row { entry.row }
 
@@ -222,6 +233,7 @@ struct CanonicalHierarchyBrowserRow: View {
                     if let timing = row.timingDescription(timezoneName: timezoneName) {
                         Text(timing).font(.caption).foregroundStyle(.secondary)
                     }
+                    if let rollup { CanonicalHierarchyRollupView(presentation: rollup, compact: true) }
                     if entry.hasUnsafeAncestry {
                         Label(row.hasHierarchyCycle ? "Hierarchy cycle · read-only"
                               : row.hasMissingParent ? "Parent unavailable · read-only"
@@ -234,7 +246,7 @@ struct CanonicalHierarchyBrowserRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(row.accessibilitySummary)
+            .accessibilityLabel(row.accessibilitySummary + (rollup.map { ". " + $0.accessibilityDescription } ?? ""))
             .accessibilityIdentifier("canonical-hierarchy.select.\(entry.id.uuidString.lowercased())")
             if canAddSubtask && !entry.hasUnsafeAncestry {
                 Button(action: addSubtask) { Image(systemName: "plus") }
@@ -274,6 +286,40 @@ struct CanonicalHierarchyBrowserRow: View {
             else { row.kind.wireValue.capitalized }
         let status: String = if case .unknown = row.status { "Newer lifecycle state" }
             else { row.status.wireValue.replacingOccurrences(of: "_", with: " ").capitalized }
-        return "\(kind) · \(status) · \(sync) · \(row.durationDescription) · Level \(entry.depth + 1)"
+        let duration = hasCanonicalChildren && row.kind != .event
+            ? "Stored estimate: \(row.durationDescription) (excluded while it has children)"
+            : row.durationDescription
+        return "\(kind) · \(status) · \(sync) · \(duration) · Level \(entry.depth + 1)"
+    }
+}
+
+/// Inert shared summary content; protected states contain no numerical values,
+/// including in their accessibility representation.
+struct CanonicalHierarchyRollupView: View {
+    let presentation: CanonicalHierarchyRollup.Presentation
+    var compact = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            switch presentation {
+            case let .available(summary):
+                Text("Saved cache · " + summary.leafDescription)
+                Text(summary.separateDescription)
+                if !compact {
+                    Text(summary.estimateDescription)
+                    Text("Recorded estimates, not remaining time or weighted progress.")
+                        .font(.caption2)
+                }
+            case .concealed:
+                Label("Leaf summary hidden · protected subtree", systemImage: "lock.fill")
+            case let .unavailable(reason):
+                Label(reason.message, systemImage: "info.circle")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilityDescription)
+        .accessibilityIdentifier("canonical-hierarchy.leaf-summary")
     }
 }

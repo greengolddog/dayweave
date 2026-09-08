@@ -67,6 +67,10 @@ and More; nested destinations highlight More and provide Back to More.
 
 Rows show kind, lifecycle/sync state, useful timing metadata, and hierarchy
 diagnostics without inventing progress percentages from today's block count.
+The [recorded leaf-summary contract](hierarchy-progress.md) defines canonical
+descendant lifecycle counts and exact-second effort estimates independently of
+search, collapse, and scheduling. These summaries do not change parent status
+or establish required-descendant completion.
 Disclosure controls, search, and selection have semantic labels and stable
 test identifiers. Reviewed editing includes supported Inbox/Planned projects
 and typed deadline/own-effort fields. Terminal, unsupported, submitted,
@@ -151,3 +155,9 @@ and the full-product release gates remain open.
 The subsequent [2026-09-08 structural-authoring checkpoint](structural-authoring.md#verification-checkpoint)
 adds Project editing and root/nested capture. Its full native gates and combined
 Android instrumentation rerun include the browser regressions described above.
+
+The [2026-09-08 recorded-summary checkpoint](hierarchy-progress.md#verification-checkpoint)
+adds complete-cache descendant lifecycle and effort summaries without changing
+item status. Its full native gates and ten Android UI interactions also rerun
+the existing browser checks. Independent progress and automatic completion are
+not claimed by this checkpoint.

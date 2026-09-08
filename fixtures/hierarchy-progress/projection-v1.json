@@ -1,0 +1,1456 @@
+{
+  "schema": "dayweave.hierarchy-progress-fixtures/1",
+  "cases": [
+    {
+      "name": "empty_forest",
+      "items": [],
+      "expected": {}
+    },
+    {
+      "name": "recorded_lifecycle_and_rich_effort",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000101",
+          "parent_id": null,
+          "kind": "goal",
+          "status": "completed",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 999,
+            "expected_seconds": 999,
+            "maximum_seconds": 999
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000102",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "task",
+          "status": "inbox",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 60,
+            "expected_seconds": 60,
+            "maximum_seconds": 60
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000103",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "task",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 30,
+            "expected_seconds": 60,
+            "maximum_seconds": 90
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000104",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "task",
+          "status": "skipped",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000105",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "task",
+          "status": "cancelled",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 15,
+            "expected_seconds": 15,
+            "maximum_seconds": 15
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000106",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 900,
+            "expected_seconds": 900,
+            "maximum_seconds": 900
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000107",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "goal",
+          "status": "blocked",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000108",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "event",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 3600,
+            "expected_seconds": 3600,
+            "maximum_seconds": 3600
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000109",
+          "parent_id": "00000000-0000-0000-0000-000000000101",
+          "kind": "event",
+          "status": "cancelled",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 600,
+            "expected_seconds": 600,
+            "maximum_seconds": 600
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000110",
+          "parent_id": "00000000-0000-0000-0000-000000000109",
+          "kind": "task",
+          "status": "paused",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 20,
+            "expected_seconds": 20,
+            "maximum_seconds": 20
+          }
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000101": {
+          "completed_leaf_items": 2,
+          "skipped_leaf_items": 1,
+          "cancelled_leaf_items": 1,
+          "open_leaf_items": 4,
+          "recurring_leaf_items": 0,
+          "fixed_events": 2,
+          "unknown_estimates": 2,
+          "minimum_estimate_seconds": 125,
+          "expected_estimate_seconds": 155,
+          "maximum_estimate_seconds": 185
+        },
+        "00000000-0000-0000-0000-000000000102": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 60,
+          "expected_estimate_seconds": 60,
+          "maximum_estimate_seconds": 60
+        },
+        "00000000-0000-0000-0000-000000000103": {
+          "completed_leaf_items": 1,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 30,
+          "expected_estimate_seconds": 60,
+          "maximum_estimate_seconds": 90
+        },
+        "00000000-0000-0000-0000-000000000104": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 1,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 1,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000105": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 1,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 15,
+          "expected_estimate_seconds": 15,
+          "maximum_estimate_seconds": 15
+        },
+        "00000000-0000-0000-0000-000000000106": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000107": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 1,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000108": {
+          "completed_leaf_items": 1,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 1,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000109": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 1,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 20,
+          "expected_estimate_seconds": 20,
+          "maximum_estimate_seconds": 20
+        },
+        "00000000-0000-0000-0000-000000000110": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 20,
+          "expected_estimate_seconds": 20,
+          "maximum_estimate_seconds": 20
+        }
+      }
+    },
+    {
+      "name": "recurrence_inherited_through_event_and_empty_container",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000201",
+          "parent_id": null,
+          "kind": "goal",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000202",
+          "parent_id": "00000000-0000-0000-0000-000000000201",
+          "kind": "routine",
+          "status": "completed",
+          "has_own_effort": true,
+          "recurs": true,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 800,
+            "expected_seconds": 800,
+            "maximum_seconds": 800
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000203",
+          "parent_id": "00000000-0000-0000-0000-000000000202",
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000204",
+          "parent_id": "00000000-0000-0000-0000-000000000203",
+          "kind": "task",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 45,
+            "expected_seconds": 45,
+            "maximum_seconds": 45
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000205",
+          "parent_id": "00000000-0000-0000-0000-000000000202",
+          "kind": "event",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 300,
+            "expected_seconds": 300,
+            "maximum_seconds": 300
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000206",
+          "parent_id": "00000000-0000-0000-0000-000000000205",
+          "kind": "task",
+          "status": "cancelled",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 30,
+            "expected_seconds": 30,
+            "maximum_seconds": 30
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000207",
+          "parent_id": "00000000-0000-0000-0000-000000000202",
+          "kind": "goal",
+          "status": "skipped",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000208",
+          "parent_id": "00000000-0000-0000-0000-000000000201",
+          "kind": "habit",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": true,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 60,
+            "expected_seconds": 60,
+            "maximum_seconds": 60
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000209",
+          "parent_id": "00000000-0000-0000-0000-000000000201",
+          "kind": "task",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": true,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 25,
+            "expected_seconds": 25,
+            "maximum_seconds": 25
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000210",
+          "parent_id": "00000000-0000-0000-0000-000000000201",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 20,
+            "expected_seconds": 20,
+            "maximum_seconds": 20
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000211",
+          "parent_id": "00000000-0000-0000-0000-000000000202",
+          "kind": "event",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 40,
+            "expected_seconds": 40,
+            "maximum_seconds": 40
+          }
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000201": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 6,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 20,
+          "expected_estimate_seconds": 20,
+          "maximum_estimate_seconds": 20
+        },
+        "00000000-0000-0000-0000-000000000202": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 4,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000203": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000204": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000205": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000206": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000207": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000208": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000209": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000210": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 20,
+          "expected_estimate_seconds": 20,
+          "maximum_estimate_seconds": 20
+        },
+        "00000000-0000-0000-0000-000000000211": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 1,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        }
+      }
+    },
+    {
+      "name": "empty_containers_and_explicit_leaf_effort",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000301",
+          "parent_id": null,
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 900,
+            "expected_seconds": 900,
+            "maximum_seconds": 900
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000302",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000303",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "goal",
+          "status": "completed",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 300,
+            "expected_seconds": 300,
+            "maximum_seconds": 300
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000304",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "routine",
+          "status": "skipped",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 700,
+            "expected_seconds": 700,
+            "maximum_seconds": 700
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000305",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "project",
+          "status": "cancelled",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000306",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "goal",
+          "status": "blocked",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 30,
+            "maximum_seconds": 59
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000307",
+          "parent_id": "00000000-0000-0000-0000-000000000301",
+          "kind": "routine",
+          "status": "inbox",
+          "has_own_effort": true,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000301": {
+          "completed_leaf_items": 1,
+          "skipped_leaf_items": 1,
+          "cancelled_leaf_items": 1,
+          "open_leaf_items": 3,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 1,
+          "minimum_estimate_seconds": 2,
+          "expected_estimate_seconds": 31,
+          "maximum_estimate_seconds": 60
+        },
+        "00000000-0000-0000-0000-000000000302": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000303": {
+          "completed_leaf_items": 1,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000304": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 1,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000305": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 1,
+          "open_leaf_items": 0,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000306": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 30,
+          "maximum_estimate_seconds": 59
+        },
+        "00000000-0000-0000-0000-000000000307": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 1,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        }
+      }
+    },
+    {
+      "name": "exact_subminute_forest",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000401",
+          "parent_id": null,
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000402",
+          "parent_id": "00000000-0000-0000-0000-000000000401",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000403",
+          "parent_id": "00000000-0000-0000-0000-000000000401",
+          "kind": "break",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000404",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 30,
+            "maximum_seconds": 59
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000405",
+          "parent_id": null,
+          "kind": "event",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000406",
+          "parent_id": null,
+          "kind": "habit",
+          "status": "inbox",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 2,
+            "expected_seconds": 2,
+            "maximum_seconds": 2
+          }
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000401": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 2,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 2,
+          "expected_estimate_seconds": 2,
+          "maximum_estimate_seconds": 2
+        },
+        "00000000-0000-0000-0000-000000000402": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000403": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000404": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 30,
+          "maximum_estimate_seconds": 59
+        },
+        "00000000-0000-0000-0000-000000000405": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 1,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 0,
+          "expected_estimate_seconds": 0,
+          "maximum_estimate_seconds": 0
+        },
+        "00000000-0000-0000-0000-000000000406": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 2,
+          "expected_estimate_seconds": 2,
+          "maximum_estimate_seconds": 2
+        }
+      }
+    },
+    {
+      "name": "every_nonterminal_status_is_open",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000501",
+          "parent_id": null,
+          "kind": "goal",
+          "status": "skipped",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000502",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "inbox",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000503",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000504",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "scheduled",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000505",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "in_progress",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000506",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "paused",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000507",
+          "parent_id": "00000000-0000-0000-0000-000000000501",
+          "kind": "task",
+          "status": "blocked",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000501": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 6,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 6,
+          "expected_estimate_seconds": 6,
+          "maximum_estimate_seconds": 6
+        },
+        "00000000-0000-0000-0000-000000000502": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000503": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000504": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000505": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000506": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        },
+        "00000000-0000-0000-0000-000000000507": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 1,
+          "expected_estimate_seconds": 1,
+          "maximum_estimate_seconds": 1
+        }
+      }
+    },
+    {
+      "name": "portable_integer_boundary",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000601",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 9223372036854775807,
+            "expected_seconds": 9223372036854775807,
+            "maximum_seconds": 9223372036854775807
+          }
+        }
+      ],
+      "expected": {
+        "00000000-0000-0000-0000-000000000601": {
+          "completed_leaf_items": 0,
+          "skipped_leaf_items": 0,
+          "cancelled_leaf_items": 0,
+          "open_leaf_items": 1,
+          "recurring_leaf_items": 0,
+          "fixed_events": 0,
+          "unknown_estimates": 0,
+          "minimum_estimate_seconds": 9223372036854775807,
+          "expected_estimate_seconds": 9223372036854775807,
+          "maximum_estimate_seconds": 9223372036854775807
+        }
+      }
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "duplicate_id",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000701",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000701",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "duplicate_item"
+    },
+    {
+      "name": "missing_parent",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000702",
+          "parent_id": "00000000-0000-0000-0000-000000000799",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "missing_parent"
+    },
+    {
+      "name": "self_cycle",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000703",
+          "parent_id": "00000000-0000-0000-0000-000000000703",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "cycle"
+    },
+    {
+      "name": "cycle_with_descendant",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000704",
+          "parent_id": "00000000-0000-0000-0000-000000000705",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000705",
+          "parent_id": "00000000-0000-0000-0000-000000000704",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000706",
+          "parent_id": "00000000-0000-0000-0000-000000000704",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "cycle"
+    },
+    {
+      "name": "incomplete_apparent_leaf",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000707",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": true,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        }
+      ],
+      "error": "incomplete_topology"
+    },
+    {
+      "name": "incomplete_parent",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000708",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": true,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000709",
+          "parent_id": "00000000-0000-0000-0000-000000000708",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "incomplete_topology"
+    },
+    {
+      "name": "zero_minimum",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000710",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 0,
+            "expected_seconds": 1,
+            "maximum_seconds": 2
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "minimum_above_expected",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000711",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 3,
+            "expected_seconds": 2,
+            "maximum_seconds": 4
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "expected_above_maximum",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000712",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 3,
+            "maximum_seconds": 2
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "malformed_ignored_parent_estimate",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000713",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 0,
+            "expected_seconds": 0,
+            "maximum_seconds": 0
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000714",
+          "parent_id": "00000000-0000-0000-0000-000000000713",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "malformed_ignored_recurring_estimate",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000715",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": true,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 0,
+            "expected_seconds": 0,
+            "maximum_seconds": 0
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "estimate_above_portable_bound",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000716",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 9223372036854775808,
+            "expected_seconds": 9223372036854775808,
+            "maximum_seconds": 9223372036854775808
+          }
+        }
+      ],
+      "error": "invalid_duration"
+    },
+    {
+      "name": "checked_ancestor_overflow",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000717",
+          "parent_id": null,
+          "kind": "project",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000718",
+          "parent_id": "00000000-0000-0000-0000-000000000717",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 9223372036854775807,
+            "expected_seconds": 9223372036854775807,
+            "maximum_seconds": 9223372036854775807
+          }
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000719",
+          "parent_id": "00000000-0000-0000-0000-000000000717",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": {
+            "minimum_seconds": 1,
+            "expected_seconds": 1,
+            "maximum_seconds": 1
+          }
+        }
+      ],
+      "error": "overflow"
+    },
+    {
+      "name": "nil_item_id",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000000",
+          "parent_id": null,
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "invalid_id"
+    },
+    {
+      "name": "nil_parent_id",
+      "items": [
+        {
+          "id": "00000000-0000-0000-0000-000000000720",
+          "parent_id": "00000000-0000-0000-0000-000000000000",
+          "kind": "task",
+          "status": "planned",
+          "has_own_effort": false,
+          "recurs": false,
+          "has_children_outside_plan": false,
+          "duration": null
+        }
+      ],
+      "error": "invalid_id"
+    }
+  ]
+}

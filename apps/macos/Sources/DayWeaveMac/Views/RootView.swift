@@ -2775,6 +2775,7 @@ private struct CanonicalInboxInspector: View {
     @EnvironmentObject private var googleOutbound: GoogleOutboundStore
     @State private var googleReviewIsPresented = false
     @State private var hierarchySourceCache = CanonicalHierarchySourceCache()
+    @State private var hierarchyRollupCache = CanonicalHierarchyRollupCache()
 
     private var selectedRow: CanonicalInboxPresentation.Row? {
         guard let selectedID = store.selectedCanonicalItemID else { return nil }
@@ -2802,6 +2803,7 @@ private struct CanonicalInboxInspector: View {
 
     private func clearTransientReview() {
         hierarchySourceCache.clear()
+        hierarchyRollupCache.clear()
         googleReviewIsPresented = false
     }
 
@@ -2840,7 +2842,10 @@ private struct CanonicalInboxInspector: View {
 
                     InspectorSection(title: "Planning") {
                         LabeledContent(
-                            "Duration",
+                            (store.destination ?? .today).hierarchyScope != nil
+                                && row.kind != .event
+                                && hierarchySourceCache.parentIDs(for: store).contains(row.itemID)
+                                ? "Stored estimate (excluded while it has children)" : "Duration",
                             value: row.durationDescription
                         )
                         if let timingTitle = row.timingTitle,
@@ -2867,6 +2872,14 @@ private struct CanonicalInboxInspector: View {
                                     .textSelection(.enabled)
                                     .privacySensitive(row.isSensitive)
                             }
+                        }
+                    }
+
+                    if (store.destination ?? .today).hierarchyScope != nil {
+                        InspectorSection(title: "Recorded leaf summary") {
+                            CanonicalHierarchyRollupView(
+                                presentation: hierarchyRollupCache.presentation(for: store)[row.itemID]
+                            )
                         }
                     }
 
