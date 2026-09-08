@@ -142,6 +142,8 @@ struct SensitiveAuthoringTests {
         let store = PlannerStore(
             blocks: blocks,
             canonicalItems: [parent, ownMark, movedChild, publicItem],
+            canonicalConfigurationIdentifier:
+                "https://api.example.com/gateway|auth=static-v1:\(String(repeating: "a", count: 64))",
             persistence: context.persistence,
             restoreFromPersistence: false
         )

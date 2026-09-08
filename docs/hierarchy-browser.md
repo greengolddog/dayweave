@@ -1,9 +1,10 @@
 # Canonical goals and projects browser
 
 This client slice implements navigation for `GOAL-001`, `HIE-001`, and
-`UX-002`–`UX-004`. It does not claim to implement parent auto-completion,
-independent progress measures, project authoring, weekly goal allocation, or
-new execution authority. Those remain in the feature ledger.
+`UX-002`–`UX-004`. Reviewed project and nested-item creation follow the
+[structural authoring contract](structural-authoring.md). Parent
+auto-completion, independent progress measures, weekly goal allocation, and
+new execution authority remain separate unfinished scope in the feature ledger.
 
 ## Source and identity
 
@@ -67,9 +68,24 @@ and More; nested destinations highlight More and provide Back to More.
 Rows show kind, lifecycle/sync state, useful timing metadata, and hierarchy
 diagnostics without inventing progress percentages from today's block count.
 Disclosure controls, search, and selection have semantic labels and stable
-test identifiers. Existing reviewed editing remains available only where the
-canonical authoring contract already supports it. Read-only project, terminal,
-unsupported, submitted, or conflicted rows remain inspectable.
+test identifiers. Reviewed editing includes supported Inbox/Planned projects
+and typed deadline/own-effort fields. Terminal, unsupported, submitted,
+configuration-bound, or conflicted rows remain inspectable without granting
+replacement authority.
+
+New Goal and New Project open an ordinary reviewed Inbox draft; Add Subtask
+opens the same form with a Task preset and the exact selected parent. No write
+occurs before Save, and these routes never claim the onboarding-first-item
+designation. Parent eligibility is independent of replacing the parent's body:
+an admitted Blocked parent can receive a child while remaining read-only itself.
+Missing, cyclic, unadmitted, executing, terminal, and unresolved pending ancestry
+cannot grant a new attachment. Save and sync recheck current authority.
+
+Eligibility projections are cached by graph and authority inputs, not rebuilt
+for every search, selection, or timer tick. Android prepares them with the
+existing off-main, exact-source hierarchy result; stale results cannot enable
+Add Subtask. Sensitive review context remains protected even if the unsaved
+draft is later detached, without silently changing its own sensitivity mark.
 
 ## Hydration, privacy, and verification
 
@@ -131,3 +147,7 @@ These are stress-case regression checks, not proof of every release performance
 budget. No owner accounts, real calendar data, physical devices, or paid cloud
 resources were used. Controlled service convergence, owner-device acceptance,
 and the full-product release gates remain open.
+
+The subsequent [2026-09-08 structural-authoring checkpoint](structural-authoring.md#verification-checkpoint)
+adds Project editing and root/nested capture. Its full native gates and combined
+Android instrumentation rerun include the browser regressions described above.

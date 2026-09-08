@@ -88,16 +88,14 @@ class CanonicalAuthoringStoreTest {
         val queued = requireNotNull(
             store.enqueueCanonicalCreate(taskDraft(), ITEM_ID, MUTATION_ID),
         ).mutation
-        val bound = requireNotNull(
-            store.bindCanonicalAuthoringMutation(MUTATION_ID, ORIGIN, CONFIGURATION_ID),
-        ).mutation
-        assertEquals(queued.idempotencyKey, bound.idempotencyKey)
         val upgradedStore = PlannerStore(
             store.state.value.copy(
                 pendingCanonicalAuthoringMutations = listOf(
-                    bound.copy(
+                    queued.copy(
                         durationRequestShapeVersion = PendingCanonicalAuthoringMutation
                             .LEGACY_DURATION_REQUEST_SHAPE_VERSION,
+                        structuralRequestShapeVersion = PendingCanonicalAuthoringMutation
+                            .LEGACY_STRUCTURAL_REQUEST_SHAPE_VERSION,
                     ),
                 ),
             ),

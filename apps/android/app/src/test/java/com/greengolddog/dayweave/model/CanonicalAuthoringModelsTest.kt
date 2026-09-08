@@ -132,6 +132,8 @@ class CanonicalAuthoringModelsTest {
             durationSeconds = 7_200,
             earliestStartAt = null,
             deadlineAt = null,
+            deadlineKind = CanonicalDeadlineKind.NONE,
+            deadlineStrength = null,
             recurrence = CanonicalRecurrenceDraft(
                 kind = CanonicalRecurrenceKind.FREQUENCY,
                 occurrencesPerPeriod = 3,
@@ -318,6 +320,7 @@ class CanonicalAuthoringModelsTest {
         )
         val routine = taskDraft().copy(
             kind = ItemKind.ROUTINE,
+            hasOwnEffort = true,
             constraints = CanonicalFlexibleConstraintsDraft(
                 routineOrdered = true,
                 hasOwnEffort = true,
@@ -325,6 +328,7 @@ class CanonicalAuthoringModelsTest {
         )
         val goal = taskDraft().copy(
             kind = ItemKind.GOAL,
+            hasOwnEffort = true,
             recurrence = null,
             constraints = CanonicalFlexibleConstraintsDraft(
                 hasOwnEffort = true,
@@ -495,11 +499,11 @@ class CanonicalAuthoringModelsTest {
         assertTrue(replacement.matches(richRoutine))
 
         val missingFlexibleOwnEffort = richRoutine.copy(flexibleConstraintsJson = "{}")
+        assertTrue(missingFlexibleOwnEffort.requireCanonicalReplacementSupport().hasOwnEffort)
+        assertNull(missingFlexibleOwnEffort.toCanonicalDraft().constraints.hasOwnEffort)
         assertThrows(IllegalArgumentException::class.java) {
-            missingFlexibleOwnEffort.requireCanonicalReplacementSupport()
-        }
-        assertThrows(IllegalArgumentException::class.java) {
-            missingFlexibleOwnEffort.toCanonicalDraft()
+            missingFlexibleOwnEffort.copy(flexibleConstraintsJson = """{"has_own_effort":false}""")
+                .toCanonicalDraft()
         }
     }
 
@@ -1036,11 +1040,15 @@ class CanonicalAuthoringModelsTest {
         taskDraft().copy(
             earliestStartAt = "0001-01-01T00:00:00Z",
             deadlineAt = null,
+            deadlineKind = CanonicalDeadlineKind.NONE,
+            deadlineStrength = null,
         )
             .requireValid(ITEM_ID)
         taskDraft().copy(
             earliestStartAt = "9999-12-31T23:59:59.123456000-18:00",
             deadlineAt = null,
+            deadlineKind = CanonicalDeadlineKind.NONE,
+            deadlineStrength = null,
         )
             .requireValid(ITEM_ID)
         listOf(

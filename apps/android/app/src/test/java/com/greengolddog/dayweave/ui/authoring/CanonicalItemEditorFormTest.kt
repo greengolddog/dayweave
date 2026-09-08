@@ -722,7 +722,8 @@ class CanonicalItemEditorFormTest {
             hasOwnEffortSpecified = true,
         ).draft(ITEM_ID).getOrThrow()
         assertEquals(true, routine.constraints.routineOrdered)
-        assertEquals(true, routine.constraints.hasOwnEffort)
+        assertTrue(routine.hasOwnEffort)
+        assertNull(routine.constraints.hasOwnEffort)
 
         val goal = CanonicalItemEditorForm.from(
             newCanonicalDetailedDraft("Book", ItemKind.GOAL),

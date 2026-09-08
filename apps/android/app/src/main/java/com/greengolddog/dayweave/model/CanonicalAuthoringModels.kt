@@ -1131,9 +1131,22 @@ data class CanonicalItemDraft(
         CanonicalDurationSource.USER
     },
     val deadlineAt: String? = null,
+    val deadlineKind: CanonicalDeadlineKind = if (kind == ItemKind.EVENT || deadlineAt == null) {
+        CanonicalDeadlineKind.NONE
+    } else {
+        CanonicalDeadlineKind.DATE_TIME
+    },
+    val deadlineDate: String? = null,
+    val deadlineStrength: CanonicalDeadlineStrength? = if (deadlineKind == CanonicalDeadlineKind.NONE) {
+        null
+    } else {
+        CanonicalDeadlineStrength.HARD
+    },
+    val deadlineSoftWeight: Long? = null,
     val earliestStartAt: String? = null,
     val recurrence: CanonicalRecurrenceDraft? = null,
     val constraints: CanonicalFlexibleConstraintsDraft = CanonicalFlexibleConstraintsDraft(),
+    val hasOwnEffort: Boolean = constraints.hasOwnEffort ?: false,
     val split: CanonicalSplitDraft = CanonicalSplitDraft(),
     val importance: Int = 50,
     val urgency: Int = 50,
@@ -1182,11 +1195,16 @@ data class CanonicalItemDraft(
         )
         requireCanonicalTimezoneName(value.timezoneName)
         requireCanonicalDraftDuration(value)
+        requireCanonicalDraftStructure(value)
         val earliest = value.earliestStartAt?.let {
             requireCanonicalInstant(it, "canonical earliest start")
         }
         val deadline = value.deadlineAt?.let {
             requireCanonicalInstant(it, "canonical deadline")
+        } ?: value.deadlineDate?.let {
+            requireNotNull(strictLocalDayEndInstant(LocalDate.parse(it).plusDays(1), ZoneId.of(value.timezoneName))) {
+                "The next local midnight does not exist for this date deadline"
+            }
         }
         require(earliest == null || deadline == null || earliest < deadline)
         value.recurrence?.requireValid()
@@ -1230,9 +1248,6 @@ data class CanonicalItemDraft(
             value.kind == ItemKind.HABIT || value.constraints.habitMinimumSpacingMinutes == 0L,
         ) { "Habit minimum spacing is only valid for habit items" }
         when (value.kind) {
-            ItemKind.PROJECT -> error(
-                "Project structure is read-only until typed structural authoring is available",
-            )
             ItemKind.HABIT -> {
                 require(
                     value.constraints.routineOrdered == null &&
@@ -1270,7 +1285,7 @@ data class CanonicalItemDraft(
                     value.constraints.goalMeasures == null &&
                     value.constraints.goalWeeklyAllocation == null,
             ) { "Break metadata cannot describe another item kind" }
-            ItemKind.TASK -> require(
+            ItemKind.TASK, ItemKind.PROJECT -> require(
                 value.constraints.habitTarget == null &&
                     value.constraints.preservesStreakWhenPaused == null &&
                     value.constraints.routineOrdered == null &&
@@ -1279,18 +1294,19 @@ data class CanonicalItemDraft(
                     value.constraints.breakCategory == null &&
                     value.constraints.breakMandatory == null &&
                     value.constraints.breakPromptToResume == null,
-            ) { "Task metadata cannot describe another item kind" }
+            ) { "Task or project metadata cannot describe another item kind" }
             ItemKind.EVENT,
             -> require(value.recurrence == null) { "This item type cannot recur" }
         }
-        if (value.kind in setOf(ItemKind.GOAL, ItemKind.BREAK)) {
+        if (value.kind in setOf(ItemKind.GOAL, ItemKind.BREAK, ItemKind.PROJECT)) {
             require(value.recurrence == null) { "This item type cannot recur" }
         }
         val richConstraints = value.constraints.scheduling
         require(value.earliestStartAt == null || richConstraints?.earliestStart == null) {
             "Earliest start cannot be defined in both canonical and flexible fields"
         }
-        require(value.deadlineAt == null || richConstraints?.latestFinish == null) {
+        require(value.deadlineKind == CanonicalDeadlineKind.NONE && value.deadlineAt == null ||
+            richConstraints?.latestFinish == null) {
             "Deadline cannot be defined in both canonical and flexible fields"
         }
         val effectiveEarliest = earliest ?: richConstraints?.earliestStart?.value?.let {
@@ -1375,10 +1391,17 @@ data class CanonicalItemDraft(
             item.durationMaxSeconds == value.durationMaxSeconds &&
             item.durationSource == value.durationSource &&
             sameInstant(item.deadlineAt, value.deadlineAt) &&
+            item.deadlineKind == value.deadlineKind &&
+            item.deadlineDate == value.deadlineDate &&
+            item.deadlineStrength == value.deadlineStrength &&
+            item.deadlineSoftWeight == value.deadlineSoftWeight &&
+            item.hasOwnEffort == value.hasOwnEffort &&
             sameInstant(item.earliestStartAt, value.earliestStartAt) &&
             normalizedRecurrenceJson(item.recurrenceJson) ==
             value.recurrence?.toCanonicalJson() &&
-            decodedConstraints.first == value.constraints &&
+            (decodedConstraints.first == value.constraints ||
+                value.hasOwnEffort && value.constraints.hasOwnEffort == null &&
+                decodedConstraints.first == value.constraints.copy(hasOwnEffort = true)) &&
             decodedConstraints.second == value.eventTiming &&
             decodeCanonicalSplit(item.splitPolicyJson) == value.split &&
             item.importance == value.importance && item.urgency == value.urgency &&
@@ -1442,6 +1465,7 @@ data class PendingCanonicalAuthoringMutation(
     val idempotencyKey: String = "android-item-$id",
     val createdAt: String,
     val durationRequestShapeVersion: Int = CURRENT_DURATION_REQUEST_SHAPE_VERSION,
+    val structuralRequestShapeVersion: Int = CURRENT_STRUCTURAL_REQUEST_SHAPE_VERSION,
     val syncOrigin: String? = null,
     val configurationId: String? = null,
     val submittedAt: String? = null,
@@ -1459,6 +1483,13 @@ data class PendingCanonicalAuthoringMutation(
             LEGACY_DURATION_REQUEST_SHAPE_VERSION,
             CURRENT_DURATION_REQUEST_SHAPE_VERSION,
         ))
+        require(structuralRequestShapeVersion in setOf(
+            LEGACY_STRUCTURAL_REQUEST_SHAPE_VERSION,
+            CURRENT_STRUCTURAL_REQUEST_SHAPE_VERSION,
+        ))
+        if (structuralRequestShapeVersion == LEGACY_STRUCTURAL_REQUEST_SHAPE_VERSION) {
+            draft?.requireLegacyStructuralRepresentability()
+        }
         val created = requireCanonicalInstant(createdAt, "canonical authoring creation")
         require(syncOrigin != null || configurationId == null)
         syncOrigin?.let(::requireCanonicalOrigin)
@@ -1538,6 +1569,8 @@ data class PendingCanonicalAuthoringMutation(
         const val CURRENT_VERSION = 1
         const val LEGACY_DURATION_REQUEST_SHAPE_VERSION = 1
         const val CURRENT_DURATION_REQUEST_SHAPE_VERSION = 2
+        const val LEGACY_STRUCTURAL_REQUEST_SHAPE_VERSION = 1
+        const val CURRENT_STRUCTURAL_REQUEST_SHAPE_VERSION = 2
         private const val MAX_BINDING_BYTES = 4_096
         const val MAX_DIAGNOSTIC_CHARS = 500
     }
@@ -1603,20 +1636,60 @@ private fun requireCanonicalDraftDuration(value: CanonicalItemDraft) {
     }
 }
 
+private fun requireCanonicalDraftStructure(value: CanonicalItemDraft) {
+    require(value.deadlineKind.isSupported && value.deadlineStrength?.isSupported != false) {
+        "Unsupported deadline metadata is read-only"
+    }
+    when (value.deadlineKind) {
+        CanonicalDeadlineKind.NONE -> require(
+            (value.deadlineAt == null || value.kind == ItemKind.EVENT) &&
+                value.deadlineDate == null && value.deadlineStrength == null &&
+                value.deadlineSoftWeight == null,
+        ) { "No deadline cannot carry deadline policy fields" }
+        CanonicalDeadlineKind.DATE -> require(
+            value.kind != ItemKind.EVENT && value.deadlineAt == null &&
+                value.deadlineDate?.isCanonicalDateOnly() == true && value.deadlineStrength != null,
+        ) { "Date deadline requires a valid date without a timestamp" }
+        CanonicalDeadlineKind.DATE_TIME -> require(
+            value.kind != ItemKind.EVENT && value.deadlineAt != null &&
+                value.deadlineDate == null && value.deadlineStrength != null,
+        ) { "Timed deadline requires a timestamp without a date-only field" }
+    }
+    when (value.deadlineStrength) {
+        CanonicalDeadlineStrength.HARD -> require(value.deadlineSoftWeight == null) {
+            "Hard deadlines cannot have a soft weight"
+        }
+        CanonicalDeadlineStrength.SOFT -> require(value.deadlineSoftWeight?.let {
+            it in 0..1_000_000
+        } == true) { "Soft deadline weight must be from 0 to 1000000" }
+    }
+    require(value.constraints.hasOwnEffort == null ||
+        value.constraints.hasOwnEffort == value.hasOwnEffort) {
+        "Own-effort metadata must agree with its retained legacy mirror"
+    }
+}
+
+/** Old journal bodies omitted the structural extension; never silently change their meaning. */
+internal fun CanonicalItemDraft.requireLegacyStructuralRepresentability() {
+    val expectedKind = if (kind == ItemKind.EVENT || deadlineAt == null) {
+        CanonicalDeadlineKind.NONE
+    } else {
+        CanonicalDeadlineKind.DATE_TIME
+    }
+    require(deadlineKind == expectedKind && deadlineDate == null && deadlineSoftWeight == null &&
+        deadlineStrength == (if (expectedKind == CanonicalDeadlineKind.NONE) null else {
+            CanonicalDeadlineStrength.HARD
+        }) && hasOwnEffort == (constraints.hasOwnEffort ?: false)) {
+        "Legacy structural requests cannot represent this typed deadline or own effort"
+    }
+}
+
 /** Structural fields that this editor can round-trip without erasing richer server semantics. */
 private fun CanonicalItemSnapshot.supportsCanonicalDraftStructure(): Boolean {
     if (!durationKind.isSupported || durationSource?.isSupported == false) return false
     if (!deadlineKind.isSupported || deadlineStrength?.isSupported == false) return false
     if (blockedReasonKind?.isSupported == false) return false
-    val legacyDeadline = if (kind == "event" || deadlineAt == null) {
-        deadlineKind == CanonicalDeadlineKind.NONE && deadlineDate == null &&
-            deadlineStrength == null && deadlineSoftWeight == null
-    } else {
-        deadlineKind == CanonicalDeadlineKind.DATE_TIME && deadlineDate == null &&
-            deadlineStrength == CanonicalDeadlineStrength.HARD && deadlineSoftWeight == null
-    }
-    return legacyDeadline && legacyHasOwnEffort(flexibleConstraintsJson) == hasOwnEffort &&
-        blockedReasonKind == null && blockedByItemId == null && blockedReason == null
+    return blockedReasonKind == null && blockedByItemId == null && blockedReason == null
 }
 
 @Serializable
@@ -1693,9 +1766,14 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
         durationMaxSeconds = durationMaxSeconds,
         durationSource = durationSource,
         deadlineAt = deadlineAt,
+        deadlineKind = deadlineKind,
+        deadlineDate = deadlineDate,
+        deadlineStrength = deadlineStrength,
+        deadlineSoftWeight = deadlineSoftWeight,
         earliestStartAt = earliestStartAt,
         recurrence = recurrenceValue,
         constraints = constraintsValue.first,
+        hasOwnEffort = hasOwnEffort,
         split = splitValue,
         importance = importance,
         urgency = urgency,

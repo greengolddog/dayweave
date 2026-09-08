@@ -234,7 +234,7 @@ enum PlannerCanonicalAuthoringError: LocalizedError, Equatable, Sendable {
         case .mutationNotFound:
             "The canonical authoring operation is no longer pending."
         case .submittedMutationIsImmutable:
-            "A submitted authoring operation is immutable until it is reconciled or conflicted."
+            "A bound, submitted, or conflicted authoring operation must be recovered before its draft can be edited."
         case .invalidConfiguration:
             "The authoring operation belongs to another API configuration or credential binding."
         case .invalidMutation:
@@ -1217,7 +1217,9 @@ final class PlannerStore: ObservableObject {
               pendingCanonicalSensitivityMutations.isEmpty,
               pendingSchedulePublication == nil,
               pendingProposalApplicationMutation == nil,
-              !pendingCanonicalAuthoringMutations.contains(where: \.hasBeenSubmitted) else {
+              !pendingCanonicalAuthoringMutations.contains(where: {
+                  $0.hasBeenSubmitted || $0.configurationIdentifier != nil || $0.disposition == .conflicted
+              }) else {
             return
         }
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
@@ -2433,6 +2435,8 @@ final class PlannerStore: ObservableObject {
         }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
         let prior = pendingCanonicalAuthoringMutations[index]
         guard !prior.hasBeenSubmitted,
+              prior.configurationIdentifier == nil,
+              prior.disposition == .pending,
               prior.operation == .create || prior.operation == .replace else {
             throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
         }
@@ -2832,60 +2836,44 @@ final class PlannerStore: ObservableObject {
         itemID: UUID,
         requiresCommittedParent: Bool
     ) -> Bool {
-        guard !wouldCreateCanonicalHierarchyCycle(
-            itemID: itemID,
-            parentID: draft.parentID
-        ) else { return false }
         guard let parentID = draft.parentID else { return true }
-
-        let parentStatus: DayWeaveCanonicalItemStatus?
-        if requiresCommittedParent {
-            parentStatus = canonicalItem(id: parentID)?.status
-        } else if let mutation = canonicalAuthoringMutation(itemID: parentID) {
-            guard mutation.disposition == .pending else { return false }
-            switch mutation.operation {
-            case .create, .replace:
-                parentStatus = mutation.draft?.status
-            case .restore:
-                parentStatus = mutation.baseItem?.status
-                    ?? canonicalTrashEntry(id: parentID)?.lastKnownItem?.status
-            case .trash:
-                return false
-            }
-        } else {
-            parentStatus = canonicalItem(id: parentID)?.status
-        }
-        return parentStatus == .inbox || parentStatus == .planned
-    }
-
-    private func wouldCreateCanonicalHierarchyCycle(
-        itemID: UUID,
-        parentID: UUID?
-    ) -> Bool {
-        guard let parentID else { return false }
-        var parentByID = Dictionary(uniqueKeysWithValues: canonicalItems.compactMap { item in
-            item.parentID.map { (item.id, $0) }
-        })
-        var knownIDs = Set(canonicalItems.map(\.id))
-        for mutation in pendingCanonicalAuthoringMutations {
-            knownIDs.insert(mutation.itemID)
-            if let parent = mutation.draft?.parentID {
-                parentByID[mutation.itemID] = parent
-            } else if mutation.draft != nil {
-                parentByID.removeValue(forKey: mutation.itemID)
-            }
-        }
-        knownIDs.insert(itemID)
-        parentByID[itemID] = parentID
-        guard knownIDs.contains(parentID) else { return true }
-
+        let items = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        let mutations = Dictionary(uniqueKeysWithValues: pendingCanonicalAuthoringMutations.map { ($0.itemID, $0) })
+        let trash = Set(canonicalTrash.map(\.id))
         var visited = Set([itemID])
         var current: UUID? = parentID
         while let candidate = current {
-            guard visited.insert(candidate).inserted else { return true }
-            current = parentByID[candidate]
+            guard visited.insert(candidate).inserted, !trash.contains(candidate),
+                  executionState.activeSession?.itemID != candidate,
+                  executionState.pendingCommand == nil,
+                  !pendingCanonicalMutations.contains(where: { $0.itemID == candidate }),
+                  !pendingCanonicalSensitivityMutations.contains(where: { $0.itemID == candidate }) else { return false }
+            let value: DayWeaveCanonicalItemDraft
+            if let mutation = mutations[candidate] {
+                guard !requiresCommittedParent, mutation.disposition == .pending,
+                      !mutation.hasBeenSubmitted, mutation.configurationIdentifier == nil,
+                      let proposed = mutation.draft,
+                      proposed.validationIssue(itemID: candidate) == nil else { return false }
+                switch mutation.operation {
+                case .create:
+                    guard items[candidate] == nil else { return false }
+                case .replace:
+                    guard canonicalConfigurationIdentifier != nil,
+                          let item = items[candidate], item.deletedAt == nil,
+                          mutation.baseItem == item, mutation.expectedRevision == item.revision else { return false }
+                case .trash, .restore: return false
+                }
+                value = proposed
+            } else {
+                guard canonicalConfigurationIdentifier != nil,
+                      let item = items[candidate], item.deletedAt == nil else { return false }
+                value = DayWeaveCanonicalItemDraft(item: item)
+            }
+            if candidate == parentID,
+               value.status != .inbox && value.status != .planned && value.status != .blocked { return false }
+            current = value.parentID
         }
-        return false
+        return true
     }
 
     private func appendCanonicalAuthoringMutation(
@@ -3031,6 +3019,8 @@ final class PlannerStore: ObservableObject {
                 expectedRevision: mutation.expectedRevision,
                 baseItem: nil,
                 createdAt: mutation.createdAt,
+                durationWireShape: mutation.durationWireShape,
+                structuralRequestShapeVersion: mutation.structuralRequestShapeVersion,
                 configurationIdentifier: mutation.configurationIdentifier,
                 hasBeenSubmitted: mutation.hasBeenSubmitted,
                 disposition: mutation.disposition,
@@ -5271,6 +5261,8 @@ final class PlannerStore: ObservableObject {
                 operation: .create,
                 draft: draft,
                 createdAt: mutation.createdAt,
+                durationWireShape: mutation.durationWireShape,
+                structuralRequestShapeVersion: mutation.structuralRequestShapeVersion,
                 configurationIdentifier: nil,
                 hasBeenSubmitted: false,
                 disposition: mutation.disposition,

@@ -403,8 +403,9 @@ private data class AuthoringNode(
             diagnostic = mutation?.diagnostic ?: unsupportedDiagnostic,
             draft = draft,
             revision = revision,
-            isReadOnly = unsupported || kind == ItemKind.PROJECT ||
+            isReadOnly = unsupported ||
                 status !in setOf("inbox", "planned") || mutation?.isSubmitted == true ||
+                mutation?.syncOrigin != null || mutation?.configurationId != null ||
                 mutation?.disposition == CanonicalAuthoringDisposition.CONFLICTED ||
                 mutation?.operation == CanonicalAuthoringOperation.RESTORE ||
                 hasMissingParent || hasHierarchyCycle || hasUnsafeAncestry,
@@ -481,18 +482,18 @@ private data class AuthoringNode(
                     item.durationSource
                 },
                 deadlineKind = if (usesPendingDraft) {
-                    inferredDeadlineKind(presentedKind.name.lowercase(), presentedDeadline)
+                    requireNotNull(decoded).deadlineKind
                 } else {
                     item.deadlineKind
                 },
                 deadlineAt = presentedDeadline,
-                deadlineDate = if (usesPendingDraft) null else item.deadlineDate,
+                deadlineDate = if (usesPendingDraft) requireNotNull(decoded).deadlineDate else item.deadlineDate,
                 deadlineStrength = if (usesPendingDraft) {
-                    inferredDeadlineStrength(presentedKind.name.lowercase(), presentedDeadline)
+                    requireNotNull(decoded).deadlineStrength
                 } else {
                     item.deadlineStrength
                 },
-                deadlineSoftWeight = if (usesPendingDraft) null else item.deadlineSoftWeight,
+                deadlineSoftWeight = if (usesPendingDraft) requireNotNull(decoded).deadlineSoftWeight else item.deadlineSoftWeight,
                 blockedReasonKind = if (usesPendingDraft) null else item.blockedReasonKind,
                 blockedByItemId = if (usesPendingDraft) null else item.blockedByItemId,
                 blockedReason = if (usesPendingDraft) null else item.blockedReason,
@@ -525,14 +526,11 @@ private data class AuthoringNode(
             durationSeconds = draft.durationSeconds,
             durationMaxSeconds = draft.durationMaxSeconds,
             durationSource = draft.durationSource,
-            deadlineKind = inferredDeadlineKind(draft.kind.name.lowercase(), draft.deadlineAt),
+            deadlineKind = draft.deadlineKind,
             deadlineAt = draft.deadlineAt,
-            deadlineDate = null,
-            deadlineStrength = inferredDeadlineStrength(
-                draft.kind.name.lowercase(),
-                draft.deadlineAt,
-            ),
-            deadlineSoftWeight = null,
+            deadlineDate = draft.deadlineDate,
+            deadlineStrength = draft.deadlineStrength,
+            deadlineSoftWeight = draft.deadlineSoftWeight,
             blockedReasonKind = null,
             blockedByItemId = null,
             blockedReason = null,

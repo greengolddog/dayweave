@@ -430,7 +430,8 @@ private extension CanonicalInboxPresentation {
             revision = nil
             activeCanonicalItem = nil
             readOnly = mutation.hasBeenSubmitted || mutation.configurationIdentifier != nil
-                || mutation.disposition == .conflicted || draft.kind == .project
+                || mutation.disposition == .conflicted
+                || draft.validationIssue(itemID: mutation.itemID) != nil
                 || (draft.status != .inbox && draft.status != .planned)
         }
 
@@ -456,8 +457,6 @@ private extension CanonicalInboxPresentation {
             let syncState = mutation.map(CanonicalInboxPresentation.syncState) ?? .synced
             let retainsCanonicalStructure = source == .canonical || source == .activeRestore
             let structuralItem = retainsCanonicalStructure ? activeCanonicalItem : nil
-            let inferredDeadlineKind: DayWeaveDeadlineKind = draft.kind == .event
-                || draft.deadlineAt == nil ? .none : .dateTime
             let hasOpaqueDependencies = CanonicalDependencyEdge.decode(
                 fromFlexibleConstraints: draft.flexibleConstraints
             ) == nil
@@ -479,12 +478,12 @@ private extension CanonicalInboxPresentation {
                 durationMaximumSeconds: structuralItem?.durationMaximumSeconds
                     ?? draft.durationMaximumSeconds,
                 durationSource: structuralItem?.durationSource ?? draft.durationSource,
-                deadlineKind: structuralItem?.deadlineKind ?? inferredDeadlineKind,
+                deadlineKind: structuralItem?.deadlineKind ?? draft.deadlineKind,
                 deadlineAt: draft.deadlineAt,
-                deadlineDate: structuralItem?.deadlineDate,
+                deadlineDate: structuralItem?.deadlineDate ?? draft.deadlineDate,
                 deadlineStrength: structuralItem?.deadlineStrength
-                    ?? (inferredDeadlineKind == .none ? nil : .hard),
-                deadlineSoftWeight: structuralItem?.deadlineSoftWeight,
+                    ?? draft.deadlineStrength,
+                deadlineSoftWeight: structuralItem?.deadlineSoftWeight ?? draft.deadlineSoftWeight,
                 blockedReasonKind: structuralItem?.blockedReasonKind,
                 blockedByItemID: structuralItem?.blockedByItemID,
                 blockedReason: structuralItem?.blockedReason,

@@ -81,7 +81,7 @@ class CanonicalHierarchyBrowserUiTest {
     }
 
     @Test
-    fun projectsAndTerminalRowsAreInspectableWithoutNewEditingAuthority() {
+    fun projectsCanBeReviewedWhileTerminalRowsRemainReadOnly() {
         var opened: CanonicalItemEditorRoute? = null
         showBrowser(
             kind = ItemKind.PROJECT,
@@ -92,8 +92,8 @@ class CanonicalHierarchyBrowserUiTest {
         )
         composeRule.onNodeWithTag("hierarchy_row_$PROJECT").performClick()
         composeRule.onNodeWithTag("hierarchy_item_details").assertIsDisplayed()
-        composeRule.onNodeWithTag("hierarchy_edit").assertDoesNotExist()
-        captureSyntheticEvidence("hierarchy-project-read-only.png")
+        composeRule.onNodeWithTag("hierarchy_edit").assertIsDisplayed()
+        captureSyntheticEvidence("hierarchy-project-authoring.png")
         composeRule.onNodeWithText("Close").performClick()
         composeRule.onNodeWithTag("hierarchy_row_$CHILD").performClick()
         composeRule.onNodeWithTag("hierarchy_item_details").assertIsDisplayed()

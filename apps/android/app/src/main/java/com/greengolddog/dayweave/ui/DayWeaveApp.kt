@@ -1323,7 +1323,8 @@ private fun DayWeaveRoot(
                     CanonicalItemEditorMode.CREATE -> route.sourceInboxId?.let { inboxId ->
                         viewModel.convertInboxDraft(inboxId, route.itemId, draft)
                     } ?: if (
-                        activeOnboardingState?.currentStep == OnboardingStep.FIRST_ITEM
+                        !route.isHierarchyCreation &&
+                            activeOnboardingState?.currentStep == OnboardingStep.FIRST_ITEM
                     ) {
                         viewModel.createOnboardingFirstItem(route.itemId, draft)
                     } else {

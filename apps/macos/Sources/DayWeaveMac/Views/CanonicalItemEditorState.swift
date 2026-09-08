@@ -332,6 +332,9 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     var earliestStartSoftWeight: UInt32
     var hasDeadline: Bool
     var deadline: Date
+    var deadlineIsDateOnly: Bool
+    var deadlineDateText: String
+    private var deadlineUsesCanonicalFields: Bool
     var deadlineStrength: CanonicalItemEditorConstraintStrength
     var deadlineSoftWeight: UInt32
     var importance: UInt8
@@ -478,10 +481,15 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         earliestStart = source.earliestStartAt ?? now
         earliestStartStrength = .hard
         earliestStartSoftWeight = 100
-        hasDeadline = source.deadlineAt != nil
+        hasDeadline = source.deadlineKind != .none || source.deadlineAt != nil
         deadline = source.deadlineAt ?? now.addingTimeInterval(24 * 60 * 60)
-        deadlineStrength = .hard
-        deadlineSoftWeight = 100
+        deadlineIsDateOnly = source.deadlineKind == .date
+        deadlineDateText = source.deadlineDate
+            ?? DayWeaveLocalDate.containing(now, timezoneName: source.timezoneName)?.rawValue
+            ?? CanonicalDateDeadline.string(now)
+        deadlineUsesCanonicalFields = !source.flexibleConstraints.hasNestedLatestFinish
+        deadlineStrength = source.deadlineStrength == .soft ? .soft : .hard
+        deadlineSoftWeight = source.deadlineSoftWeight ?? 100
         importance = source.importance
         urgency = source.urgency
         recurrence = .none
@@ -500,7 +508,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         tags = []
         hasPreferredStartMinute = false
         preferredStartMinute = 9 * 60
-        hasOwnEffort = false
+        hasOwnEffort = source.hasOwnEffort
         hasMinimumNotice = false
         minimumNoticeMinutes = 60
         minimumNoticeStrength = .hard
@@ -772,11 +780,23 @@ struct CanonicalItemEditorState: Equatable, Sendable {
             durationSeconds: authoredDuration,
             durationMaximumSeconds: authoredDurationMaximum,
             durationSource: authoredDurationSource,
+            deadlineKind: kind == .event || !hasDeadline ? DayWeaveDeadlineKind.none
+                : deadlineIsDateOnly ? .date
+                : deadlineUsesCanonicalFields || deadlineStrength == .hard ? .dateTime : .none,
+            deadlineDate: kind != .event && hasDeadline && deadlineIsDateOnly
+                ? deadlineDateText : nil,
+            deadlineStrength: kind != .event && hasDeadline
+                && (deadlineIsDateOnly || deadlineUsesCanonicalFields || deadlineStrength == .hard)
+                ? (deadlineStrength == .hard ? .hard : .soft) : nil,
+            deadlineSoftWeight: kind != .event && hasDeadline && deadlineStrength == .soft
+                && (deadlineIsDateOnly || deadlineUsesCanonicalFields) ? deadlineSoftWeight : nil,
+            hasOwnEffort: hasOwnEffort,
             deadlineAt: kind == .event
                 ? (emitsEventTiming
                     ? (eventRangeIsUnchanged ? originalEvent?.canonicalDeadline : eventEnd)
                     : nil)
-                : (hasDeadline && deadlineStrength == .hard ? deadline : nil),
+                : (hasDeadline && !deadlineIsDateOnly
+                    && (deadlineUsesCanonicalFields || deadlineStrength == .hard) ? deadline : nil),
             earliestStartAt: kind == .event
                 ? (emitsEventTiming
                     ? (eventRangeIsUnchanged
@@ -1032,7 +1052,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         return orderedIDs.compactMap { nodeID in
             guard !excluded.contains(nodeID),
                   let node = nodes[nodeID],
-                  node.status == .inbox || node.status == .planned,
+                  node.status == .inbox || node.status == .planned || node.status == .blocked,
                   let depth = depthByID[nodeID],
                   let breadcrumb = breadcrumbByID[nodeID] else {
                 return nil
@@ -1137,7 +1157,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
                 softWeight: earliestStartSoftWeight
             )
         }
-        if hasDeadline, deadlineStrength == .soft {
+        if hasDeadline, !deadlineIsDateOnly, !deadlineUsesCanonicalFields, deadlineStrength == .soft {
             schedulingConstraints["latest_finish"] = qualified(
                 .string(Self.format(deadline)),
                 strength: deadlineStrength,
@@ -1264,7 +1284,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         value["preferred_start_minute"] = hasPreferredStartMinute
             ? number(UInt32(preferredStartMinute))
             : nil
-        if ((kind == .goal || kind == .routine) && hasOwnEffort)
+        if ((kind == .goal || kind == .routine || kind == .project) && hasOwnEffort)
             || hadOwnEffortConstraint {
             value["has_own_effort"] = .bool(hasOwnEffort)
         } else {
@@ -1413,7 +1433,10 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         if weightedValues.contains(where: { invalidWeight($0.0, $0.1) }) {
             return "Soft constraint weights must be at most \(Self.maximumSoftWeight)."
         }
-        if hasEarliestStart, hasDeadline, earliestStart >= deadline {
+        let deadlineBoundary = deadlineIsDateOnly
+            ? CanonicalDateDeadline.boundary(deadlineDateText, timezoneName: timezoneName)
+            : deadline
+        if hasEarliestStart, hasDeadline, let deadlineBoundary, earliestStart >= deadlineBoundary {
             return "Earliest start must be before the deadline."
         }
         if hasAllowedWeekdays, allowedWeekdays.isEmpty {

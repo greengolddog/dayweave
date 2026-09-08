@@ -8,6 +8,7 @@ struct CanonicalHierarchyBrowserView: View {
     @State private var collapsedIDs: Set<UUID> = []
     @State private var editorRoute: CanonicalInboxEditorRoute?
     @State private var sourceCache = CanonicalHierarchySourceCache()
+    @State private var authoringCache = CanonicalHierarchyAuthoringCache()
 
     var body: some View {
         let source = sourceCache.presentation(for: store)
@@ -20,6 +21,7 @@ struct CanonicalHierarchyBrowserView: View {
             status: canonicalSync.status,
             hasPersistenceError: store.persistenceError != nil
         )
+        let eligibleParents = authoringCache.eligibleParentIDs(for: store)
         CanonicalHierarchyBrowserContent(
             scope: scope,
             presentation: presentation,
@@ -32,7 +34,10 @@ struct CanonicalHierarchyBrowserView: View {
             toggle: { id in
                 if !collapsedIDs.insert(id).inserted { collapsedIDs.remove(id) }
             },
-            review: { editorRoute = CanonicalInboxEditorRoute.review(row: $0, store: store) }
+            review: { editorRoute = CanonicalInboxEditorRoute.review(row: $0, store: store) },
+            create: { editorRoute = CanonicalHierarchyAuthoring.route(kind: $0, store: store) },
+            eligibleParentIDs: eligibleParents,
+            addSubtask: { editorRoute = CanonicalHierarchyAuthoring.route(kind: .task, parentID: $0, store: store) }
         )
         .navigationTitle(scope.title)
         .sheet(item: $editorRoute) { route in
@@ -52,6 +57,7 @@ struct CanonicalHierarchyBrowserView: View {
         collapsedIDs = []
         editorRoute = nil
         sourceCache.clear()
+        authoringCache.clear()
     }
 }
 
@@ -68,6 +74,9 @@ struct CanonicalHierarchyBrowserContent: View {
     let select: (UUID) -> Void
     let toggle: (UUID) -> Void
     let review: (CanonicalInboxPresentation.Row) -> Void
+    var create: (DayWeaveCanonicalItemKind) -> Void = { _ in }
+    var eligibleParentIDs: Set<UUID> = []
+    var addSubtask: (UUID) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -84,6 +93,12 @@ struct CanonicalHierarchyBrowserContent: View {
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
+                    Button(scope == .goals ? "New Goal" : "New Project") {
+                        create(scope == .goals ? .goal : .project)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canMutate)
+                    .accessibilityIdentifier("canonical-hierarchy.create")
                 }
                 HStack(spacing: 9) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -140,7 +155,9 @@ struct CanonicalHierarchyBrowserContent: View {
                                 timezoneName: timezoneName,
                                 select: { select(entry.id) },
                                 toggle: { toggle(entry.id) },
-                                review: { review(entry.row) }
+                                review: { review(entry.row) },
+                                canAddSubtask: eligibleParentIDs.contains(entry.id),
+                                addSubtask: { addSubtask(entry.id) }
                             )
                         }
                     }
@@ -167,6 +184,8 @@ struct CanonicalHierarchyBrowserRow: View {
     let select: () -> Void
     let toggle: () -> Void
     let review: () -> Void
+    var canAddSubtask: Bool = false
+    var addSubtask: () -> Void = {}
 
     private var row: CanonicalInboxPresentation.Row { entry.row }
 
@@ -217,6 +236,14 @@ struct CanonicalHierarchyBrowserRow: View {
             .buttonStyle(.plain)
             .accessibilityLabel(row.accessibilitySummary)
             .accessibilityIdentifier("canonical-hierarchy.select.\(entry.id.uuidString.lowercased())")
+            if canAddSubtask && !entry.hasUnsafeAncestry {
+                Button(action: addSubtask) { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+                    .disabled(!canMutate)
+                    .help("Add a new task inside this item")
+                    .accessibilityLabel("Add subtask")
+                    .accessibilityIdentifier("canonical-hierarchy.add-subtask.\(entry.id.uuidString.lowercased())")
+            }
             if !row.isReadOnly && !entry.hasUnsafeAncestry {
                 Button(action: review) { Image(systemName: "square.and.pencil") }
                     .buttonStyle(.borderless)

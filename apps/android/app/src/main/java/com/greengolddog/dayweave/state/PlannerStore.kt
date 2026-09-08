@@ -2349,7 +2349,8 @@ class PlannerStore(
             var changed = false
             val mutations = current.pendingCanonicalAuthoringMutations.map { mutation ->
                 if (
-                    mutation.isSubmitted ||
+                    mutation.isSubmitted || mutation.syncOrigin != null ||
+                    mutation.configurationId != null ||
                     mutation.disposition != CanonicalAuthoringDisposition.PENDING ||
                     mutation.operation !in setOf(
                         CanonicalAuthoringOperation.REPLACE,
@@ -2542,7 +2543,8 @@ class PlannerStore(
             require(index >= 0) { "Canonical authoring mutation is unavailable" }
             val existing = current.pendingCanonicalAuthoringMutations[index]
             require(
-                !existing.isSubmitted &&
+                !existing.isSubmitted && existing.syncOrigin == null &&
+                    existing.configurationId == null &&
                     existing.disposition == CanonicalAuthoringDisposition.PENDING &&
                     existing.operation in setOf(
                         CanonicalAuthoringOperation.CREATE,
@@ -2553,11 +2555,8 @@ class PlannerStore(
                 draft = draft.normalized(),
                 durationRequestShapeVersion = PendingCanonicalAuthoringMutation
                     .CURRENT_DURATION_REQUEST_SHAPE_VERSION,
-                // A crash can leave a persistently bound request before its submission
-                // generation. Editing is safe only because no network byte left; make the
-                // next sync bind the changed body again under the active credentials.
-                syncOrigin = null,
-                configurationId = null,
+                structuralRequestShapeVersion = PendingCanonicalAuthoringMutation
+                    .CURRENT_STRUCTURAL_REQUEST_SHAPE_VERSION,
             ).also(PendingCanonicalAuthoringMutation::requireValid)
             val prospectiveMutations = current.pendingCanonicalAuthoringMutations
                 .replaceAt(index, replacement)
@@ -3181,12 +3180,13 @@ class PlannerStore(
     private fun validateCanonicalAuthoringHierarchy(
         current: DayWeaveUiState,
         candidate: PendingCanonicalAuthoringMutation,
+        requireParentAdmission: Boolean = true,
     ) {
         candidate.requireValid()
-        val allMutations = current.pendingCanonicalAuthoringMutations
+        val exactJournals = current.pendingCanonicalAuthoringMutations
             .filterNot { it.id == candidate.id }
             .plus(candidate)
-            .filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
+        val allMutations = exactJournals.filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
         val activeById = current.canonicalItems.associateBy(CanonicalItemSnapshot::id).toMutableMap()
         val draftById = mutableMapOf<String, CanonicalItemDraft>()
         val restoredStatusById = mutableMapOf<String, String>()
@@ -3223,24 +3223,26 @@ class PlannerStore(
                 "An item with active or queued children cannot be deleted"
             }
         }
-        parentById.forEach { (itemId, parentId) ->
-            if (parentId == null) return@forEach
-            require(parentId in parentById) { "Canonical parent is unavailable" }
-            val parentDraft = draftById[parentId]
-            val parentStatus = parentDraft?.placement?.wireValue ?: activeById[parentId]?.status
-                ?: restoredStatusById[parentId]
-            require(parentStatus == "inbox" || parentStatus == "planned") {
-                "An executing or terminal item cannot become a parent"
+        if (candidate.operation != CanonicalAuthoringOperation.TRASH) {
+            // Only the chosen path grants authority. An unrelated stale branch must not block
+            // a detached Inbox capture, and ancestor lifecycle is not direct-parent lifecycle.
+            if (!requireParentAdmission) {
+                // Existing custody survives an ancestor's bound/submitted recovery window.
+                // This is not save/send permission; those paths always recheck exact journals.
+                val visited = mutableSetOf(candidate.itemId)
+                var ancestor = parentById[candidate.itemId]
+                while (ancestor != null) {
+                    require(ancestor in parentById) { "Canonical parent is unavailable" }
+                    require(visited.add(ancestor)) { "Canonical hierarchy would contain a cycle" }
+                    ancestor = parentById[ancestor]
+                }
+                return
             }
-            require(itemId != parentId)
-        }
-        parentById.keys.forEach { start ->
-            val visited = mutableSetOf<String>()
-            var currentId: String? = start
-            while (currentId != null) {
-                require(visited.add(currentId)) { "Canonical hierarchy would contain a cycle" }
-                currentId = parentById[currentId]
-            }
+            val parentIssue = com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority
+                .build(current.copy(pendingCanonicalAuthoringMutations = exactJournals),
+                    allowPendingRestores = candidate.operation == CanonicalAuthoringOperation.RESTORE)
+                .issue(parentById[candidate.itemId], candidate.itemId)
+            require(parentIssue == null) { requireNotNull(parentIssue) }
         }
     }
 
@@ -3250,7 +3252,7 @@ class PlannerStore(
         }
         if (overlayMutations.isNotEmpty()) {
             overlayMutations.forEach {
-                validateCanonicalAuthoringHierarchy(current, it)
+                validateCanonicalAuthoringHierarchy(current, it, requireParentAdmission = false)
             }
             return
         }

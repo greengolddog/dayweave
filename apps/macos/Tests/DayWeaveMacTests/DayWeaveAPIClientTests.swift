@@ -413,6 +413,7 @@ struct DayWeaveAPIClientTests {
     @Test("explicit legacy-equivalent structure remains authorable")
     func testLegacyEquivalentCanonicalStructureRemainsAuthorable() async throws {
         let itemObject = Self.structuralCanonicalItemObject { object in
+            object["status"] = "planned"
             object["deadline_kind"] = "none"
             object["deadline_at"] = NSNull()
             object["deadline_strength"] = NSNull()

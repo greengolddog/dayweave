@@ -24,6 +24,7 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.builtins.nullable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
@@ -291,6 +292,11 @@ data class CanonicalItemReplacement(
     @SerialName("duration_max_seconds") val durationMaxSeconds: Long? = null,
     @SerialName("duration_source") val durationSource: CanonicalDurationSource? = null,
     @SerialName("deadline_at") val deadlineAt: String? = null,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind? = null,
+    @SerialName("deadline_date") val deadlineDate: CanonicalRequestNullable<String>? = null,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalRequestNullable<CanonicalDeadlineStrength>? = null,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: CanonicalRequestNullable<Long>? = null,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean? = null,
     @SerialName("earliest_start_at") val earliestStartAt: String? = null,
     val recurrence: JsonElement? = null,
     @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
@@ -317,6 +323,11 @@ data class CreateCanonicalItemRequest(
     @SerialName("duration_max_seconds") val durationMaxSeconds: Long? = null,
     @SerialName("duration_source") val durationSource: CanonicalDurationSource? = null,
     @SerialName("deadline_at") val deadlineAt: String? = null,
+    @SerialName("deadline_kind") val deadlineKind: CanonicalDeadlineKind? = null,
+    @SerialName("deadline_date") val deadlineDate: CanonicalRequestNullable<String>? = null,
+    @SerialName("deadline_strength") val deadlineStrength: CanonicalRequestNullable<CanonicalDeadlineStrength>? = null,
+    @SerialName("deadline_soft_weight") val deadlineSoftWeight: CanonicalRequestNullable<Long>? = null,
+    @SerialName("has_own_effort") val hasOwnEffort: Boolean? = null,
     @SerialName("earliest_start_at") val earliestStartAt: String? = null,
     val recurrence: JsonElement? = null,
     @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
@@ -332,6 +343,20 @@ data class ReplaceCanonicalItemRequest(
     @SerialName("expected_revision") val expectedRevision: Long,
     val item: CanonicalItemReplacement,
 )
+
+/** Null outer value omits a legacy key; a present wrapper emits even an explicit JSON null. */
+@Serializable(with = CanonicalRequestNullableSerializer::class)
+data class CanonicalRequestNullable<T : Any>(val value: T?)
+
+class CanonicalRequestNullableSerializer<T : Any>(private val valueSerializer: KSerializer<T>) :
+    KSerializer<CanonicalRequestNullable<T>> {
+    override val descriptor: SerialDescriptor = valueSerializer.nullable.descriptor
+    override fun serialize(encoder: Encoder, value: CanonicalRequestNullable<T>) {
+        encoder.encodeSerializableValue(valueSerializer.nullable, value.value)
+    }
+    override fun deserialize(decoder: Decoder): CanonicalRequestNullable<T> =
+        CanonicalRequestNullable(decoder.decodeSerializableValue(valueSerializer.nullable))
+}
 
 @Serializable
 data class CanonicalItemRevisionRequest(

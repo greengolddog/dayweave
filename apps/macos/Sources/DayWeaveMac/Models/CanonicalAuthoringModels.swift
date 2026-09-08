@@ -84,10 +84,35 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         }
     }
     var durationSource: DayWeaveDurationSource?
-    var deadlineAt: Date?
+    var deadlineKind: DayWeaveDeadlineKind
+    var deadlineDate: String?
+    var deadlineStrength: DayWeaveDeadlineStrength?
+    var deadlineSoftWeight: UInt32?
+    var hasOwnEffort: Bool
+    var deadlineAt: Date? {
+        didSet {
+            guard oldValue != deadlineAt, kind != .event else { return }
+            // Existing callers author legacy deadlineAt directly. Preserve that
+            // convenience without converting a modern date-only/soft policy.
+            if deadlineKind == .none, deadlineAt != nil {
+                deadlineKind = .dateTime
+                deadlineStrength = .hard
+            } else if deadlineKind == .dateTime, deadlineAt == nil {
+                deadlineKind = .none
+                deadlineStrength = nil
+                deadlineSoftWeight = nil
+            }
+        }
+    }
     var earliestStartAt: Date?
     var recurrence: JSONValue?
-    var flexibleConstraints: JSONValue
+    var flexibleConstraints: JSONValue {
+        didSet {
+            if hasOwnEffort == Self.legacyOwnEffort(oldValue) {
+                hasOwnEffort = Self.legacyOwnEffort(flexibleConstraints)
+            }
+        }
+    }
     var splitPolicy: DayWeaveSplitPolicy
     var importance: UInt8
     var urgency: UInt8
@@ -103,6 +128,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         case durationSeconds = "duration_seconds"
         case durationMaximumSeconds = "duration_max_seconds"
         case durationSource = "duration_source"
+        case deadlineKind = "deadline_kind"
+        case deadlineDate = "deadline_date"
+        case deadlineStrength = "deadline_strength"
+        case deadlineSoftWeight = "deadline_soft_weight"
+        case hasOwnEffort = "has_own_effort"
         case deadlineAt = "deadline_at"
         case earliestStartAt = "earliest_start_at"
         case flexibleConstraints = "flexible_constraints"
@@ -123,6 +153,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         durationSeconds: UInt32? = nil,
         durationMaximumSeconds: UInt32? = nil,
         durationSource: DayWeaveDurationSource? = nil,
+        deadlineKind: DayWeaveDeadlineKind? = nil,
+        deadlineDate: String? = nil,
+        deadlineStrength: DayWeaveDeadlineStrength? = nil,
+        deadlineSoftWeight: UInt32? = nil,
+        hasOwnEffort: Bool? = nil,
         deadlineAt: Date? = nil,
         earliestStartAt: Date? = nil,
         recurrence: JSONValue? = nil,
@@ -153,6 +188,13 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         self.durationSource = durationKind == nil
             ? (durationSeconds == nil ? nil : durationSource ?? .user)
             : durationSource
+        let inferredDeadlineKind: DayWeaveDeadlineKind = kind == .event || deadlineAt == nil ? .none : .dateTime
+        self.deadlineKind = deadlineKind ?? inferredDeadlineKind
+        self.deadlineDate = deadlineDate
+        self.deadlineStrength = deadlineKind == nil
+            ? (inferredDeadlineKind == .none ? nil : .hard) : deadlineStrength
+        self.deadlineSoftWeight = deadlineSoftWeight
+        self.hasOwnEffort = hasOwnEffort ?? Self.legacyOwnEffort(flexibleConstraints)
         self.deadlineAt = deadlineAt
         self.earliestStartAt = earliestStartAt
         self.recurrence = recurrence
@@ -177,6 +219,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             durationSeconds: item.durationSeconds,
             durationMaximumSeconds: item.durationMaximumSeconds,
             durationSource: item.durationSource,
+            deadlineKind: item.deadlineKind,
+            deadlineDate: item.deadlineDate,
+            deadlineStrength: item.deadlineStrength,
+            deadlineSoftWeight: item.deadlineSoftWeight,
+            hasOwnEffort: item.hasOwnEffort,
             deadlineAt: item.deadlineAt,
             earliestStartAt: item.earliestStartAt,
             recurrence: item.recurrence,
@@ -230,6 +277,22 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             // Standalone legacy journals have no enclosing snapshot schema.
             usesRichDurationShape = false
         }
+        let structuralKeys: [CodingKeys] = [.deadlineKind, .deadlineDate, .deadlineStrength, .deadlineSoftWeight, .hasOwnEffort]
+        let presentStructuralKeys = structuralKeys.filter(container.contains)
+        let usesStructuralShape: Bool
+        if snapshotSchemaVersion.map({ $0 <= 24 }) == true {
+            guard presentStructuralKeys.isEmpty else {
+                throw DecodingError.dataCorruptedError(forKey: .deadlineKind, in: container,
+                    debugDescription: "Legacy drafts cannot acquire injected structural fields")
+            }
+            usesStructuralShape = false
+        } else {
+            usesStructuralShape = snapshotSchemaVersion.map({ $0 >= 25 }) == true || !presentStructuralKeys.isEmpty
+            guard !usesStructuralShape || presentStructuralKeys.count == structuralKeys.count else {
+                throw DecodingError.dataCorruptedError(forKey: .deadlineKind, in: container,
+                    debugDescription: "Draft structural fields must be emitted atomically")
+            }
+        }
         self.init(
             isSensitive: try container.decode(Bool.self, forKey: .isSensitive),
             kind: try container.decode(DayWeaveCanonicalItemKind.self, forKey: .kind),
@@ -250,6 +313,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             durationSource: usesRichDurationShape
                 ? try container.decodeIfPresent(DayWeaveDurationSource.self, forKey: .durationSource)
                 : nil,
+            deadlineKind: usesStructuralShape ? try container.decode(DayWeaveDeadlineKind.self, forKey: .deadlineKind) : nil,
+            deadlineDate: usesStructuralShape ? try container.decodeIfPresent(String.self, forKey: .deadlineDate) : nil,
+            deadlineStrength: usesStructuralShape ? try container.decodeIfPresent(DayWeaveDeadlineStrength.self, forKey: .deadlineStrength) : nil,
+            deadlineSoftWeight: usesStructuralShape ? try container.decodeIfPresent(UInt32.self, forKey: .deadlineSoftWeight) : nil,
+            hasOwnEffort: usesStructuralShape ? try container.decode(Bool.self, forKey: .hasOwnEffort) : nil,
             deadlineAt: try container.decodeIfPresent(Date.self, forKey: .deadlineAt),
             earliestStartAt: try container.decodeIfPresent(Date.self, forKey: .earliestStartAt),
             recurrence: try container.decodeIfPresent(JSONValue.self, forKey: .recurrence),
@@ -286,6 +354,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         }
         try container.encodeIfPresent(durationSource, forKey: .durationSource)
         if durationSource == nil { try container.encodeNil(forKey: .durationSource) }
+        try container.encode(deadlineKind, forKey: .deadlineKind)
+        try container.encode(deadlineDate, forKey: .deadlineDate)
+        try container.encode(deadlineStrength, forKey: .deadlineStrength)
+        try container.encode(deadlineSoftWeight, forKey: .deadlineSoftWeight)
+        try container.encode(hasOwnEffort, forKey: .hasOwnEffort)
         try container.encodeIfPresent(deadlineAt, forKey: .deadlineAt)
         try container.encodeIfPresent(earliestStartAt, forKey: .earliestStartAt)
         try container.encodeIfPresent(recurrence, forKey: .recurrence)
@@ -308,14 +381,32 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         ) {
             copy.flexibleConstraints = constraints
         }
+        if copy.hasOwnEffort, case var .object(object) = copy.flexibleConstraints,
+           object["has_own_effort"] == nil {
+            object["has_own_effort"] = .bool(true)
+            copy.flexibleConstraints = .object(object)
+        }
         return copy
+    }
+
+    private static func legacyOwnEffort(_ constraints: JSONValue) -> Bool {
+        guard case let .object(object) = constraints,
+              case let .bool(value)? = object["has_own_effort"] else { return false }
+        return value
+    }
+
+    var hasLegacyStructuralShape: Bool {
+        let inferred: DayWeaveDeadlineKind = kind == .event || deadlineAt == nil ? .none : .dateTime
+        return deadlineKind == inferred && deadlineDate == nil
+            && deadlineStrength == (inferred == .none ? nil : .hard) && deadlineSoftWeight == nil
+            && hasOwnEffort == Self.legacyOwnEffort(flexibleConstraints)
     }
 
     private static func wireCanonicalDate(_ value: Date) -> Date {
         CanonicalRFC3339Instant(date: value)?.dateAtMicrosecondPrecision ?? value
     }
 
-    func validationIssue(itemID: UUID) -> String? {
+    func validationIssue(itemID: UUID, permitsLegacyProjectRecurrence: Bool = false) -> String? {
         let value = normalized
         guard !value.title.isEmpty,
               value.title.unicodeScalars.count <= Self.maximumTitleScalars else {
@@ -326,6 +417,37 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         }
         guard let timeZone = Self.supportedTimeZone(identifier: value.timezoneName) else {
             return "Choose a valid IANA timezone."
+        }
+        let deadlineShapeIsValid: Bool = switch value.deadlineKind {
+        case .none: (value.deadlineAt == nil || value.kind == .event) && value.deadlineDate == nil
+            && value.deadlineStrength == nil && value.deadlineSoftWeight == nil
+        case .date: value.kind != .event && value.deadlineAt == nil
+            && value.deadlineDate.map(CanonicalDateDeadline.isCanonical) == true && value.deadlineStrength != nil
+        case .dateTime: value.kind != .event && value.deadlineAt != nil
+            && value.deadlineDate == nil && value.deadlineStrength != nil
+        case .unsupported: false
+        }
+        let deadlineStrengthIsValid: Bool = switch value.deadlineStrength {
+        case nil: value.deadlineKind == .none && value.deadlineSoftWeight == nil
+        case .hard?: value.deadlineKind != .none && value.deadlineSoftWeight == nil
+        case .soft?: value.deadlineKind != .none && value.deadlineSoftWeight.map { $0 <= 1_000_000 } == true
+        case .unsupported?: false
+        }
+        guard deadlineShapeIsValid, deadlineStrengthIsValid else {
+            return "Choose a complete, supported deadline date/time and strength."
+        }
+        let effectiveDeadline: Date?
+        if value.deadlineKind == .date {
+            guard let date = value.deadlineDate,
+                  let boundary = CanonicalDateDeadline.boundary(date, timezoneName: value.timezoneName) else {
+                return "The deadline's next civil midnight does not exist in this timezone."
+            }
+            effectiveDeadline = boundary
+        } else {
+            effectiveDeadline = value.deadlineAt
+        }
+        guard value.hasOwnEffort == Self.legacyOwnEffort(value.flexibleConstraints) else {
+            return "Own effort must agree with its retained scheduling metadata."
         }
         let durationValues = [
             value.durationMinimumSeconds,
@@ -369,7 +491,7 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             return "Canonical timestamps must fit the supported RFC 3339 range."
         }
         if let earliest = value.earliestStartAt,
-           let deadline = value.deadlineAt,
+           let deadline = effectiveDeadline,
            earliest >= deadline {
             return "Earliest start must be before the deadline."
         }
@@ -395,7 +517,7 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             return "Earliest start cannot be defined as both a canonical field and a constraint."
         }
         if value.flexibleConstraints.hasNestedLatestFinish,
-           value.deadlineAt != nil {
+           value.deadlineAt != nil || value.deadlineKind != .none {
             return "Deadline cannot be defined as both a canonical field and a constraint."
         }
         if let canonicalStart = value.earliestStartAt.flatMap({
@@ -406,7 +528,7 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             return "Canonical earliest start must precede the constrained latest finish."
         }
         if let constrainedStart = value.flexibleConstraints.canonicalNestedEarliestStart,
-           let canonicalFinish = value.deadlineAt.flatMap({
+           let canonicalFinish = effectiveDeadline.flatMap({
                CanonicalRFC3339Instant(date: $0)
            }),
            constrainedStart >= canonicalFinish {
@@ -470,8 +592,9 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             return "Habits require a recurrence."
         case .event where value.recurrence != nil,
              .goal where value.recurrence != nil,
+             .project where value.recurrence != nil && !permitsLegacyProjectRecurrence,
              .breakTime where value.recurrence != nil:
-            return "Events, goals, and breaks cannot use task recurrence."
+            return "Events, goals, projects, and breaks cannot use task recurrence."
         case .unknown:
             return "This item type is read-only in this version of DayWeave."
         default:
@@ -563,11 +686,12 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
     }
 
     var requestFields: DayWeaveCanonicalItemFields {
-        requestFields(durationWireShape: .richV2)
+        requestFields(durationWireShape: .richV2, structuralRequestShapeVersion: 2)
     }
 
     func requestFields(
-        durationWireShape: CanonicalAuthoringDurationWireShape
+        durationWireShape: CanonicalAuthoringDurationWireShape,
+        structuralRequestShapeVersion: Int = 1
     ) -> DayWeaveCanonicalItemFields {
         let value = normalized
         let emitsRichDuration = durationWireShape == .richV2
@@ -583,6 +707,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             durationSeconds: value.durationSeconds,
             durationMaximumSeconds: emitsRichDuration ? value.durationMaximumSeconds : nil,
             durationSource: emitsRichDuration ? value.durationSource : nil,
+            deadlineKind: structuralRequestShapeVersion == 2 ? value.deadlineKind : nil,
+            deadlineDate: structuralRequestShapeVersion == 2 ? value.deadlineDate : nil,
+            deadlineStrength: structuralRequestShapeVersion == 2 ? value.deadlineStrength : nil,
+            deadlineSoftWeight: structuralRequestShapeVersion == 2 ? value.deadlineSoftWeight : nil,
+            hasOwnEffort: structuralRequestShapeVersion == 2 ? value.hasOwnEffort : nil,
             deadlineAt: value.deadlineAt,
             earliestStartAt: value.earliestStartAt,
             recurrence: value.recurrence,
@@ -609,6 +738,11 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
             && item.durationMaximumSeconds == value.durationMaximumSeconds
             && item.durationSource == value.durationSource
             && item.deadlineAt == value.deadlineAt
+            && item.deadlineKind == value.deadlineKind
+            && item.deadlineDate == value.deadlineDate
+            && item.deadlineStrength == value.deadlineStrength
+            && item.deadlineSoftWeight == value.deadlineSoftWeight
+            && item.hasOwnEffort == value.hasOwnEffort
             && item.earliestStartAt == value.earliestStartAt
             && item.recurrence == value.recurrence
             && item.flexibleConstraints == value.flexibleConstraints
@@ -635,6 +769,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
     let idempotencyKey: String
     let createdAt: Date
     let durationWireShape: CanonicalAuthoringDurationWireShape
+    let structuralRequestShapeVersion: Int
     var configurationIdentifier: String?
     var hasBeenSubmitted: Bool
     var disposition: CanonicalAuthoringDisposition
@@ -649,6 +784,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         baseItem: DayWeaveCanonicalItem? = nil,
         createdAt: Date = Date(),
         durationWireShape: CanonicalAuthoringDurationWireShape = .richV2,
+        structuralRequestShapeVersion: Int = 2,
         configurationIdentifier: String? = nil,
         hasBeenSubmitted: Bool = false,
         disposition: CanonicalAuthoringDisposition = .pending,
@@ -664,6 +800,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         idempotencyKey = "mac-item-\(id.uuidString.lowercased())"
         self.createdAt = createdAt
         self.durationWireShape = durationWireShape
+        self.structuralRequestShapeVersion = structuralRequestShapeVersion
         self.configurationIdentifier = configurationIdentifier
         self.hasBeenSubmitted = hasBeenSubmitted
         self.disposition = disposition
@@ -672,7 +809,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
 
     private enum CodingKeys: String, CodingKey {
         case version, id, itemID, operation, draft, expectedRevision, baseItem
-        case idempotencyKey, createdAt, durationWireShape
+        case idempotencyKey, createdAt, durationWireShape, structuralRequestShapeVersion
         case configurationIdentifier, hasBeenSubmitted, disposition, diagnostic
     }
 
@@ -710,6 +847,19 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
             ) ?? (submittedBodyMutation ? .legacyV1 : .richV2)
         }
 
+        let structuralRequestShapeVersion: Int
+        if snapshotSchemaVersion.map({ $0 <= 24 }) == true {
+            guard !container.contains(.structuralRequestShapeVersion) else {
+                throw DecodingError.dataCorruptedError(forKey: .structuralRequestShapeVersion, in: container,
+                    debugDescription: "Legacy journals cannot acquire injected structural request authority")
+            }
+            structuralRequestShapeVersion = 1
+        } else if snapshotSchemaVersion.map({ $0 >= 25 }) == true {
+            structuralRequestShapeVersion = try container.decode(Int.self, forKey: .structuralRequestShapeVersion)
+        } else {
+            structuralRequestShapeVersion = try container.decodeIfPresent(Int.self, forKey: .structuralRequestShapeVersion) ?? 1
+        }
+
         version = try container.decode(Int.self, forKey: .version)
         id = try container.decode(UUID.self, forKey: .id)
         itemID = try container.decode(UUID.self, forKey: .itemID)
@@ -720,6 +870,7 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         idempotencyKey = try container.decode(String.self, forKey: .idempotencyKey)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         self.durationWireShape = durationWireShape
+        self.structuralRequestShapeVersion = structuralRequestShapeVersion
         configurationIdentifier = try container.decodeIfPresent(
             String.self,
             forKey: .configurationIdentifier
@@ -733,8 +884,10 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         guard version == Self.currentVersion,
               idempotencyKey == "mac-item-\(id.uuidString.lowercased())",
               durationWireShape == .richV2 || hasBeenSubmitted,
+              structuralRequestShapeVersion == 1 || structuralRequestShapeVersion == 2,
               configurationIdentifier.map({ !$0.isEmpty && $0.utf8.count <= 4_096 }) ?? true,
               disposition == .pending || diagnostic?.isEmpty == false else { return false }
+        if structuralRequestShapeVersion == 1, let draft, !draft.hasLegacyStructuralShape { return false }
         if durationWireShape == .legacyV1 {
             guard operation == .create || operation == .replace,
                   let draft else { return false }
@@ -758,13 +911,13 @@ struct DayWeavePendingCanonicalAuthoringMutation: Codable, Equatable, Identifiab
         case .create:
             return expectedRevision == nil
                 && baseItem == nil
-                && draft?.validationIssue(itemID: itemID) == nil
+                && draft?.validationIssue(itemID: itemID, permitsLegacyProjectRecurrence: structuralRequestShapeVersion == 1) == nil
         case .replace:
             return expectedRevision != nil
                 && expectedRevision == baseItem?.revision
                 && baseItem?.id == itemID
                 && baseItem?.deletedAt == nil
-                && draft?.validationIssue(itemID: itemID) == nil
+                && draft?.validationIssue(itemID: itemID, permitsLegacyProjectRecurrence: structuralRequestShapeVersion == 1) == nil
         case .trash:
             return draft == nil
                 && expectedRevision != nil
@@ -909,9 +1062,9 @@ extension DayWeaveCanonicalItem {
               retainedUnrepresentableDeadlineAt == nil,
               retainedUnrepresentableEarliestStartAt == nil,
               splitPolicy.isSupportedForWrite else { return false }
-        if kind == .project { return false }
         if case .unknown = kind { return false }
-        if case .unknown = status { return false }
+        guard status == .inbox || status == .planned else { return false }
+        guard DayWeaveCanonicalItemDraft(item: self).validationIssue(itemID: id) == nil else { return false }
         guard recurrence?.supportsCanonicalAuthoringRecurrence ?? true,
               flexibleConstraints.supportsCanonicalAuthoringConstraints else { return false }
         guard flexibleConstraints.kindSpecificAuthoringIssue(for: kind) == nil else {
@@ -1335,7 +1488,7 @@ extension JSONValue {
             && constraints["earliest_start"] != .null
     }
 
-    fileprivate var hasNestedLatestFinish: Bool {
+    var hasNestedLatestFinish: Bool {
         guard case let .object(root) = self,
               case let .object(constraints)? = root["constraints"] else { return false }
         return constraints["latest_finish"] != nil

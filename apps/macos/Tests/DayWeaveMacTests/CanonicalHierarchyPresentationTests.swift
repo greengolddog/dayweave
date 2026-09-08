@@ -99,7 +99,7 @@ struct CanonicalHierarchyPresentationTests {
             store.selectCanonicalItem(row.itemID)
             #expect(store.selectedCanonicalItemID == row.itemID)
             let route = try #require(CanonicalInboxEditorRoute.review(row: row, store: store))
-            if row.kind == .project || (row.status != .inbox && row.status != .planned) {
+            if row.status != .inbox && row.status != .planned {
                 #expect(row.isReadOnly)
                 #expect(route.readOnlyDiagnostic != nil)
             } else {
@@ -364,7 +364,8 @@ struct CanonicalHierarchyPresentationTests {
             scope: .goals, presentation: projection,
             availability: .build(hasHydratedCache: true, status: .ready), query: .constant(""),
             selectedID: Self.id(2), canMutate: true, timezoneName: "UTC",
-            select: { _ in }, toggle: { _ in }, review: { _ in }
+            select: { _ in }, toggle: { _ in }, review: { _ in },
+            eligibleParentIDs: Set(rows.filter { $0.status == .inbox || $0.status == .planned || $0.status == .blocked }.map(\.itemID))
         )
         .frame(width: 900, height: 850)
         // ImageRenderer cannot draw AppKit-backed TextField/ScrollView content.

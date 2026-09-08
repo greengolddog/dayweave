@@ -67,6 +67,8 @@ internal fun CanonicalHierarchyBrowserScreen(
     val sourceState = remember(
         state.canonicalConfigurationId, state.canonicalItems, state.pendingCanonicalAuthoringMutations,
         state.canonicalRecentlyDeleted, state.pendingCanonicalMutation,
+        state.scheduleCompositionProfile,
+        state.canonicalExecutionSession,
     ) { hierarchyAdmittedState(state) }
     val built by produceState<HierarchyBuildResult?>(null, sourceState) {
         // Full metadata/privacy admission can be expensive for very deep retained hierarchies.
@@ -74,6 +76,8 @@ internal fun CanonicalHierarchyBrowserScreen(
         value = withContext(Dispatchers.Default) {
             HierarchyBuildResult(sourceState, runCatching {
                 CanonicalAuthoringPresentation.build(sourceState)
+            }.getOrNull(), runCatching {
+                com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority.build(sourceState)
             }.getOrNull())
         }
     }
@@ -90,8 +94,15 @@ internal fun CanonicalHierarchyBrowserScreen(
     }
     BackHandler { if (selectedId != null) selectedId = null else onBack() }
     Column(modifier.fillMaxSize().testTag("canonical_hierarchy_browser")) {
-        TextButton(onClick = onBack, modifier = Modifier.testTag("hierarchy_back_to_more")) {
-            Text("Back to More")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            TextButton(onClick = onBack, modifier = Modifier.testTag("hierarchy_back_to_more")) {
+                Text("Back to More")
+            }
+            TextButton(
+                onClick = { onOpenEditor(CanonicalItemEditorRoute.hierarchy(sourceState, kind)) },
+                enabled = actionsEnabled,
+                modifier = Modifier.testTag("hierarchy_create_root"),
+            ) { Text(if (kind == ItemKind.GOAL) "New goal" else "New project") }
         }
         OutlinedTextField(
             value = query,
@@ -148,6 +159,15 @@ internal fun CanonicalHierarchyBrowserScreen(
         HierarchyItemDetails(
             row = selected,
             actionsEnabled = actionsEnabled,
+            canAddChild = currentBuild?.parentAuthority?.let {
+                it.issue(selected.itemId, "00000000-0000-4000-8000-000000000000") == null
+            } == true &&
+                !selected.hasUnsafeAncestry && !selected.hasMissingParent && !selected.hasHierarchyCycle,
+            onAddChild = {
+                val route = CanonicalItemEditorRoute.hierarchy(sourceState, ItemKind.TASK, selected.itemId)
+                selectedId = null
+                onOpenEditor(route)
+            },
             onDismiss = { selectedId = null },
             onOpenEditor = { route ->
                 selectedId = null
@@ -160,6 +180,7 @@ internal fun CanonicalHierarchyBrowserScreen(
 private data class HierarchyBuildResult(
     val source: DayWeaveUiState,
     val presentation: CanonicalAuthoringPresentation?,
+    val parentAuthority: com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority?,
 )
 
 /** Never promote an unbound legacy canonical cache into an admitted hierarchy. */
@@ -254,6 +275,8 @@ private fun hierarchyStateLabel(row: CanonicalAuthoringRow): String =
 private fun HierarchyItemDetails(
     row: CanonicalAuthoringRow,
     actionsEnabled: Boolean,
+    canAddChild: Boolean,
+    onAddChild: () -> Unit,
     onDismiss: () -> Unit,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
 ) {
@@ -283,12 +306,18 @@ private fun HierarchyItemDetails(
             }
         },
         confirmButton = {
-            if (route != null) {
-                TextButton(
-                    onClick = { onOpenEditor(route) },
-                    enabled = actionsEnabled,
-                    modifier = Modifier.testTag("hierarchy_edit"),
-                ) { Text("Review / edit") }
+            Column {
+                if (canAddChild) {
+                    TextButton(onClick = onAddChild, enabled = actionsEnabled,
+                        modifier = Modifier.testTag("hierarchy_add_child")) { Text("Add subtask") }
+                }
+                if (route != null) {
+                    TextButton(
+                        onClick = { onOpenEditor(route) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.testTag("hierarchy_edit"),
+                    ) { Text("Review / edit") }
+                }
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },

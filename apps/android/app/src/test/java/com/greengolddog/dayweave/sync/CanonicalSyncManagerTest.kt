@@ -227,7 +227,7 @@ class CanonicalSyncManagerTest {
         val cached = plannerStore.state.value.canonicalItems.single()
         assertFalse(cached.hasExplicitStructuralMetadata)
         assertNotNull(cached.requireCanonicalReplacementSupport())
-        assertTrue(
+        assertFalse(
             runCatching {
                 cached.copy(kind = "project").requireCanonicalReplacementSupport()
             }.isFailure,

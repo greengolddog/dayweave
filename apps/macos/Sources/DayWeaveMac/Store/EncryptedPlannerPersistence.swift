@@ -447,10 +447,12 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// binding-scoped durable schedule-head high-water. Its outer fence
     /// prevents a relabeled predecessor snapshot from injecting missed-target
     /// suppression authority that no schema-23 writer knew.
+    /// Version 25 persists typed authoring deadlines/own effort plus an
+    /// independent structural request marker, preserving legacy request bodies.
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 24
+    static let currentSchemaVersion = 25
 
     let schemaVersion: Int
     let savedAt: Date
@@ -608,7 +610,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         // Nested proof v3 is new authority in outer schema 24. Every older
         // snapshot must ignore an injected v3 proof before reconstruction;
         // legitimate predecessor writers emitted only v1/v2 here.
-        let publishedScheduleProof = schemaVersion < Self.currentSchemaVersion
+        let publishedScheduleProof = schemaVersion < 24
             && self.publishedScheduleProof.map({ $0.version >= 3 }) == true
             ? nil
             : self.publishedScheduleProof
@@ -751,7 +753,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
-        case 21, 22, 23:
+        case 21, 22, 23, 24:
             // Canonical structural metadata was previously nested or implicit,
             // while unknown-field retention could forward-capture the complete
             // server wire shape. The schema-aware item decoder either infers a
@@ -789,6 +791,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
                 schedulePreviewProvenance: schedulePreviewProvenance,
                 publishedScheduleProof: publishedScheduleProof,
+                publishedScheduleLatestHintRevision: schemaVersion >= 24 ? publishedScheduleLatestHintRevision : nil,
                 onboardingFirstItemAnchor: onboardingFirstItemAnchor,
                 localScheduleCompositionProvenance: localScheduleCompositionProvenance,
                 pendingSchedulePublication: pendingSchedulePublication,

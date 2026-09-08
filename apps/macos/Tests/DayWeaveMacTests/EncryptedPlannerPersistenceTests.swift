@@ -1026,11 +1026,13 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
         for key in [
             "duration_kind", "duration_min_seconds", "duration_max_seconds",
-            "duration_source",
+            "duration_source", "deadline_kind", "deadline_date", "deadline_strength",
+            "deadline_soft_weight", "has_own_effort",
         ] {
             draft.removeValue(forKey: key)
         }
         mutations[0].removeValue(forKey: "durationWireShape")
+        mutations[0].removeValue(forKey: "structuralRequestShapeVersion")
         mutations[0]["draft"] = draft
         root["pendingCanonicalAuthoringMutations"] = mutations
 
@@ -1048,7 +1050,7 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
         try require(
             migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion
-                && PlannerSnapshot.currentSchemaVersion == 24,
+                && PlannerSnapshot.currentSchemaVersion == 25,
             "Rich authoring drafts are not protected by the current rollback fence"
         )
         try require(
@@ -1088,7 +1090,7 @@ private enum EncryptedPlannerPersistenceScenarios {
         partialCurrentDraft.removeValue(forKey: "duration_kind")
         partialCurrentMutations[0]["draft"] = partialCurrentDraft
         partialCurrentRoot["pendingCanonicalAuthoringMutations"] = partialCurrentMutations
-        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 23
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = PlannerSnapshot.currentSchemaVersion
         var rejectedPartialCurrentShape = false
         do {
             _ = try decoder.decode(
@@ -1316,11 +1318,13 @@ private enum EncryptedPlannerPersistenceScenarios {
             )
             for key in [
                 "duration_kind", "duration_min_seconds", "duration_max_seconds",
-                "duration_source",
+                "duration_source", "deadline_kind", "deadline_date", "deadline_strength",
+                "deadline_soft_weight", "has_own_effort",
             ] {
                 draft.removeValue(forKey: key)
             }
             mutations[0].removeValue(forKey: "durationWireShape")
+            mutations[0].removeValue(forKey: "structuralRequestShapeVersion")
             mutations[0]["draft"] = draft
             root["pendingCanonicalAuthoringMutations"] = mutations
             let decoder = JSONDecoder()
@@ -1423,6 +1427,7 @@ private enum EncryptedPlannerPersistenceScenarios {
                 "Schema 22 identity-only fixture had no journal"
             )
             mutations[0].removeValue(forKey: "durationWireShape")
+            mutations[0].removeValue(forKey: "structuralRequestShapeVersion")
             root["pendingCanonicalAuthoringMutations"] = mutations
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
@@ -1738,6 +1743,7 @@ private enum EncryptedPlannerPersistenceScenarios {
             "Schema 21 forward-capture fixture had no pending authoring mutation"
         )
         mutations[0].removeValue(forKey: "durationWireShape")
+        mutations[0].removeValue(forKey: "structuralRequestShapeVersion")
         mutations[0]["baseItem"] = richProject
         root["pendingCanonicalAuthoringMutations"] = mutations
 

@@ -2,6 +2,7 @@ import SwiftUI
 
 enum CanonicalItemEditorMode: Equatable, Sendable {
     case create(itemID: UUID)
+    case createHierarchy(itemID: UUID, draft: DayWeaveCanonicalItemDraft, sensitiveContext: Bool)
     case createPrepared(itemID: UUID, draft: DayWeaveCanonicalItemDraft)
     case createFromSuggestion(
         suggestionID: UUID,
@@ -18,6 +19,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var itemID: UUID {
         switch self {
         case let .create(itemID),
+             let .createHierarchy(itemID, _, _),
              let .createPrepared(itemID, _),
              let .createFromSuggestion(_, itemID, _),
              let .replace(itemID, _),
@@ -29,6 +31,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var initialDraft: DayWeaveCanonicalItemDraft? {
         switch self {
         case .create: nil
+        case let .createHierarchy(_, draft, _): draft
         case let .createPrepared(_, draft),
              let .createFromSuggestion(_, _, draft),
              let .replace(_, draft),
@@ -39,6 +42,8 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var title: String {
         switch self {
         case .create: "New item"
+        case let .createHierarchy(_, draft, _): draft.parentID == nil
+            ? "New \(draft.kind.wireValue)" : "Add subtask"
         case .createPrepared: "Your first planned item"
         case .createFromSuggestion: "Review Codex item draft"
         case .replace: "Edit item"
@@ -49,6 +54,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var actionTitle: String {
         switch self {
         case .create: "Add to Inbox"
+        case .createHierarchy: "Add to Inbox"
         case .createPrepared: "Save planned item"
         case .createFromSuggestion: "Create item"
         case .replace: "Queue changes"
@@ -62,14 +68,14 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
             "Review every field. Codex cannot create this item until you approve it here."
         case .createPrepared:
             "Review every field. This is encrypted locally before it can join your first plan."
-        case .create, .replace, .updatePending:
+        case .create, .createHierarchy, .replace, .updatePending:
             "Saved locally first. Sync applies the exact queued change later."
         }
     }
 
     var allowsUnchangedDraft: Bool {
         switch self {
-        case .create, .createPrepared, .createFromSuggestion: true
+        case .create, .createHierarchy, .createPrepared, .createFromSuggestion: true
         case .replace, .updatePending: false
         }
     }
@@ -79,6 +85,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     /// title or notes before the atomic approval transition finishes.
     var preservesSensitivePresentation: Bool {
         if case .createFromSuggestion = self { return true }
+        if case let .createHierarchy(_, _, sensitiveContext) = self { return sensitiveContext }
         return false
     }
 }
@@ -93,6 +100,8 @@ struct CanonicalItemEditorView: View {
     let onSave: () -> Void
     @State private var state: CanonicalItemEditorState
     @State private var saveError: String?
+    @State private var hasReviewedSensitiveContext = false
+    @State private var authoringCache = CanonicalHierarchyAuthoringCache()
 
     init(
         mode: CanonicalItemEditorMode,
@@ -151,11 +160,15 @@ struct CanonicalItemEditorView: View {
         .frame(minWidth: 680, idealWidth: 720, minHeight: 680, idealHeight: 780)
         .onAppear {
             switch mode {
-            case .create, .createPrepared:
+            case .create, .createHierarchy, .createPrepared:
                 titleIsFocused = true
             case .createFromSuggestion, .replace, .updatePending:
                 break
             }
+            hasReviewedSensitiveContext = requiresSensitivePresentation
+        }
+        .onChange(of: requiresSensitivePresentation) { _, sensitive in
+            if sensitive { hasReviewedSensitiveContext = true }
         }
         .onChange(of: state.kind) { _, _ in
             state.normalizeForKindChange()
@@ -231,6 +244,7 @@ struct CanonicalItemEditorView: View {
                     Label("Habit", systemImage: "repeat").tag(DayWeaveCanonicalItemKind.habit)
                     Label("Routine", systemImage: "list.number").tag(DayWeaveCanonicalItemKind.routine)
                     Label("Goal", systemImage: "target").tag(DayWeaveCanonicalItemKind.goal)
+                    Label("Project", systemImage: "folder").tag(DayWeaveCanonicalItemKind.project)
                     Label("Event", systemImage: "calendar").tag(DayWeaveCanonicalItemKind.event)
                     Label("Break", systemImage: "cup.and.saucer").tag(DayWeaveCanonicalItemKind.breakTime)
                 }
@@ -303,11 +317,11 @@ struct CanonicalItemEditorView: View {
                     }
                     .accessibilityIdentifier("canonical-editor.duration.maximum")
                 }
-                if state.kind == .goal || state.kind == .routine {
+                if state.kind == .goal || state.kind == .routine || state.kind == .project {
                     Toggle("Schedule own effort when this is a leaf", isOn: $state.hasOwnEffort)
                         .accessibilityIdentifier("canonical-editor.own-effort")
                     Text(state.hasOwnEffort
-                        ? "Its duration contributes only while it has no subtasks. Put separate effort in a leaf task when it has children."
+                        ? "Its duration contributes only while it has no subtasks. Put separate schedulable work in a leaf task when it has children."
                         : "This container contributes no time of its own; schedulable leaf subtasks provide its calendar demand.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -332,13 +346,26 @@ struct CanonicalItemEditorView: View {
 
                 Toggle("Deadline", isOn: $state.hasDeadline)
                 if state.hasDeadline {
-                    DatePicker(
-                        "Finish by",
-                        selection: $state.deadline,
-                        displayedComponents: [.date, .hourAndMinute]
-                    )
-                    .environment(\.timeZone, editorTimeZone)
-                    .accessibilityIdentifier("canonical-editor.deadline")
+                    Picker("Deadline form", selection: $state.deadlineIsDateOnly) {
+                        Text("Date and time").tag(false)
+                        Text("Date only").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("canonical-editor.deadline.kind")
+                    if state.deadlineIsDateOnly {
+                        TextField("Calendar date · YYYY-MM-DD", text: $state.deadlineDateText)
+                            .textFieldStyle(.roundedBorder)
+                            .monospacedDigit()
+                            .accessibilityLabel("Deadline calendar date, year month day")
+                            .accessibilityIdentifier("canonical-editor.deadline.date")
+                        Text("The next midnight in \(state.timezoneName) is the deadline boundary.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        DatePicker("Finish by", selection: $state.deadline,
+                                   displayedComponents: [.date, .hourAndMinute])
+                            .environment(\.timeZone, editorTimeZone)
+                            .accessibilityIdentifier("canonical-editor.deadline")
+                    }
                     strengthEditor(
                         strength: $state.deadlineStrength,
                         softWeight: $state.deadlineSoftWeight
@@ -1114,6 +1141,7 @@ struct CanonicalItemEditorView: View {
                 }
             }
             .accessibilityIdentifier("canonical-editor.parent")
+            .privacySensitive()
             Text("The picker excludes this item and every descendant, at any depth.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1147,11 +1175,12 @@ struct CanonicalItemEditorView: View {
     }
 
     private var parentOptions: [CanonicalItemEditorParentOption] {
-        CanonicalItemEditorState.parentOptions(
+        let eligibleIDs = authoringCache.eligibleParentIDs(for: store)
+        return CanonicalItemEditorState.parentOptions(
             canonicalItems: store.canonicalItems,
             pendingMutations: store.pendingCanonicalAuthoringMutations,
             excluding: mode.itemID
-        )
+        ).filter { eligibleIDs.contains($0.id) }
     }
 
     private var dependencyReferences: [CanonicalDependencyReference] {
@@ -1271,21 +1300,22 @@ struct CanonicalItemEditorView: View {
     }
 
     private var parentSelectionIsValid: Bool {
-        guard let parentID = state.parentID else { return true }
-        return parentOptions.contains { $0.id == parentID }
+        store.canonicalAuthoringDraftHierarchyIsCurrent(
+            state.draft, itemID: mode.itemID, requiresCommittedParent: false
+        )
     }
 
     /// Protect edited text immediately when either the draft, its selected
     /// ancestry, or the durable pre-edit item is sensitive. Removing a marker
     /// never weakens presentation before the queued server change is proven.
     private var requiresSensitivePresentation: Bool {
-        if state.isSensitive || mode.preservesSensitivePresentation { return true }
+        if hasReviewedSensitiveContext || state.isSensitive || mode.preservesSensitivePresentation { return true }
         if let parentID = state.parentID,
            store.canonicalItemRequiresSensitivePresentation(itemID: parentID) {
             return true
         }
         switch mode {
-        case .create, .createPrepared:
+        case .create, .createHierarchy, .createPrepared:
             return false
         case .createFromSuggestion:
             return true
@@ -1296,7 +1326,7 @@ struct CanonicalItemEditorView: View {
 
     private var localValidationIssue: String? {
         if !parentSelectionIsValid {
-            return "Choose an available Inbox or Planned parent, or remove the parent."
+            return "Choose an available Inbox, Planned, or Blocked parent, or remove the parent."
         }
         if let issue = state.validationIssue { return issue }
         if let dependencySelectionIssue { return dependencySelectionIssue }
@@ -1323,6 +1353,8 @@ struct CanonicalItemEditorView: View {
         do {
             switch mode {
             case let .create(itemID):
+                try store.enqueueCanonicalCreate(itemID: itemID, draft: state.draft)
+            case let .createHierarchy(itemID, _, _):
                 try store.enqueueCanonicalCreate(itemID: itemID, draft: state.draft)
             case let .createPrepared(itemID, _):
                 try store.enqueueOnboardingFirstItemCreate(

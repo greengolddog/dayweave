@@ -1,0 +1,753 @@
+{
+  "schema": "dayweave.structural-authoring-fixtures/1",
+  "cases": [
+    {
+      "name": "project_inbox_unknown_no_deadline",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710001",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic project_inbox_unknown_no_deadline",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "project_planned_date_soft_unknown",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710002",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "planned",
+        "title": "Synthetic project_planned_date_soft_unknown",
+        "notes": null,
+        "timezone_name": "Europe/Istanbul",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": null,
+        "deadline_strength": "soft",
+        "deadline_soft_weight": 0,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "project_planned_datetime_hard_range_own_without_legacy_mirror",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710003",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "planned",
+        "title": "Synthetic project_planned_datetime_hard_range_own_without_legacy_mirror",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "range",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 3600,
+        "duration_max_seconds": 5400,
+        "duration_source": "user",
+        "deadline_kind": "date_time",
+        "deadline_date": null,
+        "deadline_at": "2026-10-02T12:00:00Z",
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": true,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      },
+      "normalized_flexible_constraints": {
+        "has_own_effort": true
+      }
+    },
+    {
+      "name": "project_date_hard_exact_with_legacy_mirror",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710004",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic project_date_hard_exact_with_legacy_mirror",
+        "notes": "Synthetic project notes\nKeep the reviewed structure.",
+        "timezone_name": "UTC",
+        "duration_kind": "exact",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 1800,
+        "duration_max_seconds": 1800,
+        "duration_source": "user",
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-03",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "has_own_effort": true
+        },
+        "has_own_effort": true,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "goal_planned_date_hard_unknown",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710005",
+        "is_sensitive": false,
+        "kind": "goal",
+        "status": "planned",
+        "title": "Synthetic goal_planned_date_hard_unknown",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-04",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "task_datetime_soft_range_assistant",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710006",
+        "is_sensitive": false,
+        "kind": "task",
+        "status": "planned",
+        "title": "Synthetic task_datetime_soft_range_assistant",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "range",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 3600,
+        "duration_max_seconds": 5400,
+        "duration_source": "assistant",
+        "deadline_kind": "date_time",
+        "deadline_date": null,
+        "deadline_at": "2026-10-05T17:00:00.123456Z",
+        "deadline_strength": "soft",
+        "deadline_soft_weight": 1000000,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "task_inbox_unknown_no_deadline",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710007",
+        "is_sensitive": false,
+        "kind": "task",
+        "status": "inbox",
+        "title": "Synthetic task_inbox_unknown_no_deadline",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "event_fixed_bounds_are_not_a_deadline",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710008",
+        "is_sensitive": false,
+        "kind": "event",
+        "status": "planned",
+        "title": "Synthetic event_fixed_bounds_are_not_a_deadline",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "exact",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 1800,
+        "duration_max_seconds": 1800,
+        "duration_source": "user",
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": "2026-10-06T10:30:00Z",
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": "2026-10-06T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": {
+          "calendar_event": {
+            "start": "2026-10-06T10:00:00Z",
+            "end": "2026-10-06T10:30:00Z",
+            "immutable": true,
+            "all_day": false,
+            "source_calendar_id": null
+          }
+        },
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "goal_datetime_soft_exact_own",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710009",
+        "is_sensitive": false,
+        "kind": "goal",
+        "status": "planned",
+        "title": "Synthetic goal_datetime_soft_exact_own",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "exact",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 1800,
+        "duration_max_seconds": 1800,
+        "duration_source": "user",
+        "deadline_kind": "date_time",
+        "deadline_date": null,
+        "deadline_at": "2026-10-07T18:00:00Z",
+        "deadline_strength": "soft",
+        "deadline_soft_weight": 250,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "has_own_effort": true
+        },
+        "has_own_effort": true,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "project_date_after_dst_transition",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710010",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic project_date_after_dst_transition",
+        "notes": null,
+        "timezone_name": "America/New_York",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-11-01",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "project_planned_duration_does_not_imply_own_effort",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000710011",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "planned",
+        "title": "Synthetic project_planned_duration_does_not_imply_own_effort",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "exact",
+        "duration_min_seconds": 1800,
+        "duration_seconds": 1800,
+        "duration_max_seconds": 1800,
+        "duration_source": "user",
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "project_recurrence",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720001",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid project_recurrence",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": {
+          "type": "daily",
+          "times_per_day": 1
+        },
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "conflicting_own_effort",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720002",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid conflicting_own_effort",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "has_own_effort": true
+        },
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "soft_deadline_missing_weight",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720003",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid soft_deadline_missing_weight",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": null,
+        "deadline_strength": "soft",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "soft_deadline_weight_too_large",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720004",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid soft_deadline_weight_too_large",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": null,
+        "deadline_strength": "soft",
+        "deadline_soft_weight": 1000001,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "hard_deadline_with_weight",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720005",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid hard_deadline_with_weight",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": 1,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "date_deadline_with_timestamp",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720006",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid date_deadline_with_timestamp",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": "2026-10-01T18:00:00Z",
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "datetime_deadline_with_date",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720007",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid datetime_deadline_with_date",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date_time",
+        "deadline_date": "2026-10-01",
+        "deadline_at": "2026-10-01T18:00:00Z",
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "invalid_civil_date",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720008",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid invalid_civil_date",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-02-30",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "event_cannot_have_task_deadline",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720009",
+        "is_sensitive": false,
+        "kind": "event",
+        "status": "inbox",
+        "title": "Synthetic invalid event_cannot_have_task_deadline",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "date",
+        "deadline_date": "2026-10-01",
+        "deadline_at": null,
+        "deadline_strength": "hard",
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "none_deadline_with_strength",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720010",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid none_deadline_with_strength",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": null,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": "soft",
+        "deadline_soft_weight": 100,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    },
+    {
+      "name": "unknown_duration_with_estimate",
+      "create": {
+        "id": "00000000-0000-4000-8000-000000720011",
+        "is_sensitive": false,
+        "kind": "project",
+        "status": "inbox",
+        "title": "Synthetic invalid unknown_duration_with_estimate",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_kind": "unknown",
+        "duration_min_seconds": null,
+        "duration_seconds": 1800,
+        "duration_max_seconds": null,
+        "duration_source": null,
+        "deadline_kind": "none",
+        "deadline_date": null,
+        "deadline_at": null,
+        "deadline_strength": null,
+        "deadline_soft_weight": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "has_own_effort": false,
+        "split_policy": {
+          "type": "indivisible"
+        },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0
+      }
+    }
+  ]
+}

@@ -27,12 +27,14 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,7 +45,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.SecureFlagPolicy
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalDeadlineKind
+import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
 import com.greengolddog.dayweave.model.CanonicalAbsoluteWindowDraft
 import com.greengolddog.dayweave.model.CanonicalBreakCategory
 import com.greengolddog.dayweave.model.CanonicalBufferPolicyDraft
@@ -98,6 +103,10 @@ internal data class CanonicalItemEditorRoute(
     val mode: CanonicalItemEditorMode,
     val mutationId: String? = null,
     val sourceInboxId: String? = null,
+    /** Generic hierarchy capture must never replace the explicit onboarding designation. */
+    val isHierarchyCreation: Boolean = false,
+    /** Retain privacy reviewed at the origin even if an unsaved draft is later detached. */
+    val minimumSensitive: Boolean = false,
 ) {
     val routeId: String = mutationId ?: sourceInboxId ?: "$mode:$itemId"
 
@@ -125,12 +134,40 @@ internal data class CanonicalItemEditorRoute(
                 sourceInboxId = item.id,
             )
         }
+
+        fun hierarchy(
+            state: DayWeaveUiState,
+            kind: ItemKind,
+            parentId: String? = null,
+        ): CanonicalItemEditorRoute {
+            val id = UUID.randomUUID().toString()
+            val issue = com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority.build(state)
+                .issue(parentId, id)
+            require(issue == null) { requireNotNull(issue) }
+            val sensitive = parentId?.let {
+                com.greengolddog.dayweave.model.effectiveCanonicalSensitivity(
+                    state.canonicalItems, it, state.pendingCanonicalMutation,
+                    state.pendingCanonicalAuthoringMutations,
+                )
+            } ?: false
+            return CanonicalItemEditorRoute(
+                itemId = id,
+                initialDraft = newCanonicalDetailedDraft(kind = kind).copy(
+                    timezoneName = state.scheduleCompositionProfile.timezoneName ?: canonicalDeviceTimezoneName(),
+                    parentId = parentId,
+                ),
+                mode = CanonicalItemEditorMode.CREATE,
+                isHierarchyCreation = true,
+                minimumSensitive = sensitive,
+            )
+        }
     }
 }
 
 internal data class CanonicalParentOption(
     val id: String,
     val title: String,
+    val isSensitive: Boolean = false,
 )
 
 internal data class CanonicalDependencyOption(
@@ -616,6 +653,10 @@ internal data class CanonicalItemEditorForm(
     val durationMaxSeconds: String = durationSeconds,
     val earliestStartAt: String,
     val deadlineAt: String,
+    val deadlineKind: CanonicalDeadlineKind,
+    val deadlineDate: String,
+    val deadlineStrength: CanonicalDeadlineStrength?,
+    val deadlineSoftWeight: String,
     val recurrenceKind: CanonicalRecurrenceKind?,
     val recurrenceCount: String,
     val recurrenceIntervalMinutes: String,
@@ -696,6 +737,21 @@ internal data class CanonicalItemEditorForm(
             else -> recurrenceKind
         },
         isSplittable = isSplittable && value != ItemKind.EVENT,
+        deadlineKind = if (value == ItemKind.EVENT || kind == ItemKind.EVENT) CanonicalDeadlineKind.NONE else deadlineKind,
+        deadlineDate = if (value == ItemKind.EVENT || kind == ItemKind.EVENT) "" else deadlineDate,
+        deadlineAt = if (value == ItemKind.EVENT || kind == ItemKind.EVENT) "" else deadlineAt,
+        deadlineStrength = if (value == ItemKind.EVENT || kind == ItemKind.EVENT) null else deadlineStrength,
+        deadlineSoftWeight = if (value == ItemKind.EVENT || kind == ItemKind.EVENT) "" else deadlineSoftWeight,
+    )
+
+    fun withDeadlineKind(value: CanonicalDeadlineKind): CanonicalItemEditorForm = copy(
+        deadlineKind = value,
+        deadlineAt = deadlineAt.takeIf { value == CanonicalDeadlineKind.DATE_TIME }.orEmpty(),
+        deadlineDate = deadlineDate.takeIf { value == CanonicalDeadlineKind.DATE }.orEmpty(),
+        deadlineStrength = if (value == CanonicalDeadlineKind.NONE) null else {
+            deadlineStrength ?: CanonicalDeadlineStrength.HARD
+        },
+        deadlineSoftWeight = deadlineSoftWeight.takeUnless { value == CanonicalDeadlineKind.NONE }.orEmpty(),
     )
 
     /** Explicitly removes metadata that cannot coexist with an owned event timing block. */
@@ -933,12 +989,9 @@ internal data class CanonicalItemEditorForm(
                     null
                 },
                 scheduling = schedulingValue.takeIf { schedulingSpecified || hasSchedulingValues },
-                hasOwnEffort = if (
-                    kind in setOf(ItemKind.ROUTINE, ItemKind.GOAL, ItemKind.EVENT)
-                ) {
-                    hasOwnEffort.takeIf { hasOwnEffortSpecified }
-                } else {
-                    source.constraints.hasOwnEffort
+                // Preserve an existing legacy mirror, but never invent one while editing.
+                hasOwnEffort = hasOwnEffort.takeIf {
+                    hasOwnEffortSpecified && source.constraints.hasOwnEffort != null
                 },
                 goalIds = source.constraints.goalIds,
                 habitTarget = if (kind == ItemKind.HABIT && hasHabitTarget) {
@@ -1009,10 +1062,22 @@ internal data class CanonicalItemEditorForm(
             durationMaxSeconds = resolvedDurationMaximum,
             durationSource = resolvedDurationSource,
             deadlineAt = when {
-                event == null -> deadlineAt.optional("Deadline")
+                event == null -> deadlineAt.optional("Deadline").takeIf {
+                    deadlineKind == CanonicalDeadlineKind.DATE_TIME
+                }
                 eventBoundsUnchanged -> source.deadlineAt
                 else -> event.endsAt
             },
+            deadlineKind = if (kind == ItemKind.EVENT) CanonicalDeadlineKind.NONE else deadlineKind,
+            deadlineDate = deadlineDate.trim().takeIf(String::isNotEmpty).takeIf {
+                kind != ItemKind.EVENT && deadlineKind == CanonicalDeadlineKind.DATE
+            },
+            deadlineStrength = deadlineStrength.takeIf {
+                kind != ItemKind.EVENT && deadlineKind != CanonicalDeadlineKind.NONE
+            },
+            deadlineSoftWeight = if (kind != ItemKind.EVENT && deadlineKind != CanonicalDeadlineKind.NONE &&
+                deadlineStrength == CanonicalDeadlineStrength.SOFT
+            ) deadlineSoftWeight.requiredLong("Soft deadline weight") else null,
             earliestStartAt = when {
                 event == null -> earliestStartAt.optional("Earliest start")
                 eventBoundsUnchanged -> source.earliestStartAt
@@ -1020,6 +1085,7 @@ internal data class CanonicalItemEditorForm(
             },
             recurrence = recurrence,
             constraints = constraints,
+            hasOwnEffort = hasOwnEffort,
             split = split,
             importance = importance,
             urgency = urgency,
@@ -1052,6 +1118,10 @@ internal data class CanonicalItemEditorForm(
                     (draft.durationMaxSeconds ?: draft.durationSeconds ?: 45L * 60L).toString(),
                 earliestStartAt = draft.earliestStartAt.orEmpty(),
                 deadlineAt = draft.deadlineAt.orEmpty(),
+                deadlineKind = draft.deadlineKind,
+                deadlineDate = draft.deadlineDate.orEmpty(),
+                deadlineStrength = draft.deadlineStrength,
+                deadlineSoftWeight = draft.deadlineSoftWeight?.toString().orEmpty(),
                 recurrenceKind = draft.recurrence?.kind,
                 recurrenceCount = (draft.recurrence?.occurrencesPerPeriod ?: 1).toString(),
                 recurrenceIntervalMinutes =
@@ -1119,7 +1189,7 @@ internal data class CanonicalItemEditorForm(
                 minimumChunkSeconds = (draft.split.minimumChunkSeconds ?: 15L * 60L).toString(),
                 maximumChunkSeconds =
                     (draft.split.maximumChunkSeconds ?: draft.durationSeconds ?: 30L * 60L).toString(),
-                hasOwnEffort = draft.constraints.hasOwnEffort ?: false,
+                hasOwnEffort = draft.hasOwnEffort,
                 hasOwnEffortSpecified = draft.constraints.hasOwnEffort != null,
                 hasHabitTarget = draft.constraints.habitTarget != null,
                 habitTargetAmount = (draft.constraints.habitTarget?.amount ?: 1).toString(),
@@ -1174,12 +1244,30 @@ internal fun CanonicalItemEditorSheet(
     }
     var saveError by remember(route.routeId) { mutableStateOf<String?>(null) }
     var isSaving by remember(route.routeId) { mutableStateOf(false) }
+    var reviewedSensitiveParent by remember(route.routeId) {
+        mutableStateOf(route.minimumSensitive || route.initialDraft.isSensitive ||
+            parentOptions.any { it.id == route.initialDraft.parentId && it.isSensitive })
+    }
     val coroutineScope = rememberCoroutineScope()
+    val currentParentSensitive = parentOptions.any { it.id == form.parentId && it.isSensitive }
+    SideEffect {
+        if (form.isSensitive || currentParentSensitive) reviewedSensitiveParent = true
+    }
+    // Review privacy is sticky, but inherited privacy must not silently become an own mark.
     val currentDraft = form.draft(route.itemId)
     val issue = currentDraft.exceptionOrNull()?.let {
         it.message?.takeIf(String::isNotBlank) ?: "Review the highlighted item details."
-    } ?: currentDraft.getOrNull()?.let(dependencyContext::cycleWarning)
-    ModalBottomSheet(onDismissRequest = { if (!isSaving) onDismiss() }) {
+    } ?: if (form.parentId != null && parentOptions.none { it.id == form.parentId }) {
+        "The selected parent is no longer available for authoring. Choose another parent or detach."
+    } else currentDraft.getOrNull()?.let(dependencyContext::cycleWarning)
+    ModalBottomSheet(
+        onDismissRequest = { if (!isSaving) onDismiss() },
+        properties = ModalBottomSheetProperties(securePolicy = canonicalEditorSecurePolicy(
+            ownSensitive = form.isSensitive,
+            parentSensitive = currentParentSensitive,
+            reviewedSensitiveContext = reviewedSensitiveParent,
+        )),
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1226,7 +1314,7 @@ internal fun CanonicalItemEditorSheet(
                     minLines = 3,
                 )
                 ChoiceRow {
-                    ItemKind.entries.filterNot { it == ItemKind.PROJECT }.forEach { option ->
+                    ItemKind.entries.forEach { option ->
                         FilterChip(
                             selected = form.kind == option,
                             onClick = { form = form.withKind(option) },
@@ -1238,7 +1326,10 @@ internal fun CanonicalItemEditorSheet(
                     title = "Sensitive",
                     detail = "Protect the title, notes, and inherited child context.",
                     checked = form.isSensitive,
-                    onCheckedChange = { form = form.copy(isSensitive = it) },
+                    onCheckedChange = {
+                        reviewedSensitiveParent = reviewedSensitiveParent || form.isSensitive || it
+                        form = form.copy(isSensitive = it)
+                    },
                     testTag = "canonical_editor_sensitive",
                 )
             }
@@ -1317,11 +1408,56 @@ internal fun CanonicalItemEditorSheet(
                         onValueChange = { form = form.copy(earliestStartAt = it) },
                         label = "Hard earliest start (optional ISO-8601)",
                     )
-                    InstantField(
-                        value = form.deadlineAt,
-                        onValueChange = { form = form.copy(deadlineAt = it) },
-                        label = "Hard deadline (optional ISO-8601)",
-                    )
+                    ChoiceRow {
+                        listOf(CanonicalDeadlineKind.NONE, CanonicalDeadlineKind.DATE, CanonicalDeadlineKind.DATE_TIME)
+                            .forEach { option ->
+                                FilterChip(
+                                    selected = form.deadlineKind == option,
+                                    onClick = { form = form.withDeadlineKind(option) },
+                                    label = { Text(when (option) {
+                                        CanonicalDeadlineKind.DATE -> "Date deadline"
+                                        CanonicalDeadlineKind.DATE_TIME -> "Timed deadline"
+                                        else -> "No deadline"
+                                    }) },
+                                )
+                            }
+                    }
+                    if (form.deadlineKind == CanonicalDeadlineKind.DATE) {
+                        OutlinedTextField(
+                            value = form.deadlineDate,
+                            onValueChange = { form = form.copy(deadlineDate = it) },
+                            label = { Text("Deadline date (YYYY-MM-DD, item time zone)") },
+                            modifier = Modifier.fillMaxWidth().testTag("canonical_editor_deadline_date"),
+                            singleLine = true,
+                        )
+                        Text("Due before the next local midnight. No arbitrary time is added.",
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (form.deadlineKind == CanonicalDeadlineKind.DATE_TIME) {
+                        InstantField(
+                            value = form.deadlineAt,
+                            onValueChange = { form = form.copy(deadlineAt = it) },
+                            label = "Deadline timestamp (ISO-8601)",
+                        )
+                    }
+                    if (form.deadlineKind != CanonicalDeadlineKind.NONE) {
+                        ChoiceRow {
+                            listOf(CanonicalDeadlineStrength.HARD, CanonicalDeadlineStrength.SOFT).forEach { strength ->
+                                FilterChip(
+                                    selected = form.deadlineStrength == strength,
+                                    onClick = { form = form.copy(deadlineStrength = strength,
+                                        deadlineSoftWeight = if (strength == CanonicalDeadlineStrength.SOFT) {
+                                            form.deadlineSoftWeight.ifBlank { "100" }
+                                        } else "") },
+                                    label = { Text(if (strength == CanonicalDeadlineStrength.HARD) "Hard deadline" else "Soft preference") },
+                                )
+                            }
+                        }
+                        if (form.deadlineStrength == CanonicalDeadlineStrength.SOFT) {
+                            NumberField(form.deadlineSoftWeight,
+                                { form = form.copy(deadlineSoftWeight = it) }, "Soft weight (0–1000000)")
+                        }
+                    }
                 }
                 PrioritySlider("Importance", form.importance) {
                     form = form.copy(importance = it)
@@ -1699,7 +1835,19 @@ internal fun CanonicalItemEditorSheet(
                         testTag = "canonical_editor_break_resume_prompt",
                     )
                 }
-                ItemKind.EVENT, ItemKind.TASK, ItemKind.PROJECT -> Unit
+                ItemKind.PROJECT -> EditorSection("Project effort") {
+                    LabeledSwitch(
+                        title = "Project has leaf work",
+                        detail = "Schedule this project's duration only while it has no children. " +
+                            "With children, schedule their leaf work instead.",
+                        checked = form.hasOwnEffort,
+                        onCheckedChange = {
+                            form = form.copy(hasOwnEffort = it, hasOwnEffortSpecified = true)
+                        },
+                        testTag = "canonical_editor_project_own_effort",
+                    )
+                }
+                ItemKind.EVENT, ItemKind.TASK -> Unit
             }
 
             EditorSection("Flexible constraints") {
@@ -2091,10 +2239,18 @@ internal fun CanonicalItemEditorSheet(
                 }
 
             EditorSection("Hierarchy") {
+                if (currentParentSensitive || reviewedSensitiveParent) {
+                    Text("Sensitive review is retained if this draft is moved out of its protected ancestry.",
+                        style = MaterialTheme.typography.bodySmall)
+                }
                 ParentPicker(
                     selectedId = form.parentId,
                     options = parentOptions,
-                    onSelected = { form = form.copy(parentId = it) },
+                    onSelected = { selected ->
+                        reviewedSensitiveParent = reviewedSensitiveParent || currentParentSensitive ||
+                            parentOptions.any { it.id == selected && it.isSensitive }
+                        form = form.copy(parentId = selected)
+                    },
                 )
                 NumberField(
                     value = form.siblingOrder,
@@ -2546,7 +2702,9 @@ private fun ParentPicker(
     var expanded by remember { mutableStateOf(false) }
     val title = options.firstOrNull { it.id == selectedId }?.title ?: "No parent"
     Box {
-        OutlinedButton(onClick = { expanded = true }) { Text("Parent · $title") }
+        OutlinedButton(onClick = { expanded = true }, modifier = Modifier.testTag("canonical_editor_parent")) {
+            Text("Parent · $title")
+        }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(
                 text = { Text("No parent") },
@@ -2567,6 +2725,14 @@ private fun ParentPicker(
         }
     }
 }
+
+internal fun canonicalEditorSecurePolicy(
+    ownSensitive: Boolean,
+    parentSensitive: Boolean,
+    reviewedSensitiveContext: Boolean,
+): SecureFlagPolicy = if (ownSensitive || parentSensitive || reviewedSensitiveContext) {
+    SecureFlagPolicy.SecureOn
+} else SecureFlagPolicy.Inherit
 
 internal fun newCanonicalDetailedDraft(
     title: String = "",
@@ -2592,36 +2758,16 @@ internal fun canonicalParentOptions(
     state: DayWeaveUiState,
     excludingItemId: String,
 ): List<CanonicalParentOption> {
-    data class ParentNode(val id: String, val title: String, val parentId: String?)
-
-    val nodes = state.canonicalItems
-        .filter { it.deletedAt == null && it.status in setOf("inbox", "planned") }
-        .associate { it.id to ParentNode(it.id, it.title, it.parentId) }
-        .toMutableMap()
-    state.pendingCanonicalAuthoringMutations.forEach { mutation ->
-        when (mutation.operation) {
-            com.greengolddog.dayweave.model.CanonicalAuthoringOperation.TRASH ->
-                nodes.remove(mutation.itemId)
-            com.greengolddog.dayweave.model.CanonicalAuthoringOperation.CREATE,
-            com.greengolddog.dayweave.model.CanonicalAuthoringOperation.REPLACE,
-            -> mutation.draft?.let { draft ->
-                nodes[mutation.itemId] = ParentNode(mutation.itemId, draft.title, draft.parentId)
-            }
-            com.greengolddog.dayweave.model.CanonicalAuthoringOperation.RESTORE -> Unit
+    val privacy = com.greengolddog.dayweave.model.CanonicalSensitivityIndex.build(
+        state.canonicalItems, state.pendingCanonicalMutation, state.pendingCanonicalAuthoringMutations,
+    )
+    return com.greengolddog.dayweave.model.CanonicalHierarchyParentAuthority.build(state)
+        .options(excludingItemId).map {
+            val sensitive = privacy[it.id]
+            CanonicalParentOption(it.id,
+                if (sensitive) "Sensitive parent · …${it.id.takeLast(8)}" else it.title,
+                sensitive)
         }
-    }
-    val excluded = mutableSetOf(excludingItemId)
-    var changed = true
-    while (changed) {
-        changed = false
-        nodes.values.forEach { node ->
-            if (node.parentId in excluded && excluded.add(node.id)) changed = true
-        }
-    }
-    return nodes.values
-        .filter { it.id !in excluded }
-        .sortedWith(compareBy({ it.title.lowercase() }, { it.id }))
-        .map { CanonicalParentOption(it.id, it.title) }
 }
 
 internal fun canonicalDependencyEditorContext(

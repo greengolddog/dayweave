@@ -739,7 +739,7 @@ private fun legacyOwnEffortValue(raw: String): LegacyBoolean = runCatching {
 internal fun legacyHasOwnEffort(raw: String): Boolean =
     legacyOwnEffortValue(raw) == LegacyBoolean.TRUE
 
-private fun String.isCanonicalDateOnly(): Boolean =
+internal fun String.isCanonicalDateOnly(): Boolean =
     length == 10 && this[4] == '-' && this[7] == '-' &&
         take(4).all(Char::isDigit) && substring(5, 7).all(Char::isDigit) &&
         takeLast(2).all(Char::isDigit) && substring(0, 4).toInt() in 1..9_999 &&

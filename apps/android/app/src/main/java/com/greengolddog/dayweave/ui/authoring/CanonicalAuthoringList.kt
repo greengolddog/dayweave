@@ -901,7 +901,7 @@ internal fun canonicalDependencyDetail(
 internal fun CanonicalAuthoringRow.editorRoute(): CanonicalItemEditorRoute? {
     val value = draft ?: return null
     if (
-        isReadOnly || kind == com.greengolddog.dayweave.model.ItemKind.PROJECT ||
+        isReadOnly ||
         status !in setOf("inbox", "planned") ||
         source !in setOf(
             CanonicalAuthoringRowSource.CANONICAL,

@@ -61,8 +61,16 @@ class RoomPlannerStateRepository(
     private val dao: PlannerSnapshotDao,
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) : PlannerStateRepository {
-    override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
+    override suspend fun load(): DayWeaveUiState? = dao.load()?.let { persistedSnapshot ->
+        val snapshot = if (persistedSnapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21) {
+            persistedSnapshot
+        } else {
+            persistedSnapshot.copy(
+                payload = migrateLegacyStructuralAuthoringSnapshot(persistedSnapshot.payload),
+            )
+        }
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V21,
             PlannerSnapshotFormats.JSON_V20 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
                 requireGoogleSchedulePublicationField = true,
@@ -234,6 +242,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
@@ -251,6 +260,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V18 ||
@@ -274,7 +284,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V20 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V21 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -305,8 +315,59 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V20,
+                payloadFormat = PlannerSnapshotFormats.JSON_V21,
             ),
+        )
+    }
+
+    /**
+     * Pre-v21 journals preserve their independent duration marker and exact submission identity.
+     * Reject relabelled modern structure before any migration can erase evidence; derive only the
+     * fields the old request actually represented. Loading is never an authoring-shape upgrade.
+     */
+    private fun migrateLegacyStructuralAuthoringSnapshot(payload: String): String {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val entries = root["pendingCanonicalAuthoringMutations"] ?: return payload
+        val mutations = entries as? JsonArray
+            ?: throw SerializationException("Legacy canonical authoring journal must be an array")
+        val migrated = mutations.map { element ->
+            val mutation = element as? JsonObject
+                ?: throw SerializationException("Legacy canonical authoring journal must be an object")
+            if (mutation.containsKey("structuralRequestShapeVersion")) {
+                throw SerializationException("Legacy canonical authoring journal contains a structural request shape")
+            }
+            val draft = mutation["draft"]
+            val migratedDraft = if (draft == null || draft is JsonNull) {
+                draft
+            } else {
+                val fields = draft as? JsonObject
+                    ?: throw SerializationException("Legacy canonical authoring draft must be an object")
+                if (fields.keys.any { it in CANONICAL_DRAFT_STRUCTURAL_FIELDS }) {
+                    throw SerializationException("Legacy canonical authoring draft contains typed structural fields")
+                }
+                val deadline = fields["deadlineAt"]
+                val hasDeadline = fields["kind"]?.jsonPrimitive?.contentOrNull != "EVENT" &&
+                    deadline != null && deadline !is JsonNull
+                val constraints = fields["constraints"] as? JsonObject
+                val ownEffort = constraints?.get("hasOwnEffort")?.takeUnless { it is JsonNull }
+                    ?: JsonPrimitive(false)
+                JsonObject(fields + mapOf(
+                    "deadlineKind" to JsonPrimitive(if (hasDeadline) "date_time" else "none"),
+                    "deadlineDate" to JsonNull,
+                    "deadlineStrength" to if (hasDeadline) JsonPrimitive("hard") else JsonNull,
+                    "deadlineSoftWeight" to JsonNull,
+                    "hasOwnEffort" to ownEffort,
+                ))
+            }
+            JsonObject(mutation + mapOf(
+                "structuralRequestShapeVersion" to JsonPrimitive(
+                    PendingCanonicalAuthoringMutation.LEGACY_STRUCTURAL_REQUEST_SHAPE_VERSION,
+                ),
+            ) + listOfNotNull(migratedDraft?.let { "draft" to it }))
+        }
+        return SNAPSHOT_JSON.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(root + ("pendingCanonicalAuthoringMutations" to JsonArray(migrated))),
         )
     }
 
@@ -576,6 +637,7 @@ class RoomPlannerStateRepository(
         if (requireCanonicalDraftDurationFields) {
             requireCanonicalDraftDurationFields(root)
         }
+        requireCanonicalDraftStructuralFields(root)
         if (requireHabitMissedResolutionFields) {
             requireHabitMissedResolutionFields(root)
         }
@@ -786,6 +848,28 @@ class RoomPlannerStateRepository(
                 throw SerializationException(
                     "pendingCanonicalAuthoringMutations[$index].draft is missing habit spacing",
                 )
+            }
+        }
+    }
+
+    private fun requireCanonicalDraftStructuralFields(root: JsonObject) {
+        (root["pendingCanonicalAuthoringMutations"] as? JsonArray)?.forEachIndexed { index, element ->
+            val mutation = element as? JsonObject
+                ?: throw SerializationException("Canonical authoring journal must be an object")
+            if (!mutation.containsKey("structuralRequestShapeVersion")) {
+                throw SerializationException(
+                    "pendingCanonicalAuthoringMutations[$index] is missing its structural request shape",
+                )
+            }
+            val draft = mutation["draft"]
+            if (draft != null && draft !is JsonNull) {
+                val fields = draft as? JsonObject
+                    ?: throw SerializationException("Canonical authoring draft must be an object")
+                if (!fields.keys.containsAll(CANONICAL_DRAFT_STRUCTURAL_FIELDS)) {
+                    throw SerializationException(
+                        "pendingCanonicalAuthoringMutations[$index].draft is missing structural metadata",
+                    )
+                }
             }
         }
     }
@@ -1481,6 +1565,13 @@ class RoomPlannerStateRepository(
             "durationMinSeconds",
             "durationMaxSeconds",
             "durationSource",
+        )
+        val CANONICAL_DRAFT_STRUCTURAL_FIELDS = setOf(
+            "deadlineKind",
+            "deadlineDate",
+            "deadlineStrength",
+            "deadlineSoftWeight",
+            "hasOwnEffort",
         )
         val CURRENT_HABIT_LEDGER_FIELDS = setOf(
             "schemaVersion",

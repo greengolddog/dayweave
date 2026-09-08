@@ -198,6 +198,7 @@ class OnboardingFirstItemStoreTest {
             store.enqueueOnboardingFirstItemCreate(
                 plannedDraft().copy(
                     constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                    hasOwnEffort = true,
                 ),
                 ITEM_ID,
                 MUTATION_ID,
@@ -229,6 +230,7 @@ class OnboardingFirstItemStoreTest {
                 plannedDraft().copy(
                     title = "Independent parent work",
                     constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                    hasOwnEffort = true,
                 ),
             )
         }

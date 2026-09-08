@@ -2817,7 +2817,8 @@ final class CanonicalSyncStore: ObservableObject {
                 DayWeaveNewCanonicalItem(
                     id: mutation.itemID,
                     fields: draft.requestFields(
-                        durationWireShape: mutation.durationWireShape
+                        durationWireShape: mutation.durationWireShape,
+                        structuralRequestShapeVersion: mutation.structuralRequestShapeVersion
                     )
                 ),
                 idempotencyKey: mutation.idempotencyKey
@@ -2831,7 +2832,8 @@ final class CanonicalSyncStore: ObservableObject {
                 mutation.itemID,
                 expectedRevision: expectedRevision,
                 item: draft.requestFields(
-                    durationWireShape: mutation.durationWireShape
+                    durationWireShape: mutation.durationWireShape,
+                    structuralRequestShapeVersion: mutation.structuralRequestShapeVersion
                 ),
                 idempotencyKey: mutation.idempotencyKey
             )

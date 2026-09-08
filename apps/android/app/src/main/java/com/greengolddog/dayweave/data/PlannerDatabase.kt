@@ -68,11 +68,13 @@ object PlannerSnapshotFormats {
     const val JSON_V19 = "json-v19-habit-missed-resolution-authority"
     /** Exact current-publication occurrence membership plus durable later-head invalidation. */
     const val JSON_V20 = "json-v20-published-occurrence-membership-authority"
+    /** Typed structural authoring and an independent exact-request shape rollback fence. */
+    const val JSON_V21 = "json-v21-structural-authoring-request-shape"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 20,
+    version = 21,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -235,6 +237,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_19_20 = object : Migration(19, 20) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. Typed draft structure and exact legacy request-shape authority
+     * live in the encrypted payload; rollback must not erase or reinterpret either.
+     */
+    val MIGRATION_20_21 = object : Migration(20, 21) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -294,6 +304,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_17_18,
                 PlannerDatabaseMigrations.MIGRATION_18_19,
                 PlannerDatabaseMigrations.MIGRATION_19_20,
+                PlannerDatabaseMigrations.MIGRATION_20_21,
             )
             .build()
     }

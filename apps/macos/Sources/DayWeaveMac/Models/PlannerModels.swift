@@ -213,37 +213,7 @@ private func dayWeaveDateDeadlineBoundary(
     _ value: String,
     timezoneName: String
 ) -> Date? {
-    guard value.utf8.count == 10,
-          value.utf8.enumerated().allSatisfy({ index, byte in
-              index == 4 || index == 7 ? byte == 45 : (48...57).contains(byte)
-          }),
-          let year = Int(value.prefix(4)),
-          let month = Int(value.dropFirst(5).prefix(2)),
-          let day = Int(value.suffix(2)),
-          let timezone = TimeZone(identifier: timezoneName)
-    else { return nil }
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.locale = Locale(identifier: "en_US_POSIX")
-    calendar.timeZone = timezone
-    let components = DateComponents(
-        calendar: calendar,
-        timeZone: timezone,
-        year: year,
-        month: month,
-        day: day,
-        hour: 0,
-        minute: 0,
-        second: 0
-    )
-    guard let start = calendar.date(from: components) else { return nil }
-    let resolved = calendar.dateComponents([.year, .month, .day, .hour], from: start)
-    guard resolved.year == year,
-          resolved.month == month,
-          resolved.day == day,
-          resolved.hour == 0,
-          let boundary = calendar.date(byAdding: .day, value: 1, to: start),
-          calendar.component(.hour, from: boundary) == 0 else { return nil }
-    return boundary
+    CanonicalDateDeadline.boundary(value, timezoneName: timezoneName)
 }
 
 struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {

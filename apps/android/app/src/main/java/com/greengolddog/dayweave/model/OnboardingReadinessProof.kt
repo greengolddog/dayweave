@@ -74,15 +74,15 @@ fun CanonicalItemDraft.createsPlanningDemand(
     require(value.kind == ItemKind.EVENT || !hasChildren)
     when (value.kind) {
         ItemKind.EVENT -> true
-        ItemKind.PROJECT -> false
         ItemKind.TASK,
         ItemKind.HABIT,
         ItemKind.BREAK,
         -> value.durationSeconds?.let { it > 0 } == true
         ItemKind.GOAL,
+        ItemKind.PROJECT,
         ItemKind.ROUTINE,
         -> value.durationSeconds?.let { it > 0 } == true &&
-            value.constraints.hasOwnEffort == true
+            value.hasOwnEffort
     }
 }.getOrDefault(false)
 

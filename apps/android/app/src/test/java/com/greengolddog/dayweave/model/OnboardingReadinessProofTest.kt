@@ -20,6 +20,7 @@ class OnboardingReadinessProofTest {
         assertFalse(
             task.copy(
                 constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                hasOwnEffort = true,
             ).createsPlanningDemand(ITEM_ID, hasChildren = true),
         )
         val habit = task.copy(
@@ -36,6 +37,7 @@ class OnboardingReadinessProofTest {
             assertFalse(
                 leaf.copy(
                     constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                    hasOwnEffort = true,
                 ).createsPlanningDemand(ITEM_ID, hasChildren = true),
             )
         }
@@ -49,10 +51,12 @@ class OnboardingReadinessProofTest {
         val goalWithOwnEffort = task.copy(
             kind = ItemKind.GOAL,
             constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            hasOwnEffort = true,
         )
         val routineWithOwnEffort = task.copy(
             kind = ItemKind.ROUTINE,
             constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            hasOwnEffort = true,
         )
         assertTrue(goalWithOwnEffort.createsPlanningDemand(ITEM_ID))
         assertTrue(routineWithOwnEffort.createsPlanningDemand(ITEM_ID))
@@ -106,7 +110,7 @@ class OnboardingReadinessProofTest {
         )
         assertTrue(goalWithOwnEffort.createsPlanningDemand(listOf(goalWithOwnEffort)))
         assertTrue(routineWithOwnEffort.createsPlanningDemand(listOf(routineWithOwnEffort)))
-        assertFalse(
+        assertTrue(
             goalWithOwnEffort.copy(flexibleConstraintsJson = "{}")
                 .createsPlanningDemand(listOf(goalWithOwnEffort.copy(flexibleConstraintsJson = "{}"))),
         )
@@ -174,6 +178,7 @@ class OnboardingReadinessProofTest {
                     create.copy(
                         draft = plannedTask().copy(
                             constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                            hasOwnEffort = true,
                         ),
                     ),
                     childCreate,
@@ -435,6 +440,7 @@ class OnboardingReadinessProofTest {
         val parentCreate = pendingCreate(draft = plannedTask().copy(
             kind = ItemKind.GOAL,
             constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            hasOwnEffort = true,
         ))
         val childCreate = pendingCreate(
             itemId = CHILD_ID,
