@@ -35,7 +35,7 @@ class OnboardingReadinessProofPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(state.onboardingFirstItemAnchor, restored.onboardingFirstItemAnchor)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
         val root = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
         val anchor = requireNotNull(root["onboardingFirstItemAnchor"]).jsonObject
         assertEquals(setOf("itemId", "canonicalRevision"), anchor.keys)
@@ -99,7 +99,7 @@ class OnboardingReadinessProofPersistenceTest {
             val restored = requireNotNull(repository.load())
 
             assertNull(restored.onboardingFirstItemAnchor)
-            assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
             val rewritten = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
             assertTrue(rewritten.getValue("onboardingFirstItemAnchor") is JsonNull)
         }
@@ -263,7 +263,8 @@ class OnboardingReadinessProofPersistenceTest {
 private class OnboardingProofFakeDao : PlannerSnapshotDao {
     var snapshot: PlannerSnapshotEntity? = null
 
-    override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
+    override suspend fun load(singletonId: Int): PlannerSnapshotEntity? =
+            snapshot?.asPreProgressFixtureWhenRelabelled()
 
     override suspend fun save(snapshot: PlannerSnapshotEntity) {
         this.snapshot = snapshot

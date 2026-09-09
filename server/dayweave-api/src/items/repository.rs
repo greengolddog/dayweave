@@ -140,6 +140,25 @@ pub enum ItemRepositoryError {
 pub trait ItemRepository: Send + Sync {
     fn cursor_scope(&self) -> Uuid;
 
+    async fn get_progress(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<crate::item_progress::ItemProgressSnapshot, crate::item_progress::ItemProgressError>
+    {
+        Err(crate::item_progress::ItemProgressError::Unavailable)
+    }
+
+    async fn put_progress(
+        &self,
+        _item_id: Uuid,
+        _command: crate::item_progress::ItemProgressCommand,
+        _now: DateTime<Utc>,
+        _actor_session_id: Option<Uuid>,
+    ) -> Result<crate::item_progress::ItemProgressMutation, crate::item_progress::ItemProgressError>
+    {
+        Err(crate::item_progress::ItemProgressError::Unavailable)
+    }
+
     async fn create(
         &self,
         item: Item,
@@ -233,6 +252,7 @@ struct MemoryExecutionGuard {
 #[derive(Clone, Debug, Default)]
 struct MemoryState {
     items: HashMap<Uuid, Item>,
+    progress: crate::item_progress::memory::MemoryProgress,
     idempotency: HashMap<(String, String), MemoryIdempotency>,
     changes: Vec<MemoryChange>,
     next_sequence: u64,
@@ -427,6 +447,42 @@ fn validate_memory_group_completeness(
 impl ItemRepository for InMemoryItemRepository {
     fn cursor_scope(&self) -> Uuid {
         self.cursor_scope
+    }
+
+    async fn get_progress(
+        &self,
+        item_id: Uuid,
+    ) -> Result<crate::item_progress::ItemProgressSnapshot, crate::item_progress::ItemProgressError>
+    {
+        let state = self.state.lock().await;
+        let item = state
+            .items
+            .get(&item_id)
+            .filter(|item| item.deleted_at.is_none())
+            .ok_or(crate::item_progress::ItemProgressError::ItemMissing)?;
+        Ok(state.progress.get(item_id, item.revision))
+    }
+
+    async fn put_progress(
+        &self,
+        item_id: Uuid,
+        command: crate::item_progress::ItemProgressCommand,
+        now: DateTime<Utc>,
+        _actor_session_id: Option<Uuid>,
+    ) -> Result<crate::item_progress::ItemProgressMutation, crate::item_progress::ItemProgressError>
+    {
+        let mut state = self.state.lock().await;
+        if let Some(result) = state.progress.replay(item_id, &command)? {
+            return Ok(result);
+        }
+        command.validate(item_id)?;
+        let revision = state
+            .items
+            .get(&item_id)
+            .filter(|item| item.deleted_at.is_none())
+            .ok_or(crate::item_progress::ItemProgressError::ItemMissing)?
+            .revision;
+        state.progress.put(item_id, revision, command, now)
     }
 
     async fn create(

@@ -42,7 +42,7 @@ class CanonicalAuthoringPersistenceTest {
 
         assertTrue(restored.pendingCanonicalAuthoringMutations.isEmpty())
         assertTrue(restored.canonicalRecentlyDeleted.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
         assertEquals(41L, dao.snapshot?.updatedAtEpochMillis)
     }
 
@@ -87,7 +87,7 @@ class CanonicalAuthoringPersistenceTest {
         assertEquals(mutation, restored.pendingCanonicalAuthoringMutations.single())
         assertEquals(deleted, restored.canonicalRecentlyDeleted.single())
         assertTrue(requireNotNull(dao.snapshot).payload.contains("Canonical Android draft"))
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -269,7 +269,8 @@ class CanonicalAuthoringPersistenceTest {
     private class FakeDao(
         var snapshot: PlannerSnapshotEntity? = null,
     ) : PlannerSnapshotDao {
-        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
+        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? =
+            snapshot?.asPreProgressFixtureWhenRelabelled()
 
         override suspend fun save(snapshot: PlannerSnapshotEntity) {
             this.snapshot = snapshot

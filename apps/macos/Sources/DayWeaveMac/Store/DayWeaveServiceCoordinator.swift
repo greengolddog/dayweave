@@ -2,6 +2,14 @@ import Combine
 import Foundation
 
 @MainActor
+protocol ItemProgressServiceSynchronizing: AnyObject {
+    func activate()
+    func suspendForPrivacyBoundary()
+    @discardableResult func replayPending() async -> Bool
+}
+extension ItemProgressStore: ItemProgressServiceSynchronizing {}
+
+@MainActor
 protocol ProposalApplicationRecovering: AnyObject {
     var hasPendingRecovery: Bool { get }
 
@@ -79,6 +87,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     private let executionSync: any ExecutionServiceSynchronizing
     private let canonicalSync: any CanonicalServiceSynchronizing
     private let habitSync: (any HabitServiceSynchronizing)?
+    private let itemProgress: (any ItemProgressServiceSynchronizing)?
     private var activationTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
 
@@ -88,7 +97,8 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         googleSchedulePublication: (any GoogleSchedulePublicationRecovering)? = nil,
         executionSync: any ExecutionServiceSynchronizing,
         canonicalSync: any CanonicalServiceSynchronizing,
-        habitSync: (any HabitServiceSynchronizing)? = nil
+        habitSync: (any HabitServiceSynchronizing)? = nil,
+        itemProgress: (any ItemProgressServiceSynchronizing)? = nil
     ) {
         self.proposalApplications = proposalApplications
         self.googleOutbound = googleOutbound
@@ -96,6 +106,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         self.executionSync = executionSync
         self.canonicalSync = canonicalSync
         self.habitSync = habitSync
+        self.itemProgress = itemProgress
     }
 
     func activate() {
@@ -117,6 +128,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         executionSync.stopForegroundPolling()
         habitSync?.stopForegroundPolling()
         habitSync?.suspendForPrivacyBoundary()
+        itemProgress?.suspendForPrivacyBoundary()
     }
 
     /// Resolves a user-visible pending journal and resumes the full foreground
@@ -193,6 +205,9 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     }
 
     private func reconcileAndStartPolling(generation: UInt64) async -> Bool {
+        guard operationIsCurrent(generation) else { return false }
+        itemProgress?.activate()
+        _ = await itemProgress?.replayPending()
         guard operationIsCurrent(generation) else { return false }
         let executionOutcome = await executionSync.refresh()
         guard operationIsCurrent(generation) else { return false }

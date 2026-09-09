@@ -2883,6 +2883,8 @@ private struct CanonicalInboxInspector: View {
                         }
                     }
 
+                    ItemProgressPanel(itemID: row.itemID, sensitive: row.isSensitive)
+
                     if !row.dependencyCauses.isEmpty {
                         InspectorSection(title: row.blockingDependencyCauses.isEmpty
                             ? "Dependencies"
@@ -6719,6 +6721,7 @@ private struct ScheduleProfileSettingsEditor: View {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject private var itemProgress: ItemProgressStore
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
@@ -6802,6 +6805,9 @@ struct SettingsView: View {
             Section("Accounts") {
                 GoogleIntegrationSettingsView()
                 codexAccountControls
+            }
+            Section("Independent progress outbox") {
+                ItemProgressOutboxView()
             }
             Section("Appearance") {
                 Picker("Theme", selection: appearanceModeBinding) {
@@ -7547,6 +7553,7 @@ struct SettingsView: View {
                 googleOutbound.configurationDidChange()
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
+                itemProgress.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7596,6 +7603,7 @@ struct SettingsView: View {
                 googleOutbound.configurationDidChange()
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
+                itemProgress.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
             } catch {
@@ -7621,6 +7629,7 @@ struct SettingsView: View {
                 googleOutbound.configurationDidChange()
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
+                itemProgress.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
                 dayWeaveEnrollmentCode = ""
@@ -7663,6 +7672,7 @@ struct SettingsView: View {
                 googleOutbound.configurationDidChange()
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
+                itemProgress.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7740,6 +7750,7 @@ struct SettingsView: View {
         googleOutbound.configurationDidChange()
         googleSchedulePublication.configurationDidChange()
         canonicalSync.configurationDidChange()
+        itemProgress.configurationDidChange()
         await executionSync.configurationDidChange()
         guard appLock.isContentAvailable,
               durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
@@ -7764,6 +7775,7 @@ struct SettingsView: View {
         googleOutbound.configurationDidChange()
         googleSchedulePublication.configurationDidChange()
         canonicalSync.configurationDidChange()
+        itemProgress.configurationDidChange()
         executionSync.startForegroundPolling()
         return true
     }
@@ -7799,6 +7811,7 @@ struct SettingsView: View {
                 googleOutbound.configurationDidChange()
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
+                itemProgress.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }

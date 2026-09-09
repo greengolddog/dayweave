@@ -43,6 +43,10 @@ impl std::fmt::Debug for ItemService {
 }
 
 impl ItemService {
+    pub(crate) fn progress_repository(&self) -> &dyn ItemRepository {
+        self.repository.as_ref()
+    }
+
     #[must_use]
     pub fn new(repository: Arc<dyn ItemRepository>, clock: Arc<dyn Clock>) -> Self {
         Self {

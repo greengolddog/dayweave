@@ -2151,6 +2151,8 @@ data class DayWeaveUiState(
     /** Credential/workspace binding for every canonical cursor/cache field above and below. */
     val canonicalConfigurationId: String? = null,
     val canonicalDeltaCursor: String? = null,
+    /** Bound independent progress observations and exact encrypted replay custody. */
+    val itemProgressLedger: ItemProgressLedger = ItemProgressLedger(),
     /** Non-null only between durable staging and a strictly validated publish receipt. */
     val pendingSchedulePublication: PendingSchedulePublication? = null,
     /** A persisted dirty bit keeps an exact in-flight publish replayable but never authoritative. */
@@ -2903,7 +2905,17 @@ fun DayWeaveUiState.withPendingSensitivityHardened(): DayWeaveUiState {
         changed = true
         block.copy(isSensitive = true)
     }
-    return if (changed) copy(schedule = hardenedSchedule) else this
+    val progressPrivacy = if (itemProgressLedger.pending.any { !it.wasSensitive }) {
+        CanonicalSensitivityIndex.build(canonicalItems, pendingCanonicalMutation, pendingCanonicalAuthoringMutations)
+    } else null
+    val hardenedProgress = itemProgressLedger.pending.map { pending ->
+        if (!pending.wasSensitive && progressPrivacy?.get(pending.itemId) == true) {
+            changed = true
+            pending.copy(wasSensitive = true)
+        } else pending
+    }
+    return if (changed) copy(schedule = hardenedSchedule,
+        itemProgressLedger = itemProgressLedger.copy(pending = hardenedProgress)) else this
 }
 
 private fun EnergyLevel.rank(): Int = when (this) {

@@ -81,6 +81,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
     private val habitSyncManager = dayWeaveApplication.habitSyncManager
+    private val itemProgressSyncManager = dayWeaveApplication.itemProgressSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
     private val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator =
         dayWeaveApplication.googleCalendarImportCoordinator
@@ -113,6 +114,26 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val habitSyncState: StateFlow<HabitSyncState> = habitSyncManager.state
+    val itemProgressSyncState = itemProgressSyncManager.state
+
+    suspend fun loadItemProgress(itemId: String): Boolean = dayWeaveApplication.refreshSelectedItemProgress(itemId)
+
+    fun replayItemProgress(): Boolean = dayWeaveApplication.launchCanonicalAction { itemProgressSyncManager.replay() }
+
+    suspend fun saveItemProgress(itemId: String, itemRevision: Long, progressRevision: Long,
+        components: List<com.greengolddog.dayweave.model.ItemProgressComponent>, replacingOperationId: String?,
+    ): Boolean {
+        val action = dayWeaveApplication.launchCanonicalResultAction {
+            itemProgressSyncManager.stage(itemId, itemRevision, progressRevision, components, replacingOperationId)
+        } ?: return false
+        val saved = action.await()
+        if (saved) replayItemProgress()
+        return saved
+    }
+
+    fun discardReviewedItemProgress(operationId: String): Boolean = dayWeaveApplication.launchCanonicalAction {
+        itemProgressSyncManager.discardReviewed(operationId)
+    }
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
     val googleCalendarImportState: StateFlow<GoogleCalendarImportState> =
         googleCalendarImportCoordinator.state

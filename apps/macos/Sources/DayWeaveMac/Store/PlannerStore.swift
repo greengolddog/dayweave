@@ -367,6 +367,9 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var canonicalItems: [DayWeaveCanonicalItem] {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var itemProgressState: ItemProgressState {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var canonicalDeltaCursor: String? {
         didSet { scheduleAutosave() }
     }
@@ -557,6 +560,7 @@ final class PlannerStore: ObservableObject {
         selectedCanonicalItemID: UUID? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
+        itemProgressState: ItemProgressState = .empty,
         scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
@@ -693,6 +697,7 @@ final class PlannerStore: ObservableObject {
         }
         let initialCanonicalAuthoringMutations = restoredSnapshot?.pendingCanonicalAuthoringMutations
             ?? pendingCanonicalAuthoringMutations
+        let initialItemProgressState = restoredSnapshot?.itemProgressState ?? itemProgressState
         let initialCanonicalTrash = restoredSnapshot?.canonicalTrash ?? canonicalTrash
         let retentionReferenceDate = now()
         let boundedCanonicalAuthoringMutations = Self.boundedCanonicalAuthoringMutations(
@@ -704,7 +709,7 @@ final class PlannerStore: ObservableObject {
             referenceDate: retentionReferenceDate,
             pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(
                 boundedCanonicalAuthoringMutations
-            )
+            ).union(initialItemProgressState.journals.map(\.itemID))
         )
         let restoredCanonicalRetentionNeedsRewrite = restoredSnapshot != nil
             && (initialCanonicalTrash != boundedCanonicalTrash
@@ -761,6 +766,12 @@ final class PlannerStore: ObservableObject {
             ?? localCaptureDiagnostics
         let initialExecutionState = restoredSnapshot?.executionState ?? executionState
         self.executionState = initialExecutionState
+        self.itemProgressState = initialItemProgressState
+        if !initialItemProgressState.isValid
+            || (initialItemProgressState.configurationIdentifier != nil
+                && initialItemProgressState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
+            restorationError = .snapshotDecodingFailed
+        }
         if !Self.validateExecutionState(initialExecutionState) {
             restorationError = .snapshotDecodingFailed
         }
@@ -851,12 +862,13 @@ final class PlannerStore: ObservableObject {
             referenceDate: localSuggestionObservation.referenceDate,
             forcePendingExpiration: localSuggestionObservation.rollbackDetected
         )
-        hardenPendingSensitivityPresentation()
+        let progressSensitivityNeedsRewrite = hardenPendingSensitivityPresentation()
 
         if persistence != nil, restorationError == nil {
             if restoreFromPersistence, restoredSnapshot == nil {
                 scheduleAutosave()
-            } else if restoredCanonicalRetentionNeedsRewrite
+            } else if progressSensitivityNeedsRewrite
+                        || restoredCanonicalRetentionNeedsRewrite
                         || recurrenceHistoryNeedsRewrite
                         || localSuggestionsNeedRewrite
                         || localSuggestionHighWaterNeedsRewrite {
@@ -899,7 +911,7 @@ final class PlannerStore: ObservableObject {
         let boundedTrash = Self.boundedCanonicalTrash(
             canonicalTrash,
             referenceDate: retentionReferenceDate,
-            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations).union(itemProgressState.journals.map(\.itemID))
         )
 
         do {
@@ -938,6 +950,23 @@ final class PlannerStore: ObservableObject {
 
     var canPersistPlan: Bool {
         loadState == .ready
+    }
+
+    /// Exact preimage and encrypted snapshot CAS; progress never mutates the
+    /// canonical body, schedule, execution ledger, or legacy authoring journal.
+    func commitItemProgressState(_ replacement: ItemProgressState, replacing prior: ItemProgressState) throws {
+        guard hasEncryptedPersistence, canPersistPlan else { throw ItemProgressError.persistenceRequired }
+        guard itemProgressState == prior, replacement.isValid,
+              replacement.configurationIdentifier == nil
+                || replacement.configurationIdentifier == canonicalConfigurationIdentifier else {
+            throw ItemProgressError.configurationChanged
+        }
+        itemProgressState = replacement
+        flushPersistence()
+        if let persistenceError {
+            itemProgressState = prior
+            throw persistenceError
+        }
     }
 
     /// A nil value means the encrypted planner snapshot is not trustworthy, so
@@ -1217,6 +1246,7 @@ final class PlannerStore: ObservableObject {
               pendingCanonicalSensitivityMutations.isEmpty,
               pendingSchedulePublication == nil,
               pendingProposalApplicationMutation == nil,
+              itemProgressState.journals.isEmpty,
               !pendingCanonicalAuthoringMutations.contains(where: {
                   $0.hasBeenSubmitted || $0.configurationIdentifier != nil || $0.disposition == .conflicted
               }) else {
@@ -1250,6 +1280,7 @@ final class PlannerStore: ObservableObject {
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
+        itemProgressState = .empty
         pendingCanonicalAuthoringMutations = preservedCreates
         if let anchor = onboardingFirstItemAnchor,
            preservedCreates.contains(where: {
@@ -1505,7 +1536,7 @@ final class PlannerStore: ObservableObject {
     }
 
     private var hasCanonicalRemoteState: Bool {
-        !canonicalItems.isEmpty
+        itemProgressState.configurationIdentifier != nil || !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
             || !canonicalTombstoneRevisions.isEmpty
@@ -2928,7 +2959,7 @@ final class PlannerStore: ObservableObject {
             let boundedTrash = Self.boundedCanonicalTrash(
                 canonicalTrash,
                 referenceDate: retentionReferenceDate,
-                pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+                pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations).union(itemProgressState.journals.map(\.itemID))
             )
             try persistence.preflightSave(makeSnapshot(
                 canonicalTrashOverride: boundedTrash,
@@ -3087,7 +3118,7 @@ final class PlannerStore: ObservableObject {
     }
 
     private var pendingCanonicalRecoveryItemIDs: Set<UUID> {
-        Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations)
+        Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations).union(itemProgressState.journals.map(\.itemID))
     }
 
     private func reconcileSelectedCanonicalItem() {
@@ -4203,13 +4234,24 @@ final class PlannerStore: ObservableObject {
         return next
     }
 
-    private func hardenPendingSensitivityPresentation() {
+    @discardableResult
+    private func hardenPendingSensitivityPresentation() -> Bool {
         for index in blocks.indices {
             guard let itemID = blocks[index].sourceItemID else { continue }
             if canonicalItemRequiresSensitivePresentation(itemID: itemID) {
                 blocks[index].isSensitive = true
             }
         }
+        let sensitivity = canonicalSensitivityPresentationIndex()
+        var hardenedProgress = false
+        for index in itemProgressState.journals.indices {
+            if !itemProgressState.journals[index].wasSensitive,
+               sensitivity[itemProgressState.journals[index].itemID] != .standard {
+                itemProgressState.journals[index].wasSensitive = true
+                hardenedProgress = true
+            }
+        }
+        return hardenedProgress
     }
 
     @discardableResult
@@ -4935,7 +4977,7 @@ final class PlannerStore: ObservableObject {
     }
 
     var hasExecutionCredentialReplacementBlocker: Bool {
-        executionState.hasCredentialReplacementBlocker
+        !itemProgressState.journals.isEmpty || executionState.hasCredentialReplacementBlocker
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
             || pendingSchedulePublication != nil
@@ -5184,6 +5226,7 @@ final class PlannerStore: ObservableObject {
     }
 
     private func quarantineCredentialBoundState(preservingDeviceID: Bool) {
+        itemProgressState = .empty
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
         blocks.removeAll {
@@ -6393,7 +6436,8 @@ final class PlannerStore: ObservableObject {
             googleSchedulePublicationRecoveryJournal:
                 googleSchedulePublicationRecoveryJournal,
             localCaptureDiagnostics: localCaptureDiagnostics,
-            executionState: executionState
+            executionState: executionState,
+            itemProgressState: itemProgressState
         )
     }
 

@@ -202,6 +202,32 @@ final class CanonicalSyncStore: ObservableObject {
         }
     }
 
+    /// Read-only canonical catch-up for an item-progress GET whose joined item
+    /// revision differs. Never publishes a schedule merely for editing progress.
+    func refreshItemProgressCanonicalEvidence() async {
+        guard !isSyncing, let client = makeClient(reportFailure: false), planner.beginCanonicalSync() else { return }
+        let id = UUID()
+        let generation = configurationGeneration
+        activeSyncID = id
+        activeSyncScheduleProfile = planner.scheduleProfile
+        isSyncing = true
+        defer {
+            if activeSyncID == id {
+                activeSyncID = nil; activeSyncScheduleProfile = nil; isSyncing = false
+                planner.endCanonicalSync()
+            }
+        }
+        do {
+            try planner.prepareCanonicalReplicaRead(configurationIdentifier: client.configurationIdentifier)
+            let commit = try await pullCanonicalItemsDurably(client: client, operationID: id, generation: generation)
+            if commit.schedulingInputsChanged {
+                foregroundPublicationRepairRequired = true
+                lastPreview = nil
+                clearTransientLocalComposition()
+            }
+        } catch { /* The progress review remains read-only until a verified catch-up. */ }
+    }
+
     /// Starts content-free foreground item delivery beside a lightweight
     /// delta probe. The coordinator calls this only after the activation
     /// bootstrap has attempted to establish the durable URL/auth binding and

@@ -2,6 +2,9 @@ package com.greengolddog.dayweave.data
 
 import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.ItemProgressLedger
+import com.greengolddog.dayweave.model.decodeExactItemProgress
+import com.greengolddog.dayweave.model.requireStrictItemProgressJson
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalTrashRetentionPolicy
@@ -62,7 +65,11 @@ class RoomPlannerStateRepository(
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { persistedSnapshot ->
-        val snapshot = if (persistedSnapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21) {
+        // Inspect the original bytes before any older migration can erase an injected authority.
+        validateItemProgressSnapshotShape(persistedSnapshot)
+        val snapshot = if (persistedSnapshot.payloadFormat in setOf(
+                PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V21,
+            )) {
             persistedSnapshot
         } else {
             persistedSnapshot.copy(
@@ -70,6 +77,7 @@ class RoomPlannerStateRepository(
             )
         }
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V22,
             PlannerSnapshotFormats.JSON_V21,
             PlannerSnapshotFormats.JSON_V20 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
@@ -242,6 +250,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V22 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
@@ -260,6 +269,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V22 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V20 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V19 ||
@@ -283,8 +293,9 @@ class RoomPlannerStateRepository(
                 notificationHardened.copy(localScheduleCompositionProvenance = null)
             }
         } ?: notificationHardened
+        validateItemProgressState(hardened)
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V21 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V22 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -310,14 +321,56 @@ class RoomPlannerStateRepository(
         validateGoogleOutboundState(retainedState)
         validateGoogleSchedulePublicationState(retainedState)
         retainedState.habitLedger.requireValid()
+        validateItemProgressState(retainedState)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V21,
+                payloadFormat = PlannerSnapshotFormats.JSON_V22,
             ),
         )
+    }
+
+    private fun validateItemProgressSnapshotShape(snapshot: PlannerSnapshotEntity) {
+        if (snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V22) {
+            try {
+                // Do not let tree decoding erase equivalent duplicate authority keys. Other
+                // snapshot fields keep their existing number grammar, unlike progress integers.
+                requireStrictItemProgressJson(snapshot.payload, integersOnly = false, maxDepth = 128)
+            } catch (error: Exception) {
+                throw SerializationException("Current planner snapshot JSON is ambiguous", error)
+            }
+        }
+        val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
+        if (snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V22) {
+            if (root.containsKey("itemProgressLedger")) {
+                throw SerializationException("Legacy snapshot contains independent progress authority")
+            }
+            return
+        }
+        val raw = root["itemProgressLedger"] as? JsonObject
+            ?: throw SerializationException("Current independent progress ledger is required")
+        try {
+            decodeExactItemProgress<ItemProgressLedger>(raw.toString()).requireValid()
+        } catch (error: Exception) {
+            throw SerializationException("Independent progress recovery state is invalid", error)
+        }
+    }
+
+    private fun validateItemProgressState(state: DayWeaveUiState) {
+        try {
+            val ledger = state.itemProgressLedger
+            ledger.requireValid()
+            if (ledger.syncOrigin != null) {
+                require(ledger.syncOrigin == state.canonicalSyncOrigin &&
+                    ledger.configurationId == state.canonicalConfigurationId) {
+                    "Independent progress recovery crosses the canonical binding"
+                }
+            }
+        } catch (error: Exception) {
+            throw SerializationException("Independent progress recovery state is invalid", error)
+        }
     }
 
     /**

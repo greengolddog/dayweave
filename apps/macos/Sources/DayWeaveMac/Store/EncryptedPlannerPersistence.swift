@@ -452,7 +452,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 25
+    static let currentSchemaVersion = 26
 
     let schemaVersion: Int
     let savedAt: Date
@@ -503,6 +503,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let googleSchedulePublicationRecoveryJournal: GoogleSchedulePublicationRecoveryJournal?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
+    let itemProgressState: ItemProgressState?
 
     init(
         schemaVersion: Int = Self.currentSchemaVersion,
@@ -544,7 +545,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
         googleSchedulePublicationRecoveryJournal: GoogleSchedulePublicationRecoveryJournal? = nil,
         localCaptureDiagnostics: [UUID: String]? = nil,
-        executionState: DayWeaveExecutionDurableState? = .empty
+        executionState: DayWeaveExecutionDurableState? = .empty,
+        itemProgressState: ItemProgressState? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.savedAt = savedAt
@@ -604,9 +606,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.googleSchedulePublicationRecoveryJournal = googleSchedulePublicationRecoveryJournal
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
+        self.itemProgressState = itemProgressState ?? (schemaVersion == Self.currentSchemaVersion ? .empty : nil)
     }
 
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
+        if schemaVersion < 26 && itemProgressState != nil { throw .snapshotDecodingFailed }
         // Nested proof v3 is new authority in outer schema 24. Every older
         // snapshot must ignore an injected v3 proof before reconstruction;
         // legitimate predecessor writers emitted only v1/v2 here.
@@ -616,6 +620,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
             : self.publishedScheduleProof
         switch schemaVersion {
         case Self.currentSchemaVersion:
+            guard let itemProgressState, itemProgressState.isValid,
+                  itemProgressState.configurationIdentifier == nil
+                    || itemProgressState.configurationIdentifier == canonicalConfigurationIdentifier else {
+                throw .snapshotDecodingFailed
+            }
             let pendingTypedSuggestions = suggestions.filter { suggestion in
                 guard suggestion.state == .pending,
                       case .canonicalItemDraft = suggestion.payload else {
@@ -753,7 +762,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
-        case 21, 22, 23, 24:
+        case 21, 22, 23, 24, 25:
             // Canonical structural metadata was previously nested or implicit,
             // while unknown-field retention could forward-capture the complete
             // server wire shape. The schema-aware item decoder either infers a
@@ -1868,6 +1877,13 @@ struct EncryptedPlannerPersistence: Sendable {
         let snapshot: PlannerSnapshot
         do {
             let probe = try JSONDecoder().decode(PlannerSnapshotSchemaProbe.self, from: plaintext)
+            if probe.schemaVersion >= 26,
+               !StrictJSONObjectKeyScanner.hasUniqueKeys(in: plaintext) {
+                throw PlannerPersistenceError.snapshotDecodingFailed
+            }
+            if probe.schemaVersion < 26,
+               let fields = try JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
+               fields.keys.contains("itemProgressState") { throw PlannerPersistenceError.snapshotDecodingFailed }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
             // Only schemas that predate the sensitivity field may default it.

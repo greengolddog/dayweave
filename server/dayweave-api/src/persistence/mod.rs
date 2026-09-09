@@ -6,6 +6,7 @@ mod google_oauth_repository;
 mod google_sync_repository;
 mod habit_repository;
 mod idempotency;
+mod item_progress_repository;
 mod item_repository;
 mod outbox;
 mod proposal_application_repository;

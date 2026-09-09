@@ -28,7 +28,7 @@ class GoogleSchedulePublicationPersistenceTest {
         )
 
         assertEquals(journal, repository.load()?.pendingGoogleSchedulePublication)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
 
         val current = requireNotNull(dao.snapshot)
         assertTrue(
@@ -38,7 +38,7 @@ class GoogleSchedulePublicationPersistenceTest {
         dao.snapshot = current.copy(payloadFormat = PlannerSnapshotFormats.JSON_V13)
 
         assertNull(repository.load()?.pendingGoogleSchedulePublication)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -77,7 +77,8 @@ class GoogleSchedulePublicationPersistenceTest {
 private class SchedulePublicationFakeDao : PlannerSnapshotDao {
     var snapshot: PlannerSnapshotEntity? = null
 
-    override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
+    override suspend fun load(singletonId: Int): PlannerSnapshotEntity? =
+            snapshot?.asPreProgressFixtureWhenRelabelled()
 
     override suspend fun save(snapshot: PlannerSnapshotEntity) {
         this.snapshot = snapshot

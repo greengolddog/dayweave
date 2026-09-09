@@ -88,7 +88,7 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(ledger, restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("Good start"))
         assertTrue(restored.habitLedger.toString().contains("content=<redacted>"))
         assertTrue(
@@ -143,7 +143,7 @@ class HabitPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(HabitLedgerSnapshot(), restored.habitLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -190,7 +190,7 @@ class HabitPersistenceTest {
         assertEquals(expected.copy(deltaCaughtUp = false), restored.habitLedger)
         assertEquals(expected.deltaCursor, restored.habitLedger.deltaCursor)
         assertFalse(restored.habitLedger.deltaCaughtUp)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"missedResolution\":null"))
         assertTrue(!requireNotNull(dao.snapshot).payload.contains("missed_resolution"))
         assertNull(restored.habitLedger.pendingMissedReconcile)
@@ -517,7 +517,8 @@ class HabitPersistenceTest {
     private class FakeDao(
         var snapshot: PlannerSnapshotEntity? = null,
     ) : PlannerSnapshotDao {
-        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
+        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? =
+            snapshot?.asPreProgressFixtureWhenRelabelled()
 
         override suspend fun save(snapshot: PlannerSnapshotEntity) {
             this.snapshot = snapshot

@@ -52,6 +52,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
     @StateObject private var habitSync: HabitSyncStore
+    @StateObject private var itemProgress: ItemProgressStore
     @StateObject private var googleIntegration: GoogleIntegrationStore
     @StateObject private var googleOutbound: GoogleOutboundStore
     @StateObject private var googleSchedulePublication: GoogleSchedulePublicationStore
@@ -97,6 +98,8 @@ struct DayWeaveMacApp: App {
             habitCompositionProvider: habitSync
         )
         _canonicalSync = StateObject(wrappedValue: canonicalSync)
+        let itemProgress = ItemProgressStore(planner: store, canonicalSync: canonicalSync, authCoordinator: authCoordinator)
+        _itemProgress = StateObject(wrappedValue: itemProgress)
         let executionSync = ExecutionSyncStore(
             planner: store,
             habitCompositionProvider: habitSync,
@@ -153,7 +156,8 @@ struct DayWeaveMacApp: App {
             googleSchedulePublication: googleSchedulePublication,
             executionSync: executionSync,
             canonicalSync: canonicalSync,
-            habitSync: habitSync
+            habitSync: habitSync,
+            itemProgress: itemProgress
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
@@ -177,6 +181,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
                 .environmentObject(habitSync)
+                .environmentObject(itemProgress)
                 .environmentObject(googleIntegration)
                 .environmentObject(googleOutbound)
                 .environmentObject(googleSchedulePublication)
@@ -389,7 +394,8 @@ struct DayWeaveMacApp: App {
             Group {
                 if appLock.isContentAvailable,
                    onboarding.progress.privacyAcknowledged {
-                    SettingsView()
+                SettingsView()
+                        .environmentObject(itemProgress)
                         .environmentObject(store)
                         .environmentObject(codex)
                         .environmentObject(suggestionSync)

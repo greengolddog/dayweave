@@ -4312,6 +4312,8 @@ class CanonicalSyncManager(
         val origin = configuration.baseUrl.toString()
         val configurationId = configuration.configurationId
         val hasCanonicalCache = current.canonicalSyncOrigin != null ||
+            current.itemProgressLedger.syncOrigin != null ||
+            current.itemProgressLedger.observations.isNotEmpty() || current.itemProgressLedger.pending.isNotEmpty() ||
             current.canonicalDeltaCursor != null || current.canonicalItems.isNotEmpty() ||
             current.canonicalRecentlyDeleted.isNotEmpty() ||
             current.pendingCanonicalAuthoringMutations.isNotEmpty() ||

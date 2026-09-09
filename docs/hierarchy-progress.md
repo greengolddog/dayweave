@@ -5,9 +5,11 @@ checkpoint, not acceptance of `DOM-004`, `HIE-003`, or `HIE-004`.
 
 The full scope remains [product-requirements.md](product-requirements.md) and
 [discovery answers 203–207](discovery-answers.md). Independent percentage,
-time, and named-unit progress; required-child policy; automatic completion;
-and visible manual overrides still require authoritative commands and native
-review flows. A count of completed leaves is not a substitute for those features.
+time, and named-unit progress are tracked in the separate
+[item progress checkpoint](item-progress.md). Required-child policy, automatic
+completion and visible manual overrides still require authoritative commands
+and native review flows. A count of completed leaves is not a substitute for
+those features.
 
 ## Read-only roll-up contract
 

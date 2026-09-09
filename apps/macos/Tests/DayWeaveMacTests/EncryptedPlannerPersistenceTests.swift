@@ -1050,7 +1050,7 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
         try require(
             migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion
-                && PlannerSnapshot.currentSchemaVersion == 25,
+                && PlannerSnapshot.currentSchemaVersion >= 25,
             "Rich authoring drafts are not protected by the current rollback fence"
         )
         try require(

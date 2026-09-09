@@ -1,0 +1,910 @@
+{
+  "schema": "dayweave.item-progress-components/1",
+  "valid": [
+    {
+      "name": "empty_components",
+      "components": []
+    },
+    {
+      "name": "all_modes",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "Research time",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 3600,
+            "remaining_seconds": null
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "Writing",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "zero_and_boundaries",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 0
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 10000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 0,
+            "remaining_seconds": 0
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 3155760000,
+            "remaining_seconds": 3155760000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "-999999999999.999999",
+            "unit": "chapters",
+            "target": {
+              "value": "999999999999.999999",
+              "direction": "at_most"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "unbounded_quantity_and_unicode",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+          "value": {
+            "type": "quantity",
+            "current": "-0.000001",
+            "unit": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+            "target": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "sixteen_distinct_components",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Measure 1",
+          "value": {
+            "type": "percentage",
+            "basis_points": 0
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "Measure 2",
+          "value": {
+            "type": "percentage",
+            "basis_points": 100
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "Measure 3",
+          "value": {
+            "type": "percentage",
+            "basis_points": 200
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "name": "Measure 4",
+          "value": {
+            "type": "percentage",
+            "basis_points": 300
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "name": "Measure 5",
+          "value": {
+            "type": "percentage",
+            "basis_points": 400
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "name": "Measure 6",
+          "value": {
+            "type": "percentage",
+            "basis_points": 500
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000007",
+          "name": "Measure 7",
+          "value": {
+            "type": "percentage",
+            "basis_points": 600
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000008",
+          "name": "Measure 8",
+          "value": {
+            "type": "percentage",
+            "basis_points": 700
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000009",
+          "name": "Measure 9",
+          "value": {
+            "type": "percentage",
+            "basis_points": 800
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000010",
+          "name": "Measure 10",
+          "value": {
+            "type": "percentage",
+            "basis_points": 900
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000011",
+          "name": "Measure 11",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1000
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000012",
+          "name": "Measure 12",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1100
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000013",
+          "name": "Measure 13",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1200
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000014",
+          "name": "Measure 14",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1300
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000015",
+          "name": "Measure 15",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1400
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000016",
+          "name": "Measure 16",
+          "value": {
+            "type": "percentage",
+            "basis_points": 1500
+          }
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "duplicate_ids",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 100
+          }
+        }
+      ]
+    },
+    {
+      "name": "nil_component_id",
+      "components": [
+        {
+          "id": "00000000-0000-0000-0000-000000000000",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "malformed_component_id",
+      "components": [
+        {
+          "id": "not-an-id",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty_name",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "untrimmed_name",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read ",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "name_scalar_limit",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "control_in_name",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read\npages",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "seventeen_components",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000007",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000008",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000009",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000010",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000011",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000012",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000013",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000014",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000015",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000016",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000017",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown_component_field",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "name": "negative_percentage",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": -1
+          }
+        }
+      ]
+    },
+    {
+      "name": "percentage_above_bound",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 10001
+          }
+        }
+      ]
+    },
+    {
+      "name": "fractional_percentage",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 42.5
+          }
+        }
+      ]
+    },
+    {
+      "name": "string_percentage",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": "4250"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown_value_kind",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "future_mode",
+            "basis_points": 4250
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown_percentage_field",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "percentage",
+            "basis_points": 4250,
+            "completed": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "negative_elapsed",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": -1,
+            "remaining_seconds": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "elapsed_above_bound",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 3155760001,
+            "remaining_seconds": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "remaining_above_bound",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 0,
+            "remaining_seconds": 3155760001
+          }
+        }
+      ]
+    },
+    {
+      "name": "negative_remaining",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 0,
+            "remaining_seconds": -1
+          }
+        }
+      ]
+    },
+    {
+      "name": "fractional_seconds",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 0.5,
+            "remaining_seconds": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "missing_remaining_field",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "time",
+            "elapsed_seconds": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_not_string",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": 3.5,
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_exponent",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "1e2",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_trailing_zeros",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.50",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_precision",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "0.0000001",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_negative_zero",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "-0",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "quantity_out_of_range",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "1000000000000",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty_unit",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "unit_scalar_limit",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "untrimmed_unit",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters ",
+            "target": {
+              "value": "12",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown_target_direction",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "around"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "missing_target_field",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters"
+          }
+        }
+      ]
+    },
+    {
+      "name": "missing_target_direction",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters",
+            "target": {
+              "value": "12"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown_target_field",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters",
+            "target": {
+              "value": "12",
+              "direction": "at_least",
+              "finished": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "noncanonical_target",
+      "components": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "name": "Read the book",
+          "value": {
+            "type": "quantity",
+            "current": "3.5",
+            "unit": "chapters",
+            "target": {
+              "value": "12.0",
+              "direction": "at_least"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

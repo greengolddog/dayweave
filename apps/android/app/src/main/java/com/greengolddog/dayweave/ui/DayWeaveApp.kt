@@ -446,6 +446,7 @@ private fun DayWeaveRoot(
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val habitSyncState by viewModel.habitSyncState.collectAsStateWithLifecycle()
+    val itemProgressSyncState by viewModel.itemProgressSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val googleCalendarImportState by
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
@@ -506,6 +507,9 @@ private fun DayWeaveRoot(
                 it.disposition == com.greengolddog.dayweave.model.CanonicalAuthoringDisposition.PENDING
         }
     var showQuickCapture by remember { mutableStateOf(false) }
+    var progressItemId by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
+        mutableStateOf<String?>(null)
+    }
     var showPauseChooser by remember { mutableStateOf(false) }
     var moveLaterTargetId by remember { mutableStateOf<String?>(null) }
     var showApiConnection by remember { mutableStateOf(false) }
@@ -1099,6 +1103,7 @@ private fun DayWeaveRoot(
                     canonicalEditorRoute = CanonicalItemEditorRoute.create()
                 },
                 onOpenCanonicalEditor = { canonicalEditorRoute = it },
+                onOpenProgress = { progressItemId = it },
                 onTrashCanonicalItem = { itemId ->
                     viewModel.trashCanonicalItem(itemId, confirmed = true)
                 },
@@ -1273,11 +1278,22 @@ private fun DayWeaveRoot(
                     actionsEnabled = canonicalAuthoringActionsEnabled,
                     onOpenEditor = { canonicalEditorRoute = it },
                     onBack = { viewModel.navigate(AppDestination.MORE) },
+                    onOpenProgress = { progressItemId = it },
                     modifier = Modifier.padding(innerPadding),
                 )
             }
             }
         }
+    }
+
+    progressItemId?.let { itemId ->
+        com.greengolddog.dayweave.ui.authoring.ItemProgressReviewSheet(
+            state = state, itemId = itemId, syncState = itemProgressSyncState,
+            actionsEnabled = !accountRecoveryState.deviceAuthorizationSuppressed,
+            onLoad = viewModel::loadItemProgress, onSave = viewModel::saveItemProgress,
+            onRetry = { viewModel.replayItemProgress() }, onDiscardReviewed = { viewModel.discardReviewedItemProgress(it) },
+            onDismiss = { progressItemId = null },
+        )
     }
 
     if (showOnboardingProfileEditor) {

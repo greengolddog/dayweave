@@ -44,7 +44,7 @@ class ScheduleProfilePersistenceTest {
         assertFalse(legacyProfileJson.containsKey("sleep"))
         assertFalse(legacyProfileJson.containsKey("protectedTime"))
         assertEquals(legacy, requireNotNull(repository.load()).scheduleCompositionProfile)
-        assertEquals(PlannerSnapshotFormats.JSON_V21, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V22, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -102,7 +102,8 @@ class ScheduleProfilePersistenceTest {
     private class FakePlannerSnapshotDao(
         var snapshot: PlannerSnapshotEntity? = null,
     ) : PlannerSnapshotDao {
-        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
+        override suspend fun load(singletonId: Int): PlannerSnapshotEntity? =
+            snapshot?.asPreProgressFixtureWhenRelabelled()
 
         override suspend fun save(snapshot: PlannerSnapshotEntity) {
             this.snapshot = snapshot

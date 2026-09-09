@@ -1,0 +1,270 @@
+{
+  "schema": "dayweave.item-progress-values/1",
+  "decimals": [
+    {
+      "value": "0",
+      "valid": true,
+      "scaled_millionths": "0"
+    },
+    {
+      "value": "1",
+      "valid": true,
+      "scaled_millionths": "1000000"
+    },
+    {
+      "value": "-1",
+      "valid": true,
+      "scaled_millionths": "-1000000"
+    },
+    {
+      "value": "3.5",
+      "valid": true,
+      "scaled_millionths": "3500000"
+    },
+    {
+      "value": "0.000001",
+      "valid": true,
+      "scaled_millionths": "1"
+    },
+    {
+      "value": "-0.000001",
+      "valid": true,
+      "scaled_millionths": "-1"
+    },
+    {
+      "value": "0.00001",
+      "valid": true,
+      "scaled_millionths": "10"
+    },
+    {
+      "value": "123456789012.345678",
+      "valid": true,
+      "scaled_millionths": "123456789012345678"
+    },
+    {
+      "value": "999999999999.999999",
+      "valid": true,
+      "scaled_millionths": "999999999999999999"
+    },
+    {
+      "value": "-999999999999.999999",
+      "valid": true,
+      "scaled_millionths": "-999999999999999999"
+    },
+    {
+      "value": "",
+      "valid": false
+    },
+    {
+      "value": "-",
+      "valid": false
+    },
+    {
+      "value": "+1",
+      "valid": false
+    },
+    {
+      "value": ".5",
+      "valid": false
+    },
+    {
+      "value": "1.",
+      "valid": false
+    },
+    {
+      "value": "1e3",
+      "valid": false
+    },
+    {
+      "value": "1E3",
+      "valid": false
+    },
+    {
+      "value": "1,5",
+      "valid": false
+    },
+    {
+      "value": "1.2.3",
+      "valid": false
+    },
+    {
+      "value": " 1",
+      "valid": false
+    },
+    {
+      "value": "1 ",
+      "valid": false
+    },
+    {
+      "value": "1\n",
+      "valid": false
+    },
+    {
+      "value": "1\r",
+      "valid": false
+    },
+    {
+      "value": "1\r\n",
+      "valid": false
+    },
+    {
+      "value": "１２",
+      "valid": false
+    },
+    {
+      "value": "NaN",
+      "valid": false
+    },
+    {
+      "value": "Infinity",
+      "valid": false
+    },
+    {
+      "value": "-0",
+      "valid": false
+    },
+    {
+      "value": "-0.0",
+      "valid": false
+    },
+    {
+      "value": "00",
+      "valid": false
+    },
+    {
+      "value": "01",
+      "valid": false
+    },
+    {
+      "value": "-01",
+      "valid": false
+    },
+    {
+      "value": "0.0",
+      "valid": false
+    },
+    {
+      "value": "1.20",
+      "valid": false
+    },
+    {
+      "value": "0.0000001",
+      "valid": false
+    },
+    {
+      "value": "1000000000000",
+      "valid": false
+    },
+    {
+      "value": "-1000000000000",
+      "valid": false
+    }
+  ],
+  "labels": [
+    {
+      "value": "\u200b",
+      "max_scalars": 1,
+      "valid": true
+    },
+    {
+      "value": "\ufeff",
+      "max_scalars": 1,
+      "valid": true
+    },
+    {
+      "value": "\u180e",
+      "max_scalars": 1,
+      "valid": true
+    },
+    {
+      "value": "Read chapters",
+      "max_scalars": 80,
+      "valid": true
+    },
+    {
+      "value": "главы",
+      "max_scalars": 32,
+      "valid": true
+    },
+    {
+      "value": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+      "max_scalars": 32,
+      "valid": true
+    },
+    {
+      "value": "📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖📖",
+      "max_scalars": 32,
+      "valid": false
+    },
+    {
+      "value": "é",
+      "max_scalars": 2,
+      "valid": true
+    },
+    {
+      "value": "é",
+      "max_scalars": 1,
+      "valid": false
+    },
+    {
+      "value": "",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": " ",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": " name",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "name ",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": " name",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "name ",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": " name",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "name　",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "a\nb",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "a\tb",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "ab",
+      "max_scalars": 80,
+      "valid": false
+    },
+    {
+      "value": "ab",
+      "max_scalars": 80,
+      "valid": false
+    }
+  ]
+}

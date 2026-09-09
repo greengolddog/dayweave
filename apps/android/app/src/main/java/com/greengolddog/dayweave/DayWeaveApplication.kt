@@ -260,6 +260,7 @@ class DayWeaveApplication : Application() {
                 if (habitSyncManagerDelegate.isInitialized()) {
                     habitSyncManager.quarantineBindingState()
                 }
+                if (itemProgressSyncManagerDelegate.isInitialized()) itemProgressSyncManager.quarantineBindingState()
                 if (deviceSessionManagerDelegate.isInitialized()) {
                     deviceSessionManager.quarantineBindingState()
                 }
@@ -449,6 +450,28 @@ class DayWeaveApplication : Application() {
         )
     }
     val habitSyncManager: HabitSyncManager get() = habitSyncManagerDelegate.value
+
+    private val itemProgressSyncManagerDelegate = lazy {
+        com.greengolddog.dayweave.sync.ItemProgressSyncManager(plannerStore, apiCredentialStore,
+            com.greengolddog.dayweave.network.OkHttpItemProgressTransport())
+    }
+    val itemProgressSyncManager get() = itemProgressSyncManagerDelegate.value
+
+    /** Owned by a protected view coroutine: disappearance/lock cancels the selected GET. */
+    suspend fun refreshSelectedItemProgress(itemId: String): Boolean {
+        if (!privatePresentationAllowed.get() || !onboardingRuntimeGate.foregroundProviderWorkAllowed() ||
+            hasAccountRecoveryWorkBlocker() || hasGoogleAuthorizationRecoveryBlocker() || !canonicalActionGate.tryEnter()
+        ) return false
+        return try {
+            val loaded = itemProgressSyncManager.load(itemId)
+            val current = plannerStore.state.value
+            val observed = current.itemProgressLedger.observations[itemId]?.snapshot
+            if (loaded && observed != null && current.canonicalItems.singleOrNull { it.id == itemId }?.revision != observed.itemRevision) {
+                canonicalSyncManager.refreshCurrentPublishedSchedule()
+            }
+            loaded
+        } finally { canonicalActionGate.leave() }
+    }
 
     private val habitInvalidationManagerDelegate = lazy {
         ForegroundHabitInvalidationManager(
@@ -1235,6 +1258,7 @@ class DayWeaveApplication : Application() {
     suspend fun recoverCurrentPublishedSchedule(): CanonicalRefreshOutcome? {
         if (!onboardingRuntimeGate.backgroundWorkAllowed()) return null
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
+        itemProgressSyncManager.replay()
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
         if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return null
@@ -1255,6 +1279,7 @@ class DayWeaveApplication : Application() {
     suspend fun refreshCanonicalState(): CanonicalRefreshOutcome? {
         if (!onboardingRuntimeGate.backgroundWorkAllowed()) return null
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
+        itemProgressSyncManager.replay()
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
         if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return null
@@ -1268,6 +1293,7 @@ class DayWeaveApplication : Application() {
     suspend fun refreshForegroundExecution() {
         if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return
+        itemProgressSyncManager.replay()
         if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,

@@ -24,8 +24,11 @@ use dayweave_api::{
         full_owner_device_scopes,
     },
     google_oauth::OAuthScope,
+    item_progress::{ItemProgressCommand, ItemProgressError},
+    items::ItemRepository,
     persistence::{
         DatabaseScope, MIGRATOR, PostgresAccountDeletionRepository, PostgresCredentialRepository,
+        PostgresItemRepository,
     },
     provider_admission::{ProviderAdmission, ProviderAdmissionError},
     readiness::Readiness,
@@ -285,6 +288,37 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .expect("current timestamp");
     let credential_repository = PostgresCredentialRepository::new(pool.clone(), scope);
     let authority = issue_deletion_authority(&credential_repository, now).await;
+    let progress_item = seed_item(pool, scope, "Independent progress retained until purge").await;
+    let unrelated_progress_item = seed_item(pool, unrelated_scope, "Unrelated progress").await;
+    let progress_command = ItemProgressCommand {
+        schema_version: 1,
+        operation_id: Uuid::new_v4(),
+        expected_item_revision: 1,
+        expected_progress_revision: 0,
+        components: Vec::new(),
+    };
+    let progress_repository = PostgresItemRepository::new(pool.clone(), scope);
+    progress_repository
+        .put_progress(
+            progress_item,
+            progress_command.clone(),
+            now,
+            Some(authority.session_id),
+        )
+        .await
+        .expect("audited progress before fence");
+    PostgresItemRepository::new(pool.clone(), unrelated_scope)
+        .put_progress(
+            unrelated_progress_item,
+            ItemProgressCommand {
+                operation_id: Uuid::new_v4(),
+                ..progress_command.clone()
+            },
+            now,
+            None,
+        )
+        .await
+        .expect("unrelated independent progress");
 
     sqlx::query(
         "INSERT INTO habit_operation_receipts (workspace_id, namespace, key_hash, \
@@ -697,6 +731,27 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         .expect("hard fence commits atomically");
     assert_eq!(fenced.revision, 2);
     assert!(!fenced.replayed);
+    assert_eq!(
+        progress_repository.get_progress(progress_item).await,
+        Err(ItemProgressError::Unavailable)
+    );
+    assert_eq!(
+        progress_repository
+            .put_progress(progress_item, progress_command, now, None)
+            .await,
+        Err(ItemProgressError::Unavailable),
+        "fence denies even exact progress replay before custody lookup"
+    );
+    let fenced_progress_error =
+        sqlx::query("UPDATE item_progress SET revision=revision+1 WHERE workspace_id=$1")
+            .bind(scope.workspace_id)
+            .execute(pool)
+            .await
+            .expect_err("direct progress SQL respects fence");
+    assert_eq!(
+        postgres_code(&fenced_progress_error).as_deref(),
+        Some("DWDEL")
+    );
     assert!(
         repository
             .begin_fence(confirmation.clone(), &drained)
@@ -920,6 +975,15 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         "purging one owner cannot remove an unrelated workspace"
     );
     assert_all_current_tenant_tables_empty_and_guarded(pool, scope.workspace_id).await;
+    assert_eq!(
+        PostgresItemRepository::new(pool.clone(), unrelated_scope)
+            .get_progress(unrelated_progress_item)
+            .await
+            .unwrap()
+            .revision,
+        1,
+        "physical purge removes only the fenced owner's progress and immutable receipts"
+    );
 
     let lifecycle = repository
         .lifecycle(deletion_id)
@@ -1334,7 +1398,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     .expect("tenant table inventory");
     assert_eq!(
         tables.len(),
-        66,
+        68,
         "migration tenant-table inventory must be consciously updated"
     );
     for table in &tables {

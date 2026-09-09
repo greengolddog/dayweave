@@ -17,6 +17,14 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn item_progress(
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self::new(status, code, message)
+    }
+
     #[must_use]
     pub fn unauthorized() -> Self {
         Self::new(

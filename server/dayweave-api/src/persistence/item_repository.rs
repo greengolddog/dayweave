@@ -129,6 +129,32 @@ impl PostgresItemRepository {
 
 #[async_trait]
 impl ItemRepository for PostgresItemRepository {
+    async fn get_progress(
+        &self,
+        item_id: Uuid,
+    ) -> Result<crate::item_progress::ItemProgressSnapshot, crate::item_progress::ItemProgressError>
+    {
+        super::item_progress_repository::get(&self.pool, self.scope, item_id).await
+    }
+
+    async fn put_progress(
+        &self,
+        item_id: Uuid,
+        command: crate::item_progress::ItemProgressCommand,
+        _now: DateTime<Utc>,
+        actor_session_id: Option<Uuid>,
+    ) -> Result<crate::item_progress::ItemProgressMutation, crate::item_progress::ItemProgressError>
+    {
+        super::item_progress_repository::put(
+            &self.pool,
+            self.scope,
+            item_id,
+            command,
+            actor_session_id,
+        )
+        .await
+    }
+
     fn cursor_scope(&self) -> Uuid {
         self.scope.workspace_id
     }

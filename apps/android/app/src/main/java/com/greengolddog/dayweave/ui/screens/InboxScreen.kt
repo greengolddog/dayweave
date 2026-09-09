@@ -91,6 +91,7 @@ internal fun InboxScreen(
         List<GoogleCalendarOutboundTargetOption>,
     ) -> Unit,
     modifier: Modifier = Modifier,
+    onOpenProgress: ((String) -> Unit)? = null,
 ) {
     var tab by remember { mutableIntStateOf(0) }
     Column(modifier = modifier) {
@@ -143,6 +144,7 @@ internal fun InboxScreen(
                 retryEnabled = canonicalRetryEnabled,
                 onNewDetailed = onNewCanonicalItem,
                 onOpenEditor = onOpenCanonicalEditor,
+                onOpenProgress = onOpenProgress,
                 onTrashConfirmed = onTrashCanonicalItem,
                 onRestore = onRestoreCanonicalItem,
                 onDiscard = onDiscardCanonicalMutation,

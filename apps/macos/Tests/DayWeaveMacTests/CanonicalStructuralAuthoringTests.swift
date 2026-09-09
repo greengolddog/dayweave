@@ -276,6 +276,8 @@ struct CanonicalStructuralAuthoringTests {
         encoder.dateEncodingStrategy = .millisecondsSince1970
         var raw = try #require(JSONSerialization.jsonObject(with: encoder.encode(snapshot)) as? [String: Any])
         raw["schemaVersion"] = 24
+        // This historical fixture predates independent progress, even though built with today's initializer.
+        raw.removeValue(forKey: "itemProgressState")
         var entries = try #require(raw["pendingCanonicalAuthoringMutations"] as? [[String: Any]])
         entries[0].removeValue(forKey: "structuralRequestShapeVersion")
         var draft = try #require(entries[0]["draft"] as? [String: Any])
@@ -288,7 +290,7 @@ struct CanonicalStructuralAuthoringTests {
             "cipher": "AES.GCM.256", "sealedSnapshot": try #require(sealed.combined).base64EncodedString()]
         try JSONSerialization.data(withJSONObject: envelope).write(to: fileURL)
         let migrated = try #require(try persistence.load())
-        #expect(migrated.schemaVersion == 25)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion)
         #expect(migrated.pendingCanonicalAuthoringMutations == [mutation])
         #expect(migrated.publishedScheduleLatestHintRevision == 77)
         #expect(try persistence.load() == migrated)

@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.progressItem
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringPresentation
@@ -64,6 +65,7 @@ internal fun CanonicalHierarchyBrowserScreen(
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenProgress: ((String) -> Unit)? = null,
 ) {
     var query by remember(kind) { mutableStateOf("") }
     var collapsedIds by remember(kind) { mutableStateOf(emptySet<String>()) }
@@ -176,6 +178,9 @@ internal fun CanonicalHierarchyBrowserScreen(
             onOpenEditor = { route ->
                 selectedId = null
                 onOpenEditor(route)
+            },
+            onOpenProgress = onOpenProgress?.takeIf { sourceState.progressItem(selected.itemId) != null }?.let { action ->
+                { selectedId = null; action(selected.itemId) }
             },
         )
     }
@@ -303,6 +308,7 @@ private fun HierarchyItemDetails(
     onAddChild: () -> Unit,
     onDismiss: () -> Unit,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
+    onOpenProgress: (() -> Unit)?,
 ) {
     val route = row.editorRoute()
     AlertDialog(
@@ -335,6 +341,11 @@ private fun HierarchyItemDetails(
         },
         confirmButton = {
             Column {
+                if (onOpenProgress != null) {
+                    TextButton(onClick = onOpenProgress, modifier = Modifier.testTag("hierarchy_independent_progress")) {
+                        Text("Independent progress")
+                    }
+                }
                 if (canAddChild) {
                     TextButton(onClick = onAddChild, enabled = actionsEnabled,
                         modifier = Modifier.testTag("hierarchy_add_child")) { Text("Add subtask") }

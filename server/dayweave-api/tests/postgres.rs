@@ -39,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32
+            25, 26, 27, 28, 29, 30, 31, 32, 33
         ]
     );
 
@@ -76,6 +76,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0030_account_deletion_external_principal.sql"),
         include_str!("../migrations/0031_account_deletion_provider_cleanup.sql"),
         include_str!("../migrations/0032_provider_operation_admission.sql"),
+        include_str!("../migrations/0033_item_progress.sql"),
     ]
     .join("\n");
     for table in [

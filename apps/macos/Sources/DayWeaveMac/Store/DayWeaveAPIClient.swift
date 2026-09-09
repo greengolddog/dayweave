@@ -666,6 +666,14 @@ enum DayWeaveDiagnosticSanitizer {
     }
 }
 
+extension DayWeaveAPIClient: ItemProgressTransport {}
+
+protocol ItemProgressTransport: Sendable {
+    var configurationIdentifier: String { get }
+    func itemProgress(_ itemID: UUID) async throws -> ItemProgressSnapshot
+    func putItemProgress(_ itemID: UUID, requestBody: Data) async throws -> ItemProgressReceipt
+}
+
 protocol GoogleOutboundTransport: Sendable {
     var configurationIdentifier: String { get }
 
@@ -3081,6 +3089,26 @@ struct DayWeaveAPIClient: Sendable {
         }
     }
 
+    func itemProgress(_ itemID: UUID) async throws -> ItemProgressSnapshot {
+        guard itemID != Self.nilUUID else { throw ItemProgressError.invalidData }
+        let result: ItemProgressSnapshot = try await send(method: "GET",
+            pathComponents: ["v1", "items", itemID.uuidString.lowercased(), "progress"], requiredStatusCode: 200)
+        guard result.itemID == itemID else { throw ItemProgressError.invalidData }
+        return result
+    }
+
+    func putItemProgress(_ itemID: UUID, requestBody: Data) async throws -> ItemProgressReceipt {
+        guard itemID != Self.nilUUID, requestBody.count <= 64 * 1_024,
+              StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: requestBody),
+              let command = try? JSONDecoder().decode(ItemProgressCommand.self, from: requestBody),
+              command.isValid else { throw ItemProgressError.invalidData }
+        let result: ItemProgressReceipt = try await send(method: "PUT",
+            pathComponents: ["v1", "items", itemID.uuidString.lowercased(), "progress"],
+            body: requestBody, requiredStatusCode: 200)
+        guard result.matches(itemID: itemID, command: command) else { throw ItemProgressError.invalidData }
+        return result
+    }
+
     private func send<Response: Decodable>(
         method: String,
         pathComponents: [String],
@@ -3205,6 +3233,35 @@ struct DayWeaveAPIClient: Sendable {
 
         let data = result.data
         let httpResponse = result.response
+        let isItemProgress = pathComponents.count == 4 && pathComponents[0] == "v1"
+            && pathComponents[1] == "items" && pathComponents[3] == "progress"
+        if isItemProgress {
+            guard Self.isStrictJSONMediaType(httpResponse.value(forHTTPHeaderField: "content-type")),
+                  httpResponse.value(forHTTPHeaderField: "cache-control")?.lowercased() == "no-store, max-age=0",
+                  httpResponse.value(forHTTPHeaderField: "pragma")?.lowercased() == "no-cache",
+                  StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: data) else {
+                throw ItemProgressError.invalidData
+            }
+            if httpResponse.statusCode == 200 {
+                let replay = httpResponse.value(forHTTPHeaderField: "idempotency-replayed")?.lowercased()
+                if method == "GET" {
+                    guard replay == nil else { throw ItemProgressError.invalidData }
+                } else {
+                    guard let replay, replay == "true" || replay == "false",
+                          let receipt = try? JSONDecoder().decode(ItemProgressReceipt.self, from: data),
+                          receipt.replayed == (replay == "true") else { throw ItemProgressError.invalidData }
+                }
+            } else if let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data) {
+                let code = envelope.error.code
+                let expectedStatus: Int? = switch code {
+                case "item_progress_item_stale", "item_progress_revision_stale", "item_progress_operation_reused": 409
+                case "item_progress_item_missing": 404
+                case "item_progress_invalid": 422
+                default: nil
+                }
+                if expectedStatus == httpResponse.statusCode { throw ItemProgressError.definitive(code) }
+            }
+        }
         let hasAcceptedStatus = requiredStatusCode.map {
             httpResponse.statusCode == $0
         } ?? (200..<300).contains(httpResponse.statusCode)

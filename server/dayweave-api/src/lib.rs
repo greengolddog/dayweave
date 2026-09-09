@@ -18,6 +18,7 @@ pub mod habits;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
+pub mod item_progress;
 pub mod items;
 pub mod mcp;
 pub mod mcp_oauth;
@@ -183,6 +184,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
 pub struct AppState {
     pub proposals: Arc<ProposalService>,
     pub items: Arc<ItemService>,
+    pub item_progress: Arc<item_progress::ItemProgressService>,
     pub habits: Arc<HabitService>,
     pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
@@ -234,6 +236,10 @@ impl AppState {
             config.proposal_ttl,
         ));
         let items = Arc::new(ItemService::new(item_repository, clock.clone()));
+        let item_progress = Arc::new(item_progress::ItemProgressService::new(
+            items.clone(),
+            clock.clone(),
+        ));
         let habits = Arc::new(HabitService::new(
             habit_repository,
             items.clone(),
@@ -384,6 +390,7 @@ impl AppState {
         Ok(Self {
             proposals,
             items,
+            item_progress,
             habits,
             execution,
             authenticator,
@@ -435,6 +442,10 @@ impl AppState {
         );
         Self {
             proposals,
+            item_progress: Arc::new(item_progress::ItemProgressService::new(
+                items.clone(),
+                clock.clone(),
+            )),
             items,
             habits,
             execution,
@@ -460,6 +471,10 @@ impl AppState {
         // memory lease with PostgreSQL item state), so execution deliberately retains its
         // original paired ItemService and fails closed for items that exist only in `items`.
         self.items = items;
+        self.item_progress = Arc::new(item_progress::ItemProgressService::new(
+            self.items.clone(),
+            self.clock.clone(),
+        ));
         self
     }
 

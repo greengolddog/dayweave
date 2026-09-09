@@ -3477,6 +3477,14 @@ class PlannerStore(
     private fun <T> List<T>.replaceAt(index: Int, replacement: T): List<T> =
         mapIndexed { currentIndex, value -> if (currentIndex == index) replacement else value }
 
+    /** Mutates only the independent progress sidecar through an exact encrypted save. */
+    internal fun mutateItemProgress(
+        update: (DayWeaveUiState) -> com.greengolddog.dayweave.model.ItemProgressLedger,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val ledger = update(current).also(com.greengolddog.dayweave.model.ItemProgressLedger::requireValid)
+        current.copy(itemProgressLedger = ledger)
+    }
+
     /** Establishes an empty habit cache under the exact credential/workspace binding. */
     fun bindHabitLedger(
         syncOrigin: String,
@@ -5209,6 +5217,7 @@ class PlannerStore(
             current.pendingExecutionDeferIntent != null ||
             current.pendingProposalApplicationMutation != null ||
             current.habitLedger.pendingMutations.isNotEmpty() ||
+            current.itemProgressLedger.pending.isNotEmpty() ||
             current.pendingGoogleCalendarOutbound != null ||
             current.pendingGoogleSchedulePublication?.stage?.let {
                 it != GoogleSchedulePublicationStage.ACCEPTED
@@ -5889,6 +5898,9 @@ class PlannerStore(
 
     /** Locally forgets all canonical execution state before credential destruction. */
     fun abandonCanonicalConnection(): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.itemProgressLedger.pending.isEmpty()) {
+            "Every saved progress change must be explicitly resolved before disconnecting"
+        }
         require(!current.hasSubmittedCanonicalAuthoring()) {
             "Every submitted canonical authoring write must be explicitly resolved before disconnecting"
         }
@@ -5933,6 +5945,7 @@ class PlannerStore(
             recurrenceMoves = emptyMap(),
             recurrenceCompletionAnchors = emptyMap(),
             habitLedger = HabitLedgerSnapshot(),
+            itemProgressLedger = com.greengolddog.dayweave.model.ItemProgressLedger(),
             pendingCanonicalMutation = null,
             canonicalExecutionSyncOrigin = null,
             canonicalExecutionConfigurationId = null,
@@ -7717,6 +7730,19 @@ class PlannerStore(
             canonicalTrashCleanupCancellation?.cancel()
             canonicalTrashCleanupCancellation = null
             canonicalTrashCleanupToken += 1L
+            // Failed progress saves cannot become observation proof or submitted custody. Keep
+            // every last-durable operation, including sticky protection learned while in flight.
+            val current = mutableState.value
+            val durableProgress = mutableDurableState.value?.itemProgressLedger
+                ?: com.greengolddog.dayweave.model.ItemProgressLedger()
+            val retainedProgress = durableProgress.copy(pending = durableProgress.pending.map { saved ->
+                saved.copy(wasSensitive = saved.wasSensitive || current.itemProgressLedger.pending.any {
+                    it.operationId == saved.operationId && it.itemId == saved.itemId &&
+                        it.requestJson == saved.requestJson && it.wasSensitive
+                })
+            })
+            mutableState.value = current.copy(itemProgressLedger = retainedProgress)
+                .withPendingSensitivityHardened()
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {
                 exactSaveRequests.removeFirst().completion?.complete(false)

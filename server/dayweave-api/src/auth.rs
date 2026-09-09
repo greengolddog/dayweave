@@ -374,19 +374,21 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/suggestions/application-previews/{id}/apply"
             | "/suggestions/applications/{id}/undo",
         ) => Some(Scope::SuggestionsWrite),
-        (&Method::GET, "/items" | "/items/delta" | "/items/stream" | "/items/{id}") => {
-            Some(Scope::ItemsRead)
-        }
         (
             &Method::GET,
-            "/habits/occurrences/delta"
+            "/items"
+            | "/items/delta"
+            | "/items/stream"
+            | "/items/{id}"
+            | "/items/{item_id}/progress"
+            | "/habits/occurrences/delta"
             | "/habits/stream"
             | "/habits/{habit_id}/occurrences"
             | "/habits/{habit_id}/analytics",
         ) => Some(Scope::ItemsRead),
         (
             &Method::POST | &Method::PUT | &Method::DELETE,
-            "/items" | "/items/{id}" | "/items/{id}/restore",
+            "/items" | "/items/{id}" | "/items/{id}/restore" | "/items/{item_id}/progress",
         )
         | (
             &Method::PUT | &Method::POST,

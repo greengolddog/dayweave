@@ -55,6 +55,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundCandidate
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
+import com.greengolddog.dayweave.model.progressItem
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundEntityKind
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundOperation
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
@@ -84,6 +85,7 @@ internal fun CanonicalAuthoringList(
         List<GoogleCalendarOutboundTargetOption>,
     ) -> Unit,
     modifier: Modifier = Modifier,
+    onOpenProgress: ((String) -> Unit)? = null,
 ) {
     val presentation = remember(
         state.canonicalItems,
@@ -97,6 +99,9 @@ internal fun CanonicalAuthoringList(
     var actionInFlight by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val effectiveActionsEnabled = actionsEnabled && !actionInFlight
+    val openProgress = onOpenProgress?.let { action ->
+        { id: String -> if (state.progressItem(id) != null) action(id) }
+    }
 
     fun perform(message: String, action: suspend () -> Boolean) {
         if (actionInFlight) return
@@ -158,6 +163,24 @@ internal fun CanonicalAuthoringList(
             }
         }
 
+        if (onOpenProgress != null) {
+            val recoverable = state.itemProgressLedger.pending.filter { state.progressItem(it.itemId) == null }
+            if (recoverable.isNotEmpty()) {
+                item(key = "independent-progress-recovery") {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Saved progress recovery", style = MaterialTheme.typography.titleMedium)
+                        Text("These exact saved changes remain available even when their item is unavailable.")
+                        recoverable.forEach { pending ->
+                            TextButton(onClick = { onOpenProgress(pending.itemId) },
+                                modifier = Modifier.testTag("item_progress_recovery_${pending.itemId}")) {
+                                Text("Review saved change · …${pending.itemId.takeLast(8)}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         diagnostic?.let { message ->
             item(key = "canonical-authoring-diagnostic") {
                 Row(
@@ -181,6 +204,7 @@ internal fun CanonicalAuthoringList(
 
         canonicalSection(
             title = "Inbox",
+            onOpenProgress = openProgress,
             rows = presentation.inbox,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is waiting for triage.",
@@ -209,6 +233,7 @@ internal fun CanonicalAuthoringList(
         )
         canonicalSection(
             title = "Planned",
+            onOpenProgress = openProgress,
             rows = presentation.planned,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Move an item to Planned when it is ready for composition.",
@@ -235,6 +260,7 @@ internal fun CanonicalAuthoringList(
         )
         canonicalSection(
             title = "Blocked",
+            onOpenProgress = openProgress,
             rows = presentation.blocked,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is currently waiting on a blocker.",
@@ -265,6 +291,7 @@ internal fun CanonicalAuthoringList(
         )
         canonicalSection(
             title = "Conflicts",
+            onOpenProgress = openProgress,
             rows = presentation.conflicts,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "No authoring conflicts need review.",
@@ -291,6 +318,7 @@ internal fun CanonicalAuthoringList(
         )
         canonicalSection(
             title = "Recently Deleted",
+            onOpenProgress = null,
             rows = presentation.recentlyDeleted,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Deleted items available for restore appear here.",
@@ -369,6 +397,7 @@ internal fun CanonicalAuthoringList(
 
 private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     title: String,
+    onOpenProgress: ((String) -> Unit)?,
     rows: List<CanonicalAuthoringRow>,
     activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     emptyMessage: String,
@@ -406,6 +435,8 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     items(rows, key = { "$title:${it.itemId}" }) { row ->
         CanonicalAuthoringCard(
             row = row,
+            onOpenProgress = onOpenProgress?.takeIf { row.source == CanonicalAuthoringRowSource.CANONICAL &&
+                !row.hasUnsafeAncestry && !row.hasMissingParent && !row.hasHierarchyCycle }?.let { action -> { action(row.itemId) } },
             activeRowsByItemId = activeRowsByItemId,
             actionsEnabled = actionsEnabled,
             onOpenEditor = onOpenEditor,
@@ -424,6 +455,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
 @Composable
 private fun CanonicalAuthoringCard(
     row: CanonicalAuthoringRow,
+    onOpenProgress: (() -> Unit)?,
     activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     actionsEnabled: Boolean,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
@@ -687,6 +719,11 @@ private fun CanonicalAuthoringCard(
                                 },
                             )
                         }
+                    }
+                }
+                if (onOpenProgress != null) {
+                    TextButton(onClick = onOpenProgress, modifier = Modifier.testTag("canonical_progress_${row.itemId}")) {
+                        Text("Independent progress")
                     }
                 }
                 if (googlePublicationCandidate != null && googleTargets.isEmpty()) {
