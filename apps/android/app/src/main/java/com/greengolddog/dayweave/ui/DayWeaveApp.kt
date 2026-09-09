@@ -676,6 +676,7 @@ private fun DayWeaveRoot(
                     } else {
                         null
                     },
+                    itemProgressRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundItemProgress else null,
                     polling = {
                         // Polling remains the durable fallback for old servers and missed publishes.
                         while (isActive) {
@@ -1290,7 +1291,8 @@ private fun DayWeaveRoot(
         com.greengolddog.dayweave.ui.authoring.ItemProgressReviewSheet(
             state = state, itemId = itemId, syncState = itemProgressSyncState,
             actionsEnabled = !accountRecoveryState.deviceAuthorizationSuppressed,
-            onLoad = viewModel::loadItemProgress, onSave = viewModel::saveItemProgress,
+            onLoad = { false }, onSave = viewModel::saveItemProgress,
+            onObserve = viewModel::observeItemProgress,
             onRetry = { viewModel.replayItemProgress() }, onDiscardReviewed = { viewModel.discardReviewedItemProgress(it) },
             onDismiss = { progressItemId = null },
         )
@@ -1915,6 +1917,7 @@ internal suspend fun runForegroundInvalidationWorkers(
     canonicalItemInvalidations: (suspend () -> Unit)?,
     scheduleInvalidations: (suspend () -> Unit)? = null,
     habitInvalidations: (suspend () -> Unit)? = null,
+    itemProgressRefresh: (suspend () -> Unit)? = null,
     polling: suspend () -> Unit,
 ) = supervisorScope {
     listOfNotNull(
@@ -1922,6 +1925,7 @@ internal suspend fun runForegroundInvalidationWorkers(
         canonicalItemInvalidations,
         scheduleInvalidations,
         habitInvalidations,
+        itemProgressRefresh,
     ).forEach {
         collectInvalidations ->
         launch {

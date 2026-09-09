@@ -33,6 +33,66 @@ import org.junit.runner.RunWith
 class ItemProgressUiTest {
     @get:Rule val compose = createComposeRule()
 
+    @Test fun unresolvedCanonicalCatchUpKeepsTypedReviewProtectedAndDisabled() {
+        val sync = mutableStateOf(ItemProgressSyncState())
+        compose.setContent { MaterialTheme { ItemProgressReviewSheet(state(), ITEM, sync.value, true,
+            onLoad = { false }, onSave = { _, _, _, _, _ -> error("Catch-up is required") },
+            onRetry = {}, onDiscardReviewed = {}, onDismiss = {}) } }
+        compose.onNodeWithTag("item_progress_add_percentage").performScrollTo().performClick()
+        compose.onNodeWithTag("item_progress_name_0").performScrollTo().performTextInput("Synthetic retained catchup review")
+        compose.runOnIdle { sync.value = ItemProgressSyncState(canonicalCatchUpItemIds = setOf(ITEM)) }
+        compose.onNodeWithTag("item_progress_name_0").assertTextContains("Synthetic retained catchup review")
+        compose.onNodeWithTag("item_progress_save").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("item_progress_review_latest").assertDoesNotExist()
+        assertSecureReviewWindow()
+    }
+
+    @Test fun refreshedObservationNeverOverwritesTypedEditorAndRequiresExplicitReview() {
+        val current = mutableStateOf(state())
+        compose.setContent { MaterialTheme { ItemProgressReviewSheet(current.value, ITEM, ItemProgressSyncState(), true,
+            onLoad = { false }, onSave = { _, _, _, _, _ -> error("Stale review cannot save") },
+            onRetry = {}, onDiscardReviewed = {}, onDismiss = {}) } }
+        compose.onNodeWithTag("item_progress_add_percentage").performScrollTo().performClick()
+        compose.onNodeWithTag("item_progress_name_0").performScrollTo().performTextInput("Synthetic retained input")
+        compose.onNodeWithTag("item_progress_percentage_0").performScrollTo().performTextClearance()
+        compose.onNodeWithTag("item_progress_percentage_0").performTextInput("42.50")
+        compose.runOnIdle { current.value = state(listOf(ItemProgressComponent(COMPONENT, "Synthetic server observation",
+            ItemProgressValue.Percentage(7500)))) }
+        compose.onNodeWithTag("item_progress_percentage_0").assertTextContains("42.50")
+        compose.onNodeWithTag("item_progress_name_0").assertTextContains("Synthetic retained input")
+        compose.onNodeWithTag("item_progress_save").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun newlyQueuedIntentAtSameGetBaselineCannotBeReplacedByAnOlderOpenEditor() {
+        val current = mutableStateOf(state())
+        compose.setContent { MaterialTheme { ItemProgressReviewSheet(current.value, ITEM, ItemProgressSyncState(), true,
+            onLoad = { false }, onSave = { _, _, _, _, _ -> error("Old nil-operation review cannot replace new intent") },
+            onRetry = {}, onDiscardReviewed = {}, onDismiss = {}) } }
+        compose.onNodeWithTag("item_progress_add_percentage").performScrollTo().performClick()
+        compose.onNodeWithTag("item_progress_name_0").performScrollTo().performTextInput("Synthetic unqueued input")
+        compose.runOnIdle { current.value = current.value.copy(itemProgressLedger = current.value.itemProgressLedger.copy(
+            pending = listOf(pending(ItemProgressDisposition.REVIEW_REQUIRED)))) }
+        compose.onNodeWithTag("item_progress_name_0").performScrollTo().assertTextContains("Synthetic unqueued input")
+        compose.onNodeWithTag("item_progress_save").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun reReviewedReplacementCannotBeOverwrittenByEditorForPreviousOperation() {
+        val reviewed = pending(ItemProgressDisposition.REVIEW_REQUIRED)
+        val current = mutableStateOf(state().let { it.copy(itemProgressLedger = it.itemProgressLedger.copy(pending = listOf(reviewed))) })
+        compose.setContent { MaterialTheme { ItemProgressReviewSheet(current.value, ITEM, ItemProgressSyncState(), true,
+            onLoad = { false }, onSave = { _, _, _, _, _ -> error("Old operation review cannot replace new intent") },
+            onRetry = {}, onDiscardReviewed = {}, onDismiss = {}) } }
+        compose.onNodeWithTag("item_progress_review_latest").performScrollTo().performClick()
+        compose.onNodeWithTag("item_progress_current_0").performScrollTo().performTextClearance()
+        compose.onNodeWithTag("item_progress_current_0").performTextInput("3.25")
+        val newOperation = "00000000-0000-4000-8000-000000000099"
+        compose.runOnIdle { current.value = current.value.copy(itemProgressLedger = current.value.itemProgressLedger.copy(
+            pending = listOf(reviewed.copy(operationId = newOperation,
+                requestJson = reviewed.requestJson.replace(OPERATION, newOperation))))) }
+        compose.onNodeWithTag("item_progress_current_0").assertTextContains("3.25")
+        compose.onNodeWithTag("item_progress_save").performScrollTo().assertIsNotEnabled()
+    }
+
     @Test fun completedGoalOpensIndependentReviewWithoutFullReplacementEligibility() {
         var selected: String? = null
         compose.setContent {
@@ -150,7 +210,8 @@ class ItemProgressUiTest {
             AppLockPresentationGate(AppLockState(AppLockSettings(), isLocked = locked.value),
                 lockedContent = { Text("Synthetic locked") }, unlockedContent = {
                     ItemProgressReviewSheet(initial, ITEM, ItemProgressSyncState(), true,
-                        onLoad = { entered.set(true); try { awaitCancellation() } finally { cancelled.set(true) } },
+                        onLoad = { error("Production observer owns the selected GET") },
+                        onObserve = { entered.set(true); try { awaitCancellation() } finally { cancelled.set(true) } },
                         onSave = { _, _, _, _, _ -> false }, onRetry = {}, onDiscardReviewed = {}, onDismiss = {})
                 })
         } }

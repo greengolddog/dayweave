@@ -390,6 +390,33 @@ class CanonicalSyncManager(
     suspend fun refreshCurrentPublishedSchedule(): CanonicalRefreshOutcome =
         refreshCurrentPublishedScheduleInternal(epochResetFence = null)
 
+    /** Read-only item catch-up also works before any schedule exists; it never previews/publishes. */
+    internal suspend fun refreshItemProgressCanonicalEvidence(isCurrent: () -> Boolean): Boolean {
+        val requestJob = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+        fun active() = requestJob?.isActive == true && isCurrent()
+        if (plannerStore.loadState.first { it != PlannerLoadState.LOADING } != PlannerLoadState.READY) return false
+        return operationMutex.withLock {
+            try {
+                require(active())
+                val resolution = authenticatedConfiguration() as? ConfigurationResolution.Ready ?: return@withLock false
+                val configuration = resolution.configuration
+                configuration.withBindingOperation {
+                    val expected = plannerStore.state.value
+                    require(expected.canonicalSyncOrigin == configuration.baseUrl.toString() &&
+                        expected.canonicalConfigurationId == configuration.configurationId)
+                    require(!expected.hasReplicaBlockingMutation())
+                    val canonical = loadDelta(configuration)
+                    ensureConfigurationCurrent(configuration)
+                    require(active())
+                    val receipt = plannerStore.installItemProgressCanonicalEvidence(expected, canonical.items,
+                        canonical.cursor, ::active)
+                    receipt?.awaitDurable() == true && active()
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (_: Exception) { false }
+        }
+    }
+
     internal suspend fun refreshCurrentPublishedScheduleAfterCursorReset(
         epochResetFence: ScheduleRevisionEpochResetFence,
     ): CanonicalRefreshOutcome = refreshCurrentPublishedScheduleInternal(epochResetFence)

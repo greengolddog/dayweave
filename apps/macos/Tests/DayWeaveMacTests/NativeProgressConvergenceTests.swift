@@ -42,7 +42,7 @@ struct NativeProgressConvergenceTests {
         let recording = RecordingProgressTransport(client: client, dropSuccessfulReply: phase == "submit_lost")
         let progress = ItemProgressStore(planner: planner, connection: { recording },
             now: { Date(timeIntervalSince1970: 1_788_854_400) },
-            sleep: { _ in throw CancellationError() })
+            sleep: { _ in throw CancellationError() }, automaticOutbox: false)
         progress.activate()
         defer { progress.suspendForPrivacyBoundary() }
 

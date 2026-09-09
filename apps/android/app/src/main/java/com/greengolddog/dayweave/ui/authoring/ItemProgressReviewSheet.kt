@@ -99,6 +99,7 @@ internal fun ItemProgressReviewSheet(
     onRetry: () -> Unit,
     onDiscardReviewed: (String) -> Unit,
     onDismiss: () -> Unit,
+    onObserve: (suspend (String) -> Unit)? = null,
 ) {
     val item = remember(state.canonicalItems, state.canonicalConfigurationId, state.canonicalSyncOrigin,
         state.canonicalDeltaCursor, itemId) { state.progressItem(itemId) }
@@ -107,30 +108,36 @@ internal fun ItemProgressReviewSheet(
     }
     val observation = ledger?.observations?.get(itemId)
     val pending = ledger?.pending?.singleOrNull { it.itemId == itemId }
-    var reviewed by remember(itemId, state.canonicalConfigurationId) { mutableStateOf<ItemProgressSnapshot?>(null) }
-    var forms by remember(itemId, state.canonicalConfigurationId) { mutableStateOf<List<ItemProgressComponentForm>?>(null) }
-    var replacing by remember(itemId, state.canonicalConfigurationId) { mutableStateOf<String?>(null) }
+    val canonicalCatchUpRequired = itemId in syncState.canonicalCatchUpItemIds
+    var reviewed by remember(itemId, state.canonicalConfigurationId, state.canonicalSyncOrigin) { mutableStateOf<ItemProgressSnapshot?>(null) }
+    var forms by remember(itemId, state.canonicalConfigurationId, state.canonicalSyncOrigin) { mutableStateOf<List<ItemProgressComponentForm>?>(null) }
+    var replacing by remember(itemId, state.canonicalConfigurationId, state.canonicalSyncOrigin) { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
-    val sensitive = remember(state.canonicalItems, state.pendingCanonicalMutation, state.pendingCanonicalAuthoringMutations,
+    val cachedSensitivity = remember(state.canonicalItems, state.pendingCanonicalMutation, state.pendingCanonicalAuthoringMutations,
         state.itemProgressLedger.pending, itemId) { state.progressReviewSensitive(itemId) }
+    val sensitive = canonicalCatchUpRequired || cachedSensitivity
     var reviewedSensitive by remember(itemId, state.canonicalConfigurationId) { mutableStateOf(sensitive) }
     SideEffect { if (sensitive) reviewedSensitive = true }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     LaunchedEffect(itemId, state.canonicalConfigurationId, state.canonicalSyncOrigin, item != null, lifecycle) {
         if (item == null) return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            if (onObserve != null) {
+                onObserve(itemId)
+                return@repeatOnLifecycle
+            }
             var failures = 0
             while (isActive) {
                 val success = onLoad(itemId)
                 failures = if (success) 0 else (failures + 1).coerceAtMost(4)
-                delay(if (success) 5_000L else 5_000L * (1L shl failures))
+                delay(if (success) 5_000L else (5_000L * (1L shl failures)).coerceAtMost(60_000))
             }
         }
     }
     val issue = state.progressReviewIssue(itemId)
-    LaunchedEffect(observation, pending, issue) {
-        if (forms == null && observation?.isGetProof == true && issue == null && pending == null) {
+    LaunchedEffect(observation, pending, issue, canonicalCatchUpRequired) {
+        if (forms == null && observation?.isGetProof == true && issue == null && pending == null && !canonicalCatchUpRequired) {
             reviewed = observation.snapshot
             forms = observation.snapshot.components.map(ItemProgressComponentForm::from)
         }
@@ -139,7 +146,7 @@ internal fun ItemProgressReviewSheet(
     val parsed = forms?.let { runCatching { it.map(ItemProgressComponentForm::component).also(::requireProgressComponents) } }
     val currentReview = reviewed?.let { baseline -> observation?.isGetProof == true &&
         observation.snapshot.itemRevision == baseline.itemRevision && observation.snapshot.revision == baseline.revision &&
-        item?.revision == baseline.itemRevision } == true
+        item?.revision == baseline.itemRevision && pending?.operationId == replacing && !canonicalCatchUpRequired } == true
     ModalBottomSheet(onDismissRequest = { if (!saving) onDismiss() },
         properties = ModalBottomSheetProperties(securePolicy = canonicalEditorSecurePolicy(sensitive, false, reviewedSensitive))) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp).testTag("item_progress_sheet"),
@@ -191,7 +198,7 @@ internal fun ItemProgressReviewSheet(
                     }
                 }
                 issue?.let { Text(it, modifier = Modifier.testTag("item_progress_issue")) }
-                if (observation?.isGetProof == true && issue == null) {
+                if (observation?.isGetProof == true && issue == null && !canonicalCatchUpRequired) {
                     TextButton(onClick = {
                         reviewed = observation.snapshot
                         forms = (pending?.request()?.components ?: observation.snapshot.components).map(ItemProgressComponentForm::from)

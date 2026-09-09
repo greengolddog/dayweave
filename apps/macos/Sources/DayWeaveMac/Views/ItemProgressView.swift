@@ -36,6 +36,7 @@ struct ItemProgressPanel: View {
     let sensitive: Bool
     @State private var review: ItemProgressReview?
     @State private var localMessage: String?
+    @State private var detailOwner = UUID()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -78,24 +79,33 @@ struct ItemProgressPanel: View {
                 }
             }
             HStack {
-                Button("Refresh") { Task { await progress.refresh(itemID) } }.disabled(progress.isWorking)
+                Button("Refresh") {
+                    progress.showDetail(itemID, owner: detailOwner)
+                    progress.refreshVisibleDetail(owner: detailOwner)
+                }.disabled(progress.isWorking)
                 Button(progress.journal(for: itemID) == nil ? "Review progress…" : "Review saved values…") {
-                    guard let baseline = progress.observation(for: itemID)?.snapshot else { return }
+                    progress.showDetail(itemID, owner: detailOwner)
+                    guard let baseline = progress.observation(for: itemID)?.snapshot,
+                          let lease = progress.reviewLease(itemID: itemID, owner: detailOwner) else { return }
                     review = .init(baseline: baseline,
                         components: progress.journal(for: itemID)?.command.components ?? baseline.components,
-                        sensitive: sensitive || progress.isSensitive(itemID))
+                        sensitive: sensitive || progress.isSensitive(itemID), lease: lease)
                 }.disabled(!progress.canReview(itemID))
             }
             Text(localMessage ?? progress.message).font(.caption).foregroundStyle(.secondary)
         }
         .accessibilityIdentifier("item-progress.panel")
-        .onAppear { progress.showDetail(itemID) }
-        .onChange(of: itemID) { _, value in review = nil; progress.showDetail(value) }
-        .onChange(of: planner.canonicalConfigurationIdentifier) { _, _ in review = nil; progress.hideDetail() }
-        .onDisappear { review = nil; progress.hideDetail() }
+        .onAppear { progress.showDetail(itemID, owner: detailOwner) }
+        .onChange(of: itemID) { _, value in review = nil; progress.showDetail(value, owner: detailOwner) }
+        .onChange(of: planner.canonicalConfigurationIdentifier) { _, _ in
+            review = nil; progress.hideDetail(owner: detailOwner)
+            progress.showDetail(itemID, owner: detailOwner)
+        }
+        .onDisappear { review = nil; progress.hideDetail(owner: detailOwner) }
         .sheet(item: $review) { context in
             ItemProgressReviewView(context: context) { values in
-                try progress.queue(itemID: itemID, baseline: context.baseline, components: values)
+                guard let lease = context.lease else { throw ItemProgressError.staleReview }
+                try progress.queueReviewed(lease: lease, baseline: context.baseline, components: values)
             }.privacySensitive(context.sensitive || progress.isSensitive(itemID))
         }
     }
@@ -106,6 +116,7 @@ struct ItemProgressReview: Identifiable {
     let baseline: ItemProgressSnapshot
     let components: [ItemProgressComponent]
     let sensitive: Bool
+    var lease: ItemProgressReviewLease? = nil
 }
 
 struct ItemProgressEditorComponent: Identifiable, Equatable {

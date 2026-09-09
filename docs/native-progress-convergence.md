@@ -2,7 +2,9 @@
 
 Status: all six native phases and the service restart passed on 2026-09-09
 against a fresh local PostgreSQL-backed service. Final database assertions and
-owned API/PostgreSQL cleanup also passed.
+owned API/PostgreSQL cleanup also passed. The gate was rerun successfully after
+the foreground/detail/reconnect lifecycle changes, in addition to its original
+harness-introduction run at `8bafaf2`.
 
 This gate connects the production macOS and Android progress transports/stores
 to the same actual HTTP service and PostgreSQL database. It complements the
@@ -77,12 +79,16 @@ partial opt-in rejection and encrypted restart/tamper behavior. Eight runner
 safety tests cover environment isolation, redirect rejection, private artifacts,
 timeouts, interruption and descendant-process cleanup.
 
-The post-change default gates also passed: macOS discovered 976 tests in 62
+At the harness-introduction checkpoint (`8bafaf2`), the default gates also passed:
+macOS discovered 976 tests in 62
 suites with warnings treated as errors; Android discovered 1,567 JVM tests in
 126 suites with no failures/errors, and lint reported no errors and 29 existing
 warnings. Each default run intentionally skips its one live phase; the six
-explicitly configured executions above passed separately. No production source,
-database migration or app-distribution configuration changed in this checkpoint.
+explicitly configured executions above passed separately. That harness-only
+checkpoint changed no production source, database migration or app-distribution
+configuration. Subsequent production foreground/reconnect integration and its
+current native regression evidence are recorded in
+[independent item progress](item-progress.md#verification-and-remaining-work).
 
 ## Coverage boundary
 

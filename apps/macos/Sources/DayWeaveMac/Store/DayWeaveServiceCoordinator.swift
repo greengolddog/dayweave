@@ -90,6 +90,9 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     private let itemProgress: (any ItemProgressServiceSynchronizing)?
     private var activationTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
+    // A blocked startup is inactive but still has foreground permission.
+    // Only an explicit activation grants it; recovery cannot grant its own.
+    private var desiredForeground = false
 
     init(
         proposalApplications: any ProposalApplicationRecovering,
@@ -110,6 +113,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     }
 
     func activate() {
+        desiredForeground = true
         guard !servicesAreActive, activationTask == nil else { return }
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
@@ -120,6 +124,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     }
 
     func deactivate() {
+        desiredForeground = false
         lifecycleGeneration &+= 1
         servicesAreActive = false
         activationTask?.cancel()
@@ -137,21 +142,26 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     /// the Boolean result—is the authoritative completion signal.
     @discardableResult
     func recoverPendingProposalAndResume() async -> Bool {
-        guard activationTask == nil else { return false }
+        guard desiredForeground, activationTask == nil, !Task.isCancelled else { return false }
+        // An unresolved startup journal deliberately leaves services inactive.
+        // Such a caller may recover, but may not carry that authority across a
+        // later deactivation or replacement foreground lifecycle.
+        let recoveryGeneration = lifecycleGeneration
         if proposalApplications.hasPendingRecovery {
             _ = await proposalApplications.recoverPendingMutation()
         }
-        guard !proposalApplications.hasPendingRecovery, !Task.isCancelled else {
+        guard !proposalApplications.hasPendingRecovery,
+              recoveryIsCurrent(recoveryGeneration) else {
             return false
         }
         if googleOutbound?.hasPendingRecovery == true {
             _ = await googleOutbound?.recoverPendingOperation()
         }
-        guard !Task.isCancelled else { return false }
+        guard recoveryIsCurrent(recoveryGeneration) else { return false }
         if googleSchedulePublication?.hasPendingRecovery == true {
             _ = await googleSchedulePublication?.recoverPendingPublication()
         }
-        guard !Task.isCancelled else { return false }
+        guard recoveryIsCurrent(recoveryGeneration) else { return false }
 
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
@@ -176,8 +186,11 @@ final class DayWeaveServiceCoordinator: ObservableObject {
             }
         }
 
+        guard operationIsCurrent(generation) else { return }
+
         if proposalApplications.hasPendingRecovery {
             _ = await proposalApplications.recoverPendingMutation()
+            guard operationIsCurrent(generation) else { return }
             guard !proposalApplications.hasPendingRecovery else {
                 if generation == lifecycleGeneration {
                     servicesAreActive = false
@@ -237,7 +250,12 @@ final class DayWeaveServiceCoordinator: ObservableObject {
 
     private func operationIsCurrent(_ generation: UInt64) -> Bool {
         !Task.isCancelled
+            && desiredForeground
             && servicesAreActive
             && generation == lifecycleGeneration
+    }
+
+    private func recoveryIsCurrent(_ generation: UInt64) -> Bool {
+        !Task.isCancelled && desiredForeground && generation == lifecycleGeneration && activationTask == nil
     }
 }

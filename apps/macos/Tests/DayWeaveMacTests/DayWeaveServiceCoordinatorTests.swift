@@ -90,7 +90,7 @@ struct DayWeaveServiceCoordinatorTests {
     func manualRecoveryResumesOrderedServices() async {
         let events = ServiceEventLog()
         let proposals = ProposalRecoveryDouble(
-            hasPendingRecovery: true,
+            hasPendingRecovery: false,
             resolvesRecovery: true,
             reportedResult: false,
             events: events
@@ -103,6 +103,10 @@ struct DayWeaveServiceCoordinatorTests {
             canonicalSync: canonical
         )
 
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        proposals.hasPendingRecovery = true
+        events.values.removeAll()
         #expect(await coordinator.recoverPendingProposalAndResume())
         #expect(coordinator.servicesAreActive)
         #expect(events.values == [
@@ -147,6 +151,130 @@ struct DayWeaveServiceCoordinatorTests {
             "canonical.poll",
             "execution.poll",
         ])
+    }
+
+    @Test("manual recovery cannot self-authorize before any foreground activation")
+    func initiallyInactiveManualRecoveryDoesNothing() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(hasPendingRecovery: true, resolvesRecovery: true,
+            reportedResult: true, events: events)
+        let outbound = GoogleOutboundRecoveryDouble(hasPendingRecovery: true, resolvesRecovery: true,
+            reportedResult: true, events: events)
+        let coordinator = DayWeaveServiceCoordinator(proposalApplications: proposals,
+            googleOutbound: outbound, executionSync: ExecutionServiceDouble(events: events),
+            canonicalSync: CanonicalServiceDouble(events: events),
+            itemProgress: ProgressServiceDouble(events: events))
+
+        #expect(await coordinator.recoverPendingProposalAndResume() == false)
+        #expect(!coordinator.servicesAreActive)
+        #expect(proposals.hasPendingRecovery && outbound.hasPendingRecovery)
+        #expect(events.values.isEmpty)
+    }
+
+    @Test("a delayed manual UI task cannot start recovery after deactivation")
+    func manualTaskStartingAfterDeactivationDoesNothing() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: true,
+            reportedResult: true, events: events)
+        let outbound = GoogleOutboundRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: true,
+            reportedResult: true, events: events)
+        let coordinator = DayWeaveServiceCoordinator(proposalApplications: proposals,
+            googleOutbound: outbound, executionSync: ExecutionServiceDouble(events: events),
+            canonicalSync: CanonicalServiceDouble(events: events),
+            itemProgress: ProgressServiceDouble(events: events))
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        proposals.hasPendingRecovery = true
+        outbound.hasPendingRecovery = true
+        events.values.removeAll()
+        // This MainActor task cannot enter recovery until the current actor turn
+        // yields. Deactivation therefore precedes even its initial authority check.
+        let delayedRecovery = Task { @MainActor in await coordinator.recoverPendingProposalAndResume() }
+        coordinator.deactivate()
+        let stoppedEvents = events.values
+
+        #expect(await delayedRecovery.value == false)
+        #expect(await coordinator.recoverPendingProposalAndResume() == false)
+        #expect(!coordinator.servicesAreActive)
+        #expect(proposals.hasPendingRecovery && outbound.hasPendingRecovery)
+        #expect(events.values == stoppedEvents)
+    }
+
+    @Test("held manual recovery cannot reactivate services after privacy deactivation")
+    func heldManualRecoveryCannotUndoDeactivation() async {
+        for kind in ["proposal", "google-outbound", "google-schedule"] {
+            let events = ServiceEventLog()
+            let held = HeldServiceRecovery(kind: kind, events: events)
+            let coordinator = await heldRecoveryCoordinator(held, kind: kind, events: events)
+            let recovery = Task { await coordinator.recoverPendingProposalAndResume() }
+            await held.waitUntilHeld()
+            coordinator.deactivate()
+            let stoppedEvents = events.values
+            held.release()
+
+            #expect(await recovery.value == false, "\(kind)")
+            #expect(!coordinator.servicesAreActive, "\(kind)")
+            #expect(events.values == stoppedEvents, "\(kind)")
+            #expect(!events.values.contains("progress.activate"), "\(kind)")
+        }
+    }
+
+    @Test("old manual recovery cannot replace a newer foreground activation")
+    func heldManualRecoveryCannotReplaceNewActivation() async {
+        for kind in ["proposal", "google-outbound", "google-schedule"] {
+            let events = ServiceEventLog()
+            let held = HeldServiceRecovery(kind: kind, events: events)
+            let coordinator = await heldRecoveryCoordinator(held, kind: kind, events: events)
+            let recovery = Task { await coordinator.recoverPendingProposalAndResume() }
+            await held.waitUntilHeld()
+            coordinator.deactivate()
+            coordinator.activate()
+            await coordinator.waitForActivation()
+            #expect(coordinator.servicesAreActive, "\(kind)")
+            let newActivationEvents = events.values
+            held.release()
+
+            #expect(await recovery.value == false, "\(kind)")
+            #expect(coordinator.servicesAreActive, "\(kind)")
+            #expect(events.values == newActivationEvents, "\(kind)")
+            #expect(events.values.filter { $0 == "progress.activate" }.count == 1, "\(kind)")
+        }
+    }
+
+    @Test("cancelled manual recovery cannot start reconciliation after a late reply")
+    func cancelledManualRecoveryDoesNotResume() async {
+        let events = ServiceEventLog()
+        let held = HeldServiceRecovery(kind: "proposal", events: events)
+        let coordinator = await heldRecoveryCoordinator(held, kind: "proposal", events: events)
+        let recovery = Task { await coordinator.recoverPendingProposalAndResume() }
+        await held.waitUntilHeld()
+        recovery.cancel()
+        held.release()
+        #expect(await recovery.value == false)
+        #expect(coordinator.servicesAreActive) // Cancellation cannot stop the existing foreground lifecycle.
+        #expect(events.values == ["proposal.recover"])
+    }
+
+    private func heldRecoveryCoordinator(_ held: HeldServiceRecovery, kind: String,
+                                        events: ServiceEventLog) async -> DayWeaveServiceCoordinator {
+        let proposals: any ProposalApplicationRecovering
+        if kind == "proposal" { proposals = held }
+        else {
+            proposals = ProposalRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: false,
+                reportedResult: false, events: events)
+        }
+        let coordinator = DayWeaveServiceCoordinator(proposalApplications: proposals,
+            googleOutbound: kind == "google-outbound" ? held : nil,
+            googleSchedulePublication: kind == "google-schedule" ? held : nil,
+            executionSync: ExecutionServiceDouble(events: events),
+            canonicalSync: CanonicalServiceDouble(events: events),
+            itemProgress: ProgressServiceDouble(events: events))
+        held.hasPendingRecovery = false
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        held.hasPendingRecovery = true
+        events.values.removeAll()
+        return coordinator
     }
 
     @Test("privacy deactivation stops all execution foreground delivery")
@@ -250,6 +378,50 @@ struct DayWeaveServiceCoordinatorTests {
 @MainActor
 private final class ServiceEventLog {
     var values: [String] = []
+}
+
+/// Holds only the first call, deliberately ignoring cancellation to model a
+/// recovery response racing with deactivation or a newer activation.
+@MainActor
+private final class HeldServiceRecovery: ProposalApplicationRecovering, GoogleOutboundRecovering,
+    GoogleSchedulePublicationRecovering {
+    var hasPendingRecovery = true
+    private let kind: String
+    private let events: ServiceEventLog
+    private var calls = 0
+    private var held: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+
+    init(kind: String, events: ServiceEventLog) { self.kind = kind; self.events = events }
+    func recoverPendingMutation() async -> Bool { await recover() }
+    func recoverPendingOperation() async -> Bool { await recover() }
+    func recoverPendingPublication() async -> Bool { await recover() }
+    func waitUntilHeld() async {
+        if held != nil { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func release() { let completion = held; held = nil; completion?.resume() }
+    private func recover() async -> Bool {
+        calls += 1
+        events.values.append("\(kind).recover")
+        if calls == 1 {
+            await withCheckedContinuation { continuation in
+                held = continuation
+                let waiting = entered; entered = nil; waiting?.resume()
+            }
+        }
+        hasPendingRecovery = false
+        return true
+    }
+}
+
+@MainActor
+private final class ProgressServiceDouble: ItemProgressServiceSynchronizing {
+    private let events: ServiceEventLog
+    init(events: ServiceEventLog) { self.events = events }
+    func activate() { events.values.append("progress.activate") }
+    func suspendForPrivacyBoundary() { events.values.append("progress.suspend") }
+    func replayPending() async -> Bool { events.values.append("progress.replay"); return true }
 }
 
 @MainActor

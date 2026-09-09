@@ -57,6 +57,10 @@ import com.greengolddog.dayweave.sync.AssistantManager
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
+import com.greengolddog.dayweave.sync.ItemProgressRefreshCoordinator
+import com.greengolddog.dayweave.sync.ItemProgressRefreshResult
+import com.greengolddog.dayweave.sync.refreshItemProgressDetailEvidence
+import com.greengolddog.dayweave.network.foregroundNetworkReconnects
 import com.greengolddog.dayweave.sync.AtomicGoogleAuthorizationJournalStore
 import com.greengolddog.dayweave.sync.AtomicGoogleCalendarImportJournalStore
 import com.greengolddog.dayweave.sync.DurableCanonicalItemInvalidationCursor
@@ -212,6 +216,9 @@ class DayWeaveApplication : Application() {
             }
             if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
             cancelAndDrainLocalScheduleComposition()
+            if (itemProgressRefreshCoordinatorDelegate.isInitialized()) {
+                itemProgressRefreshCoordinator.cancelAndDrainActiveSessions()
+            }
             if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
                 canonicalItemInvalidationManager.cancelAndDrainActiveSession()
             }
@@ -457,19 +464,41 @@ class DayWeaveApplication : Application() {
     }
     val itemProgressSyncManager get() = itemProgressSyncManagerDelegate.value
 
-    /** Owned by a protected view coroutine: disappearance/lock cancels the selected GET. */
-    suspend fun refreshSelectedItemProgress(itemId: String): Boolean {
-        if (!privatePresentationAllowed.get() || !onboardingRuntimeGate.foregroundProviderWorkAllowed() ||
-            hasAccountRecoveryWorkBlocker() || hasGoogleAuthorizationRecoveryBlocker() || !canonicalActionGate.tryEnter()
-        ) return false
+    private val itemProgressRefreshCoordinatorDelegate = lazy {
+        ItemProgressRefreshCoordinator(apiCredentialStore, ::itemProgressForegroundAllowed,
+            ::refreshSelectedItemProgressOwned, ::replayForegroundItemProgress)
+    }
+    private val itemProgressRefreshCoordinator get() = itemProgressRefreshCoordinatorDelegate.value
+
+    private fun itemProgressForegroundAllowed(): Boolean = privatePresentationAllowed.get() &&
+        onboardingRuntimeGate.foregroundProviderWorkAllowed() && !hasAccountRecoveryWorkBlocker() &&
+        !hasGoogleAuthorizationRecoveryBlocker()
+
+    suspend fun observeSelectedItemProgress(itemId: String) = itemProgressRefreshCoordinator.runSelectedDetail(itemId)
+
+    fun requestItemProgressReplay() { itemProgressRefreshCoordinator.requestOutboxReplay() }
+
+    suspend fun runForegroundItemProgressSync() {
+        if (!privatePresentationAllowed.get() || !onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
+        itemProgressRefreshCoordinator.runForegroundActivation(foregroundNetworkReconnects(this))
+    }
+
+    /** All UI GETs carry the coordinator's selected item, binding and visible-lifetime lease. */
+    private suspend fun refreshSelectedItemProgressOwned(itemId: String, isCurrent: () -> Boolean): ItemProgressRefreshResult {
+        if (!isCurrent() || !itemProgressForegroundAllowed()) return ItemProgressRefreshResult.FAILED
+        if (!canonicalActionGate.tryEnter()) return ItemProgressRefreshResult.DEFERRED
         return try {
-            val loaded = itemProgressSyncManager.load(itemId)
-            val current = plannerStore.state.value
-            val observed = current.itemProgressLedger.observations[itemId]?.snapshot
-            if (loaded && observed != null && current.canonicalItems.singleOrNull { it.id == itemId }?.revision != observed.itemRevision) {
-                canonicalSyncManager.refreshCurrentPublishedSchedule()
-            }
-            loaded
+            if (refreshItemProgressDetailEvidence(itemId, itemProgressSyncManager, isCurrent,
+                    canonicalSyncManager::refreshItemProgressCanonicalEvidence)) ItemProgressRefreshResult.SUCCESS
+            else ItemProgressRefreshResult.FAILED
+        } finally { canonicalActionGate.leave() }
+    }
+
+    private suspend fun replayForegroundItemProgress(isCurrent: () -> Boolean): ItemProgressRefreshResult {
+        if (!isCurrent() || !itemProgressForegroundAllowed()) return ItemProgressRefreshResult.FAILED
+        if (!canonicalActionGate.tryEnter()) return ItemProgressRefreshResult.DEFERRED
+        return try {
+            if (itemProgressSyncManager.replay(isCurrent)) ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
         } finally { canonicalActionGate.leave() }
     }
 
@@ -1155,6 +1184,7 @@ class DayWeaveApplication : Application() {
     private fun closePrivatePresentationBoundary() {
         energySignalGenerationFence.close()
         privatePresentationAllowed.set(false)
+        if (itemProgressRefreshCoordinatorDelegate.isInitialized()) itemProgressRefreshCoordinator.cancelActiveSessions()
         if (energySignalManagerDelegate.isInitialized()) {
             energySignalManager.quarantineForPrivacyBoundary()
         }
@@ -1293,7 +1323,6 @@ class DayWeaveApplication : Application() {
     suspend fun refreshForegroundExecution() {
         if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return
-        itemProgressSyncManager.replay()
         if (habitSyncManager.refresh() !in HABIT_REFRESH_COMPOSE_SAFE_OUTCOMES) return
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,

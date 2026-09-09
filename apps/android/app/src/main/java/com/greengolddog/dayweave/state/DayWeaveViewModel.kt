@@ -116,9 +116,14 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val habitSyncState: StateFlow<HabitSyncState> = habitSyncManager.state
     val itemProgressSyncState = itemProgressSyncManager.state
 
-    suspend fun loadItemProgress(itemId: String): Boolean = dayWeaveApplication.refreshSelectedItemProgress(itemId)
+    suspend fun observeItemProgress(itemId: String) = dayWeaveApplication.observeSelectedItemProgress(itemId)
 
-    fun replayItemProgress(): Boolean = dayWeaveApplication.launchCanonicalAction { itemProgressSyncManager.replay() }
+    suspend fun collectForegroundItemProgress() = dayWeaveApplication.runForegroundItemProgressSync()
+
+    fun replayItemProgress(): Boolean {
+        dayWeaveApplication.requestItemProgressReplay()
+        return dayWeaveApplication.launchCanonicalAction { itemProgressSyncManager.replay() }
+    }
 
     suspend fun saveItemProgress(itemId: String, itemRevision: Long, progressRevision: Long,
         components: List<com.greengolddog.dayweave.model.ItemProgressComponent>, replacingOperationId: String?,

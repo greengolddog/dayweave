@@ -12,14 +12,21 @@ import com.greengolddog.dayweave.state.PlannerStore
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-data class ItemProgressSyncState(val isBusy: Boolean = false, val message: String = "Saved independent progress", val failed: Boolean = false)
+data class ItemProgressSyncState(val isBusy: Boolean = false, val message: String = "Saved independent progress",
+    val failed: Boolean = false, val canonicalCatchUpItemIds: Set<String> = emptySet()) {
+    val requiresCanonicalCatchUp: Boolean get() = canonicalCatchUpItemIds.isNotEmpty()
+}
 
 /** Selected GET is cancellable; durable bound outbox replay does not depend on a selected view. */
 class ItemProgressSyncManager(
@@ -32,24 +39,41 @@ class ItemProgressSyncManager(
     private val mutex = Mutex()
     private val mutableState = MutableStateFlow(ItemProgressSyncState())
     val state = mutableState.asStateFlow()
+    private val catchUpItems = ConcurrentHashMap.newKeySet<String>()
+    private val presentationGeneration = AtomicLong()
+    private val presentationLock = Any()
 
-    internal fun quarantineBindingState() { mutableState.value = ItemProgressSyncState() }
+    internal fun quarantineBindingState() = synchronized(presentationLock) {
+        presentationGeneration.incrementAndGet()
+        catchUpItems.clear()
+        mutableState.value = ItemProgressSyncState()
+    }
 
-    suspend fun load(itemId: String): Boolean = operation("Loading independent progress…") { configuration ->
+    suspend fun load(itemId: String, isCurrent: () -> Boolean = { true }): Boolean = operation("Loading independent progress…", isCurrent) { configuration ->
+        val admittedGeneration = presentationGeneration.get()
         require(store.state.value.progressItem(itemId) != null)
-        val snapshot = transport.get(configuration, itemId)
+        val snapshot = try { transport.get(configuration, itemId) }
+        catch (error: ItemProgressApiException.Definitive) {
+            if (error.code == ItemProgressFailureCode.ITEM_MISSING) throw CanonicalCatchUpRequired(itemId)
+            throw error
+        }
         snapshot.requireValid()
         require(snapshot.itemId == itemId)
-        persist { current ->
+        persist(isCurrent) { current ->
             checkBinding(current, configuration)
-            require(current.progressItem(itemId) != null)
+            val item = requireNotNull(current.progressItem(itemId))
+            if (item.revision != snapshot.itemRevision) throw CanonicalCatchUpRequired(itemId)
             current.itemProgressLedger.withObservation(ItemProgressObservation(snapshot, instant(), isGetProof = true))
+        }
+        if (currentCoroutineContext().job.isActive && isCurrent() && presentationGeneration.get() == admittedGeneration) {
+            catchUpItems.remove(itemId)
         }
     }
 
     suspend fun stage(itemId: String, expectedItemRevision: Long, expectedProgressRevision: Long,
         components: List<ItemProgressComponent>, replacingOperationId: String? = null,
     ): Boolean = operation("Saving independent progress securely…") { configuration ->
+        if (itemId in catchUpItems) throw CanonicalCatchUpRequired(itemId)
         val request = ItemProgressRequest(operationId = uuid().toString(), expectedItemRevision = expectedItemRevision,
             expectedProgressRevision = expectedProgressRevision, components = components).also(ItemProgressRequest::requireValid)
         val mutation = PendingItemProgressMutation(operationId = request.operationId, itemId = itemId,
@@ -60,19 +84,20 @@ class ItemProgressSyncManager(
         persist { current -> checkBinding(current, configuration); current.stageItemProgress(mutation, replacingOperationId) }
     }
 
-    suspend fun replay(): Boolean = if (store.state.value.itemProgressLedger.pending.none { it.disposition == ItemProgressDisposition.PENDING }) {
+    suspend fun replay(isCurrent: () -> Boolean = { true }): Boolean = if (store.state.value.itemProgressLedger.pending.none { it.disposition == ItemProgressDisposition.PENDING }) {
         true
-    } else operation("Synchronizing saved progress changes…") { configuration ->
+    } else operation("Synchronizing saved progress changes…", isCurrent) { configuration ->
         for (saved in store.state.value.itemProgressLedger.pending.filter { it.disposition == ItemProgressDisposition.PENDING }) {
             var pending = saved
             if (pending.submittedAt == null) {
-                if (!store.state.value.canFirstSendItemProgress(pending)) {
-                    markDisposition(configuration, pending, ItemProgressDisposition.REVIEW_REQUIRED)
+                if (pending.itemId in catchUpItems || !store.state.value.canFirstSendItemProgress(pending)) {
+                    markDisposition(configuration, pending, ItemProgressDisposition.REVIEW_REQUIRED, isCurrent)
                     continue
                 }
                 val submitted = pending.copy(submittedAt = instant())
-                persist { current ->
+                persist(isCurrent) { current ->
                     checkBinding(current, configuration)
+                    require(pending.itemId !in catchUpItems)
                     require(current.canFirstSendItemProgress(pending))
                     replaceExact(current.itemProgressLedger, pending, submitted)
                 }
@@ -81,8 +106,9 @@ class ItemProgressSyncManager(
             // Once submitted, current item absence/revision changes cannot suppress exact replay.
             try {
                 pending.requireValid()
+                require(isCurrent())
                 val result = transport.put(configuration, pending.itemId, pending.requestJson)
-                persist { current ->
+                persist(isCurrent) { current ->
                     checkBinding(current, configuration)
                     current.itemProgressLedger.settleItemProgress(pending, result, instant())
                 }
@@ -92,7 +118,7 @@ class ItemProgressSyncManager(
                     ItemProgressFailureCode.INVALID -> ItemProgressDisposition.REJECTED
                     else -> ItemProgressDisposition.REVIEW_REQUIRED
                 }
-                markDisposition(configuration, pending, disposition)
+                markDisposition(configuration, pending, disposition, isCurrent)
             }
         }
     }
@@ -108,7 +134,8 @@ class ItemProgressSyncManager(
 
     private suspend fun markDisposition(configuration: AuthenticatedApiConfiguration, expected: PendingItemProgressMutation,
         disposition: ItemProgressDisposition,
-    ) = persist { current ->
+        isCurrent: () -> Boolean = { true },
+    ) = persist(isCurrent) { current ->
         checkBinding(current, configuration)
         replaceExact(current.itemProgressLedger, expected, expected.copy(disposition = disposition))
     }
@@ -121,16 +148,29 @@ class ItemProgressSyncManager(
         return ledger.copy(pending = ledger.pending.map { if (it.operationId == expected.operationId) replacement.copy(wasSensitive = exact.wasSensitive) else it })
     }
 
-    private suspend fun operation(message: String, block: suspend (AuthenticatedApiConfiguration) -> Unit): Boolean = mutex.withLock {
+    private suspend fun operation(message: String, isCurrent: () -> Boolean = { true },
+        block: suspend (AuthenticatedApiConfiguration) -> Unit,
+    ): Boolean = mutex.withLock {
+        val operationJob = currentCoroutineContext().job
+        val admittedGeneration = presentationGeneration.get()
+        fun active() = operationJob.isActive && isCurrent() && presentationGeneration.get() == admittedGeneration
+        fun publishActive(update: () -> ItemProgressSyncState): Boolean = synchronized(presentationLock) {
+            if (!active()) false else {
+                mutableState.value = update()
+                true
+            }
+        }
         if (store.loadState.first { it != PlannerLoadState.LOADING } != PlannerLoadState.READY) {
-            mutableState.value = ItemProgressSyncState(message = "Encrypted progress storage is unavailable", failed = true)
+            publishActive { progressState(message = "Encrypted progress storage is unavailable", failed = true) }
             return@withLock false
         }
-        mutableState.value = ItemProgressSyncState(isBusy = true, message = message)
+        val ownedBusyState = progressState(isBusy = true, message = message)
+        if (!publishActive { ownedBusyState }) return@withLock false
         try {
+            require(active())
             val configuration = credentials.authenticatedConfiguration() ?: error("Unconfigured")
             configuration.withBindingOperation {
-                persist { current ->
+                persist(isCurrent) { current ->
                     require(current.canonicalSyncOrigin == configuration.baseUrl.toString() && current.canonicalConfigurationId == configuration.configurationId)
                     val ledger = current.itemProgressLedger
                     if (ledger.syncOrigin == null) ItemProgressLedger(syncOrigin = configuration.baseUrl.toString(),
@@ -139,14 +179,27 @@ class ItemProgressSyncManager(
                 }
                 block(configuration)
             }
-            mutableState.value = ItemProgressSyncState(message = "Saved progress · refresh the selected item for a current observation")
-            true
+            publishActive { progressState(message = "Saved progress · refresh the selected item for a current observation") }
         } catch (error: CancellationException) {
-            mutableState.value = ItemProgressSyncState(message = "Progress refresh paused")
+            publishActive { progressState(message = "Progress refresh paused") }
             throw error
-        } catch (_: Exception) {
-            mutableState.value = ItemProgressSyncState(message = "Progress unavailable · saved values and exact changes are retained", failed = true)
+        } catch (error: CanonicalCatchUpRequired) {
+            publishActive {
+                catchUpItems.add(error.itemId)
+                progressState(message = "The item changed · canonical catch-up is required before editing", failed = true)
+            }
             false
+        } catch (_: Exception) {
+            publishActive { progressState(message = "Progress unavailable · saved values and exact changes are retained", failed = true) }
+            false
+        } finally {
+            // Still under the operation mutex: even cancellation-insensitive I/O has now drained.
+            // Releasing this operation's presentation ownership is not a successful read or replay.
+            synchronized(presentationLock) {
+                if (presentationGeneration.get() == admittedGeneration && mutableState.value === ownedBusyState) {
+                    mutableState.value = progressState(message = "Progress refresh paused")
+                }
+            }
         }
     }
 
@@ -157,7 +210,17 @@ class ItemProgressSyncManager(
         require(current.itemProgressLedger.syncOrigin == current.canonicalSyncOrigin && current.itemProgressLedger.configurationId == current.canonicalConfigurationId)
     }
 
-    private suspend fun persist(update: (DayWeaveUiState) -> ItemProgressLedger) = await(store.mutateItemProgress(update))
+    private suspend fun persist(isCurrent: () -> Boolean = { true }, update: (DayWeaveUiState) -> ItemProgressLedger) {
+        val job = currentCoroutineContext().job
+        require(job.isActive && isCurrent())
+        await(store.mutateItemProgress { current ->
+            require(job.isActive && isCurrent())
+            update(current)
+        })
+    }
     private suspend fun await(receipt: PlannerPersistenceReceipt?) { check(receipt != null && receipt.awaitDurable()) }
     private fun instant(): String = now().truncatedTo(ChronoUnit.MICROS).toString()
+    private fun progressState(isBusy: Boolean = false, message: String, failed: Boolean = false) =
+        ItemProgressSyncState(isBusy, message, failed, catchUpItems.toSet())
+    private class CanonicalCatchUpRequired(val itemId: String) : IllegalStateException()
 }

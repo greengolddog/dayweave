@@ -72,6 +72,7 @@ import com.greengolddog.dayweave.model.effectiveHabitMissedProjection
 import com.greengolddog.dayweave.model.estimatedHabitCacheBytes
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringShape
+import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.model.nextCanonicalTrashRetentionExpiryEpochMillis
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
@@ -3476,6 +3477,40 @@ class PlannerStore(
 
     private fun <T> List<T>.replaceAt(index: Int, replacement: T): List<T> =
         mapIndexed { currentIndex, value -> if (currentIndex == index) replacement else value }
+
+    /** Admits read-only canonical catch-up without previewing, publishing, or mutating execution. */
+    internal fun installItemProgressCanonicalEvidence(
+        expected: DayWeaveUiState,
+        items: List<CanonicalItemSnapshot>,
+        deltaCursor: String,
+        isCurrent: () -> Boolean,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(isCurrent())
+        require(current.canonicalSyncOrigin == expected.canonicalSyncOrigin &&
+            current.canonicalConfigurationId == expected.canonicalConfigurationId &&
+            current.canonicalItems == expected.canonicalItems && current.canonicalDeltaCursor == expected.canonicalDeltaCursor)
+        requireNoReplicaBlockingMutation(current)
+        require(deltaCursor.isNotBlank() && items.map { it.id }.distinct().size == items.size)
+        // The production delta mapper owns wire validation; unrelated read-only/future items
+        // must not be narrowed through selected-item authoring eligibility here.
+        items.forEach { require(it.deletedAt == null); it.requireValidStructuralMetadata() }
+        val changed = current.canonicalItems != items
+        val refreshed = current.copy(canonicalItems = items, canonicalDeltaCursor = deltaCursor)
+        if (!changed) refreshed else refreshed.copy(
+            canonicalRecentlyDeleted = current.canonicalRecentlyDeleted.filterNot { deleted -> items.any { it.id == deleted.id } },
+            onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeIf { anchor ->
+                items.any { it.id == anchor.itemId && it.revision == anchor.canonicalRevision }
+            },
+            publishedScheduleRevision = null,
+            publishedScheduleProof = null,
+            publishedOccurrenceMembershipProof = null,
+            // Retain the publication high-water; a canonical read cannot authorize an epoch reset.
+            scheduleInputDigest = null,
+            localScheduleCompositionProvenance = null,
+            scheduleMessage = "Canonical items refreshed · schedule needs authoritative refresh",
+        ).withStaleHabitRecurrenceProjectionRemoved(current.canonicalItems)
+            .withHabitRecurrenceProjectionRebuilt()
+    }
 
     /** Mutates only the independent progress sidecar through an exact encrypted save. */
     internal fun mutateItemProgress(
