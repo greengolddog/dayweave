@@ -1,5 +1,7 @@
 package com.greengolddog.dayweave.state
 
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.AppDestination
@@ -1046,7 +1048,7 @@ class CanonicalAuthoringStoreTest {
     }
 
     @Test
-    fun newerDeletionConflictsSubmittedRestoreWithoutDroppingItsJournal() {
+    fun newerDeletionRetainsSubmittedRestoreForExactReplay() {
         val deleted = deletedRecord(ITEM_ID, NOW)
         val store = PlannerStore(
             boundState().copy(canonicalRecentlyDeleted = listOf(deleted)),
@@ -1071,9 +1073,242 @@ class CanonicalAuthoringStoreTest {
 
         val retained = store.state.value.pendingCanonicalAuthoringMutations.single()
         assertEquals(submitted.id, retained.id)
-        assertEquals(CanonicalAuthoringDisposition.CONFLICTED, retained.disposition)
+        assertEquals(submitted, retained)
         assertEquals(newer.revision, store.state.value.canonicalRecentlyDeleted.single().revision)
         assertTrue(store.hasCredentialReplacementBlocker())
+    }
+
+    @Test
+    fun historicalReceiptSettlesAtomicallyWithNewerAuthoritativeFieldsAndCursor() {
+        val base = canonicalItem(ITEM_ID, revision = 7)
+        val seed = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalReplace(
+            ITEM_ID, base.toCanonicalDraft().copy(title = "Reviewed old title"), MUTATION_ID,
+        )).mutation)
+        val response = base.copy(title = "Reviewed old title", revision = 8, updatedAt = NOW)
+        val newer = response.copy(title = "Newer private title", revision = 9, isSensitive = true)
+        val store = PlannerStore(boundState(newer).copy(
+            canonicalDeltaCursor = "already-passed-newer-revision",
+            pendingCanonicalAuthoringMutations = listOf(submitted),
+        ), nowEpochMillis = { NOW_MILLIS })
+
+        assertNotNull(store.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(listOf(newer), "fresh-cursor")))
+
+        assertEquals(newer, store.state.value.canonicalItems.single())
+        assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals("fresh-cursor", store.state.value.canonicalDeltaCursor)
+        assertNull(store.state.value.publishedScheduleProof)
+        val restarted = PlannerStore(requireNotNull(store.durableState.value), nowEpochMillis = { NOW_MILLIS })
+        assertEquals("fresh-cursor", restarted.state.value.canonicalDeltaCursor)
+        assertEquals(newer, restarted.state.value.canonicalItems.single())
+    }
+
+    @Test
+    fun historicalDesignatedCreateClearsOnlyItsLocalAnchorAcrossEncryptedCodecRestart() = runBlocking {
+        val temporary = org.junit.rules.TemporaryFolder().also { it.create() }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val seed = PlannerStore(boundState(), nowEpochMillis = { NOW_MILLIS })
+            val submitted = submit(seed, requireNotNull(seed.enqueueOnboardingFirstItemCreate(
+                taskDraft(), ITEM_ID, MUTATION_ID)).mutation)
+            assertEquals(ITEM_ID, seed.state.value.onboardingFirstItemAnchor?.itemId)
+            assertNull(seed.state.value.onboardingFirstItemAnchor?.canonicalRevision)
+            val response = canonicalItem(ITEM_ID, revision = 1)
+            val newer = response.copy(revision = 3, title = "Newer authoritative item")
+            val directory = temporary.root.toPath().resolve("synthetic-onboarding-replay")
+            fun repository(prepare: Boolean) = com.greengolddog.dayweave.data.RoomPlannerStateRepository(
+                com.greengolddog.dayweave.sync.NativeConvergenceSnapshotDao(
+                    com.greengolddog.dayweave.sync.NativeConvergenceDisk(
+                        directory, "synthetic-onboarding-replay", prepare)),
+            ) { NOW_MILLIS }
+            val firstRepository = repository(true)
+            firstRepository.save(seed.state.value.copy(canonicalItems = listOf(newer)))
+            val store = PlannerStore(DayWeaveUiState(), firstRepository, scope,
+                nowEpochMillis = { NOW_MILLIS })
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val receipt = requireNotNull(store.settleCanonicalAuthoringReplay(submitted, response,
+                canonicalUpdate(listOf(newer), "fresh-designated-create")))
+            assertTrue(withTimeout(3_000) { receipt.awaitDurable() })
+            assertNull(store.state.value.onboardingFirstItemAnchor)
+            assertEquals(newer, store.state.value.canonicalItems.single())
+            assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+            val restarted = requireNotNull(repository(false).load())
+            assertNull(restarted.onboardingFirstItemAnchor)
+            assertEquals(newer, restarted.canonicalItems.single())
+            assertTrue(restarted.pendingCanonicalAuthoringMutations.isEmpty())
+            assertEquals("fresh-designated-create", restarted.canonicalDeltaCursor)
+        } finally {
+            scope.cancel()
+            temporary.delete()
+        }
+    }
+
+    @Test
+    fun historicalReceiptCannotResurrectAnAbsentItemOrDiscardNewerDeletionEvidence() {
+        val base = canonicalItem(ITEM_ID, revision = 7)
+        val seed = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalReplace(
+            ITEM_ID, base.toCanonicalDraft(), MUTATION_ID,
+        )).mutation)
+        val response = base.copy(revision = 8, updatedAt = NOW)
+        val deletion = CanonicalRecentlyDeletedRecord(id = ITEM_ID, revision = 9,
+            deletedAt = NOW, retentionAnchorAt = NOW)
+        for (deleted in listOf(emptyList(), listOf(deletion))) {
+            val store = PlannerStore(boundState().copy(
+                canonicalDeltaCursor = "passed-tombstone", canonicalRecentlyDeleted = deleted,
+                pendingCanonicalAuthoringMutations = listOf(submitted),
+            ), nowEpochMillis = { NOW_MILLIS })
+            assertNotNull(store.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(emptyList(), "fresh-cursor")))
+            assertTrue(store.state.value.canonicalItems.isEmpty())
+            assertEquals(deleted, store.state.value.canonicalRecentlyDeleted)
+            assertEquals("fresh-cursor", store.state.value.canonicalDeltaCursor)
+        }
+    }
+
+    @Test
+    fun historicalSettlementDoesNotWeakenExactResponseOrBindingValidation() {
+        val base = canonicalItem(ITEM_ID, revision = 7)
+        val seed = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalReplace(
+            ITEM_ID, base.toCanonicalDraft(), MUTATION_ID,
+        )).mutation)
+        for (response in listOf(base.copy(revision = 9), base.copy(revision = 8, title = "Not reviewed"))) {
+            assertThrows(IllegalArgumentException::class.java) {
+                seed.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(listOf(response), "fresh-cursor"))
+            }
+            assertEquals(submitted, seed.state.value.pendingCanonicalAuthoringMutations.single())
+        }
+        val before = seed.state.value
+        assertThrows(IllegalArgumentException::class.java) {
+            seed.settleCanonicalAuthoringReplay(submitted, base.copy(revision = 8),
+                canonicalUpdate(listOf(base), "stale-full-read"))
+        }
+        assertEquals(before, seed.state.value)
+    }
+
+    @Test
+    fun atomicReplayRetainsOtherExactJournalsOrRejectsTheEntireRefresh() {
+        val base = canonicalItem(ITEM_ID)
+        val other = canonicalItem(CHILD_ID, parentId = ITEM_ID)
+        val seed = PlannerStore(boundState(base, other), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalReplace(
+            ITEM_ID, base.toCanonicalDraft(), MUTATION_ID)).mutation)
+        val childEdit = com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation(
+            id = stableUuid("other-replay-journal"), itemId = CHILD_ID, operation = CanonicalAuthoringOperation.REPLACE,
+            draft = other.toCanonicalDraft().copy(title = "Still saved locally"),
+            expectedRevision = other.revision, baseItem = other, createdAt = NOW)
+        val receipt = base.copy(revision = 8, updatedAt = NOW)
+        val initial = seed.state.value.copy(pendingCanonicalAuthoringMutations = listOf(submitted, childEdit))
+        val store = PlannerStore(initial, nowEpochMillis = { NOW_MILLIS })
+        assertNotNull(store.settleCanonicalAuthoringReplay(submitted, receipt,
+            canonicalUpdate(listOf(receipt, other), "fresh-all")))
+        assertEquals(listOf(childEdit), store.state.value.pendingCanonicalAuthoringMutations)
+
+        val childCreate = childEdit.copy(operation = CanonicalAuthoringOperation.CREATE,
+            expectedRevision = null, baseItem = null)
+        val createStore = PlannerStore(initial.copy(canonicalItems = listOf(base),
+            pendingCanonicalAuthoringMutations = listOf(submitted, childCreate)), nowEpochMillis = { NOW_MILLIS })
+        assertNotNull(createStore.settleCanonicalAuthoringReplay(submitted, receipt,
+            canonicalUpdate(listOf(receipt), "fresh-parent-with-local-child")))
+        assertEquals(listOf(childCreate), createStore.state.value.pendingCanonicalAuthoringMutations)
+
+        val missingParentStore = PlannerStore(initial, nowEpochMillis = { NOW_MILLIS })
+        val before = missingParentStore.state.value
+        assertThrows(IllegalArgumentException::class.java) {
+            missingParentStore.settleCanonicalAuthoringReplay(submitted, receipt,
+                canonicalUpdate(emptyList(), "parent-now-absent"))
+        }
+        assertEquals(before, missingParentStore.state.value)
+
+        val deleted = deletedRecord(CHILD_ID, NOW)
+        val restoreSeed = PlannerStore(boundState(base).copy(canonicalRecentlyDeleted = listOf(deleted)),
+            nowEpochMillis = { NOW_MILLIS })
+        val restore = requireNotNull(restoreSeed.enqueueCanonicalRestore(CHILD_ID, stableUuid("other-restore"))).mutation
+        val restoreStore = PlannerStore(restoreSeed.state.value.copy(
+            pendingCanonicalAuthoringMutations = listOf(submitted, restore)), nowEpochMillis = { NOW_MILLIS })
+        val restored = requireNotNull(deleted.lastKnownItem).copy(revision = deleted.revision + 1,
+            deletedAt = null, isExecutable = true)
+        val beforeRestore = restoreStore.state.value
+        assertThrows(IllegalArgumentException::class.java) {
+            restoreStore.settleCanonicalAuthoringReplay(submitted, receipt,
+                canonicalUpdate(listOf(receipt, restored), "unrelated-restore-would-disappear"))
+        }
+        assertEquals(beforeRestore, restoreStore.state.value)
+    }
+
+    @Test
+    fun equalRevisionContradictionsCannotSettleHistoricalCustody() {
+        val base = canonicalItem(ITEM_ID, revision = 7)
+        val seed = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalReplace(
+            ITEM_ID, base.toCanonicalDraft(), MUTATION_ID,
+        )).mutation)
+        val response = base.copy(revision = 8, updatedAt = NOW)
+        val conflictingStates = listOf(
+            boundState(response.copy(title = "Different same-revision content")),
+            boundState().copy(canonicalRecentlyDeleted = listOf(CanonicalRecentlyDeletedRecord(
+                id = ITEM_ID, revision = 8, deletedAt = NOW, retentionAnchorAt = NOW))),
+        )
+        for (state in conflictingStates) {
+            val store = PlannerStore(state.copy(pendingCanonicalAuthoringMutations = listOf(submitted)),
+                nowEpochMillis = { NOW_MILLIS })
+            assertThrows(IllegalArgumentException::class.java) {
+                store.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(listOf(response), "fresh-cursor"))
+            }
+            assertEquals(submitted, store.state.value.pendingCanonicalAuthoringMutations.single())
+        }
+    }
+
+    @Test
+    fun equalRevisionTombstoneReplayKeepsTheEarliestLocallyClampedRetentionAnchor() {
+        var now = NOW_MILLIS
+        val future = Instant.ofEpochMilli(now).plusSeconds(365L * 24 * 60 * 60).toString()
+        val record = deletedRecord(ITEM_ID, future).copy(retentionAnchorAt = null)
+        val store = PlannerStore(boundState().copy(canonicalRecentlyDeleted = listOf(record)),
+            nowEpochMillis = { now })
+        val earliest = store.state.value.canonicalRecentlyDeleted.single().retentionAnchorAt
+        now += 24L * 60 * 60 * 1_000
+        assertNotNull(store.recordCanonicalRecentlyDeleted(record.copy(lastKnownItem = null)))
+        assertEquals(earliest, store.state.value.canonicalRecentlyDeleted.single().retentionAnchorAt)
+        assertEquals(earliest, PlannerStore(requireNotNull(store.durableState.value),
+            nowEpochMillis = { now }).state.value.canonicalRecentlyDeleted.single().retentionAnchorAt)
+    }
+
+    @Test
+    fun submittedRestoreIsNotSettledByNewerActivePreflightEvidence() {
+        val deleted = deletedRecord(ITEM_ID, NOW)
+        val store = PlannerStore(boundState().copy(canonicalRecentlyDeleted = listOf(deleted)),
+            nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(store, requireNotNull(store.enqueueCanonicalRestore(ITEM_ID, MUTATION_ID)).mutation)
+        val newer = requireNotNull(deleted.lastKnownItem).copy(revision = deleted.revision + 2,
+            title = "Changed after restore", deletedAt = null, isExecutable = true)
+        assertNotNull(store.replaceCanonicalPlan(canonicalUpdate(listOf(newer), "newer-active-cursor")))
+        assertEquals(submitted, store.state.value.pendingCanonicalAuthoringMutations.single())
+    }
+
+    @Test
+    fun equalRevisionHistoricalTrashRequiresMatchingDeletionIdentityAndRetainedBody() {
+        val base = canonicalItem(ITEM_ID, revision = 7)
+        val seed = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+        val submitted = submit(seed, requireNotNull(seed.enqueueCanonicalTrash(ITEM_ID, MUTATION_ID)).mutation)
+        val response = base.copy(revision = 8, deletedAt = NOW, updatedAt = NOW, isExecutable = false)
+        val matching = CanonicalRecentlyDeletedRecord(id = ITEM_ID, revision = 8, deletedAt = NOW,
+            lastKnownItem = response, retentionAnchorAt = Instant.parse(NOW).minusSeconds(1).toString())
+        val evidence = listOf(matching.copy(parentId = PARENT_ID),
+            matching.copy(lastKnownItem = response.copy(title = "Conflicting deleted content")), matching)
+        for ((index, deleted) in evidence.withIndex()) {
+            val store = PlannerStore(boundState().copy(canonicalRecentlyDeleted = listOf(deleted),
+                pendingCanonicalAuthoringMutations = listOf(submitted)), nowEpochMillis = { NOW_MILLIS })
+            if (index < 2) {
+                assertThrows(IllegalArgumentException::class.java) {
+                    store.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(emptyList(), "fresh-cursor"))
+                }
+                assertEquals(submitted, store.state.value.pendingCanonicalAuthoringMutations.single())
+            } else {
+                assertNotNull(store.settleCanonicalAuthoringReplay(submitted, response, canonicalUpdate(emptyList(), "fresh-cursor")))
+                assertEquals(deleted.retentionAnchorAt, store.state.value.canonicalRecentlyDeleted.single().retentionAnchorAt)
+            }
+        }
     }
 
     @Test

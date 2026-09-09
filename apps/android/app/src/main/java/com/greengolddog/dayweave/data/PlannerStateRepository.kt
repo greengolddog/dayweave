@@ -1152,8 +1152,7 @@ class RoomPlannerStateRepository(
             val revisionIsValid = when {
                 !mutation.isSubmitted -> record.revision == expectedRevision
                 record.revision == expectedRevision -> true
-                record.revision > expectedRevision &&
-                    mutation.disposition == CanonicalAuthoringDisposition.CONFLICTED -> true
+                record.revision > expectedRevision && mutation.isSubmitted -> true
                 else -> false
             }
             if (!revisionIsValid) {

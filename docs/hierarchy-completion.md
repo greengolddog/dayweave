@@ -153,6 +153,19 @@ Android rejects unknown fields, and macOS retains them as read-only. Completion
 policy and override commands need an independently versioned contract rather
 than widening old status journals or silently changing their wire bytes.
 
+Structural admission must also distinguish policy-qualified parent completion
+from executable lifecycle. The current server `is_executing_state` predicate
+includes Completed, Skipped and Cancelled; `validate_parent` and non-leaf update
+guards therefore reject these states. Merely adding a derived status writer
+would leave later child edits and restores unable to re-enter that parent.
+Integrate explicit completion provenance and atomic reopening with these
+guards; do not broadly permit actively executing or ambiguous terminal parents.
+
+The native [historical receipt recovery](item-sync.md#historical-authoring-receipts)
+checkpoint addresses exact replay after newer state has arrived. Its store and
+sync regressions are prerequisites only; they do not verify server completion
+cascades, proposal undo or deep cold-client hydration.
+
 Both native clients still need protected completion explanations, required-edge
 editing, reviewed override/resume-automatic controls, encrypted offline intent,
 conflict/retry/discard custody, explicit storage upgrades and refreshed server

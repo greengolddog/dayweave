@@ -982,9 +982,8 @@ class CanonicalSyncManager(
     }
 
     /**
-     * Installs a fresh, unpublished canonical view before sending queued authoring operations.
-     * This both establishes the exact credential binding for first-sync drafts and gives submitted
-     * requests one authoritative cache observation before their immutable idempotent replay.
+     * Submitted custody is replayed before consulting mutable cache evidence. Fresh, unpublished
+     * preflight is only authority for first-send drafts, never proof of an old operation outcome.
      */
     private suspend fun publishPendingCanonicalAuthoringMutations(
         configuration: AuthenticatedApiConfiguration,
@@ -997,38 +996,51 @@ class CanonicalSyncManager(
         ) {
             return CanonicalAuthoringPushSummary()
         }
+        var appliedCount = 0
+        var conflictedCount = 0
+        val submitted = plannerStore.state.value.pendingCanonicalAuthoringMutations
+            .filter { it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING }
+            .sortedWith(compareBy({ it.createdAt }, { it.id }))
+        for (mutation in submitted) {
+            ensureConfigurationCurrent(configuration)
+            try {
+                sendAndConfirmCanonicalAuthoringMutation(configuration, mutation) {
+                    loadConsistentPlan(configuration, instant, planningZone, forceCanonicalRebuild = true).update
+                }
+                appliedCount += 1
+            } catch (_: PlannerApiException.CanonicalMutationRejected) {
+                ensureConfigurationCurrent(configuration)
+                persistCanonicalAuthoringConflict(mutation,
+                    "The server rejected this saved canonical hierarchy or revision. " +
+                        "Review the retained change before copying or discarding it.")
+                conflictedCount += 1
+                break
+            } catch (error: PlannerApiException.Validation) {
+                ensureConfigurationCurrent(configuration)
+                persistCanonicalAuthoringConflict(mutation, canonicalAuthoringValidationDiagnostic(error))
+                conflictedCount += 1
+                break
+            }
+        }
+        if (conflictedCount > 0 || plannerStore.state.value.pendingCanonicalAuthoringMutations.none {
+                it.disposition == CanonicalAuthoringDisposition.PENDING
+            }) {
+            return CanonicalAuthoringPushSummary(appliedCount, conflictedCount,
+                plannerStore.state.value.pendingCanonicalAuthoringMutations.count {
+                    it.disposition == CanonicalAuthoringDisposition.PENDING
+                })
+        }
         val preflight = loadConsistentPlan(configuration, instant, planningZone)
         rebaseCanonicalAuthoringPreflight(configuration, preflight.update.items)
         persistCanonicalAuthoringPreflight(configuration, preflight.update)
-
-        // A crash can leave one submitted request beside older unsubmitted siblings. Reconcile
-        // that ambiguous request first; the store's topological order remains intact because a
-        // submitted request cannot retain an unresolved dependency.
         val ordered = plannerStore.sortedCanonicalAuthoringMutations()
             .filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
-            .let { mutations ->
-                mutations.filter(PendingCanonicalAuthoringMutation::isSubmitted) +
-                    mutations.filterNot(PendingCanonicalAuthoringMutation::isSubmitted)
-            }
-        var appliedCount = 0
-        var conflictedCount = 0
         for (original in ordered) {
             var mutation = plannerStore.canonicalAuthoringMutation(original.id)
                 ?.takeIf { it.disposition == CanonicalAuthoringDisposition.PENDING }
                 ?: continue
-            if (mutation.isSubmitted) {
-                when (reconcileCanonicalAuthoringFromCache(configuration, mutation)) {
-                    CanonicalAuthoringCacheResolution.APPLIED -> {
-                        appliedCount += 1
-                        continue
-                    }
-                    CanonicalAuthoringCacheResolution.CONFLICTED -> {
-                        conflictedCount += 1
-                        break
-                    }
-                    CanonicalAuthoringCacheResolution.NO_EVIDENCE -> Unit
-                }
-            } else {
+            require(!mutation.isSubmitted) { "Submitted authoring must replay before preflight" }
+            run {
                 if (mutation.syncOrigin == null) {
                     val bound = plannerStore.bindCanonicalAuthoringMutation(
                         id = mutation.id,
@@ -1056,18 +1068,7 @@ class CanonicalSyncManager(
             }
             ensureConfigurationCurrent(configuration)
             try {
-                val remote = sendCanonicalAuthoringMutation(configuration, mutation)
-                ensureConfigurationCurrent(configuration)
-                val response = mapCanonicalItem(
-                    remote,
-                    requireActive = mutation.operation != CanonicalAuthoringOperation.TRASH,
-                )
-                val receipt = try {
-                    plannerStore.applyCanonicalAuthoringResponse(mutation, response)
-                } catch (error: IllegalArgumentException) {
-                    throw CanonicalAuthoringResponseException(error)
-                } ?: throw LocalPlannerStorageException()
-                if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+                val response = sendAndConfirmCanonicalAuthoringMutation(configuration, mutation)
                 appliedCount += 1
                 if (hasQueuedMutationForAffectedParent(mutation, response)) {
                     val refreshed = loadConsistentPlan(
@@ -1148,39 +1149,32 @@ class CanonicalSyncManager(
         }
     }
 
-    private suspend fun reconcileCanonicalAuthoringFromCache(
+    private suspend fun sendAndConfirmCanonicalAuthoringMutation(
         configuration: AuthenticatedApiConfiguration,
         mutation: PendingCanonicalAuthoringMutation,
-    ): CanonicalAuthoringCacheResolution {
-        val state = plannerStore.state.value
-        val candidate = when (mutation.operation) {
-            CanonicalAuthoringOperation.CREATE -> state.canonicalItems.firstOrNull {
-                it.id == mutation.itemId
-            }
-            CanonicalAuthoringOperation.REPLACE,
-            CanonicalAuthoringOperation.RESTORE,
-            -> state.canonicalItems.firstOrNull {
-                it.id == mutation.itemId &&
-                    it.revision > requireNotNull(mutation.expectedRevision)
-            }
-            CanonicalAuthoringOperation.TRASH -> state.canonicalRecentlyDeleted.firstOrNull {
-                it.id == mutation.itemId &&
-                    it.revision > requireNotNull(mutation.expectedRevision)
-            }?.lastKnownItem?.takeIf { it.deletedAt != null }
-        } ?: return CanonicalAuthoringCacheResolution.NO_EVIDENCE
+        historicalCatchUp: (suspend () -> CanonicalPlanUpdate)? = null,
+    ): CanonicalItemSnapshot {
+        val remote = sendCanonicalAuthoringMutation(configuration, mutation)
+        ensureConfigurationCurrent(configuration)
+        val response = mapCanonicalItem(remote,
+            requireActive = mutation.operation != CanonicalAuthoringOperation.TRASH)
+        val authoritativeRefresh = try {
+            historicalCatchUp?.invoke()
+        } catch (error: PlannerApiException.CanonicalMutationRejected) {
+            // Read/preview rejection is not evidence that the preceding immutable write failed.
+            throw CanonicalAuthoringResponseException(error)
+        } catch (error: PlannerApiException.Validation) {
+            throw CanonicalAuthoringResponseException(error)
+        }
         ensureConfigurationCurrent(configuration)
         val receipt = try {
-            plannerStore.applyCanonicalAuthoringResponse(mutation, candidate)
-        } catch (_: IllegalArgumentException) {
-            persistCanonicalAuthoringConflict(
-                mutation,
-                "The canonical item now has different content or revision state. Review the " +
-                    "retained local change before copying or discarding it.",
-            )
-            return CanonicalAuthoringCacheResolution.CONFLICTED
+            if (authoritativeRefresh == null) plannerStore.applyCanonicalAuthoringResponse(mutation, response)
+            else plannerStore.settleCanonicalAuthoringReplay(mutation, response, authoritativeRefresh)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalAuthoringResponseException(error)
         } ?: throw LocalPlannerStorageException()
         if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
-        return CanonicalAuthoringCacheResolution.APPLIED
+        return response
     }
 
     private suspend fun persistCanonicalAuthoringConflict(
@@ -4573,12 +4567,6 @@ class CanonicalSyncManager(
         NONE,
         APPLIED,
         SUPERSEDED,
-    }
-
-    private enum class CanonicalAuthoringCacheResolution {
-        NO_EVIDENCE,
-        APPLIED,
-        CONFLICTED,
     }
 
     private enum class TerminalProjectionResult {

@@ -138,3 +138,61 @@ during a mixed-version rollout may disable stream attempts for the current app
 activation without disabling polling. A `400`/`409` requires explicit binding
 or rebootstrap recovery rather than silently replacing encrypted local state.
 The endpoint adds no database schema or migration.
+
+## Historical authoring receipts
+
+A successful create, replace, trash or restore receipt belongs to its exact
+submitted journal, not necessarily to the newest canonical revision. After a
+lost reply or restart, another writer may already have changed the item's
+content, lifecycle, privacy or deletion state. Newer cache divergence alone is
+not proof that the original operation failed. Submitted requests retain their
+original body, revision, idempotency key and configuration binding for exact
+replay; fresh-edit preflight must not turn that replay into a new write or a
+conflict merely because the current item has advanced.
+
+Receipt admission still checks operation identity, reviewed content, deletion
+shape and the operation's successful revision. Equal-revision contradictions fail
+closed. When admitted active, trash or tombstone evidence is newer than a valid
+historical receipt, settling the journal preserves that newer state. It must
+not reselect obsolete content, revive a deleted item, downgrade privacy, or
+promote an old onboarding designation into current canonical evidence. A
+local-only designation that depended on the settled create journal is cleared
+instead. Failed encrypted persistence restores both the exact pending journal
+and its previous projections.
+
+Android also repairs a legacy preflight-cache ambiguity: an older pending
+replace/trash base could be retained while the saved delta cursor advanced past
+newer server changes. An already-submitted request therefore replays before
+fresh-edit preflight. Its historical item must not replace current data. A
+bounded full canonical rebuild repairs the uncertain baseline before new
+authoring or publication. Keep the exact submitted journal, including its
+privacy protection, until the admitted fresh evidence and receipt settlement
+can be saved together. If rebuild fails, the original request remains available
+for exact replay after restart. Do not fabricate canonical sensitivity
+fields/revisions or remove another saved intent to hide uncertainty.
+If the refreshed hierarchy cannot represent a remaining saved draft, retain
+all affected journals rather than partially installing the refresh or silently
+rewriting that draft.
+The existing hydration limits remain in force; this is not the future bounded
+current-state bootstrap required for deep completion cascades.
+
+A delayed equal-revision trash receipt must preserve the earliest local
+retention anchor. Server deletion timestamps may be ahead of the local clock,
+so reclamping the same receipt to a later observation must not extend the
+trash retention period.
+
+These semantics are a prerequisite for future derived ancestor-completion
+updates; they do not implement those updates. See
+[parent completion](hierarchy-completion.md) for the remaining integration.
+
+Verification on 2026-09-09: the warnings-denied macOS wrapper reports 1,004
+tests across 64 suites passing; Android's full JVM gate reports 1,609 tests
+across 130 suites with no failures or errors. Android lint passes with zero
+errors and 29 warnings. Each default native gate leaves
+its opt-in controlled-service phase skipped. Coverage includes lost responses,
+newer active/deleted state, exact replay through encrypted restart, own and
+inherited privacy, dependent-journal custody, equal-revision contradictions,
+local-only onboarding-anchor recovery and trash retention. The dedicated
+restore test checks repository/serializer restart; separate manager tests
+exercise synthetic encrypted-disk restart. These gates do not establish a new
+live-service/two-device acceptance run or final macOS/APK release acceptance.

@@ -5157,6 +5157,227 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun submittedCreateReplaysExactOriginalBeforeNewerCacheAndAcrossResponseLoss() = runBlocking {
+        val mutation = submittedReplayCreate()
+        val newer = authoredRemote(TASK_ID, 2, "Newer private edit").copy(isSensitive = true)
+        val cached = replayBase().copy(revision = 2, title = newer.title, isSensitive = true)
+        val store = PlannerStore(replayState(mutation).copy(canonicalItems = listOf(cached)))
+        val lost = FakeCanonicalTransport().apply { createError = IOException("Synthetic lost response") }
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE, manager(store, lost).refreshAndCompose())
+        assertTrue(lost.deltaCursors.isEmpty())
+        assertEquals(mutation, store.state.value.pendingCanonicalAuthoringMutations.single())
+        val restarted = PlannerStore(requireNotNull(store.durableState.value))
+        val replay = FakeCanonicalTransport().apply {
+            createHandler = { key, request ->
+                assertTrue(deltaCursors.isEmpty())
+                assertEquals(mutation.idempotencyKey, key)
+                assertEquals(lost.createRequests.single().second, request)
+                authoredRemote(TASK_ID, 1)
+            }
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange(type = "upsert", item = newer)), "replay-newer", false)
+            pages["replay-newer"] = RemoteItemDeltaPage(emptyList(), "replay-newer", false)
+            previewResult = itemsPreview(listOf(newer))
+        }
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(restarted, replay).refreshAndCompose())
+        assertEquals(listOf(null, "replay-newer"), replay.deltaCursors)
+        assertTrue(restarted.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(2L, restarted.state.value.canonicalItems.single().revision)
+        assertTrue(restarted.state.value.canonicalItems.single().isSensitive)
+    }
+
+    @Test
+    fun submittedReplaceRepairsLegacyRetainedBaseAfterCursorAlreadyPassedNewerRevision() = runBlocking {
+        val base = replayBase()
+        val mutation = submittedReplayCreate().copy(operation = CanonicalAuthoringOperation.REPLACE,
+            expectedRevision = 7, baseItem = base, draft = authoredDraft("Reviewed replacement"))
+        val store = PlannerStore(replayState(mutation).copy(canonicalItems = listOf(base)))
+        val newer = authoredRemote(TASK_ID, 9, "Subsequent server edit")
+        val transport = FakeCanonicalTransport().apply {
+            replacementHandler = { _, key, request ->
+                assertTrue(deltaCursors.isEmpty())
+                assertEquals(mutation.idempotencyKey, key)
+                assertEquals(7L, request.expectedRevision)
+                authoredRemote(TASK_ID, 8, "Reviewed replacement")
+            }
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange(type = "upsert", item = newer)), "repaired-current", false)
+            pages["repaired-current"] = RemoteItemDeltaPage(emptyList(), "repaired-current", false)
+            previewResult = itemsPreview(listOf(newer))
+        }
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
+        assertEquals(1, transport.replacementRequests.size)
+        assertEquals(listOf(null, "repaired-current"), transport.deltaCursors)
+        assertEquals(9L, store.state.value.canonicalItems.single().revision)
+    }
+
+    @Test
+    fun replayAfterConsumedTombstoneDoesNotReinstallOriginalCreate() = runBlocking {
+        val mutation = submittedReplayCreate()
+        val store = PlannerStore(replayState(mutation))
+        val transport = FakeCanonicalTransport().apply {
+            createResult = authoredRemote(TASK_ID, 1)
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange(type = "tombstone",
+                tombstone = RemoteItemTombstone(TASK_ID, 2, "2026-09-01T07:05:00Z"))), "deleted-current", false)
+            pages["deleted-current"] = RemoteItemDeltaPage(emptyList(), "deleted-current", false)
+            previewResult = itemsPreview(emptyList())
+        }
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
+        assertEquals(1, transport.createRequests.size)
+        assertTrue(store.state.value.canonicalItems.isEmpty())
+        assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals("deleted-current", store.state.value.canonicalDeltaCursor)
+    }
+
+    private fun submittedReplayCreate() = PendingCanonicalAuthoringMutation(
+        id = "99999999-9999-4999-8999-999999999990", itemId = TASK_ID,
+        operation = CanonicalAuthoringOperation.CREATE, draft = authoredDraft(),
+        createdAt = "2026-09-01T06:00:00Z", submittedAt = "2026-09-01T07:00:00Z",
+        syncOrigin = "https://api.example.test/", configurationId = "connection-1")
+
+    @Test
+    fun historicalTrashAndRestoreReplayEvenAfterNewerOppositeLifecycleEvidence() = runBlocking {
+        val base = replayBase()
+        val deletedBase = base.copy(revision = 8, deletedAt = "2026-09-01T07:01:00Z",
+            updatedAt = "2026-09-01T07:01:00Z", isExecutable = false)
+        val deletedRemote = authoredRemote(TASK_ID, 8).copy(deletedAt = deletedBase.deletedAt,
+            updatedAt = deletedBase.updatedAt, isExecutable = false)
+        for (operation in listOf(CanonicalAuthoringOperation.TRASH, CanonicalAuthoringOperation.RESTORE)) {
+            val restore = operation == CanonicalAuthoringOperation.RESTORE
+            val mutation = submittedReplayCreate().copy(operation = operation, draft = null,
+                expectedRevision = if (restore) 8 else 7, baseItem = if (restore) deletedBase else base)
+            val latest = authoredRemote(TASK_ID, 10, "Later restoration and edit")
+            val store = PlannerStore(replayState(mutation).copy(
+                canonicalItems = if (restore) emptyList() else listOf(base.copy(revision = 10, title = latest.title)),
+                canonicalRecentlyDeleted = if (restore) listOf(com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord(
+                    id = TASK_ID, revision = 10, deletedAt = "2026-09-01T07:03:00Z")) else emptyList()))
+            val transport = FakeCanonicalTransport().apply {
+                trashHandler = { request ->
+                    assertTrue(deltaCursors.isEmpty())
+                    assertEquals(mutation.idempotencyKey, request.idempotencyKey)
+                    deletedRemote
+                }
+                restoreHandler = { request ->
+                    assertTrue(deltaCursors.isEmpty())
+                    assertEquals(mutation.idempotencyKey, request.idempotencyKey)
+                    authoredRemote(TASK_ID, 9)
+                }
+                pages[null] = RemoteItemDeltaPage(if (restore) listOf(RemoteItemDeltaChange(type = "tombstone",
+                    tombstone = RemoteItemTombstone(TASK_ID, 10, "2026-09-01T07:03:00Z")))
+                    else listOf(RemoteItemDeltaChange(type = "upsert", item = latest)), "lifecycle-current", false)
+                pages["lifecycle-current"] = RemoteItemDeltaPage(emptyList(), "lifecycle-current", false)
+                previewResult = itemsPreview(if (restore) emptyList() else listOf(latest))
+            }
+            assertEquals(operation.name, CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
+            assertEquals(1, transport.trashRequests.size + transport.restoreRequests.size)
+            assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+            if (restore) assertTrue(store.state.value.canonicalItems.isEmpty())
+            else assertEquals(10L, store.state.value.canonicalItems.single().revision)
+        }
+    }
+
+    @Test
+    fun failedReplayCatchupRetainsExactJournalAndPrivacyThroughEncryptedRestart() = runBlocking {
+        val temporary = org.junit.rules.TemporaryFolder().also { it.create() }
+        var scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+          for (inherited in listOf(false, true)) {
+            val directory = temporary.root.toPath().resolve("encrypted-replay-$inherited")
+            fun repository(prepare: Boolean) = com.greengolddog.dayweave.data.RoomPlannerStateRepository(
+                NativeConvergenceSnapshotDao(NativeConvergenceDisk(directory, "synthetic-replay-binding", prepare)),
+            ) { clock.toEpochMilli() }
+            val firstRepository = repository(true)
+            val old = replayBase()
+            val privateParentId = "88888888-8888-4888-8888-888888888881"
+            val childId = "88888888-8888-4888-8888-888888888882"
+            val privateParent = old.copy(id = privateParentId, isSensitive = true)
+            val child = old.copy(id = childId, parentId = TASK_ID)
+            val draft = authoredDraft().copy(isSensitive = !inherited,
+                parentId = privateParentId.takeIf { inherited })
+            val submitted = submittedReplayCreate().copy(operation = CanonicalAuthoringOperation.REPLACE,
+                expectedRevision = 7, baseItem = old, draft = draft)
+            val original = authoredRemote(TASK_ID, 8, parentId = draft.parentId, isExecutable = false)
+                .copy(isSensitive = draft.isSensitive)
+            firstRepository.save(replayState(submitted).copy(canonicalItems = listOf(old, privateParent, child)))
+            val store = PlannerStore(DayWeaveUiState(), firstRepository, scope)
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val lostCatchup = FakeCanonicalTransport().apply {
+                replacementResult = original
+                deltaError = IOException("Synthetic rebuild offline")
+            }
+            assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+                manager(store, lostCatchup).refreshAndCompose())
+            val durable = requireNotNull(firstRepository.load())
+            assertEquals(listOf(submitted), durable.pendingCanonicalAuthoringMutations)
+            assertEquals("legacy-cursor-after-newer-state", durable.canonicalDeltaCursor)
+            assertEquals(old, durable.canonicalItems.first { it.id == TASK_ID })
+            assertReplayPrivacy(durable, setOf(TASK_ID, childId))
+            assertNull(durable.publishedScheduleProof)
+            scope.cancel()
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val restarted = PlannerStore(DayWeaveUiState(), repository(false), scope)
+            withTimeout(3_000) { restarted.loadState.first { it == PlannerLoadState.READY } }
+            assertEquals(listOf(submitted), restarted.state.value.pendingCanonicalAuthoringMutations)
+            assertReplayPrivacy(restarted.state.value, setOf(TASK_ID, childId))
+            val fresh = listOf(original.copy(revision = 9),
+                authoredRemote(privateParentId, 7, isExecutable = !inherited).copy(isSensitive = true),
+                authoredRemote(childId, 7, parentId = TASK_ID))
+            val recovery = FakeCanonicalTransport().apply {
+                replacementHandler = { _, key, request ->
+                    assertEquals(lostCatchup.replacementIdempotencyKeys.single(), key)
+                    assertEquals(lostCatchup.replacementRequests.single(), request)
+                    original
+                }
+                pages[null] = RemoteItemDeltaPage(fresh.map { RemoteItemDeltaChange(type = "upsert", item = it) },
+                    "recovered-current", false)
+                pages["recovered-current"] = RemoteItemDeltaPage(emptyList(), "recovered-current", false)
+                previewResult = itemsPreview(fresh)
+            }
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(restarted, recovery).refreshAndCompose())
+            assertEquals(1, recovery.replacementRequests.size)
+            assertEquals(listOf(null, "recovered-current"), recovery.deltaCursors)
+            assertTrue(restarted.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+            assertReplayPrivacy(restarted.state.value, setOf(TASK_ID, childId))
+            scope.cancel()
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+          }
+        } finally { scope.cancel(); temporary.delete() }
+    }
+
+    private fun assertReplayPrivacy(state: DayWeaveUiState, protectedIds: Set<String>) {
+        val presentation = com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringPresentation.build(state)
+        for (id in protectedIds) {
+            assertTrue(com.greengolddog.dayweave.model.effectiveCanonicalSensitivity(
+                state.canonicalItems, id, state.pendingCanonicalMutation, state.pendingCanonicalAuthoringMutations))
+            assertTrue(presentation.hierarchyRows.single { it.itemId == id }.isSensitive)
+        }
+        assertTrue(com.greengolddog.dayweave.assistant.AssistantContextProjector.project(state, clock).plannerItems.isEmpty())
+    }
+
+    @Test
+    fun replayCatchupValidationDoesNotTurnAnAcceptedWriteIntoAConflict() = runBlocking {
+        for (error in listOf(PlannerApiException.Validation(422), PlannerApiException.CanonicalMutationRejected())) {
+            val submitted = submittedReplayCreate()
+            val store = PlannerStore(replayState(submitted))
+            val transport = FakeCanonicalTransport().apply {
+                createResult = authoredRemote(TASK_ID, 1)
+                deltaError = error
+            }
+            assertTrue(CanonicalRefreshOutcome.SUCCESS != manager(store, transport).refreshAndCompose())
+            assertEquals(listOf(submitted), store.state.value.pendingCanonicalAuthoringMutations)
+            assertEquals(1, transport.createRequests.size)
+        }
+    }
+
+    private fun replayState(mutation: PendingCanonicalAuthoringMutation) = DayWeaveUiState(
+        canonicalSyncOrigin = "https://api.example.test/", canonicalConfigurationId = "connection-1",
+        canonicalDeltaCursor = "legacy-cursor-after-newer-state", pendingCanonicalAuthoringMutations = listOf(mutation))
+
+    private fun replayBase() = localCanonicalItem().copy(title = authoredDraft().title,
+        durationSeconds = 3_600, durationMinSeconds = 3_600, durationMaxSeconds = 3_600,
+        deadlineAt = "2026-09-01T12:00:00Z", deadlineKind = CanonicalDeadlineKind.DATE_TIME,
+        deadlineStrength = CanonicalDeadlineStrength.HARD, importance = 80, urgency = 60,
+        createdAt = "2026-09-01T07:00:00Z", updatedAt = "2026-09-01T07:00:00Z")
+
+    @Test
     fun submittedLegacyCreateAndReplaceKeepTheirFrozenDurationRequestShape() = runBlocking {
         val createMutation = PendingCanonicalAuthoringMutation(
             id = "99999999-9999-4999-8999-999999999991",
@@ -5179,14 +5400,13 @@ class CanonicalSyncManagerTest {
             ),
         )
         val createTransport = FakeCanonicalTransport().apply {
-            pages[null] = RemoteItemDeltaPage(emptyList(), "legacy-create-empty", false)
-            pages["legacy-create-empty"] = RemoteItemDeltaPage(
+            pages[null] = RemoteItemDeltaPage(
                 listOf(RemoteItemDeltaChange(type = "upsert", item = created)),
                 "legacy-create-applied",
                 false,
             )
-            queuedPreviews += itemsPreview(emptyList())
-            queuedPreviews += itemsPreview(listOf(created))
+            pages["legacy-create-applied"] = RemoteItemDeltaPage(emptyList(), "legacy-create-applied", false)
+            previewResult = itemsPreview(listOf(created))
             createHandler = { _, request ->
                 assertEquals(3_600L, request.durationSeconds)
                 assertEquals(null, request.durationKind)
@@ -5238,7 +5458,6 @@ class CanonicalSyncManagerTest {
             configurationId = "connection-1",
             submittedAt = "2026-09-01T07:00:00Z",
         ).also(PendingCanonicalAuthoringMutation::requireValid)
-        val remoteBase = authoredRemote(TASK_ID, revision = base.revision)
         val replaced = authoredRemote(
             TASK_ID,
             revision = base.revision + 1,
@@ -5254,17 +5473,12 @@ class CanonicalSyncManagerTest {
         )
         val replaceTransport = FakeCanonicalTransport().apply {
             pages[null] = RemoteItemDeltaPage(
-                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteBase)),
-                "legacy-replace-base",
-                false,
-            )
-            pages["legacy-replace-base"] = RemoteItemDeltaPage(
                 listOf(RemoteItemDeltaChange(type = "upsert", item = replaced)),
                 "legacy-replace-applied",
                 false,
             )
-            queuedPreviews += itemsPreview(listOf(remoteBase))
-            queuedPreviews += itemsPreview(listOf(replaced))
+            pages["legacy-replace-applied"] = RemoteItemDeltaPage(emptyList(), "legacy-replace-applied", false)
+            previewResult = itemsPreview(listOf(replaced))
             replacementHandler = { _, _, request ->
                 assertEquals(3_600L, request.item.durationSeconds)
                 assertEquals(null, request.item.durationKind)

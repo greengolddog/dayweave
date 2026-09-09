@@ -2250,6 +2250,7 @@ class PlannerStore(
         val freshById = freshItems.associateBy(CanonicalItemSnapshot::id)
         val reconciledRestoreItemIds = current.pendingCanonicalAuthoringMutations.asSequence()
             .filter { it.operation == CanonicalAuthoringOperation.RESTORE }
+            .filterNot(PendingCanonicalAuthoringMutation::isSubmitted)
             .filter { mutation ->
                 freshById[mutation.itemId]?.revision?.let { revision ->
                     revision > requireNotNull(mutation.expectedRevision)
@@ -2843,8 +2844,22 @@ class PlannerStore(
     fun applyCanonicalAuthoringResponse(
         expected: PendingCanonicalAuthoringMutation,
         response: CanonicalItemSnapshot,
+    ): PlannerPersistenceReceipt? = confirmCanonicalAuthoringResponse(expected, response, null)
+
+    /** Immutable replay receipt and current full-forest evidence settle in one encrypted save. */
+    internal fun settleCanonicalAuthoringReplay(
+        expected: PendingCanonicalAuthoringMutation,
+        response: CanonicalItemSnapshot,
+        authoritativeRefresh: CanonicalPlanUpdate,
+    ): PlannerPersistenceReceipt? = confirmCanonicalAuthoringResponse(expected, response, authoritativeRefresh)
+
+    private fun confirmCanonicalAuthoringResponse(
+        expected: PendingCanonicalAuthoringMutation,
+        response: CanonicalItemSnapshot,
+        authoritativeRefresh: CanonicalPlanUpdate?,
     ): PlannerPersistenceReceipt? {
         expected.requireValid()
+        authoritativeRefresh?.let(::validateCanonicalPlanUpdate)
         return mutateDurably { current ->
             val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == expected.id }
             require(index >= 0) { "Canonical authoring fence is unavailable" }
@@ -2866,8 +2881,56 @@ class PlannerStore(
                         it.revision == durableExpected.expectedRevision
                 },
             )
+            current.canonicalItems.firstOrNull {
+                it.id == response.id && it.revision == response.revision
+            }?.let { require(it == response) { "Equal canonical revisions have contradictory content" } }
+            current.canonicalRecentlyDeleted.firstOrNull {
+                it.id == response.id && it.revision == response.revision
+            }?.let { deleted ->
+                require(response.deletedAt != null && deleted.deletedAt.sameInstant(response.deletedAt) &&
+                    deleted.parentId == response.parentId) { "Equal canonical revisions have contradictory deletion evidence" }
+                deleted.lastKnownItem?.takeIf { it.revision == response.revision }?.let {
+                    require(it == response) { "Equal deleted revisions have contradictory content" }
+                }
+            }
             val withoutMutation = current.pendingCanonicalAuthoringMutations.filterNot {
                 it.id == durableExpected.id
+            }
+            if (authoritativeRefresh != null) {
+                require(authoritativeRefresh.syncOrigin == durableExpected.syncOrigin &&
+                    authoritativeRefresh.configurationId == durableExpected.configurationId)
+                authoritativeRefresh.items.firstOrNull {
+                    it.id == response.id
+                }?.let {
+                    require(it.revision >= response.revision) { "Fresh evidence predates the immutable receipt" }
+                    if (it.revision == response.revision) require(it == response) {
+                        "Fresh equal revisions contradict the immutable receipt"
+                    }
+                }
+                // Replays can return a superseded response. Old preflights could also retain old
+                // draft bases after advancing the cursor. Feed the complete fresh forest into
+                // both sides of reconciliation, never projecting the historical response itself.
+                // The original journal protects privacy until this entire exact save succeeds.
+                val freshIds = authoritativeRefresh.items.mapTo(hashSetOf()) { it.id }
+                val reconciliation = current.copy(
+                    pendingCanonicalAuthoringMutations = withoutMutation,
+                    canonicalItems = authoritativeRefresh.items,
+                    canonicalRecentlyDeleted = current.canonicalRecentlyDeleted.filterNot { it.id in freshIds },
+                    // A local-only designation depended on the journal being settled.
+                    // Neither the old receipt nor a newer item silently renews that review.
+                    onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeUnless {
+                        it.itemId == durableExpected.itemId && it.canonicalRevision == null
+                    },
+                )
+                val settled = canonicalPlanState(reconciliation, authoritativeRefresh)
+                require(settled.pendingCanonicalAuthoringMutations == withoutMutation) {
+                    "Replay refresh cannot settle or rewrite another saved change"
+                }
+                return@mutateDurably settled.copy(
+                    publishedScheduleRevision = null,
+                    publishedScheduleProof = null,
+                    scheduleMessage = "Exact saved change confirmed · current canonical items refreshed",
+                )
             }
             val removedBlockIds = current.schedule.asSequence()
                 .filter { it.canonicalItemId == durableExpected.itemId }
@@ -2967,7 +3030,7 @@ class PlannerStore(
             val pending = current.pendingCanonicalAuthoringMutations.firstOrNull {
                 it.itemId == record.id
             }
-            require(pending == null || pending.operation == CanonicalAuthoringOperation.RESTORE) {
+            require(pending == null || pending.isSubmitted || pending.operation == CanonicalAuthoringOperation.RESTORE) {
                 "A non-restore authoring operation must be reconciled before this tombstone"
             }
             if (pending?.expectedRevision?.let { record.revision < it } == true) {
@@ -3003,11 +3066,6 @@ class PlannerStore(
                             it.revision == retained.revision && it.deletedAt != null
                         } ?: pending.baseItem?.takeIf { retained.revision == pending.expectedRevision },
                     ).also(PendingCanonicalAuthoringMutation::requireValid)
-                    record.revision > requireNotNull(pending.expectedRevision) &&
-                        pending.disposition == CanonicalAuthoringDisposition.PENDING -> pending.copy(
-                            disposition = CanonicalAuthoringDisposition.CONFLICTED,
-                            diagnostic = "A newer deletion superseded the submitted restore",
-                        ).also(PendingCanonicalAuthoringMutation::requireValid)
                     else -> pending
                 }
                 current.pendingCanonicalAuthoringMutations.map {
@@ -3297,7 +3355,7 @@ class PlannerStore(
                         ?.parentId
                     CanonicalAuthoringOperation.TRASH -> null
                 }
-                if (mutation.disposition != CanonicalAuthoringDisposition.PENDING ||
+                if (mutation.isSubmitted || mutation.disposition != CanonicalAuthoringDisposition.PENDING ||
                     mutation.id in conflictedIds ||
                     mutation.operation !in setOf(
                         CanonicalAuthoringOperation.CREATE,
