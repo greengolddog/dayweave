@@ -2640,8 +2640,10 @@ final class CanonicalSyncStore: ObservableObject {
                 if observed { appliedCount += 1 }
                 continue
             }
-            guard try canonicalAuthoringPreflightIsCurrent(mutation) else { continue }
             if !mutation.hasBeenSubmitted {
+                // Current item/hierarchy admission is required only for a first
+                // send. Once submitted, revision drift cannot suppress exact replay.
+                guard try canonicalAuthoringPreflightIsCurrent(mutation) else { continue }
                 mutation = try planner.bindCanonicalAuthoringMutation(
                     mutation.id,
                     configurationIdentifier: client.configurationIdentifier
@@ -2884,9 +2886,8 @@ final class CanonicalSyncStore: ObservableObject {
         }
     }
 
-    /// Returns `true` when the exact journal was committed, `false` when it was
-    /// moved to explicit conflict review, and `nil` when no conclusive local
-    /// observation exists and the exact request still needs replay.
+    /// Returns `true` when the journal was reconciled, and `nil` when local
+    /// observation is inconclusive and the exact request still needs replay.
     private func reconcileCanonicalAuthoringFromCache(
         _ mutation: DayWeavePendingCanonicalAuthoringMutation
     ) throws -> Bool? {
@@ -2913,17 +2914,14 @@ final class CanonicalSyncStore: ObservableObject {
     private func reconcileCanonicalAuthoringCandidate(
         _ candidate: DayWeaveCanonicalItem,
         mutation: DayWeavePendingCanonicalAuthoringMutation
-    ) throws -> Bool {
+    ) throws -> Bool? {
         do {
             try planner.applyCanonicalAuthoringResponse(mutation.id, item: candidate)
             return true
         } catch PlannerCanonicalAuthoringError.invalidRemoteResponse {
-            _ = try planner.markCanonicalAuthoringMutationConflicted(
-                mutation.id,
-                diagnostic: "The canonical item now has different content or revision state. Review both versions before deciding which to keep."
-            )
-            warnings.append("An Inbox edit resolved to different canonical content and needs review.")
-            return false
+            // A later writer may have superseded a successful, lost response.
+            // Current state does not prove that this exact request made no change.
+            return nil
         }
     }
 
@@ -2986,23 +2984,17 @@ final class CanonicalSyncStore: ObservableObject {
                     ? try markCanonicalAuthoringNoEffectConflict(mutation)
                     : nil
             }
-            return try reconcileCanonicalAuthoringCandidate(candidate, mutation: mutation)
+            if let reconciled = try reconcileCanonicalAuthoringCandidate(candidate, mutation: mutation) {
+                return reconciled
+            }
+            return trustedNoEffect ? try markCanonicalAuthoringNoEffectConflict(mutation) : nil
         }
         if trustedNoEffect {
             return try markCanonicalAuthoringNoEffectConflict(mutation)
         }
-        if statusCode == 404,
-           observed.count < DayWeaveAPIClient.maximumCanonicalItemListLimit {
-            _ = try planner.markCanonicalAuthoringMutationConflicted(
-                mutation.id,
-                diagnostic: "The authenticated server confirmed that this item is absent. Keep the saved draft or discard this operation."
-            )
-            warnings.append("An Inbox edit references an item that is no longer available.")
-            return false
-        }
-        // A 409 with no observed item can mean the matching idempotent request
-        // is still in progress. A full 200-item list can also be truncated.
-        // Preserve the exact submitted journal and retry later.
+        // Generic 404/409 plus absence still cannot distinguish an original
+        // rejection from a successful request followed by deletion. A full
+        // list may also be truncated. Preserve exact submitted custody.
         return nil
     }
 

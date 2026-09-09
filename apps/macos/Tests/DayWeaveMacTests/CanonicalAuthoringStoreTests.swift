@@ -1050,7 +1050,10 @@ struct CanonicalAuthoringStoreTests {
         try restarted.applyCanonicalAuthoringResponse(mutation.id, item: deleted)
         restarted.endCanonicalSync()
         #expect(restarted.canonicalAuthoringMutation(id: mutation.id) == nil)
-        #expect(restarted.canonicalTrashEntry(id: itemID)?.revision == 2)
+        // Settling the final pin cannot reset the original local retention
+        // anchor. The expired row is removed; revision authority remains.
+        #expect(restarted.canonicalTrashEntry(id: itemID) == nil)
+        #expect(restarted.canonicalTombstoneRevisions[itemID] == 2)
     }
 
     @Test("the authoring journal byte budget rejects before persistence is wedged")

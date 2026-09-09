@@ -2738,6 +2738,33 @@ final class PlannerStore: ObservableObject {
             throw PlannerCanonicalAuthoringError.invalidRemoteResponse
         }
 
+        let currentItem = canonicalItems.first { $0.id == response.id }
+        let currentTrash = canonicalTrash.first { $0.id == response.id }
+        let currentTombstoneRevision = canonicalTombstoneRevisions[response.id] ?? 0
+        // A receipt proves only its exact operation. Equal revisions cannot describe
+        // contradictory state, even when the submitted draft itself still matches.
+        if let currentItem, currentItem.revision == response.revision,
+           currentItem != response {
+            throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+        }
+        if currentTombstoneRevision == response.revision, response.deletedAt == nil {
+            throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+        }
+        if let currentTrash, currentTrash.revision == response.revision {
+            guard response.deletedAt != nil, currentTrash.parentID == response.parentID else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            if let retained = currentTrash.lastKnownItem,
+               retained.revision == response.revision, retained != response {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+        }
+        let responseIsSuperseded = max(
+            currentItem?.revision ?? 0,
+            currentTrash?.revision ?? 0,
+            currentTombstoneRevision
+        ) > response.revision
+
         let priorItems = canonicalItems
         let priorTrash = canonicalTrash
         let priorTombstones = canonicalTombstoneRevisions
@@ -2745,38 +2772,40 @@ final class PlannerStore: ObservableObject {
         let priorOnboardingFirstItemAnchor = onboardingFirstItemAnchor
         let priorSelection = selectedCanonicalItemID
 
-        switch mutation.operation {
-        case .trash:
-            guard (canonicalItems.first(where: { $0.id == response.id })?.revision ?? 0)
-                    <= response.revision else {
-                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
-            }
-            canonicalItems.removeAll { $0.id == response.id }
-            canonicalTombstoneRevisions[response.id] = max(
-                canonicalTombstoneRevisions[response.id] ?? 0,
-                response.revision
-            )
-            upsertCanonicalTrash(DayWeaveCanonicalTrashEntry(item: response))
-        case .create, .replace, .restore:
-            guard response.revision > (canonicalTombstoneRevisions[response.id] ?? 0) else {
-                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
-            }
-            if let current = canonicalItems.first(where: { $0.id == response.id }),
-               current.revision > response.revision {
-                guard mutation.operation == .restore
-                        || mutation.draft?.matches(current) == true else {
+        if !responseIsSuperseded {
+            switch mutation.operation {
+            case .trash:
+                guard (canonicalItems.first(where: { $0.id == response.id })?.revision ?? 0)
+                        <= response.revision else {
                     throw PlannerCanonicalAuthoringError.invalidRemoteResponse
                 }
-            } else {
+                canonicalItems.removeAll { $0.id == response.id }
+                canonicalTombstoneRevisions[response.id] = max(
+                    canonicalTombstoneRevisions[response.id] ?? 0,
+                    response.revision
+                )
+                upsertCanonicalTrash(DayWeaveCanonicalTrashEntry(item: response))
+            case .create, .replace, .restore:
+                guard response.revision > (canonicalTombstoneRevisions[response.id] ?? 0) else {
+                    throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+                }
                 canonicalItems.removeAll { $0.id == response.id }
                 canonicalItems.append(response)
                 canonicalItems = Self.hierarchicallySorted(canonicalItems)
+                canonicalTombstoneRevisions.removeValue(forKey: response.id)
+                canonicalTrash.removeAll { $0.id == response.id }
             }
-            canonicalTombstoneRevisions.removeValue(forKey: response.id)
-            canonicalTrash.removeAll { $0.id == response.id }
         }
         pendingCanonicalAuthoringMutations.remove(at: index)
-        if onboardingFirstItemAnchor?.itemID == response.id {
+        // Historical settlement neither selects obsolete content nor upgrades a
+        // reviewed onboarding designation into current canonical evidence.
+        if responseIsSuperseded, onboardingFirstItemAnchor?.itemID == response.id,
+           onboardingFirstItemAnchor?.canonicalRevision == nil {
+            // The local-only designation depended on the journal just settled;
+            // a newer canonical record is not proof of that obsolete review.
+            onboardingFirstItemAnchor = nil
+        }
+        if !responseIsSuperseded, onboardingFirstItemAnchor?.itemID == response.id {
             switch mutation.operation {
             case .create, .replace, .restore:
                 onboardingFirstItemAnchor = .init(
@@ -2788,7 +2817,7 @@ final class PlannerStore: ObservableObject {
                 onboardingFirstItemAnchor = nil
             }
         }
-        selectedCanonicalItemID = response.id
+        if !responseIsSuperseded { selectedCanonicalItemID = response.id }
         guard currentCanonicalAuthoringStateIsValid else {
             canonicalItems = priorItems
             canonicalTrash = priorTrash
@@ -2998,7 +3027,17 @@ final class PlannerStore: ObservableObject {
     private func upsertCanonicalTrash(_ entry: DayWeaveCanonicalTrashEntry) {
         if let index = canonicalTrash.firstIndex(where: { $0.id == entry.id }) {
             guard canonicalTrash[index].revision <= entry.revision else { return }
-            canonicalTrash[index] = entry
+            if canonicalTrash[index].revision == entry.revision {
+                // deletedAt is also the first locally observed retention anchor.
+                // Replaying a future-dated server timestamp must not restart it.
+                canonicalTrash[index] = .init(
+                    id: entry.id, revision: entry.revision,
+                    deletedAt: min(canonicalTrash[index].deletedAt, entry.deletedAt),
+                    parentID: entry.parentID, lastKnownItem: entry.lastKnownItem
+                )
+            } else {
+                canonicalTrash[index] = entry
+            }
         } else {
             canonicalTrash.append(entry)
         }

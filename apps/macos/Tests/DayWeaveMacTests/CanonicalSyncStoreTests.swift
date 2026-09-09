@@ -2660,6 +2660,81 @@ struct CanonicalSyncStoreTests {
         #expect(creates[1].headers["Idempotency-Key"] == queued.idempotencyKey)
     }
 
+    @Test("lost authoring replies replay exact requests after a newer differing delta", arguments: [false, true])
+    func canonicalAuthoringHistoricalReplyReplaysPastNewerCache(replace: Bool) async throws {
+        let token = "synthetic-authoring-historical-\(replace ? "replace" : "create")"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000017")!
+        let now = Date(timeIntervalSince1970: 1_787_990_400)
+        let original = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1, status: "inbox"))
+        let responseObject = Self.itemObject(id: itemID, revision: replace ? 2 : 1, status: "inbox")
+            .replacingOccurrences(of: "Write launch plan", with: "Exact reviewed synthetic title")
+        let response = try Self.decodeItem(responseObject)
+        let newerObject = Self.itemObject(id: itemID, revision: 4, status: "completed", isSensitive: true)
+            .replacingOccurrences(of: "Write launch plan", with: "Newer synthetic canonical title")
+        let newer = try Self.decodeItem(newerObject)
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(canonicalItems: replace ? [original] : [],
+            canonicalDeltaCursor: "historical-before", canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence, restoreFromPersistence: false, now: { now })
+        let draft = DayWeaveCanonicalItemDraft(item: response)
+        let queued = try replace ? planner.enqueueCanonicalReplace(itemID: itemID, draft: draft)
+            : planner.enqueueCanonicalCreate(itemID: itemID, draft: draft)
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"historical-lost","has_more":false}"#.utf8)))
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+        let submitted = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(submitted.hasBeenSubmitted && submitted.disposition == .pending)
+        let first = try #require(URLProtocolStub.storage.requests(for: token).last)
+        #expect(first.method == (replace ? "PUT" : "POST"))
+        #expect(first.body != nil)
+        #expect(first.headers["Idempotency-Key"] == queued.idempotencyKey)
+
+        let restored = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restored.pendingCanonicalAuthoringMutations == [submitted])
+        URLProtocolStub.storage.enqueue(key: token,
+            .init(statusCode: 200, body: Data("{\"changes\":[{\"type\":\"upsert\",\"item\":\(newerObject)}],\"next_cursor\":\"historical-newer\",\"has_more\":false}".utf8)))
+        // Lose another reply after the divergent observation. That observation
+        // still cannot turn uncertain submitted custody into discardable conflict.
+        await Self.makeSync(planner: restored, token: token, now: now).sync()
+        #expect(restored.pendingCanonicalAuthoringMutations == [submitted])
+        #expect(restored.canonicalItem(id: itemID) == newer)
+        URLProtocolStub.storage.enqueue(key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"historical-generic","has_more":false}"#.utf8)),
+            .init(statusCode: replace ? 404 : 409,
+                body: Data(#"{"error":{"code":"conflict","message":"Synthetic ambiguous response"}}"#.utf8)),
+            .init(statusCode: 200, body: replace ? Data(#"{"items":[]}"#.utf8)
+                : Data("{\"items\":[\(newerObject)]}".utf8)))
+        await Self.makeSync(planner: restored, token: token, now: now).sync()
+        #expect(restored.pendingCanonicalAuthoringMutations == [submitted])
+        #expect(restored.canonicalItem(id: itemID) == newer)
+        let resumed = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(resumed.pendingCanonicalAuthoringMutations == [submitted])
+        URLProtocolStub.storage.enqueue(key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"historical-restarted","has_more":false}"#.utf8)),
+            .init(statusCode: replace ? 200 : 201, body: Data("{\"item\":\(responseObject)}".utf8)),
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"historical-final","has_more":false}"#.utf8)),
+            .init(statusCode: 200, body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 4]).utf8)))
+        let sync = Self.makeSync(planner: resumed, token: token, now: now)
+        await sync.sync()
+        let writes = URLProtocolStub.storage.requests(for: token).filter { $0.headers["Idempotency-Key"] == queued.idempotencyKey }
+        #expect(writes.count == 4)
+        for replay in writes {
+            #expect(replay.body == first.body)
+            #expect(replay.method == first.method)
+            #expect(replay.url == first.url)
+        }
+        #expect(resumed.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(resumed.canonicalItem(id: itemID) == newer)
+        #expect(resumed.canonicalItemRequiresSensitivePresentation(itemID: itemID))
+        #expect(sync.warnings.allSatisfy { !$0.contains("conflict review") })
+        if case .online = sync.status {} else { Issue.record("Historical replay did not complete the sync") }
+        let final = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(final.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(final.canonicalItem(id: itemID) == newer)
+    }
+
     @Test("a pulled matching create resolves a submitted journal without another create")
     func canonicalAuthoringReconcilesSubmittedCreateFromDelta() async throws {
         let token = "canonical-authoring-delta-reconcile-token"
