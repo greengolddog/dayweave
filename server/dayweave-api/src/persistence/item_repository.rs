@@ -16,7 +16,15 @@ use crate::items::{
     delivery_bounded_delta_prefix_len, max_expanded_delta_page_size,
 };
 
-use super::{DatabaseScope, database::lock_canonical_item_space};
+use super::{
+    DatabaseScope,
+    database::lock_canonical_item_space,
+    item_completion_repository::{
+        CompletionDeliveryMode, capture_completion_before_tx, completion_error,
+        ensure_legacy_completion_transition_tx, finalize_item_completion_tx,
+        has_qualified_completion_tx,
+    },
+};
 
 const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
      item.duration_kind, item.duration_seconds, item.duration_min_seconds, item.duration_max_seconds, \
@@ -90,6 +98,7 @@ pub(crate) enum TransactionalItemCommand {
         item_id: Uuid,
         expected_revision: u64,
         snapshot: Box<Item>,
+        completion_state: Option<Box<crate::item_completion::ItemCompletionState>>,
     },
 }
 
@@ -125,10 +134,49 @@ impl PostgresItemRepository {
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self { pool, scope }
     }
+
+    /// Establishes one-off completion authority before serving canonical state.
+    ///
+    /// # Errors
+    /// Rejects invalid or fenced authority and rolls back every derived effect.
+    pub async fn initialize_completion(
+        &self,
+    ) -> Result<(), crate::item_completion::ItemCompletionError> {
+        super::item_completion_repository::initialize(&self.pool, self.scope).await
+    }
 }
 
 #[async_trait]
 impl ItemRepository for PostgresItemRepository {
+    async fn get_completion(
+        &self,
+        item_id: Uuid,
+    ) -> Result<
+        crate::item_completion::ItemCompletionSnapshot,
+        crate::item_completion::ItemCompletionError,
+    > {
+        super::item_completion_repository::get(&self.pool, self.scope, item_id).await
+    }
+
+    async fn put_completion(
+        &self,
+        item_id: Uuid,
+        command: crate::item_completion::ItemCompletionCommand,
+        _now: DateTime<Utc>,
+        actor_session_id: Option<Uuid>,
+    ) -> Result<
+        crate::item_completion::ItemCompletionMutation,
+        crate::item_completion::ItemCompletionError,
+    > {
+        super::item_completion_repository::put(
+            &self.pool,
+            self.scope,
+            item_id,
+            command,
+            actor_session_id,
+        )
+        .await
+    }
     async fn bootstrap(
         &self,
         position: Option<crate::items::ItemBootstrapPosition>,
@@ -185,12 +233,12 @@ impl ItemRepository for PostgresItemRepository {
         // Execution Start takes the execution-state lock before the canonical
         // item-space lock. Adding a child must take the same order because it
         // makes the parent non-executable.
-        let active_execution = if item.parent_id.is_some() {
-            lock_active_execution(&mut transaction, self.scope.workspace_id).await?
-        } else {
-            None
-        };
+        let active_execution =
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(completion_error)?;
         validate_parent(
             &mut transaction,
             self.scope.workspace_id,
@@ -246,6 +294,15 @@ impl ItemRepository for PostgresItemRepository {
         .await?;
         validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
             .await?;
+        finalize_item_completion_tx(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            item.updated_at,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(completion_error)?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -324,21 +381,26 @@ impl ItemRepository for PostgresItemRepository {
         // execution must take the same order so either Start observes that state or this
         // replacement observes the open lease, without an item/state deadlock. Exact idempotency
         // replays intentionally return before taking this current-state guard.
-        let active_execution = if replacement.status.prevents_execution()
-            || replacement.may_remove_executable_component()
-            || replacement.parent_id.is_some()
-        {
-            lock_active_execution(&mut transaction, self.scope.workspace_id).await?
-        } else {
-            None
-        };
+        let active_execution =
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(completion_error)?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
         ensure_revision(&current, expected_revision)?;
         let previous_parent_id = current.parent_id;
         let previous_sibling_order = current.sibling_order;
         let item = current.replaced(replacement, now)?;
+        ensure_legacy_completion_transition_tx(
+            &mut transaction,
+            self.scope.workspace_id,
+            &current,
+            &item,
+        )
+        .await
+        .map_err(completion_error)?;
         if ((!current.status.prevents_execution() && item.status.prevents_execution())
             || (current.is_executable && !item.execution_is_allowed(false)))
             && let Some((session_id, active_item_id)) = active_execution
@@ -374,6 +436,10 @@ impl ItemRepository for PostgresItemRepository {
         .await?;
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await?
             && item.status.is_executing_state()
+            && !(item.status == ItemStatus::Completed
+                && has_qualified_completion_tx(&mut transaction, self.scope.workspace_id, id)
+                    .await
+                    .map_err(completion_error)?)
         {
             return Err(ItemRepositoryError::NonLeafExecutable);
         }
@@ -411,6 +477,15 @@ impl ItemRepository for PostgresItemRepository {
         }
         validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
             .await?;
+        finalize_item_completion_tx(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            item.updated_at,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(completion_error)?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -439,6 +514,9 @@ impl ItemRepository for PostgresItemRepository {
         let active_execution =
             lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(completion_error)?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
         ensure_revision(&current, expected_revision)?;
@@ -476,6 +554,15 @@ impl ItemRepository for PostgresItemRepository {
         .await?;
         validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
             .await?;
+        finalize_item_completion_tx(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            item.updated_at,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(completion_error)?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -504,6 +591,9 @@ impl ItemRepository for PostgresItemRepository {
         let active_execution =
             lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(completion_error)?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, true).await?;
         if current.deleted_at.is_none() {
@@ -533,6 +623,10 @@ impl ItemRepository for PostgresItemRepository {
         let item = current.restored(now)?;
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await?
             && item.status.is_executing_state()
+            && !(item.status == ItemStatus::Completed
+                && has_qualified_completion_tx(&mut transaction, self.scope.workspace_id, id)
+                    .await
+                    .map_err(completion_error)?)
         {
             return Err(ItemRepositoryError::NonLeafExecutable);
         }
@@ -559,6 +653,15 @@ impl ItemRepository for PostgresItemRepository {
         .await?;
         validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
             .await?;
+        finalize_item_completion_tx(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            item.updated_at,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(completion_error)?;
         complete_idempotency(&mut transaction, self.scope, &idempotency, &item).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(ItemMutation {
@@ -881,6 +984,47 @@ pub(crate) async fn list_item_batch_tx(
         .collect()
 }
 
+/// Completion admits the full current forest, never historical trash or a
+/// scheduler-filtered subset. One extra row detects overflow before evaluation.
+pub(crate) async fn list_active_completion_items_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Vec<Item>, ItemRepositoryError> {
+    let (count, bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*),COALESCE(sum(octet_length(to_jsonb(item)::text)+512+ \
+         (SELECT COALESCE(sum(octet_length(to_jsonb(dependency)::text)+256),0) \
+          FROM item_dependencies dependency WHERE dependency.workspace_id=item.workspace_id \
+          AND dependency.successor_item_id=item.id)+COALESCE((SELECT octet_length(state.state_json::text) \
+          FROM item_completion_state state WHERE state.workspace_id=item.workspace_id AND state.item_id=item.id),0)),0)::bigint \
+         FROM items item WHERE item.workspace_id=$1 AND item.trashed_at IS NULL",
+    ).bind(workspace_id).fetch_one(&mut **transaction).await.map_err(internal)?;
+    if count > i64::try_from(crate::item_completion::MAX_COMPLETION_ITEMS).map_err(internal)?
+        || bytes
+            > i64::try_from(crate::item_completion::MAX_COMPLETION_PAYLOAD_BYTES)
+                .map_err(internal)?
+        || bytes < 0
+    {
+        return Err(ItemRepositoryError::DeltaGroupTooLarge);
+    }
+    let mut builder = QueryBuilder::<Postgres>::new(ITEM_SELECT);
+    builder
+        .push(" WHERE item.workspace_id = ")
+        .push_bind(workspace_id)
+        .push(" AND item.trashed_at IS NULL ORDER BY item.id LIMIT ")
+        .push_bind(
+            i64::try_from(crate::item_completion::MAX_COMPLETION_ITEMS + 1).map_err(internal)?,
+        );
+    let rows = builder
+        .build()
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    if rows.len() > crate::item_completion::MAX_COMPLETION_ITEMS {
+        return Err(ItemRepositoryError::DeltaGroupTooLarge);
+    }
+    rows.iter().map(item_from_row).collect()
+}
+
 /// Constructs the exact neutral identity persisted for a staged create.
 /// Projection and SQL staging share this normalization so neither can observe
 /// hierarchy, dependency, completion, or blocker state before finalization.
@@ -1022,6 +1166,14 @@ pub(crate) async fn apply_item_command_tx(
             let previous_parent_id = current.parent_id;
             let previous_sibling_order = current.sibling_order;
             let item = current.replaced(replacement, now)?;
+            ensure_legacy_completion_transition_tx(
+                transaction,
+                scope.workspace_id,
+                &current,
+                &item,
+            )
+            .await
+            .map_err(completion_error)?;
             reject_closing_transition_for_active_execution(
                 transaction,
                 scope.workspace_id,
@@ -1037,6 +1189,10 @@ pub(crate) async fn apply_item_command_tx(
             validate_blocked_by(transaction, scope.workspace_id, item.blocked_by_item_id).await?;
             if has_active_children(transaction, scope.workspace_id, item_id).await?
                 && item.status.is_executing_state()
+                && !(item.status == ItemStatus::Completed
+                    && has_qualified_completion_tx(transaction, scope.workspace_id, item_id)
+                        .await
+                        .map_err(completion_error)?)
             {
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
@@ -1150,6 +1306,10 @@ pub(crate) async fn apply_item_command_tx(
             let item = current.restored(now)?;
             if has_active_children(transaction, scope.workspace_id, item_id).await?
                 && item.status.is_executing_state()
+                && !(item.status == ItemStatus::Completed
+                    && has_qualified_completion_tx(transaction, scope.workspace_id, item_id)
+                        .await
+                        .map_err(completion_error)?)
             {
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
@@ -1188,6 +1348,7 @@ pub(crate) async fn apply_item_command_tx(
             item_id,
             expected_revision,
             snapshot,
+            completion_state,
         } => {
             restore_item_snapshot_tx(
                 transaction,
@@ -1195,6 +1356,7 @@ pub(crate) async fn apply_item_command_tx(
                 item_id,
                 expected_revision,
                 *snapshot,
+                completion_state.as_deref(),
                 now,
                 record,
                 graph_mode,
@@ -1204,13 +1366,14 @@ pub(crate) async fn apply_item_command_tx(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keeps canonical inverse, completion custody, and primary delta in one reviewed boundary.
 async fn restore_item_snapshot_tx(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     item_id: Uuid,
     expected_revision: u64,
     mut snapshot: Item,
+    completion_state: Option<&crate::item_completion::ItemCompletionState>,
     now: DateTime<Utc>,
     record: bool,
     graph_mode: TransactionalGraphMode,
@@ -1219,6 +1382,16 @@ async fn restore_item_snapshot_tx(
     ensure_revision(&current, expected_revision)?;
     if snapshot.id != item_id || snapshot.created_at != current.created_at {
         return Err(ItemRepositoryError::Internal);
+    }
+    if completion_state.is_none() {
+        ensure_legacy_completion_transition_tx(
+            transaction,
+            scope.workspace_id,
+            &current,
+            &snapshot,
+        )
+        .await
+        .map_err(completion_error)?;
     }
     reject_closing_transition_for_active_execution(
         transaction,
@@ -1236,6 +1409,15 @@ async fn restore_item_snapshot_tx(
         validate_blocked_by(transaction, scope.workspace_id, snapshot.blocked_by_item_id).await?;
         if has_active_children(transaction, scope.workspace_id, item_id).await?
             && snapshot.status.is_executing_state()
+            && !super::item_completion_repository::has_qualified_completion(
+                &snapshot,
+                completion_state,
+            )
+            && !(completion_state.is_none()
+                && snapshot.status == ItemStatus::Completed
+                && has_qualified_completion_tx(transaction, scope.workspace_id, item_id)
+                    .await
+                    .map_err(completion_error)?)
         {
             return Err(ItemRepositoryError::NonLeafExecutable);
         }
@@ -1276,6 +1458,18 @@ async fn restore_item_snapshot_tx(
             change_kind,
         )
         .await?;
+    }
+    if let Some(completion_state) = completion_state {
+        super::item_completion_repository::restore_completion_semantics_tx(
+            transaction,
+            scope,
+            &current,
+            &restored,
+            completion_state,
+            now,
+        )
+        .await
+        .map_err(completion_error)?;
     }
     if current.parent_id != restored.parent_id
         || current.sibling_order != restored.sibling_order
@@ -1374,7 +1568,7 @@ async fn insert_item(
     }
 }
 
-async fn update_item(
+pub(super) async fn update_item(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     item: &Item,
@@ -1612,7 +1806,12 @@ pub(super) async fn validate_parent(
     let Some(status) = status else {
         return Err(ItemRepositoryError::ParentNotFound(parent_id));
     };
-    if parse_status(&status)?.is_executing_state() {
+    if parse_status(&status)?.is_executing_state()
+        && !(status == "completed"
+            && has_qualified_completion_tx(transaction, workspace_id, parent_id)
+                .await
+                .map_err(completion_error)?)
+    {
         return Err(ItemRepositoryError::InvalidParentState);
     }
     let cycle: bool = sqlx::query_scalar(
@@ -1964,12 +2163,12 @@ async fn complete_idempotency(
 }
 
 #[derive(Clone, Copy)]
-enum ChangeKind {
+pub(super) enum ChangeKind {
     Upsert,
     Tombstone,
 }
 
-async fn record_mutation(
+pub(super) async fn record_mutation(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     item: &Item,

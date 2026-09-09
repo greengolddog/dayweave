@@ -12,6 +12,11 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::execution::ExecutionRepository;
+use crate::item_completion::{
+    ItemCompletionCommand, ItemCompletionEffect, ItemCompletionError,
+    ItemCompletionExecutionEvidence, ItemCompletionMutation, ItemCompletionPlan,
+    ItemCompletionSnapshot, ItemCompletionState, plan_item_completion,
+};
 
 use super::{Item, ItemDomainError, ReplaceItem};
 
@@ -148,6 +153,29 @@ pub enum ItemRepositoryError {
 pub trait ItemRepository: Send + Sync {
     fn cursor_scope(&self) -> Uuid;
 
+    async fn get_completion(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<
+        crate::item_completion::ItemCompletionSnapshot,
+        crate::item_completion::ItemCompletionError,
+    > {
+        Err(crate::item_completion::ItemCompletionError::Unavailable)
+    }
+
+    async fn put_completion(
+        &self,
+        _item_id: Uuid,
+        _command: crate::item_completion::ItemCompletionCommand,
+        _now: DateTime<Utc>,
+        _actor_session_id: Option<Uuid>,
+    ) -> Result<
+        crate::item_completion::ItemCompletionMutation,
+        crate::item_completion::ItemCompletionError,
+    > {
+        Err(crate::item_completion::ItemCompletionError::Unavailable)
+    }
+
     async fn bootstrap(
         &self,
         _position: Option<super::ItemBootstrapPosition>,
@@ -265,9 +293,168 @@ struct MemoryExecutionGuard {
     operation_gate: Arc<Mutex<()>>,
 }
 
+impl InMemoryItemRepository {
+    async fn completion_execution(
+        &self,
+    ) -> Result<crate::execution::ExecutionSnapshot, ItemCompletionError> {
+        match &self.execution_guard {
+            Some(guard) => guard
+                .execution
+                .snapshot()
+                .await
+                .map_err(|_| ItemCompletionError::Unavailable),
+            None => Ok(crate::execution::ExecutionSnapshot {
+                revision: 0,
+                active_session: None,
+            }),
+        }
+    }
+
+    /// The execution gate always precedes canonical state, including writes whose
+    /// primary target is not itself executable. An ancestor may still transition.
+    async fn mutate_with_completion<F>(
+        &self,
+        context: IdempotencyContext,
+        mutation: F,
+    ) -> Result<ItemMutation, ItemRepositoryError>
+    where
+        F: FnOnce(
+            &mut MemoryState,
+            IdempotencyContext,
+            &crate::execution::ExecutionSnapshot,
+        ) -> Result<ItemMutation, ItemRepositoryError>,
+    {
+        let _operation = match &self.execution_guard {
+            Some(guard) => Some(guard.operation_gate.lock().await),
+            None => None,
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(result) = replay(&mut state, &context) {
+                return result;
+            }
+        }
+        let execution = self
+            .completion_execution()
+            .await
+            .map_err(completion_repository_error)?;
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        let result = mutation(&mut next, context, &execution)?;
+        if result.replayed {
+            return Ok(result);
+        }
+        let plan = completion_memory_plan(&next, &execution, None, result.item.updated_at)
+            .map_err(completion_repository_error)?;
+        apply_completion_memory(&mut next, plan).map_err(completion_repository_error)?;
+        *state = next;
+        // The original primary receipt remains immutable even if finalization
+        // emitted a newer revision of the same identity.
+        Ok(result)
+    }
+}
+
+fn completion_memory_plan(
+    state: &MemoryState,
+    execution: &crate::execution::ExecutionSnapshot,
+    command: Option<(Uuid, &ItemCompletionCommand)>,
+    now: DateTime<Utc>,
+) -> Result<ItemCompletionPlan, ItemCompletionError> {
+    let items = state
+        .items
+        .values()
+        .filter(|item| item.deleted_at.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let states = state
+        .completion_states
+        .values()
+        .filter(|value| {
+            state
+                .items
+                .get(&value.item_id)
+                .is_some_and(|item| item.deleted_at.is_none())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let evidence = ItemCompletionExecutionEvidence {
+        revision: execution.revision,
+        live_item_ids: execution
+            .active_session
+            .iter()
+            .map(|session| session.item_id)
+            .collect(),
+    };
+    plan_item_completion(&items, &states, &evidence, command, now)
+}
+
+fn apply_completion_memory(
+    state: &mut MemoryState,
+    plan: ItemCompletionPlan,
+) -> Result<(), ItemCompletionError> {
+    let mut group_id = Uuid::new_v4();
+    let mut count = 0;
+    let mut bytes = 0;
+    for effect in plan.effects {
+        if effect
+            .after_state
+            .provenance
+            .as_ref()
+            .and_then(|value| value.reopen.blocked_by_item_id)
+            .is_some_and(|id| !state.items.contains_key(&id))
+            || effect
+                .after_item
+                .blocked_by_item_id
+                .is_some_and(|id| !state.items.contains_key(&id))
+        {
+            return Err(ItemCompletionError::Invalid);
+        }
+        let change = DeltaChange::Upsert {
+            item: Box::new(effect.after_item.clone()),
+        };
+        let size = serde_json::to_vec(&change)
+            .map_err(|_| ItemCompletionError::Unavailable)?
+            .len();
+        if size > MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES {
+            return Err(ItemCompletionError::TooLarge);
+        }
+        if count == MAX_ITEM_CHANGE_GROUP_SIZE || bytes + size > MAX_ITEM_CHANGE_GROUP_PAYLOAD_BYTES
+        {
+            group_id = Uuid::new_v4();
+            count = 0;
+            bytes = 0;
+        }
+        state
+            .items
+            .insert(effect.after_item.id, effect.after_item.clone());
+        state
+            .completion_states
+            .insert(effect.after_state.item_id, effect.after_state.clone());
+        append_change(state, Some(group_id), change)
+            .map_err(|_| ItemCompletionError::Unavailable)?;
+        state.completion_effects.push(effect);
+        count += 1;
+        bytes += size;
+    }
+    Ok(())
+}
+
+fn completion_repository_error(error: ItemCompletionError) -> ItemRepositoryError {
+    match error {
+        ItemCompletionError::TooLarge => ItemRepositoryError::DeltaGroupTooLarge,
+        ItemCompletionError::ReopeningReviewRequired
+        | ItemCompletionError::OccurrenceEvidenceRequired
+        | ItemCompletionError::ParentRequired => ItemRepositoryError::InvalidParentState,
+        _ => ItemRepositoryError::Internal,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct MemoryState {
     items: HashMap<Uuid, Item>,
+    completion_states: HashMap<Uuid, ItemCompletionState>,
+    completion_receipts: HashMap<Uuid, (Uuid, ItemCompletionCommand, ItemCompletionMutation)>,
+    completion_effects: Vec<ItemCompletionEffect>,
     progress: crate::item_progress::memory::MemoryProgress,
     idempotency: HashMap<(String, String), MemoryIdempotency>,
     changes: Vec<MemoryChange>,
@@ -466,6 +653,88 @@ impl ItemRepository for InMemoryItemRepository {
         self.cursor_scope
     }
 
+    async fn get_completion(
+        &self,
+        item_id: Uuid,
+    ) -> Result<ItemCompletionSnapshot, ItemCompletionError> {
+        let _operation = match &self.execution_guard {
+            Some(guard) => Some(guard.operation_gate.lock().await),
+            None => None,
+        };
+        let execution = self.completion_execution().await?;
+        let state = self.state.lock().await;
+        if state
+            .items
+            .get(&item_id)
+            .is_none_or(|item| item.deleted_at.is_some())
+        {
+            return Err(ItemCompletionError::ItemMissing);
+        }
+        completion_memory_plan(&state, &execution, None, Utc::now())?
+            .snapshots
+            .remove(&item_id)
+            .ok_or(ItemCompletionError::ItemMissing)
+    }
+
+    async fn put_completion(
+        &self,
+        item_id: Uuid,
+        command: ItemCompletionCommand,
+        now: DateTime<Utc>,
+        _actor_session_id: Option<Uuid>,
+    ) -> Result<ItemCompletionMutation, ItemCompletionError> {
+        let _operation = match &self.execution_guard {
+            Some(guard) => Some(guard.operation_gate.lock().await),
+            None => None,
+        };
+        {
+            let state = self.state.lock().await;
+            if let Some((target, original, result)) =
+                state.completion_receipts.get(&command.operation_id)
+            {
+                if *target != item_id || *original != command {
+                    return Err(ItemCompletionError::OperationReused);
+                }
+                return Ok(ItemCompletionMutation {
+                    replayed: true,
+                    ..result.clone()
+                });
+            }
+        }
+        command.validate(item_id)?;
+        let execution = self.completion_execution().await?;
+        let mut state = self.state.lock().await;
+        // A standalone in-memory repository may not have an execution gate.
+        // Recheck the permanent receipt under the final write lock as well.
+        if let Some((target, original, result)) =
+            state.completion_receipts.get(&command.operation_id)
+        {
+            if *target != item_id || *original != command {
+                return Err(ItemCompletionError::OperationReused);
+            }
+            return Ok(ItemCompletionMutation {
+                replayed: true,
+                ..result.clone()
+            });
+        }
+        let plan = completion_memory_plan(&state, &execution, Some((item_id, &command)), now)?;
+        let mut next = state.clone();
+        apply_completion_memory(&mut next, plan)?;
+        let completion = completion_memory_plan(&next, &execution, None, now)?
+            .snapshots
+            .remove(&item_id)
+            .ok_or(ItemCompletionError::ItemMissing)?;
+        let result = ItemCompletionMutation {
+            operation_id: command.operation_id,
+            replayed: false,
+            completion,
+        };
+        next.completion_receipts
+            .insert(command.operation_id, (item_id, command, result.clone()));
+        *state = next;
+        Ok(result)
+    }
+
     async fn bootstrap(
         &self,
         position: Option<super::ItemBootstrapPosition>,
@@ -543,36 +812,18 @@ impl ItemRepository for InMemoryItemRepository {
         item: Item,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        if let Some(parent_id) = item.parent_id
-            && let Some(execution_guard) = &self.execution_guard
-        {
-            let _operation = execution_guard.operation_gate.lock().await;
-            {
-                let mut state = self.state.lock().await;
-                if let Some(replay) = replay(&mut state, &idempotency) {
-                    return replay;
-                }
-            }
-            let snapshot = execution_guard
-                .execution
-                .snapshot()
-                .await
-                .map_err(|_| ItemRepositoryError::Internal)?;
-            if let Some(session) = snapshot
-                .active_session
-                .filter(|session| session.item_id == parent_id)
+        self.mutate_with_completion(idempotency, move |state, context, execution| {
+            if let Some(session) = &execution.active_session
+                && item.parent_id == Some(session.item_id)
             {
                 return Err(ItemRepositoryError::ActiveExecutionConflict {
-                    item_id: parent_id,
+                    item_id: session.item_id,
                     session_id: session.id,
                 });
             }
-            let mut state = self.state.lock().await;
-            return create_memory(&mut state, item, idempotency);
-        }
-
-        let mut state = self.state.lock().await;
-        create_memory(&mut state, item, idempotency)
+            create_memory(state, item, context)
+        })
+        .await
     }
 
     async fn get(&self, id: Uuid, include_deleted: bool) -> Result<Item, ItemRepositoryError> {
@@ -617,69 +868,28 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        let may_close_self = replacement.status.prevents_execution()
-            || replacement.may_remove_executable_component();
-        if (may_close_self || replacement.parent_id.is_some())
-            && let Some(execution_guard) = &self.execution_guard
-        {
-            let _operation = execution_guard.operation_gate.lock().await;
-            let previous_parent_id = {
-                let mut state = self.state.lock().await;
-                if let Some(replay) = replay(&mut state, &idempotency) {
-                    return replay;
-                }
-                let current = state
-                    .items
-                    .get(&id)
-                    .filter(|item| item.deleted_at.is_none())
-                    .ok_or(ItemRepositoryError::NotFound(id))?;
-                ensure_revision(current, expected_revision)?;
-                current.parent_id
-            };
-
-            let snapshot = execution_guard
-                .execution
-                .snapshot()
-                .await
-                .map_err(|_| ItemRepositoryError::Internal)?;
-            if let Some(session) = snapshot.active_session {
-                let conflicted_item = if may_close_self && session.item_id == id {
-                    Some(id)
-                } else if replacement.parent_id != previous_parent_id
-                    && replacement.parent_id == Some(session.item_id)
-                {
-                    Some(session.item_id)
-                } else {
-                    None
-                };
-                if let Some(item_id) = conflicted_item {
-                    return Err(ItemRepositoryError::ActiveExecutionConflict {
-                        item_id,
-                        session_id: session.id,
-                    });
-                }
+        self.mutate_with_completion(idempotency, move |state, context, execution| {
+            let current = state
+                .items
+                .get(&id)
+                .filter(|item| item.deleted_at.is_none())
+                .ok_or(ItemRepositoryError::NotFound(id))?;
+            ensure_revision(current, expected_revision)?;
+            let may_close_self = replacement.status.prevents_execution()
+                || replacement.may_remove_executable_component();
+            if let Some(session) = &execution.active_session
+                && ((may_close_self && session.item_id == id)
+                    || (replacement.parent_id != current.parent_id
+                        && replacement.parent_id == Some(session.item_id)))
+            {
+                return Err(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: session.item_id,
+                    session_id: session.id,
+                });
             }
-
-            let mut state = self.state.lock().await;
-            return replace_memory(
-                &mut state,
-                id,
-                expected_revision,
-                replacement,
-                now,
-                idempotency,
-            );
-        }
-
-        let mut guard = self.state.lock().await;
-        replace_memory(
-            &mut guard,
-            id,
-            expected_revision,
-            replacement,
-            now,
-            idempotency,
-        )
+            replace_memory(state, id, expected_revision, replacement, now, context)
+        })
+        .await
     }
 
     async fn trash(
@@ -689,42 +899,18 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        if let Some(execution_guard) = &self.execution_guard {
-            let _operation = execution_guard.operation_gate.lock().await;
-            {
-                let mut state = self.state.lock().await;
-                if let Some(replay) = replay(&mut state, &idempotency) {
-                    return replay;
-                }
-                let current = state
-                    .items
-                    .get(&id)
-                    .filter(|item| item.deleted_at.is_none())
-                    .ok_or(ItemRepositoryError::NotFound(id))?;
-                ensure_revision(current, expected_revision)?;
-            }
-
-            let snapshot = execution_guard
-                .execution
-                .snapshot()
-                .await
-                .map_err(|_| ItemRepositoryError::Internal)?;
-            if let Some(session) = snapshot
-                .active_session
-                .filter(|session| session.item_id == id)
+        self.mutate_with_completion(idempotency, move |state, context, execution| {
+            if let Some(session) = &execution.active_session
+                && session.item_id == id
             {
                 return Err(ItemRepositoryError::ActiveExecutionConflict {
                     item_id: id,
                     session_id: session.id,
                 });
             }
-
-            let mut state = self.state.lock().await;
-            return trash_memory(&mut state, id, expected_revision, now, idempotency);
-        }
-
-        let mut guard = self.state.lock().await;
-        trash_memory(&mut guard, id, expected_revision, now, idempotency)
+            trash_memory(state, id, expected_revision, now, context)
+        })
+        .await
     }
 
     async fn restore(
@@ -734,43 +920,24 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        if let Some(execution_guard) = &self.execution_guard {
-            let _operation = execution_guard.operation_gate.lock().await;
-            let parent_id = {
-                let mut state = self.state.lock().await;
-                if let Some(replay) = replay(&mut state, &idempotency) {
-                    return replay;
-                }
-                let current = state
-                    .items
-                    .get(&id)
-                    .filter(|item| item.deleted_at.is_some())
-                    .ok_or(ItemRepositoryError::NotFound(id))?;
-                ensure_revision(current, expected_revision)?;
-                current.parent_id
-            };
-            if let Some(parent_id) = parent_id {
-                let snapshot = execution_guard
-                    .execution
-                    .snapshot()
-                    .await
-                    .map_err(|_| ItemRepositoryError::Internal)?;
-                if let Some(session) = snapshot
-                    .active_session
-                    .filter(|session| session.item_id == parent_id)
-                {
-                    return Err(ItemRepositoryError::ActiveExecutionConflict {
-                        item_id: parent_id,
-                        session_id: session.id,
-                    });
-                }
+        self.mutate_with_completion(idempotency, move |state, context, execution| {
+            let current = state
+                .items
+                .get(&id)
+                .filter(|item| item.deleted_at.is_some())
+                .ok_or(ItemRepositoryError::NotFound(id))?;
+            ensure_revision(current, expected_revision)?;
+            if let Some(session) = &execution.active_session
+                && current.parent_id == Some(session.item_id)
+            {
+                return Err(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: session.item_id,
+                    session_id: session.id,
+                });
             }
-            let mut state = self.state.lock().await;
-            return restore_memory(&mut state, id, expected_revision, now, idempotency);
-        }
-
-        let mut state = self.state.lock().await;
-        restore_memory(&mut state, id, expected_revision, now, idempotency)
+            restore_memory(state, id, expected_revision, now, context)
+        })
+        .await
     }
 
     async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError> {
@@ -841,7 +1008,12 @@ fn create_memory(
     if next.items.contains_key(&item.id) {
         return Err(ItemRepositoryError::Duplicate(item.id));
     }
-    validate_parent(&next.items, item.id, item.parent_id)?;
+    validate_parent(
+        &next.items,
+        &next.completion_states,
+        item.id,
+        item.parent_id,
+    )?;
     validate_blocked_by(&next.items, item.blocked_by_item_id)?;
     // The repository owns the topology-aware projection even when an internal
     // adapter supplies a stale pre-structural value.
@@ -892,10 +1064,21 @@ fn replace_memory(
     let previous_parent_id = current.parent_id;
     let previous_sibling_order = current.sibling_order;
     let mut item = current.replaced(replacement, now)?;
-    validate_parent(&next.items, id, item.parent_id)?;
+    if current.status != item.status
+        && next.completion_states.get(&id).is_some_and(|state| {
+            state.mode != crate::item_completion::ItemCompletionMode::Automatic
+                || state.provenance.is_some()
+        })
+    {
+        return Err(ItemRepositoryError::InvalidParentState);
+    }
+    validate_parent(&next.items, &next.completion_states, id, item.parent_id)?;
     validate_blocked_by(&next.items, item.blocked_by_item_id)?;
     let has_children = has_active_children(id, &next.items);
-    if has_children && item.status.is_executing_state() {
+    if has_children
+        && item.status.is_executing_state()
+        && !completion_allows_parent(&item, &next.completion_states)
+    {
         return Err(ItemRepositoryError::NonLeafExecutable);
     }
     item.is_executable = item.execution_is_allowed(has_children);
@@ -951,9 +1134,13 @@ fn restore_memory(
         return Err(ItemRepositoryError::DeletedParent);
     }
     let mut item = current.restored(now)?;
+    validate_parent(&next.items, &next.completion_states, id, item.parent_id)?;
     let has_children = has_active_children(id, &next.items);
     item.is_executable = item.execution_is_allowed(has_children);
-    if has_children && item.status.is_executing_state() {
+    if has_children
+        && item.status.is_executing_state()
+        && !completion_allows_parent(&item, &next.completion_states)
+    {
         return Err(ItemRepositoryError::NonLeafExecutable);
     }
     next.items.insert(id, item.clone());
@@ -1032,6 +1219,7 @@ fn trash_memory(
 
 fn validate_parent(
     items: &HashMap<Uuid, Item>,
+    completion_states: &HashMap<Uuid, ItemCompletionState>,
     item_id: Uuid,
     parent_id: Option<Uuid>,
 ) -> Result<(), ItemRepositoryError> {
@@ -1045,7 +1233,7 @@ fn validate_parent(
         .get(&parent_id)
         .filter(|item| item.deleted_at.is_none())
         .ok_or(ItemRepositoryError::ParentNotFound(parent_id))?;
-    if parent.status.is_executing_state() {
+    if parent.status.is_executing_state() && !completion_allows_parent(parent, completion_states) {
         return Err(ItemRepositoryError::InvalidParentState);
     }
     let mut visited = HashSet::new();
@@ -1060,6 +1248,13 @@ fn validate_parent(
         ancestor = items.get(&ancestor_id).and_then(|item| item.parent_id);
     }
     Ok(())
+}
+
+fn completion_allows_parent(item: &Item, states: &HashMap<Uuid, ItemCompletionState>) -> bool {
+    item.status == super::ItemStatus::Completed
+        && states.get(&item.id).is_some_and(|state| {
+            state.revision > 0 && state.provenance.is_some() && state.validate().is_ok()
+        })
 }
 
 /// A soft-deleted blocker remains a valid historical identity and can still

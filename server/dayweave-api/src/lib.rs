@@ -18,6 +18,7 @@ pub mod habits;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
+pub mod item_completion;
 pub mod item_progress;
 pub mod items;
 pub mod mcp;
@@ -79,9 +80,23 @@ type Repositories = (
     Readiness,
 );
 
+// Keep startup admission and repository assembly together so readiness follows
+// every required initialization gate.
+#[allow(clippy::too_many_lines)]
 async fn repositories(config: &Config) -> Result<Repositories, PersistenceError> {
     if let Some(database_config) = &config.database {
         let database = Database::connect(database_config).await?;
+        let postgres_items = Arc::new(PostgresItemRepository::new(
+            database.pool().clone(),
+            database.scope(),
+        ));
+        // Reconcile legacy current state before any readiness or request
+        // consumer can trust a completed/open prerequisite. This transaction
+        // preserves original mutation receipts and provider mapping baselines.
+        postgres_items
+            .initialize_completion()
+            .await
+            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
         let oauth_scope = OAuthScope {
             workspace_id: database.scope().workspace_id,
             user_id: database.scope().user_id,
@@ -115,10 +130,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             )),
-            Arc::new(PostgresItemRepository::new(
-                database.pool().clone(),
-                database.scope(),
-            )),
+            postgres_items,
             Arc::new(PostgresHabitRepository::new(
                 database.pool().clone(),
                 database.scope(),
@@ -185,6 +197,7 @@ pub struct AppState {
     pub proposals: Arc<ProposalService>,
     pub items: Arc<ItemService>,
     pub item_progress: Arc<item_progress::ItemProgressService>,
+    pub item_completion: Arc<item_completion::ItemCompletionService>,
     pub habits: Arc<HabitService>,
     pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
@@ -237,6 +250,10 @@ impl AppState {
         ));
         let items = Arc::new(ItemService::new(item_repository, clock.clone()));
         let item_progress = Arc::new(item_progress::ItemProgressService::new(
+            items.clone(),
+            clock.clone(),
+        ));
+        let item_completion = Arc::new(item_completion::ItemCompletionService::new(
             items.clone(),
             clock.clone(),
         ));
@@ -391,6 +408,7 @@ impl AppState {
             proposals,
             items,
             item_progress,
+            item_completion,
             habits,
             execution,
             authenticator,
@@ -446,6 +464,10 @@ impl AppState {
                 items.clone(),
                 clock.clone(),
             )),
+            item_completion: Arc::new(item_completion::ItemCompletionService::new(
+                items.clone(),
+                clock.clone(),
+            )),
             items,
             habits,
             execution,
@@ -472,6 +494,10 @@ impl AppState {
         // original paired ItemService and fails closed for items that exist only in `items`.
         self.items = items;
         self.item_progress = Arc::new(item_progress::ItemProgressService::new(
+            self.items.clone(),
+            self.clock.clone(),
+        ));
+        self.item_completion = Arc::new(item_completion::ItemCompletionService::new(
             self.items.clone(),
             self.clock.clone(),
         ));

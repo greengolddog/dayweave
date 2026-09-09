@@ -4020,10 +4020,9 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         ))
         .await
         .expect("execution defer authorization migration applies");
-    for migration in MIGRATOR
-        .iter()
-        .filter(|migration| (22..=27).contains(&migration.version))
-    {
+    // Runtime repositories require the complete schema after the isolated
+    // authorization cutover, including later canonical lifecycle authority.
+    for migration in MIGRATOR.iter().filter(|migration| migration.version > 21) {
         test_database
             .pool
             .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
@@ -4217,10 +4216,9 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
     assert_eq!(replacement_index, 10);
     assert!(!actionable);
 
-    for migration in MIGRATOR
-        .iter()
-        .filter(|migration| (21..=27).contains(&migration.version))
-    {
+    // Preserve the migration-20 assertions above, then complete the upgrade
+    // before modern item and scheduling repositories consume the fixture.
+    for migration in MIGRATOR.iter().filter(|migration| migration.version > 20) {
         test_database
             .pool
             .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))

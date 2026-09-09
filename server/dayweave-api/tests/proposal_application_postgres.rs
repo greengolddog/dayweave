@@ -1130,8 +1130,8 @@ async fn undo_restores_completion_and_deletion_timestamps_while_advancing_revisi
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // Covers both proposal apply and snapshot undo terminal guards.
-async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
+#[allow(clippy::too_many_lines)] // Covers execution evidence drift and historical apply/undo replay.
+async fn proposal_execution_changes_invalidate_review_and_fresh_undo_but_not_replay() {
     let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
         eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; proposal execution guard test skipped");
         return;
@@ -1218,12 +1218,15 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
             None,
         )
         .await;
-    assert!(matches!(
-        blocked_apply,
-        Err(ProposalApplicationError::Stale(
-            ProposalConflictCode::InvalidItem
-        ))
-    ));
+    assert!(
+        matches!(
+            blocked_apply,
+            Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewMismatch
+            ))
+        ),
+        "execution changes invalidate the full reviewed evidence: {blocked_apply:?}"
+    );
     assert_eq!(
         fixture.items.get(projected.id).await.unwrap().status,
         projected.status
@@ -1245,6 +1248,38 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
         )
         .await
         .expect("projection execution closes");
+    let blocked_apply_after_close_effects =
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let stale_after_close = fixture
+        .applications
+        .apply(
+            projection_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: projection_preview.review_hash,
+            },
+            "proposal-execution-apply",
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            stale_after_close,
+            Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewMismatch
+            ))
+        ),
+        "closing execution does not restore obsolete review evidence: {stale_after_close:?}"
+    );
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        blocked_apply_after_close_effects,
+    );
+    let projection_preview = fixture
+        .applications
+        .preview(preview_request(&projection_proposal))
+        .await
+        .expect("terminal proposal is reviewed again after execution closes");
+    assert!(projection_preview.can_apply);
     let applied = fixture
         .applications
         .apply(
@@ -1256,7 +1291,7 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
             None,
         )
         .await
-        .expect("same failed apply key succeeds after close");
+        .expect("same unreserved apply key succeeds with fresh review after close");
     assert!(!applied.replayed);
     assert_eq!(
         fixture.items.get(projected.id).await.unwrap().status,
@@ -1404,12 +1439,15 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
             None,
         )
         .await;
-    assert!(matches!(
-        blocked_undo,
-        Err(ProposalApplicationError::Stale(
-            ProposalConflictCode::InvalidItem
-        ))
-    ));
+    assert!(
+        matches!(
+            blocked_undo,
+            Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::UndoDiverged
+            ))
+        ),
+        "execution changes invalidate the full post-apply evidence: {blocked_undo:?}"
+    );
     assert_eq!(
         application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
         blocked_undo_effects_before,
@@ -1427,6 +1465,78 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
         )
         .await
         .expect("undo fixture execution closes");
+    let blocked_undo_after_close_effects =
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let stale_undo_after_close = fixture
+        .applications
+        .undo(
+            undo_application.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: undo_application.application.application_revision,
+            },
+            "undo-execution-undo",
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            stale_undo_after_close,
+            Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::UndoDiverged
+            ))
+        ),
+        "closing execution does not revive stale undo evidence: {stale_undo_after_close:?}"
+    );
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        blocked_undo_after_close_effects,
+    );
+    assert_eq!(fixture.items.get(reopened.id).await.unwrap(), reopened);
+
+    // A fresh reviewed application captures the new execution evidence. Its
+    // immediate undo succeeds; its historical receipt must still replay after
+    // another lease opens, without reverting that later canonical state.
+    let fresh_completed = fixture
+        .items
+        .replace(
+            reopened.id,
+            reopened.revision,
+            replacement(&reopened, ItemStatus::Completed),
+            item_key("undo-execution-fresh-completed", 62),
+        )
+        .await
+        .expect("complete the closed item before fresh review")
+        .item;
+    let fresh_undo_proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Reopen after reviewing the changed execution evidence",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: fresh_completed.id,
+            expected_revision: fresh_completed.revision,
+            item: replacement(&fresh_completed, ItemStatus::Planned),
+        }],
+    )
+    .await;
+    let fresh_undo_preview = fixture
+        .applications
+        .preview(preview_request(&fresh_undo_proposal))
+        .await
+        .expect("fresh undo fixture previews");
+    assert!(fresh_undo_preview.can_apply);
+    let undo_application = fixture
+        .applications
+        .apply(
+            fresh_undo_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: fresh_undo_preview.review_hash,
+            },
+            "undo-execution-fresh-apply",
+            None,
+        )
+        .await
+        .expect("fresh undo fixture applies");
     let undone = fixture
         .applications
         .undo(
@@ -1438,7 +1548,7 @@ async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
             None,
         )
         .await
-        .expect("same failed undo key succeeds after close");
+        .expect("unreserved undo key succeeds for the newly reviewed application");
     assert!(!undone.replayed);
     assert_eq!(
         fixture
@@ -3248,6 +3358,754 @@ async fn hierarchy_batch_rejects_initial_parent_revision_before_child_refresh() 
         Some(parent.id)
     );
 
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn completion_proposal_preview_apply_undo_and_historical_replay_are_atomic() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Completion parent",
+                false,
+                None,
+            ),
+            item_key("completion-proposal-parent", 171),
+        )
+        .await
+        .unwrap()
+        .item;
+    let child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Required child",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-proposal-child", 172),
+        )
+        .await
+        .unwrap()
+        .item;
+    let before_parent = fixture.items.get(parent.id).await.unwrap();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Complete required work",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: child.id,
+            expected_revision: child.revision,
+            item: replacement(&child, ItemStatus::Completed),
+        }],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .unwrap();
+    assert!(preview.can_apply, "{:?}", preview.conflicts);
+    assert!(
+        preview
+            .implicit_diffs
+            .iter()
+            .any(|diff| diff.item_id == parent.id
+                && diff.before.status == ItemStatus::Inbox
+                && diff.after.status == ItemStatus::Completed)
+    );
+    assert!(
+        preview.risks.iter().any(|risk| risk.command_id.is_none()
+            && risk.code == ProposalRiskCode::ChangesExecutionState)
+    );
+    assert_eq!(fixture.items.get(parent.id).await.unwrap(), before_parent);
+    let sidecars: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM item_completion_state WHERE workspace_id=$1")
+            .bind(fixture.scope.workspace_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(sidecars, 0, "preview sidecars rolled back");
+    let request = ProposalApplyRequest {
+        expected_review_hash: preview.review_hash.clone(),
+    };
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            request.clone(),
+            "completion-proposal-apply",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(applied.application.affected_item_ids.contains(&parent.id));
+    assert_eq!(
+        fixture.items.get(parent.id).await.unwrap().status,
+        ItemStatus::Completed
+    );
+    let completion: Value = sqlx::query_scalar(
+        "SELECT state_json FROM item_completion_state WHERE workspace_id=$1 AND item_id=$2",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(parent.id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(completion["provenance"]["reopen"]["status"], "inbox");
+    let undo_request = ProposalUndoRequest {
+        expected_application_revision: 1,
+    };
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            undo_request.clone(),
+            "completion-proposal-undo",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.items.get(parent.id).await.unwrap().status,
+        ItemStatus::Inbox
+    );
+    assert_eq!(
+        fixture.items.get(child.id).await.unwrap().status,
+        ItemStatus::Inbox
+    );
+    let current_parent = fixture.items.get(parent.id).await.unwrap();
+    let mut edited = replacement(&current_parent, current_parent.status);
+    edited.title = "Newer current content".to_owned();
+    fixture
+        .items
+        .replace(
+            parent.id,
+            current_parent.revision,
+            edited,
+            item_key("completion-proposal-newer", 173),
+        )
+        .await
+        .unwrap();
+    let current = fixture.items.get(parent.id).await.unwrap();
+    let counts = application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    assert!(
+        fixture
+            .applications
+            .apply(
+                preview.preview_id,
+                request,
+                "completion-proposal-apply",
+                None
+            )
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert!(
+        fixture
+            .applications
+            .undo(
+                applied.application.application_id,
+                undo_request,
+                "completion-proposal-undo",
+                None
+            )
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(fixture.items.get(parent.id).await.unwrap(), current);
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        counts
+    );
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn completion_proposal_undo_restores_direct_parent_provenance_and_blocker_custody() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let mut input = item(Uuid::new_v4(), ItemKind::Goal, "Blocked parent", true, None);
+    input.status = ItemStatus::Blocked;
+    input.blocked_reason_kind = Some(dayweave_api::items::BlockedReasonKind::Manual);
+    input.blocked_reason = Some("Synthetic approval is still required".to_owned());
+    let parent = fixture
+        .items
+        .create(input, item_key("completion-inverse-parent", 174))
+        .await
+        .unwrap()
+        .item;
+    let child = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Reopen child",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-inverse-child", 175),
+        )
+        .await
+        .unwrap()
+        .item;
+    fixture
+        .items
+        .replace(
+            child.id,
+            child.revision,
+            replacement(&child, ItemStatus::Completed),
+            item_key("completion-inverse-initial", 176),
+        )
+        .await
+        .unwrap();
+    let parent = fixture.items.get(parent.id).await.unwrap();
+    let child = fixture.items.get(child.id).await.unwrap();
+    assert_eq!(parent.status, ItemStatus::Completed);
+    let original_state: Value = sqlx::query_scalar(
+        "SELECT state_json FROM item_completion_state WHERE workspace_id=$1 AND item_id=$2",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(parent.id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    let mut parent_edit = replacement(&parent, parent.status);
+    parent_edit.title = "Edited while complete".to_owned();
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Edit completed parent and reopen child",
+        vec![
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: parent.id,
+                expected_revision: parent.revision,
+                item: parent_edit,
+            },
+            ProposalCommand::ReplaceItem {
+                command_id: Uuid::new_v4(),
+                item_id: child.id,
+                expected_revision: child.revision,
+                item: replacement(&child, ItemStatus::Inbox),
+            },
+        ],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .unwrap();
+    assert!(preview.can_apply, "{:?}", preview.conflicts);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "completion-inverse-apply",
+            None,
+        )
+        .await
+        .unwrap();
+    let reopened = fixture.items.get(parent.id).await.unwrap();
+    assert_eq!(reopened.status, ItemStatus::Blocked);
+    assert_eq!(
+        reopened.blocked_reason.as_deref(),
+        Some("Synthetic approval is still required")
+    );
+    fixture
+        .applications
+        .undo(
+            applied.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: 1,
+            },
+            "completion-inverse-undo",
+            None,
+        )
+        .await
+        .unwrap();
+    let restored = fixture.items.get(parent.id).await.unwrap();
+    assert_eq!(restored.status, ItemStatus::Completed);
+    assert_eq!(restored.title, parent.title);
+    assert_eq!(restored.blocked_reason, None);
+    let state: Value = sqlx::query_scalar(
+        "SELECT state_json FROM item_completion_state WHERE workspace_id=$1 AND item_id=$2",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(parent.id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(state["provenance"], original_state["provenance"]);
+    assert!(state["revision"].as_u64().unwrap() > original_state["revision"].as_u64().unwrap());
+    let child = fixture.items.get(child.id).await.unwrap();
+    fixture
+        .items
+        .replace(
+            child.id,
+            child.revision,
+            replacement(&child, ItemStatus::Inbox),
+            item_key("completion-inverse-later", 177),
+        )
+        .await
+        .unwrap();
+    let reopened = fixture.items.get(parent.id).await.unwrap();
+    assert_eq!(reopened.status, ItemStatus::Blocked);
+    assert_eq!(
+        reopened.blocked_reason.as_deref(),
+        Some("Synthetic approval is still required")
+    );
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn completion_undo_fences_unchanged_required_branch_but_not_historical_replay() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Goal,
+                "Read-set parent",
+                false,
+                None,
+            ),
+            item_key("completion-readset-parent", 178),
+        )
+        .await
+        .unwrap()
+        .item;
+    let first = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Reviewed child",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-readset-first", 179),
+        )
+        .await
+        .unwrap()
+        .item;
+    let other = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Other required branch",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-readset-other", 180),
+        )
+        .await
+        .unwrap()
+        .item;
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Complete one branch",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: first.id,
+            expected_revision: first.revision,
+            item: replacement(&first, ItemStatus::Completed),
+        }],
+    )
+    .await;
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .unwrap();
+    assert!(preview.can_apply);
+    let request = ProposalApplyRequest {
+        expected_review_hash: preview.review_hash,
+    };
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            request.clone(),
+            "completion-readset-apply",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!applied.application.affected_item_ids.contains(&parent.id));
+    assert!(!applied.application.affected_item_ids.contains(&other.id));
+    let mut edited = replacement(&other, other.status);
+    edited.title = "New required-branch evidence".to_owned();
+    fixture
+        .items
+        .replace(
+            other.id,
+            other.revision,
+            edited,
+            item_key("completion-readset-newer", 181),
+        )
+        .await
+        .unwrap();
+    let counts = application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    assert!(matches!(
+        fixture
+            .applications
+            .undo(
+                applied.application.application_id,
+                ProposalUndoRequest {
+                    expected_application_revision: 1
+                },
+                "completion-readset-undo",
+                None
+            )
+            .await,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::UndoDiverged
+        ))
+    ));
+    assert!(
+        fixture
+            .applications
+            .apply(
+                preview.preview_id,
+                request,
+                "completion-readset-apply",
+                None
+            )
+            .await
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        counts
+    );
+    assert_eq!(
+        fixture.items.get(first.id).await.unwrap().status,
+        ItemStatus::Completed
+    );
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn completion_policy_only_drift_invalidates_proposal_review_and_fresh_undo() {
+    use dayweave_api::item_completion::{ItemCompletionCommand, ItemCompletionMode};
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let parent = fixture
+        .items
+        .create(
+            item(Uuid::new_v4(), ItemKind::Goal, "Policy parent", false, None),
+            item_key("completion-policy-parent", 182),
+        )
+        .await
+        .unwrap()
+        .item;
+    let first = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Policy reviewed child",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-policy-first", 183),
+        )
+        .await
+        .unwrap()
+        .item;
+    fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Other open branch",
+                false,
+                Some(parent.id),
+            ),
+            item_key("completion-policy-other", 184),
+        )
+        .await
+        .unwrap();
+    let repository = PostgresItemRepository::new(fixture.database.pool.clone(), fixture.scope);
+    let proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Review against exact policy",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: first.id,
+            expected_revision: first.revision,
+            item: replacement(&first, ItemStatus::Completed),
+        }],
+    )
+    .await;
+    let old_preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .unwrap();
+    let evidence = repository.get_completion(parent.id).await.unwrap();
+    repository
+        .put_completion(
+            parent.id,
+            ItemCompletionCommand {
+                schema_version: 1,
+                operation_id: Uuid::new_v4(),
+                expected_item_revision: evidence.item_revision,
+                expected_completion_revision: evidence.state.revision,
+                expected_evidence_hash: evidence.evidence_hash,
+                required_for_parent: true,
+                mode: ItemCompletionMode::KeepOpen,
+                reopening: None,
+            },
+            Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.items.get(parent.id).await.unwrap().status,
+        ItemStatus::Inbox
+    );
+    assert!(matches!(
+        fixture
+            .applications
+            .apply(
+                old_preview.preview_id,
+                ProposalApplyRequest {
+                    expected_review_hash: old_preview.review_hash
+                },
+                "completion-policy-stale-preview",
+                None
+            )
+            .await,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::PreviewMismatch
+        ))
+    ));
+    let preview = fixture
+        .applications
+        .preview(preview_request(&proposal))
+        .await
+        .unwrap();
+    assert!(preview.can_apply, "{:?}", preview.conflicts);
+    let applied = fixture
+        .applications
+        .apply(
+            preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: preview.review_hash,
+            },
+            "completion-policy-apply",
+            None,
+        )
+        .await
+        .unwrap();
+    let evidence = repository.get_completion(parent.id).await.unwrap();
+    repository
+        .put_completion(
+            parent.id,
+            ItemCompletionCommand {
+                schema_version: 1,
+                operation_id: Uuid::new_v4(),
+                expected_item_revision: evidence.item_revision,
+                expected_completion_revision: evidence.state.revision,
+                expected_evidence_hash: evidence.evidence_hash,
+                required_for_parent: true,
+                mode: ItemCompletionMode::Automatic,
+                reopening: None,
+            },
+            Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.items.get(parent.id).await.unwrap().status,
+        ItemStatus::Inbox
+    );
+    assert!(matches!(
+        fixture
+            .applications
+            .undo(
+                applied.application.application_id,
+                ProposalUndoRequest {
+                    expected_application_revision: 1
+                },
+                "completion-policy-stale-undo",
+                None
+            )
+            .await,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::UndoDiverged
+        ))
+    ));
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn completion_startup_reconciles_legacy_forest_once_without_rewriting_primary_receipts() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let mut parent_input = item(
+        Uuid::new_v4(),
+        ItemKind::Goal,
+        "Legacy open parent",
+        false,
+        None,
+    );
+    parent_input.status = ItemStatus::Planned;
+    let parent_identity = item_key("completion-startup-parent", 185);
+    let parent_receipt = fixture
+        .items
+        .create(parent_input.clone(), parent_identity.clone())
+        .await
+        .unwrap();
+    let mut child_input = item(
+        Uuid::new_v4(),
+        ItemKind::Task,
+        "Legacy completed child",
+        false,
+        Some(parent_receipt.item.id),
+    );
+    child_input.status = ItemStatus::Planned;
+    let child = fixture
+        .items
+        .create(child_input, item_key("completion-startup-child", 186))
+        .await
+        .unwrap()
+        .item;
+    let parent_before = fixture.items.get(parent_receipt.item.id).await.unwrap();
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    let mut historical_child = child.clone();
+    historical_child.status = ItemStatus::Completed;
+    historical_child.revision += 1;
+    historical_child.updated_at = now;
+    historical_child.completed_at = Some(now);
+    // Model a pre-activation writer with an ordinary valid leaf completion and
+    // its exact delta, but no ancestor reconciliation. No completion sidecar
+    // or stored primary receipt is fabricated or modified by this fixture.
+    let mut transaction = fixture.database.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE items SET status='completed',revision=$3,completed_at=$4,updated_at=$4 \
+        WHERE workspace_id=$1 AND id=$2 AND revision=$5",
+    )
+    .bind(fixture.scope.workspace_id)
+    .bind(child.id)
+    .bind(i64::try_from(historical_child.revision).unwrap())
+    .bind(now)
+    .bind(i64::try_from(child.revision).unwrap())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO item_changes(workspace_id,item_id,item_revision,change_kind,payload,changed_at,change_group_id) \
+        VALUES($1,$2,$3,'upsert',$4,$5,$6)")
+        .bind(fixture.scope.workspace_id).bind(child.id)
+        .bind(i64::try_from(historical_child.revision).unwrap())
+        .bind(serde_json::to_value(&historical_child).unwrap()).bind(now).bind(Uuid::new_v4())
+        .execute(&mut *transaction).await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        fixture.items.get(parent_before.id).await.unwrap(),
+        parent_before
+    );
+    let repository = PostgresItemRepository::new(fixture.database.pool.clone(), fixture.scope);
+    repository.initialize_completion().await.unwrap();
+    let parent_after = fixture.items.get(parent_before.id).await.unwrap();
+    assert_eq!(parent_after.status, ItemStatus::Completed);
+    assert_eq!(parent_after.revision, parent_before.revision + 1);
+    assert_eq!(fixture.items.get(child.id).await.unwrap(), historical_child);
+    let evidence = repository.get_completion(parent_before.id).await.unwrap();
+    assert_eq!(
+        evidence.state.provenance.as_ref().unwrap().reopen.status,
+        ItemStatus::Planned
+    );
+    let counts = application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let state_count: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+        (SELECT count(*) FROM item_completion_state WHERE workspace_id=$1), \
+        (SELECT count(*) FROM item_completion_evaluations WHERE workspace_id=$1), \
+        (SELECT count(*) FROM item_completion_effects WHERE workspace_id=$1)",
+    )
+    .bind(fixture.scope.workspace_id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    repository.initialize_completion().await.unwrap();
+    assert_eq!(
+        fixture.items.get(parent_before.id).await.unwrap(),
+        parent_after
+    );
+    assert_eq!(
+        repository.get_completion(parent_before.id).await.unwrap(),
+        evidence
+    );
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        counts
+    );
+    let repeated: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+        (SELECT count(*) FROM item_completion_state WHERE workspace_id=$1), \
+        (SELECT count(*) FROM item_completion_evaluations WHERE workspace_id=$1), \
+        (SELECT count(*) FROM item_completion_effects WHERE workspace_id=$1)",
+    )
+    .bind(fixture.scope.workspace_id)
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(repeated, state_count);
+    let replay = fixture
+        .items
+        .create(parent_input, parent_identity)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.item, parent_receipt.item);
+    assert_eq!(
+        fixture.items.get(parent_before.id).await.unwrap(),
+        parent_after
+    );
     fixture.database.destroy().await;
 }
 

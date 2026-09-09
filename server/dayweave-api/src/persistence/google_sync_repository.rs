@@ -53,7 +53,13 @@ use crate::{
     },
 };
 
-use super::DatabaseScope;
+use super::{
+    DatabaseScope,
+    item_completion_repository::{
+        CompletionDeliveryMode, CompletionForestSnapshot, capture_completion_before_tx,
+        finalize_item_completion_tx,
+    },
+};
 
 const COLLECTION_COLUMNS: &str = "id, provider_account_id, collection_kind, remote_collection_id, display_name, \
     provider_access_role, provider_primary, provider_selected, provider_hidden, provider_deleted, \
@@ -667,8 +673,11 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .map_err(internal)?;
         if kind == GoogleCollectionKind::Calendar {
             teardown_collections.extend(newly_deleted);
+            let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+                .await
+                .map_err(internal)?;
             for collection_id in teardown_collections {
-                retire_active_calendar_occurrences(
+                retire_active_calendar_occurrences_tx(
                     &mut transaction,
                     self.scope,
                     account_id,
@@ -677,6 +686,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 )
                 .await?;
             }
+            finalize_google_completion(&mut transaction, self.scope, &completion_before, now)
+                .await?;
         }
         sqlx::query(
             "UPDATE google_sync_outbox outbox SET state = 'conflict', claim_id = NULL, \
@@ -1668,6 +1679,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             now,
         )
         .await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(internal)?;
         let mapping = sqlx::query(
             "SELECT id, local_entity_id, remote_etag, remote_payload_hash, remote_projection_hash, \
              local_revision, sync_state, ownership \
@@ -1703,6 +1717,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             )
             .await?
         };
+        finalize_google_completion(&mut transaction, self.scope, &completion_before, now).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(outcome)
     }
@@ -1831,9 +1846,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             now,
         )
         .await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(internal)?;
         let outcome =
             apply_calendar_series_metadata_tx(&mut transaction, self.scope, claim, &change, now)
                 .await?;
+        finalize_google_completion(&mut transaction, self.scope, &completion_before, now).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(outcome)
     }
@@ -1904,6 +1923,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             now,
         )
         .await?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(internal)?;
         let mappings = sqlx::query(
             "SELECT id, local_entity_id, remote_resource_id, remote_etag, remote_updated_at, \
              remote_parent_id, remote_payload_hash, remote_projection_hash, local_revision, \
@@ -1950,6 +1972,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 .await?,
             );
         }
+        finalize_google_completion(&mut transaction, self.scope, &completion_before, now).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(counts)
     }
@@ -7645,6 +7668,9 @@ async fn replace_calendar_projection_tx(
     generation: u64,
     now: DateTime<Utc>,
 ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let completion_before = capture_completion_before_tx(transaction, scope)
+        .await
+        .map_err(internal)?;
     let mut counts = SyncCounts::default();
     let owned_remote_ids = owned_calendar_remote_ids(transaction, scope, batch).await?;
     for change in &batch.changes {
@@ -7701,6 +7727,7 @@ async fn replace_calendar_projection_tx(
                 .await?,
         );
     }
+    finalize_google_completion(transaction, scope, &completion_before, now).await?;
     Ok(counts)
 }
 
@@ -8292,6 +8319,25 @@ pub(crate) async fn retire_active_calendar_occurrences(
     collection_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let completion_before = capture_completion_before_tx(transaction, scope)
+        .await
+        .map_err(internal)?;
+    let counts =
+        retire_active_calendar_occurrences_tx(transaction, scope, account_id, collection_id, now)
+            .await?;
+    finalize_google_completion(transaction, scope, &completion_before, now).await?;
+    Ok(counts)
+}
+
+/// Compound callers retire every collection before evaluating the resulting
+/// forest; another collection can contain a descendant of a retired item.
+async fn retire_active_calendar_occurrences_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    collection_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<SyncCounts, GoogleSyncRepositoryError> {
     let active_item_id = google_active_execution(transaction, scope.workspace_id)
         .await?
         .map(|(_, item_id)| item_id);
@@ -8403,6 +8449,9 @@ pub(crate) async fn retire_active_calendar_occurrences_for_account(
     account_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let completion_before = capture_completion_before_tx(transaction, scope)
+        .await
+        .map_err(internal)?;
     sqlx::query(
         "UPDATE google_sync_collections SET planning_projection_state = 'uninitialized', \
          planning_collection_revision = NULL, planning_window_start = NULL, \
@@ -8431,10 +8480,17 @@ pub(crate) async fn retire_active_calendar_occurrences_for_account(
     let mut counts = SyncCounts::default();
     for collection_id in collection_ids {
         counts.merge(
-            &retire_active_calendar_occurrences(transaction, scope, account_id, collection_id, now)
-                .await?,
+            &retire_active_calendar_occurrences_tx(
+                transaction,
+                scope,
+                account_id,
+                collection_id,
+                now,
+            )
+            .await?,
         );
     }
+    finalize_google_completion(transaction, scope, &completion_before, now).await?;
     Ok(counts)
 }
 
@@ -9914,6 +9970,46 @@ async fn update_imported_item(
     Ok(())
 }
 
+/// Finishes an entire provider batch after all independent primary groups and
+/// mapping writes. Only an exact external mapping baseline may follow a
+/// derived revision; local forks and reviewed outbound authority stay stale.
+async fn finalize_google_completion(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    before: &CompletionForestSnapshot,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let finalized = finalize_item_completion_tx(
+        transaction,
+        scope,
+        before,
+        now,
+        CompletionDeliveryMode::Committed,
+    )
+    .await
+    .map_err(|error| {
+        let item_error = super::item_completion_repository::completion_error(error);
+        map_google_item_validation_error(&item_error)
+    })?;
+    for effect in finalized.effects {
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET local_revision=$4, updated_at=$5 \
+             WHERE workspace_id=$1 AND local_entity_id=$2 AND local_revision=$3 \
+             AND entity_kind IN ('item','calendar_occurrence') AND ownership='external' \
+             AND tombstoned_at IS NULL AND sync_state <> 'conflict'",
+        )
+        .bind(scope.workspace_id)
+        .bind(effect.after_item.id)
+        .bind(u64_to_i64(effect.before_item.revision)?)
+        .bind(u64_to_i64(effect.after_item.revision)?)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Records one complete canonical mutation envelope.
 async fn record_import_mutation(
     transaction: &mut Transaction<'_, Postgres>,
@@ -9997,6 +10093,17 @@ async fn reject_google_close_for_active_execution(
     current: &Item,
     replacement: &Item,
 ) -> Result<(), GoogleSyncRepositoryError> {
+    super::item_completion_repository::ensure_legacy_completion_transition_tx(
+        transaction,
+        workspace_id,
+        current,
+        replacement,
+    )
+    .await
+    .map_err(|error| {
+        let item_error = super::item_completion_repository::completion_error(error);
+        map_google_item_validation_error(&item_error)
+    })?;
     let prevents_execution =
         !current.status.prevents_execution() && replacement.status.prevents_execution();
     let becomes_trashed = current.deleted_at.is_none() && replacement.deleted_at.is_some();
@@ -18594,6 +18701,263 @@ mod tests {
             .await,
             Some(expected)
         );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_import_completion_cascades_and_mapping_cas_preserves_local_forks() {
+        struct CompletionClock(std::sync::RwLock<DateTime<Utc>>);
+        impl crate::proposals::Clock for CompletionClock {
+            fn now(&self) -> DateTime<Utc> {
+                *self.0.read().unwrap()
+            }
+        }
+        async fn assert_completion_clock(
+            fixture: &SyncFixture,
+            item: &Item,
+            expected: DateTime<Utc>,
+        ) {
+            let (state, state_at, effect_at, evaluation_at): (
+                Value,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+            ) = sqlx::query_as(
+                "SELECT state.state_json,state.updated_at,effect.recorded_at,evaluation.recorded_at \
+                FROM item_completion_state state \
+                JOIN item_completion_effects effect ON effect.workspace_id=state.workspace_id \
+                AND effect.item_id=state.item_id AND effect.completion_revision=state.revision \
+                JOIN item_completion_evaluations evaluation ON evaluation.workspace_id=effect.workspace_id \
+                AND evaluation.evaluation_id=effect.evaluation_id \
+                WHERE state.workspace_id=$1 AND state.item_id=$2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(item.id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+            let state: crate::item_completion::ItemCompletionState =
+                serde_json::from_value(state).unwrap();
+            assert_eq!(item.updated_at, expected);
+            assert_eq!(state.updated_at, Some(expected));
+            assert_eq!(
+                (state_at, effect_at, evaluation_at),
+                (expected, expected, expected)
+            );
+        }
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let discovered = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                None,
+                GoogleCollectionKind::TaskList,
+                vec![DiscoveredCollection {
+                    kind: GoogleCollectionKind::TaskList,
+                    remote_id: "completion-tasks".to_owned(),
+                    display_name: "Completion tasks".to_owned(),
+                    provider_access_role: None,
+                    provider_primary: false,
+                    provider_selected: true,
+                    provider_hidden: false,
+                    provider_deleted: false,
+                }],
+                fixture.now,
+            )
+            .await
+            .unwrap();
+        let collection = discovered
+            .iter()
+            .find(|value| value.kind == GoogleCollectionKind::TaskList)
+            .unwrap();
+        let collection = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                collection.id,
+                collection.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .unwrap();
+        let parent_change = remote_task(
+            fixture.account_id,
+            collection.id,
+            collection.revision,
+            "completion-parent",
+            "Imported parent",
+            ItemStatus::Planned,
+            [221; 32],
+        );
+        let child_change = remote_task(
+            fixture.account_id,
+            collection.id,
+            collection.revision,
+            "completion-child",
+            "Imported child",
+            ItemStatus::Planned,
+            [222; 32],
+        );
+        let parent_id = parent_change.item.as_ref().unwrap().id;
+        let child_id = child_change.item.as_ref().unwrap().id;
+        let child_input = child_change.item.as_ref().unwrap().clone();
+        for change in [parent_change, child_change] {
+            assert_eq!(
+                fixture
+                    .repository
+                    .apply_remote_item(&fixture.claim, change, fixture.now)
+                    .await
+                    .unwrap(),
+                ImportOutcome::Created
+            );
+        }
+        let local_now = Utc::now();
+        let clock = Arc::new(CompletionClock(std::sync::RwLock::new(local_now)));
+        let items = ItemService::new(
+            Arc::new(PostgresItemRepository::new(
+                fixture.database.pool.clone(),
+                fixture.scope,
+            )),
+            clock.clone(),
+        );
+        let mut draft = serde_json::to_value(child_input).unwrap();
+        draft.as_object_mut().unwrap().remove("id");
+        draft["parent_id"] = json!(parent_id);
+        items
+            .replace(
+                child_id,
+                1,
+                serde_json::from_value(draft).unwrap(),
+                crate::items::IdempotencyKey {
+                    key: "completion-import-attach".to_owned(),
+                    fingerprint: [223; 32],
+                },
+            )
+            .await
+            .unwrap();
+        // Establish the synthetic provider baseline after the real hierarchy
+        // mutation. Production finalization below must not erase later drift.
+        sqlx::query(
+            "UPDATE provider_sync_mappings mapping SET local_revision=item.revision \
+            FROM items item WHERE mapping.workspace_id=$1 AND mapping.collection_id=$2 \
+            AND item.workspace_id=mapping.workspace_id AND item.id=mapping.local_entity_id \
+            AND mapping.local_revision=1 AND item.revision=2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(collection.id)
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_task(
+                        fixture.account_id,
+                        collection.id,
+                        collection.revision,
+                        "completion-child",
+                        "Imported child",
+                        ItemStatus::Completed,
+                        [224; 32]
+                    ),
+                    fixture.now + Duration::seconds(1) + Duration::nanoseconds(123_456_789)
+                )
+                .await
+                .unwrap(),
+            ImportOutcome::Updated
+        );
+        let parent = items.get(parent_id).await.unwrap();
+        assert_eq!(parent.status, ItemStatus::Completed);
+        let completed_at = fixture.now + Duration::seconds(1) + Duration::microseconds(123_456);
+        assert_eq!(parent.completed_at, Some(completed_at));
+        assert_completion_clock(&fixture, &parent, completed_at).await;
+        let mapped: i64 = sqlx::query_scalar(
+            "SELECT local_revision FROM provider_sync_mappings \
+            WHERE workspace_id=$1 AND collection_id=$2 AND local_entity_id=$3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(collection.id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(mapped, i64::try_from(parent.revision).unwrap());
+        *clock.0.write().unwrap() = local_now + Duration::seconds(2);
+        let mut draft = serde_json::to_value(local_task_input(
+            parent.id,
+            "Private local fork",
+            fixture.now,
+        ))
+        .unwrap();
+        draft.as_object_mut().unwrap().remove("id");
+        draft["status"] = json!("completed");
+        items
+            .replace(
+                parent.id,
+                parent.revision,
+                serde_json::from_value(draft).unwrap(),
+                crate::items::IdempotencyKey {
+                    key: "completion-import-local-fork".to_owned(),
+                    fingerprint: [225; 32],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_task(
+                        fixture.account_id,
+                        collection.id,
+                        collection.revision,
+                        "completion-child",
+                        "Imported child",
+                        ItemStatus::Planned,
+                        [226; 32]
+                    ),
+                    fixture.now + Duration::seconds(3) + Duration::nanoseconds(123_456_789)
+                )
+                .await
+                .unwrap(),
+            ImportOutcome::Updated
+        );
+        let parent = items.get(parent_id).await.unwrap();
+        assert_eq!(parent.status, ItemStatus::Planned);
+        assert_eq!(parent.completed_at, None);
+        assert_completion_clock(
+            &fixture,
+            &parent,
+            fixture.now + Duration::seconds(3) + Duration::microseconds(123_456),
+        )
+        .await;
+        assert_eq!(parent.title, "Private local fork");
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT local_revision FROM provider_sync_mappings \
+            WHERE workspace_id=$1 AND collection_id=$2 AND local_entity_id=$3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(collection.id)
+        .bind(parent_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, mapped,
+            "derived revision never blesses an unrelated local edit"
+        );
+        assert!(parent.revision > u64::try_from(retained).unwrap());
         fixture.database.destroy().await;
     }
 

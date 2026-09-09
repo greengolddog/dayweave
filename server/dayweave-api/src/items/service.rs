@@ -43,6 +43,10 @@ impl std::fmt::Debug for ItemService {
 }
 
 impl ItemService {
+    pub(crate) fn completion_repository(&self) -> &dyn ItemRepository {
+        self.repository.as_ref()
+    }
+
     pub(crate) fn progress_repository(&self) -> &dyn ItemRepository {
         self.repository.as_ref()
     }

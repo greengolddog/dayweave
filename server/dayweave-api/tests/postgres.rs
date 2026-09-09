@@ -39,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
         ]
     );
 
@@ -78,6 +78,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0032_provider_operation_admission.sql"),
         include_str!("../migrations/0033_item_progress.sql"),
         include_str!("../migrations/0034_item_bootstrap.sql"),
+        include_str!("../migrations/0035_item_completion.sql"),
     ]
     .join("\n");
     for table in [
@@ -113,6 +114,12 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_changes",
         "item_bootstrap_snapshots",
         "item_bootstrap_members",
+        "item_completion_state",
+        "item_completion_evaluations",
+        "item_completion_effects",
+        "item_completion_operations",
+        "proposal_application_completion_evidence",
+        "proposal_application_completion_states",
         "execution_sessions",
         "execution_state",
         "schedule_deferred_placements",
@@ -236,6 +243,14 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_bootstrap_history_mutation_lock",
         "item_bootstrap_pinned_change_guard",
         "item_changes_workspace_sequence_unique",
+        "completion migration requires reviewed reopening",
+        "ADD COLUMN completion_capture_xid xid8",
+        "item_change_completion_capture_guard",
+        "item_completion_state_evidence",
+        "item_completion_evaluations_complete",
+        "item_completion_effects_complete",
+        "item_completion_operations_complete",
+        "proposal_completion_evidence_complete",
         "ADD COLUMN review_ordinal smallint",
         "proposal_application_effects_review_ordinal_uq",
         "proposal_application_effects_review_complete",
@@ -245,6 +260,101 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
             "{structural_contract}"
         );
     }
+}
+
+#[tokio::test]
+async fn completion_migration_refuses_ambiguous_terminal_parents_without_fabricating_provenance() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; completion migration test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 35) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-completion migration applies");
+    }
+    let scope = seed_scope(pool).await;
+    let mut parents = Vec::new();
+    for status in ["completed", "skipped", "cancelled"] {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        for (id, recorded_status) in [(parent, status), (child, "planned")] {
+            sqlx::query(
+                "INSERT INTO items(id,workspace_id,created_by_user_id,kind,status,title, \
+                 timezone_name,duration_seconds) VALUES($1,$2,$3,'task',$4, \
+                 'Private legacy completion evidence','UTC',600)",
+            )
+            .bind(id)
+            .bind(scope.workspace_id)
+            .bind(scope.user_id)
+            .bind(recorded_status)
+            .execute(pool)
+            .await
+            .expect("legacy terminal parent fixture");
+        }
+        sqlx::query(
+            "INSERT INTO item_hierarchy(workspace_id,parent_item_id,child_item_id) VALUES($1,$2,$3)",
+        )
+        .bind(scope.workspace_id)
+        .bind(parent)
+        .bind(child)
+        .execute(pool)
+        .await
+        .expect("legacy structural child fixture");
+        parents.push(parent);
+    }
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 35)
+        .expect("completion migration is embedded");
+    let mut transaction = pool.begin().await.unwrap();
+    let error = (&mut *transaction)
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect_err("legacy structural terminal statuses need explicit prior-open review");
+    let message = error.as_database_error().unwrap().message();
+    assert!(message.contains("reviewed reopening of 3 legacy terminal structural parents"));
+    assert!(!message.contains("Private legacy"));
+    assert!(parents.iter().all(|id| !message.contains(&id.to_string())));
+    transaction.rollback().await.unwrap();
+    let preserved: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM items WHERE id=ANY($1) ORDER BY status")
+            .bind(&parents)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(preserved, ["cancelled", "completed", "skipped"]);
+    let sidecar: Option<String> = sqlx::query_scalar(
+        "SELECT to_regclass(current_schema() || '.item_completion_state')::text",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        sidecar.is_none(),
+        "failed preflight cannot mint any completion provenance"
+    );
+    // Synthetic prior-open review is explicit; the migration itself never
+    // chooses this state or rewrites an existing terminal item.
+    sqlx::query("UPDATE items SET status='planned' WHERE id=ANY($1)")
+        .bind(&parents)
+        .execute(pool)
+        .await
+        .unwrap();
+    pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect("reviewed nonterminal forest admits completion storage");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM item_completion_state")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0,
+        "absent policy remains revision-zero default"
+    );
+    test_database.destroy().await;
 }
 
 #[tokio::test]

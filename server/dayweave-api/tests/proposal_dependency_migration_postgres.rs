@@ -29,8 +29,8 @@ async fn pre_dependency_graph_application_keeps_exact_snapshot_and_remains_undoa
     apply_pre_dependency_graph_migrations(&database.pool).await;
     let scope = seed_scope(&database.pool).await;
     let historical = seed_historical_application(&database.pool, scope, false, false).await;
-    let original_snapshot: Value = sqlx::query_scalar(
-        "SELECT before_snapshot FROM proposal_application_effects \
+    let (original_snapshot, original_snapshot_text, original_snapshot_hash): (Value, String, Vec<u8>) = sqlx::query_as(
+        "SELECT before_snapshot,before_snapshot::text,before_snapshot_hash FROM proposal_application_effects \
          WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 AND ordinal=0",
     )
     .bind(scope.workspace_id)
@@ -79,6 +79,44 @@ async fn pre_dependency_graph_application_keeps_exact_snapshot_and_remains_undoa
             .as_deref(),
         Some("23514")
     );
+
+    // The assertions above isolate the 0025 cutover. A current repository must
+    // run against the complete current schema, as production startup does.
+    for migration in MIGRATOR.iter().filter(|migration| migration.version > 25) {
+        database
+            .pool
+            .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("remaining migrations preserve safe historical undo");
+    }
+    let upgraded_evidence: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT before_snapshot::text,before_snapshot_hash FROM proposal_application_effects \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 AND ordinal=0",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(historical.application)
+    .fetch_one(&database.pool)
+    .await
+    .expect("historical snapshot and hash survive the complete upgrade");
+    assert_eq!(
+        upgraded_evidence,
+        (original_snapshot_text, original_snapshot_hash),
+        "later migrations preserve exact stored JSON and its original receipt hash",
+    );
+    let completion_evidence: (i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM item_completion_state WHERE workspace_id=$1), \
+         (SELECT count(*) FROM proposal_application_completion_evidence \
+          WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(historical.application)
+    .fetch_one(&database.pool)
+    .await
+    .expect("legacy application has no retrofitted completion authority");
+    assert_eq!(completion_evidence, (0, 0));
 
     let applications = PostgresProposalApplicationRepository::new(database.pool.clone(), scope);
     let undone = applications

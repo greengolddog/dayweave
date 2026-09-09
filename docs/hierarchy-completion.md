@@ -1,10 +1,11 @@
 # Required descendants and parent completion
 
-Status: implementation in progress for `HIE-004`. The first implementation part
-is a pure, iterative decision engine. It is not yet a server mutation path or a
-native completion control. The full requirement remains automatic completion,
-visible manual overrides, durable cross-device behavior, and native review on
-both platforms.
+Status: implementation in progress for `HIE-004`. A pure iterative engine and
+the [versioned one-off server checkpoint](item-completion-api.md) implement
+completion policy and synchronous canonical reconciliation. Native completion
+controls are not yet implemented. The full requirement still includes visible
+manual overrides, durable cross-device behavior, qualified recurring instances,
+and native review on both platforms.
 
 The accepted source is [requirements](product-requirements.md#43-hierarchy-goals-projects-routines-and-dependencies)
 and [discovery answers 203–207](discovery-answers.md). The detailed defaults below
@@ -41,9 +42,10 @@ owner. [Recorded summaries](hierarchy-progress.md) and
   provenance requires an explicit policy/reopening review. It must not become
   an invisible permanent override. In particular, preserving ordinary terminal
   leaves is not permission to silently preserve a cancelled/skipped parent or a
-  completed parent with unfinished required descendants. Current canonical CRUD
-  already rejects terminal non-leaf states; migration and future parent-status
-  commands must establish explicit, visible semantics before admitting them.
+  completed parent with unfinished required descendants. Canonical CRUD admits
+  completed parents only with retained completion provenance; actively executing
+  and ambiguous terminal parents remain inadmissible. Migration never invents
+  reopening evidence.
 - Reopening, reparenting, restoring, removing a required relationship, and
   changing a manual mode must evaluate affected old and new ancestry. No stale
   automatically completed prerequisite may authorize scheduling or publication.
@@ -101,30 +103,30 @@ topology and retained provenance. Independent semantic review identified and
 checked the terminal-parent and unqualified-occurrence regressions. These are
 pure-engine results, not server or physical-device acceptance.
 
-## Authoritative and native integration still required
+## Server checkpoint and remaining native integration
 
-The server policy/read/command contract must bind explicit review to the item,
-policy and evaluated requirement evidence, with exact durable operation replay.
-It must preserve policy and completion provenance across legacy full-item
-replacement, proposal apply/undo, imports and snapshot restoration. No old
-submitted request may silently reset the new policy.
+The [server policy/read/command contract](item-completion-api.md) binds explicit
+review to the item, policy and evaluated requirement/execution evidence, with
+exact durable operation replay. It preserves policy and completion provenance
+across legacy full-item replacement, proposal apply/undo, imports and snapshot
+restoration. No old submitted request may silently reset the new policy.
 
-All canonical writers must apply the same completion rules before stale status
-can authorize a dependent operation. Unlimited-depth derived updates must
-coexist with the existing 300-record/8-MiB atomic delta-group bounds. Transaction
-grouping, direct-mutation historical receipts, proposal preview/undo and native
-terminal-cursor hydration need integration tests; a background ancestor worker
-alone is not sufficient.
+All canonical writers now use the same synchronous completion boundary.
+Unlimited-depth derived updates coexist with the existing 300-record/8-MiB
+atomic delta-group bounds. Server transaction grouping and historical receipts
+have focused live tests; final verification is recorded in the API checkpoint.
+Native terminal-cursor hydration after these actual cascades remains open. A
+background ancestor worker alone is not sufficient.
 
-The intended application strategy is synchronous evaluation under the existing
+The application strategy is synchronous evaluation under the existing
 execution/workspace lock, before the transaction commits. Keep the primary
 direct or compound delta group intact, close it, then partition derived ancestor
 changes into separately bounded, contiguous groups in the same transaction.
 This avoids exposing a committed child change alongside stale prerequisite
-completion. It still needs implementation and integration verification; the
-following are the identified writer boundaries, not completed integrations:
+completion. Startup reconciles valid legacy current state before readiness.
+The implemented writer boundaries are:
 
-| Writer | Required integration |
+| Writer | Server boundary |
 | --- | --- |
 | [Direct item CRUD](../server/dayweave-api/src/persistence/item_repository.rs) | Finalize after the direct group, retain the exact direct-operation receipt, evaluate old and new ancestry, and publish derived status changes before commit. Do not replace the transaction-local group setting inside an unfinished primary group. |
 | [Proposal preview/apply/undo](../server/dayweave-api/src/persistence/proposal_application_repository.rs) | Evaluate only after the entire command batch, before final snapshot/diff/fence capture. Preview and undo simulation must use the same path. Preserve changed-item and undo-fence accounting even when an affected ancestor recomputes to an unchanged value. |
@@ -138,7 +140,8 @@ treated as proof that all ancestor changes have arrived.
 
 Per-group bounds do not remove the total hydration bounds: macOS currently
 limits one catch-up to 20,000 changes/32 MiB retained data/100 pages; Android
-limits it to 25,600 changes/512 pages and a 24-MiB folded canonical cache.
+limits it to 25,600 changes/512 pages and a 24-MiB folded canonical cache, with
+at most 10,000 active-plus-retained-tombstone identities in that folded state.
 Repeated deep complete/reopen cascades can exhaust a fresh client's historical
 bootstrap budget even when its current forest is small enough. The separate
 [current-state bootstrap](item-sync.md#bounded-current-state-bootstrap) captures
@@ -156,13 +159,12 @@ Android rejects unknown fields, and macOS retains them as read-only. Completion
 policy and override commands need an independently versioned contract rather
 than widening old status journals or silently changing their wire bytes.
 
-Structural admission must also distinguish policy-qualified parent completion
-from executable lifecycle. The current server `is_executing_state` predicate
-includes Completed, Skipped and Cancelled; `validate_parent` and non-leaf update
-guards therefore reject these states. Merely adding a derived status writer
-would leave later child edits and restores unable to re-enter that parent.
-Integrate explicit completion provenance and atomic reopening with these
-guards; do not broadly permit actively executing or ambiguous terminal parents.
+Structural admission distinguishes policy-qualified parent completion from
+executable lifecycle. The shared `is_executing_state` predicate still includes
+Completed, Skipped and Cancelled; server parent/non-leaf guards now permit only
+provenance-qualified Completed parents. Native parent selection and Add Subtask
+guards still require the matching revision-bound policy integration. Do not
+broadly permit actively executing or ambiguous terminal parents.
 
 The native [historical receipt recovery](item-sync.md#historical-authoring-receipts)
 checkpoint addresses exact replay after newer state has arrived. Its store and

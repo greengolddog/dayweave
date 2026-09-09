@@ -353,6 +353,7 @@ pub async fn require_authentication(
     Ok(next.run(request).await)
 }
 
+#[allow(clippy::too_many_lines)] // Keep the complete route-to-scope authorization table auditable together.
 fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Scope> {
     let matched_path = matched_path?;
     let path = matched_path.strip_prefix("/v1").unwrap_or(matched_path);
@@ -381,6 +382,7 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/items/stream"
             | "/items/{id}"
             | "/items/{item_id}/progress"
+            | "/items/{item_id}/completion"
             | "/habits/occurrences/delta"
             | "/habits/stream"
             | "/habits/{habit_id}/occurrences"
@@ -388,7 +390,11 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
         ) => Some(Scope::ItemsRead),
         (
             &Method::POST | &Method::PUT | &Method::DELETE,
-            "/items" | "/items/{id}" | "/items/{id}/restore" | "/items/{item_id}/progress",
+            "/items"
+            | "/items/{id}"
+            | "/items/{id}/restore"
+            | "/items/{item_id}/progress"
+            | "/items/{item_id}/completion",
         )
         | (
             &Method::PUT | &Method::POST,

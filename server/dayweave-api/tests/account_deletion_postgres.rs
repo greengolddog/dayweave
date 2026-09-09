@@ -24,6 +24,7 @@ use dayweave_api::{
         full_owner_device_scopes,
     },
     google_oauth::OAuthScope,
+    item_completion::{ItemCompletionCommand, ItemCompletionError, ItemCompletionMode},
     item_progress::{ItemProgressCommand, ItemProgressError},
     items::ItemRepository,
     persistence::{
@@ -322,6 +323,8 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         )
         .await
         .expect("unrelated independent progress");
+    let completion_command = seed_completion_policy(pool, scope, progress_item, now).await;
+    seed_completion_policy(pool, unrelated_scope, unrelated_progress_item, now).await;
 
     sqlx::query(
         "INSERT INTO habit_operation_receipts (workspace_id, namespace, key_hash, \
@@ -739,6 +742,27 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         Err(ItemProgressError::Unavailable)
     );
     assert_eq!(
+        progress_repository.get_completion(progress_item).await,
+        Err(ItemCompletionError::Unavailable)
+    );
+    assert_eq!(
+        progress_repository
+            .put_completion(progress_item, completion_command, now, None)
+            .await,
+        Err(ItemCompletionError::Unavailable),
+        "fence denies exact completion replay before permanent custody lookup"
+    );
+    let fenced_completion_error =
+        sqlx::query("UPDATE item_completion_state SET revision=revision+1 WHERE workspace_id=$1")
+            .bind(scope.workspace_id)
+            .execute(pool)
+            .await
+            .expect_err("direct completion policy SQL respects fence");
+    assert_eq!(
+        postgres_code(&fenced_completion_error).as_deref(),
+        Some("DWDEL")
+    );
+    assert_eq!(
         progress_repository
             .put_progress(progress_item, progress_command, now, None)
             .await,
@@ -1009,6 +1033,16 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
             .revision,
         1,
         "physical purge removes only the fenced owner's progress and immutable receipts"
+    );
+    assert_eq!(
+        PostgresItemRepository::new(pool.clone(), unrelated_scope)
+            .get_completion(unrelated_progress_item)
+            .await
+            .unwrap()
+            .state
+            .revision,
+        1,
+        "completion policy, exact receipts and pinned evaluation history survive in unrelated scope"
     );
 
     let lifecycle = repository
@@ -1412,6 +1446,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     );
     assert_provider_admission_catalog_coverage(pool).await;
     assert_bootstrap_catalog_coverage(pool).await;
+    assert_completion_catalog_coverage(pool).await;
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
@@ -1425,7 +1460,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     .expect("tenant table inventory");
     assert_eq!(
         tables.len(),
-        70,
+        76,
         "migration tenant-table inventory must be consciously updated"
     );
     for table in &tables {
@@ -1447,6 +1482,82 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     }
 
     assert_user_reference_guards(pool).await;
+}
+
+async fn assert_completion_catalog_coverage(pool: &PgPool) {
+    let complete_evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger trigger \
+         JOIN pg_class relation ON relation.oid=trigger.tgrelid \
+         JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace \
+         WHERE namespace.nspname=current_schema() AND NOT trigger.tgisinternal \
+         AND trigger.tgname IN ('item_completion_state_evidence', \
+             'item_completion_evaluations_complete','item_completion_effects_complete', \
+             'item_completion_operations_complete','proposal_completion_evidence_complete', \
+             'item_completion_canonical_consistent') \
+         AND trigger.tgdeferrable AND trigger.tginitdeferred",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("completion state, effects, exact requests and companions seal atomically");
+    assert_eq!(complete_evidence, 6);
+    let hardened: bool = sqlx::query_scalar(
+        "SELECT count(*)=17 AND bool_and(function.proconfig IS NOT NULL \
+         AND array_to_string(function.proconfig, ',') = \
+             'search_path=' || current_schema() || ', pg_catalog, pg_temp' \
+         AND NOT has_function_privilege('public', function.oid, 'EXECUTE')) \
+         FROM pg_proc function JOIN pg_namespace namespace ON namespace.oid=function.pronamespace \
+         WHERE namespace.nspname=current_schema() AND function.proname IN ( \
+             'guard_item_change_completion_capture', \
+             'valid_item_completion_revision','valid_item_completion_reopen', \
+             'valid_item_completion_state','valid_item_completion_snapshot', \
+             'guard_item_completion_state','guard_item_completion_evaluation', \
+             'guard_item_completion_evidence','verify_item_completion_state', \
+             'verify_item_completion_effect','verify_item_completion_evaluation', \
+             'verify_item_completion_operation','verify_item_completion_canonical_state', \
+             'guard_proposal_completion_evidence', \
+             'guard_proposal_completion_state','verify_proposal_completion_evidence', \
+             'reject_item_completion_truncate')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("completion guard function hardening");
+    assert!(hardened);
+    let immutable_history_references: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint constraint_row \
+         JOIN pg_class relation ON relation.oid=constraint_row.conrelid \
+         JOIN pg_class referenced ON referenced.oid=constraint_row.confrelid \
+         WHERE constraint_row.connamespace=current_schema()::regnamespace \
+         AND relation.relname='item_completion_effects' AND referenced.relname='item_changes' \
+         AND constraint_row.contype='f' AND cardinality(constraint_row.conkey)=3",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("before and after canonical revisions have scoped immutable history references");
+    assert_eq!(immutable_history_references, 2);
+    let immutable_append_identity: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_trigger trigger \
+         WHERE trigger.tgrelid='item_changes'::regclass AND NOT trigger.tgisinternal \
+         AND trigger.tgname='item_change_completion_capture_guard' AND trigger.tgtype=23) \
+         AND EXISTS(SELECT 1 FROM information_schema.columns \
+         WHERE table_schema=current_schema() AND table_name='item_changes' \
+         AND column_name='completion_capture_xid' AND udt_name='xid8' AND is_nullable='YES' \
+         AND column_default='pg_current_xact_id()')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("canonical append identity is captured once without rewriting historical rows");
+    assert!(immutable_append_identity);
+    let truncate_guards: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger trigger \
+         JOIN pg_class relation ON relation.oid=trigger.tgrelid \
+         JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace \
+         WHERE namespace.nspname=current_schema() AND NOT trigger.tgisinternal \
+         AND trigger.tgname='item_completion_no_truncate' AND trigger.tgtype=34",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("all completion evidence tables reject unguarded truncate");
+    assert_eq!(truncate_guards, 6);
 }
 
 async fn assert_bootstrap_catalog_coverage(pool: &PgPool) {
@@ -1933,6 +2044,48 @@ async fn wait_until_backend_waits_on_advisory_lock(pool: &PgPool, backend_pid: i
     })
     .await
     .expect("fence insert must block on the earlier mutation's advisory guard");
+}
+
+async fn seed_completion_policy(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    now: DateTime<Utc>,
+) -> ItemCompletionCommand {
+    let repository = PostgresItemRepository::new(pool.clone(), scope);
+    let before = repository
+        .get_completion(item_id)
+        .await
+        .expect("complete admitted forest before deletion fixture policy review");
+    let command = ItemCompletionCommand {
+        schema_version: 1,
+        operation_id: Uuid::new_v4(),
+        expected_item_revision: before.item_revision,
+        expected_completion_revision: before.state.revision,
+        expected_evidence_hash: before.evidence_hash,
+        required_for_parent: false,
+        mode: ItemCompletionMode::Automatic,
+        reopening: None,
+    };
+    let result = repository
+        .put_completion(item_id, command.clone(), now, None)
+        .await
+        .expect("completion policy and permanent evidence before account fence");
+    assert_eq!(result.completion.state.revision, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM item_completion_state WHERE workspace_id=$1) \
+             +(SELECT count(*) FROM item_completion_evaluations WHERE workspace_id=$1) \
+             +(SELECT count(*) FROM item_completion_effects WHERE workspace_id=$1) \
+             +(SELECT count(*) FROM item_completion_operations WHERE workspace_id=$1)",
+        )
+        .bind(scope.workspace_id)
+        .fetch_one(pool)
+        .await
+        .expect("all permanent completion tables contain scoped deletion fixture evidence"),
+        4
+    );
+    command
 }
 
 async fn seed_bootstrap_capture(pool: &PgPool, scope: DatabaseScope, item_id: Uuid) -> Uuid {

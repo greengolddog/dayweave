@@ -7,6 +7,7 @@ mod google_sync_repository;
 mod habit_repository;
 mod idempotency;
 mod item_bootstrap_repository;
+pub(crate) mod item_completion_repository;
 mod item_progress_repository;
 mod item_repository;
 mod outbox;

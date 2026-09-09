@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -13,6 +13,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    item_completion::{ItemCompletionState, item_completion_evidence_hash},
     items::{DeadlineKind, DeadlineStrength, Item, ItemRepositoryError, validate_dependency_graph},
     proposals::{
         Clock, DecisionKind, MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, Proposal,
@@ -26,6 +27,11 @@ use crate::{
     },
 };
 
+use super::item_completion_repository::{
+    CompletionDeliveryMode, CompletionForestSnapshot, capture_completion_before_tx,
+    completion_error, finalize_item_completion_tx, has_qualified_completion,
+    load_completion_states_tx,
+};
 use super::{
     DatabaseScope, TransactionalGraphMode, TransactionalItemCommand, TransactionalItemEffect,
     apply_item_command_tx, clear_dependency_edges_tx, fetch_item_batch_tx, list_item_batch_tx,
@@ -146,7 +152,7 @@ impl PostgresProposalApplicationRepository {
         let maintenance_now = self.authoritative_now(&mut transaction).await?;
         scrub_expired_effect_snapshots(&mut transaction, self.scope, maintenance_now).await?;
         prune_and_limit_previews(&mut transaction, self.scope, maintenance_now).await?;
-        let canonical_hash = canonical_item_hash(&mut transaction, self.scope.workspace_id).await?;
+        let canonical_hash = canonical_item_hash(&mut transaction, self.scope).await?;
 
         let proposals = lock_requested_proposals(&mut transaction, self.scope, &request).await?;
         let now = self.authoritative_now(&mut transaction).await?;
@@ -154,6 +160,20 @@ impl PostgresProposalApplicationRepository {
         let before_items = list_item_batch_tx(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(map_item_error)?;
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(|error| map_item_error(completion_error(error)))?;
+        let before_completion_states = load_completion_states_tx(
+            &mut transaction,
+            self.scope,
+            &prepared
+                .commands
+                .iter()
+                .map(ProposalCommand::target_item_id)
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|error| map_item_error(completion_error(error)))?;
         sqlx::query("SAVEPOINT dayweave_proposal_preview_simulation")
             .execute(&mut *transaction)
             .await
@@ -165,8 +185,26 @@ impl PostgresProposalApplicationRepository {
         let apply_group_id = start_item_change_group_tx(&mut transaction)
             .await
             .map_err(map_item_error)?;
-        let simulated =
-            simulate_commands(&mut transaction, self.scope, &prepared.commands, now, true).await;
+        let simulated: Result<Vec<TransactionalItemEffect>, ProposalConflict> = async {
+            let mut effects =
+                simulate_commands(&mut transaction, self.scope, &prepared.commands, now, true)
+                    .await?;
+            finish_proposal_completion(
+                &mut transaction,
+                self.scope,
+                &completion_before,
+                apply_group_id,
+                now,
+                CompletionDeliveryMode::Preview,
+            )
+            .await
+            .map_err(|error| item_conflict(&prepared.commands[0], &error))?;
+            refresh_effects_after_completion(&mut transaction, self.scope, &mut effects)
+                .await
+                .map_err(|error| item_conflict(&prepared.commands[0], &error))?;
+            Ok(effects)
+        }
+        .await;
         let (effects, implicit_diffs, mut conflicts) = match simulated {
             Ok(mut effects) => {
                 let after_items = list_item_batch_tx(&mut transaction, self.scope.workspace_id)
@@ -193,16 +231,10 @@ impl PostgresProposalApplicationRepository {
                 )
                 .await?;
                 let mut conflicts = conflicts;
-                if let Err(error) = validate_preview_item_change_group_tx(
-                    &mut transaction,
-                    self.scope.workspace_id,
-                    apply_group_id,
-                )
-                .await
-                {
-                    conflicts.push(item_conflict(&prepared.commands[0], &error));
-                }
-
+                let undo_completion_before =
+                    capture_completion_before_tx(&mut transaction, self.scope)
+                        .await
+                        .map_err(|error| map_item_error(completion_error(error)))?;
                 let undo_group_id = start_item_change_group_tx(&mut transaction)
                     .await
                     .map_err(map_item_error)?;
@@ -211,15 +243,19 @@ impl PostgresProposalApplicationRepository {
                     self.scope,
                     &prepared.commands,
                     &effects,
+                    &before_completion_states,
                     now,
                 )
                 .await
                 {
                     Ok(()) => {
-                        if let Err(error) = validate_preview_item_change_group_tx(
+                        if let Err(error) = finish_proposal_completion(
                             &mut transaction,
-                            self.scope.workspace_id,
+                            self.scope,
+                            &undo_completion_before,
                             undo_group_id,
+                            now,
+                            CompletionDeliveryMode::Preview,
                         )
                         .await
                         {
@@ -246,7 +282,8 @@ impl PostgresProposalApplicationRepository {
             .zip(&prepared.commands)
             .map(|(effect, command)| item_diff(command, effect))
             .collect::<Vec<_>>();
-        let risks = proposal_risks(&prepared.commands, &effects);
+        let mut risks = proposal_risks(&prepared.commands, &effects);
+        risks.extend(implicit_completion_risks(&implicit_diffs));
         let maximum_risk = risks
             .iter()
             .map(|risk| risk.level)
@@ -415,21 +452,39 @@ impl PostgresProposalApplicationRepository {
         }
         let commands = prepare_change_set(&proposals, now)?.commands;
         validate_stored_preview(&preview, self.scope, &members, &proposals, &commands)?;
-        if canonical_item_hash(&mut transaction, self.scope.workspace_id).await?
-            != preview.canonical_hash
-        {
+        if canonical_item_hash(&mut transaction, self.scope).await? != preview.canonical_hash {
             return Err(ProposalApplicationError::Stale(
                 ProposalConflictCode::PreviewMismatch,
             ));
         }
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(|error| map_item_error(completion_error(error)))?;
+        let before_completion_states = load_completion_states_tx(
+            &mut transaction,
+            self.scope,
+            &commands
+                .iter()
+                .map(ProposalCommand::target_item_id)
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|error| map_item_error(completion_error(error)))?;
         let watermark = item_change_watermark(&mut transaction, self.scope.workspace_id).await?;
         let change_group_id = start_item_change_group_tx(&mut transaction)
             .await
             .map_err(map_item_error)?;
         let effects = execute_commands(&mut transaction, self.scope, &commands, now, true).await?;
-        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
-            .await
-            .map_err(map_item_error)?;
+        finish_proposal_completion(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            change_group_id,
+            now,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(map_item_error)?;
         let affected_item_ids =
             changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
         reject_provider_managed_items(&mut transaction, self.scope, &affected_item_ids).await?;
@@ -477,6 +532,17 @@ impl PostgresProposalApplicationRepository {
             &commands,
             &effects,
             &final_items,
+            now,
+        )
+        .await?;
+        insert_completion_application_evidence(&mut transaction, self.scope, application_id, now)
+            .await?;
+        insert_completion_effect_evidence(
+            &mut transaction,
+            self.scope,
+            application_id,
+            &effects,
+            &before_completion_states,
             now,
         )
         .await?;
@@ -625,6 +691,16 @@ impl PostgresProposalApplicationRepository {
                 ProposalConflictCode::UndoExpired,
             ));
         }
+        let completion_before = capture_completion_before_tx(&mut transaction, self.scope)
+            .await
+            .map_err(|error| map_item_error(completion_error(error)))?;
+        validate_completion_undo_evidence(
+            &mut transaction,
+            self.scope,
+            application_id,
+            &completion_before,
+        )
+        .await?;
         let fences = lock_fences(&mut transaction, self.scope, application_id).await?;
         validate_fences(&mut transaction, self.scope, &fences).await?;
         reject_provider_managed_items(
@@ -683,11 +759,21 @@ impl PostgresProposalApplicationRepository {
         validate_dependency_graph_batch_tx(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(map_item_error)?;
-        validate_item_change_group_tx(&mut transaction, self.scope.workspace_id, change_group_id)
-            .await
-            .map_err(map_item_error)?;
-        let undo_item_ids =
+        finish_proposal_completion(
+            &mut transaction,
+            self.scope,
+            &completion_before,
+            change_group_id,
+            now,
+            CompletionDeliveryMode::Committed,
+        )
+        .await
+        .map_err(map_item_error)?;
+        let mut undo_item_ids =
             changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
+        undo_item_ids.extend(fences.iter().map(|fence| fence.item_id));
+        undo_item_ids.sort_unstable();
+        undo_item_ids.dedup();
         let undo_items =
             fetch_items(&mut transaction, self.scope.workspace_id, &undo_item_ids).await?;
         let undo_audit_id = Uuid::new_v4();
@@ -814,6 +900,7 @@ struct StoredEffect {
     operation: ProposalOperation,
     item_id: Uuid,
     before: Option<Item>,
+    completion_before: Option<ItemCompletionState>,
 }
 
 struct StoredFence {
@@ -979,10 +1066,18 @@ async fn simulate_commands(
         .into_iter()
         .map(|item| (item.id, item))
         .collect::<HashMap<_, _>>();
+    let completion_states = load_completion_states_tx(
+        transaction,
+        scope,
+        &initial_by_id.keys().copied().collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|error| item_conflict(&commands[0], &completion_error(error)))?;
     validate_initial_command_fences(commands, &initial_by_id)
         .map_err(|(index, error)| item_conflict(&commands[index], &error))?;
-    let execution_order = command_execution_order(commands, &initial_by_id, now)
-        .map_err(|(index, error)| item_conflict(&commands[index], &error))?;
+    let execution_order =
+        command_execution_order(commands, &initial_by_id, &completion_states, now)
+            .map_err(|(index, error)| item_conflict(&commands[index], &error))?;
 
     // Stage every new identity before authoring any edge or blocked-by foreign
     // key. These rows remain transaction-local shells until their command is
@@ -1125,6 +1220,7 @@ async fn simulate_preview_undo_group(
     scope: DatabaseScope,
     commands: &[ProposalCommand],
     effects: &[TransactionalItemEffect],
+    before_completion_states: &BTreeMap<Uuid, ItemCompletionState>,
     now: DateTime<Utc>,
 ) -> Result<(), ProposalConflict> {
     let Some(first_command) = commands.first() else {
@@ -1175,6 +1271,12 @@ async fn simulate_preview_undo_group(
             operation: command.operation(),
             item_id: effect.after.id,
             before: effect.before.clone(),
+            completion_before: Some(
+                before_completion_states
+                    .get(&effect.after.id)
+                    .cloned()
+                    .unwrap_or_else(|| ItemCompletionState::empty(effect.after.id)),
+            ),
         };
         let inverse = inverse_command(&stored, &current)
             .map_err(|_| item_conflict(command, &ItemRepositoryError::Internal))?;
@@ -1190,6 +1292,7 @@ async fn simulate_preview_undo_group(
 #[derive(Clone)]
 struct ProjectedBatchState {
     items: HashMap<Uuid, Item>,
+    completion_states: BTreeMap<Uuid, ItemCompletionState>,
     pending_create_ids: HashSet<Uuid>,
 }
 
@@ -1198,6 +1301,7 @@ const MAX_COMMAND_ORDER_SEARCH_STATES: usize = 50_000;
 fn command_execution_order(
     commands: &[ProposalCommand],
     initial_by_id: &HashMap<Uuid, Item>,
+    completion_states: &BTreeMap<Uuid, ItemCompletionState>,
     now: DateTime<Utc>,
 ) -> Result<Vec<usize>, (usize, ItemRepositoryError)> {
     // Only a newly created parent is an unconditional prerequisite. Existing
@@ -1243,7 +1347,7 @@ fn command_execution_order(
         .enumerate()
         .filter_map(|(index, degree)| (*degree == 0).then_some(index))
         .collect::<BTreeSet<_>>();
-    let initial_projected = projected_batch_state(commands, initial_by_id, now)?;
+    let initial_projected = projected_batch_state(commands, initial_by_id, completion_states, now)?;
     let mut projected = initial_projected.clone();
     let mut order = Vec::with_capacity(commands.len());
     while !ready.is_empty() {
@@ -1382,6 +1486,7 @@ fn search_command_execution_order(
 fn projected_batch_state(
     commands: &[ProposalCommand],
     initial_by_id: &HashMap<Uuid, Item>,
+    completion_states: &BTreeMap<Uuid, ItemCompletionState>,
     now: DateTime<Utc>,
 ) -> Result<ProjectedBatchState, (usize, ItemRepositoryError)> {
     let mut items = initial_by_id.clone();
@@ -1417,6 +1522,7 @@ fn projected_batch_state(
     }
     Ok(ProjectedBatchState {
         items,
+        completion_states: completion_states.clone(),
         pending_create_ids,
     })
 }
@@ -1433,7 +1539,7 @@ fn project_command_for_ordering(
                 return Err(ItemRepositoryError::Duplicate(item.id));
             }
             let item = Item::new(item.clone(), now).map_err(ItemRepositoryError::from)?;
-            validate_projected_parent(&next.items, item.id, item.parent_id)?;
+            validate_projected_parent(&next, item.id, item.parent_id)?;
             validate_projected_blocker(&next.items, item.blocked_by_item_id)?;
             let parent_id = item.parent_id;
             (item, vec![parent_id])
@@ -1450,10 +1556,11 @@ fn project_command_for_ordering(
             let item = current
                 .replaced(item.clone(), now)
                 .map_err(ItemRepositoryError::from)?;
-            validate_projected_parent(&next.items, *item_id, item.parent_id)?;
+            validate_projected_parent(&next, *item_id, item.parent_id)?;
             validate_projected_blocker(&next.items, item.blocked_by_item_id)?;
             if projected_has_active_children(*item_id, &next.items)
                 && item.status.is_executing_state()
+                && !has_qualified_completion(&item, next.completion_states.get(item_id))
             {
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
@@ -1489,15 +1596,16 @@ fn project_command_for_ordering(
                 .filter(|item| item.deleted_at.is_some())
                 .cloned()
                 .ok_or(ItemRepositoryError::NotFound(*item_id))?;
-            validate_projected_parent(&next.items, *item_id, current.parent_id).map_err(
-                |error| match error {
+            validate_projected_parent(&next, *item_id, current.parent_id).map_err(|error| {
+                match error {
                     ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
                     other => other,
-                },
-            )?;
+                }
+            })?;
             let item = current.restored(now).map_err(ItemRepositoryError::from)?;
             if projected_has_active_children(*item_id, &next.items)
                 && item.status.is_executing_state()
+                && !has_qualified_completion(&item, next.completion_states.get(item_id))
             {
                 return Err(ItemRepositoryError::NonLeafExecutable);
             }
@@ -1522,7 +1630,7 @@ fn project_command_for_ordering(
 }
 
 fn validate_projected_parent(
-    items: &HashMap<Uuid, Item>,
+    state: &ProjectedBatchState,
     item_id: Uuid,
     parent_id: Option<Uuid>,
 ) -> Result<(), ItemRepositoryError> {
@@ -1532,11 +1640,14 @@ fn validate_projected_parent(
     if parent_id == item_id {
         return Err(ItemRepositoryError::SelfParent);
     }
+    let items = &state.items;
     let parent = items
         .get(&parent_id)
         .filter(|item| item.deleted_at.is_none())
         .ok_or(ItemRepositoryError::ParentNotFound(parent_id))?;
-    if parent.status.is_executing_state() {
+    if parent.status.is_executing_state()
+        && !has_qualified_completion(parent, state.completion_states.get(&parent_id))
+    {
         return Err(ItemRepositoryError::InvalidParentState);
     }
     let mut visited = HashSet::new();
@@ -1617,6 +1728,77 @@ async fn execute_commands(
     simulate_commands(transaction, scope, commands, now, record)
         .await
         .map_err(|conflict| ProposalApplicationError::Stale(conflict.code))
+}
+
+async fn finish_proposal_completion(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    before: &CompletionForestSnapshot,
+    primary_group_id: Uuid,
+    now: DateTime<Utc>,
+    delivery: CompletionDeliveryMode,
+) -> Result<(), ItemRepositoryError> {
+    match delivery {
+        CompletionDeliveryMode::Committed => {
+            validate_item_change_group_tx(transaction, scope.workspace_id, primary_group_id)
+                .await?;
+        }
+        CompletionDeliveryMode::Preview => {
+            validate_preview_item_change_group_tx(
+                transaction,
+                scope.workspace_id,
+                primary_group_id,
+            )
+            .await?;
+        }
+    }
+    let finalized = finalize_item_completion_tx(transaction, scope, before, now, delivery)
+        .await
+        .map_err(completion_error)?;
+    if finalized
+        .effects
+        .iter()
+        .any(|effect| !finalized.evaluated_item_ids.contains(&effect.after_item.id))
+    {
+        return Err(ItemRepositoryError::Internal);
+    }
+    Ok(())
+}
+
+async fn refresh_effects_after_completion(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    effects: &mut [TransactionalItemEffect],
+) -> Result<(), ItemRepositoryError> {
+    for effect in effects {
+        effect.after =
+            fetch_item_batch_tx(transaction, scope.workspace_id, effect.after.id, true).await?;
+    }
+    Ok(())
+}
+
+fn implicit_completion_risks(diffs: &[ProposalImplicitItemDiff]) -> Vec<ProposalRisk> {
+    let count = diffs
+        .iter()
+        .filter(|diff| {
+            diff.before.status != diff.after.status
+                || diff.before.completed_at != diff.after.completed_at
+                || diff.after.status == crate::items::ItemStatus::Completed
+        })
+        .count();
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![ProposalRisk {
+        code: ProposalRiskCode::ChangesExecutionState,
+        level: ProposalRiskLevel::Medium,
+        command_id: None,
+        item_id: None,
+        requires_explicit_approval: true,
+        summary: format!(
+            "Re-evaluates completion for {count} parent items; their resulting lifecycle changes are included in the hierarchy review."
+        ),
+    }]
 }
 
 async fn transactional_command_at_current_revision(
@@ -2443,8 +2625,9 @@ fn calculate_preview_hash(
 
 async fn canonical_item_hash(
     transaction: &mut Transaction<'_, Postgres>,
-    workspace_id: Uuid,
+    scope: DatabaseScope,
 ) -> Result<[u8; 32], ProposalApplicationError> {
+    let workspace_id = scope.workspace_id;
     let rows = sqlx::query(
         "SELECT id,revision,trashed_at IS NOT NULL AS deleted FROM items \
          WHERE workspace_id=$1 ORDER BY id",
@@ -2477,7 +2660,23 @@ async fn canonical_item_hash(
     for item_id in managed_item_ids {
         digest.update(item_id.as_bytes());
     }
+    let completion = capture_completion_before_tx(transaction, scope)
+        .await
+        .map_err(|error| map_item_error(completion_error(error)))?;
+    digest.update(b"\0completion-evidence\0");
+    digest.update(completion_forest_hash(&completion)?.as_bytes());
     Ok(digest.finalize().into())
+}
+
+fn completion_forest_hash(
+    snapshot: &CompletionForestSnapshot,
+) -> Result<String, ProposalApplicationError> {
+    item_completion_evidence_hash(
+        &snapshot.items,
+        &snapshot.states.values().cloned().collect::<Vec<_>>(),
+        &snapshot.execution,
+    )
+    .map_err(|error| map_item_error(completion_error(error)))
 }
 
 fn hash_json<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32], ProposalApplicationError> {
@@ -2581,6 +2780,21 @@ async fn scrub_expired_effect_snapshots(
          AND application.workspace_id=effect.workspace_id \
          AND application.user_id=effect.user_id AND application.id=effect.application_id \
          AND application.undo_expires_at <= $3 AND effect.snapshots_scrubbed_at IS NULL",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "UPDATE proposal_application_completion_states AS completion \
+         SET before_state_json=NULL,snapshots_scrubbed_at=$3 \
+         FROM proposal_applications AS application \
+         WHERE completion.workspace_id=$1 AND completion.user_id=$2 \
+         AND application.workspace_id=completion.workspace_id \
+         AND application.user_id=completion.user_id AND application.id=completion.application_id \
+         AND application.undo_expires_at <= $3 AND completion.snapshots_scrubbed_at IS NULL",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -2857,6 +3071,103 @@ async fn insert_fences(
         .map_err(internal)?;
     }
     Ok(())
+}
+
+async fn insert_completion_effect_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    effects: &[TransactionalItemEffect],
+    before_states: &BTreeMap<Uuid, ItemCompletionState>,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    for effect in effects {
+        let state = before_states
+            .get(&effect.after.id)
+            .cloned()
+            .unwrap_or_else(|| ItemCompletionState::empty(effect.after.id));
+        state
+            .validate()
+            .map_err(|error| map_item_error(completion_error(error)))?;
+        let hash = hash_domain_json(b"dayweave.proposal.completion-state.v1\0", &state)?;
+        sqlx::query(
+            "INSERT INTO proposal_application_completion_states \
+             (workspace_id,user_id,application_id,ordinal,item_id,before_state_json,before_state_hash,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(scope.workspace_id).bind(scope.user_id).bind(application_id)
+        .bind(i16::try_from(effect.execution_ordinal).map_err(internal)?)
+        .bind(effect.after.id).bind(serde_json::to_value(&state).map_err(internal)?)
+        .bind(hash.as_slice()).bind(now)
+        .execute(&mut **transaction).await.map_err(internal)?;
+    }
+    Ok(())
+}
+
+async fn insert_completion_application_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    let snapshot = capture_completion_before_tx(transaction, scope)
+        .await
+        .map_err(|error| map_item_error(completion_error(error)))?;
+    let hash = completion_forest_hash(&snapshot)?;
+    sqlx::query(
+        "INSERT INTO proposal_application_completion_evidence \
+         (workspace_id,user_id,application_id,post_apply_evidence_hash,execution_revision,created_at) \
+         VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(scope.workspace_id).bind(scope.user_id).bind(application_id)
+    .bind(hash).bind(revision_i64(snapshot.execution.revision)?).bind(now)
+    .execute(&mut **transaction).await.map_err(internal)?;
+    Ok(())
+}
+
+async fn validate_completion_undo_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    current: &CompletionForestSnapshot,
+) -> Result<(), ProposalApplicationError> {
+    let stored = sqlx::query(
+        "SELECT post_apply_evidence_hash,execution_revision \
+         FROM proposal_application_completion_evidence \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let matches = if let Some(stored) = stored {
+        let expected: String = stored
+            .try_get("post_apply_evidence_hash")
+            .map_err(internal)?;
+        let execution_revision: i64 = stored.try_get("execution_revision").map_err(internal)?;
+        expected == completion_forest_hash(current)?
+            && execution_revision == revision_i64(current.execution.revision)?
+    } else {
+        // Historical receipts replay before this gate. An old fresh undo has
+        // no completion read-set or inverse custody, so it is safe only before
+        // the workspace has acquired any explicit completion state.
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM item_completion_state WHERE workspace_id=$1)",
+        )
+        .bind(scope.workspace_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::UndoDiverged,
+        ))
+    }
 }
 
 async fn accept_proposals(
@@ -3171,8 +3482,18 @@ async fn load_effects_reverse(
     application_id: Uuid,
 ) -> Result<Vec<StoredEffect>, ProposalApplicationError> {
     let rows = sqlx::query(
-        "SELECT operation,item_id,before_snapshot,before_snapshot_hash FROM proposal_application_effects \
-         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY ordinal DESC",
+        "SELECT effect.operation,effect.item_id,effect.before_snapshot,effect.before_snapshot_hash, \
+         completion.item_id AS completion_item_id,completion.before_state_json,completion.before_state_hash, \
+         completion.snapshots_scrubbed_at, evidence.application_id IS NOT NULL AS completion_recorded \
+         FROM proposal_application_effects effect \
+         LEFT JOIN proposal_application_completion_states completion \
+           ON completion.workspace_id=effect.workspace_id AND completion.user_id=effect.user_id \
+           AND completion.application_id=effect.application_id AND completion.ordinal=effect.ordinal \
+         LEFT JOIN proposal_application_completion_evidence evidence \
+           ON evidence.workspace_id=effect.workspace_id AND evidence.user_id=effect.user_id \
+           AND evidence.application_id=effect.application_id \
+         WHERE effect.workspace_id=$1 AND effect.user_id=$2 AND effect.application_id=$3 \
+         ORDER BY effect.ordinal DESC",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -3182,6 +3503,37 @@ async fn load_effects_reverse(
     .map_err(internal)?;
     rows.iter()
         .map(|row| {
+            let item_id: Uuid = row.try_get("item_id").map_err(internal)?;
+            let completion_recorded: bool = row.try_get("completion_recorded").map_err(internal)?;
+            let completion_item_id: Option<Uuid> =
+                row.try_get("completion_item_id").map_err(internal)?;
+            let completion_before = if completion_recorded {
+                let scrubbed: Option<DateTime<Utc>> =
+                    row.try_get("snapshots_scrubbed_at").map_err(internal)?;
+                let value: Option<Value> = row.try_get("before_state_json").map_err(internal)?;
+                let hash: Option<Vec<u8>> = row.try_get("before_state_hash").map_err(internal)?;
+                if completion_item_id != Some(item_id) || scrubbed.is_some() {
+                    return Err(ProposalApplicationError::Internal);
+                }
+                let state: ItemCompletionState =
+                    serde_json::from_value(value.ok_or(ProposalApplicationError::Internal)?)
+                        .map_err(internal)?;
+                state
+                    .validate()
+                    .map_err(|error| map_item_error(completion_error(error)))?;
+                if state.item_id != item_id
+                    || bytes32(hash.ok_or(ProposalApplicationError::Internal)?)?
+                        != hash_domain_json(b"dayweave.proposal.completion-state.v1\0", &state)?
+                {
+                    return Err(ProposalApplicationError::Internal);
+                }
+                Some(state)
+            } else {
+                if completion_item_id.is_some() {
+                    return Err(ProposalApplicationError::Internal);
+                }
+                None
+            };
             let before_value: Option<Value> = row.try_get("before_snapshot").map_err(internal)?;
             let before = before_value
                 .map(serde_json::from_value)
@@ -3200,8 +3552,9 @@ async fn load_effects_reverse(
                 operation: parse_operation(
                     &row.try_get::<String, _>("operation").map_err(internal)?,
                 )?,
-                item_id: row.try_get("item_id").map_err(internal)?,
+                item_id,
                 before,
+                completion_before,
             })
         })
         .collect()
@@ -3227,6 +3580,7 @@ fn inverse_command(
                 item_id: effect.item_id,
                 expected_revision: current.revision,
                 snapshot: Box::new(before.clone()),
+                completion_state: effect.completion_before.clone().map(Box::new),
             })
         }
     }
@@ -3735,6 +4089,7 @@ mod tests {
             command_execution_order(
                 &commands,
                 &initial_by_id,
+                &BTreeMap::new(),
                 "2026-09-04T12:05:00Z".parse().unwrap(),
             )
             .expect("fallback finds the valid projected sequence"),
