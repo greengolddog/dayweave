@@ -8,6 +8,7 @@
 mod custom_recurrence;
 mod domain;
 mod habits;
+mod hierarchy_completion;
 mod hierarchy_progress;
 mod progress_value;
 mod recurrence;
@@ -16,6 +17,7 @@ mod scheduler;
 pub use custom_recurrence::*;
 pub use domain::*;
 pub use habits::*;
+pub use hierarchy_completion::*;
 pub use hierarchy_progress::*;
 pub use progress_value::*;
 pub use recurrence::*;

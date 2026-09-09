@@ -11,6 +11,11 @@ completion and visible manual overrides still require authoritative commands
 and native review flows. A count of completed leaves is not a substitute for
 those features.
 
+The separate [required-descendant completion engine](hierarchy-completion.md)
+now defines pure decisions, explicit override/provenance rules and occurrence
+boundaries. It does not yet apply those decisions to the server or expose native
+completion controls; `HIE-004` remains in progress.
+
 ## Read-only roll-up contract
 
 1. Derive summaries from the complete admitted canonical forest, never schedule

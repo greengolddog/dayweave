@@ -1,0 +1,161 @@
+# Required descendants and parent completion
+
+Status: implementation in progress for `HIE-004`. The first implementation part
+is a pure, iterative decision engine. It is not yet a server mutation path or a
+native completion control. The full requirement remains automatic completion,
+visible manual overrides, durable cross-device behavior, and native review on
+both platforms.
+
+The accepted source is [requirements](product-requirements.md#43-hierarchy-goals-projects-routines-and-dependencies)
+and [discovery answers 203–207](discovery-answers.md). The detailed defaults below
+are implementation decisions; they are not additional answers attributed to the
+owner. [Recorded summaries](hierarchy-progress.md) and
+[independent progress components](item-progress.md) remain separate concepts.
+
+## Completion rules
+
+- A child relationship is required by default. The owner may explicitly make
+  that relationship optional. An optional edge excludes its entire branch from
+  that ancestor's completion requirements; the branch still evaluates its own
+  requirements independently.
+- Automatic completion requires at least one required descendant, and every
+  descendant reachable through required edges must be completed. A newly empty
+  goal, or a parent whose children are all optional, must not complete merely
+  because there is no required work. Neither skipped nor cancelled means done.
+- Evaluate bottom-up. An automatically completed child can satisfy its own
+  required position in the next ancestor. An open required grandchild still
+  prevents automatic ancestor completion even if its immediate parent was
+  manually marked complete. Manual overrides affect only their own item; they
+  do not silently waive another ancestor's requirements or mutate descendants.
+- The explicit modes are **Automatic**, **Keep open**, and **Mark complete**.
+  A manual mode remains visible and persists until the owner explicitly returns
+  to Automatic. Mark complete requires review of the unfinished requirements;
+  it does not stop a child's timer, cancel remaining tasks, or rewrite recorded
+  work. Keep open suppresses automatic completion of its item.
+- Record completion provenance and the previous open status. When requirements
+  regress, an automatically completed parent reopens to that recorded status.
+  Clearing a manual completion also needs an explicit preserved reopening
+  status; do not invent one from a completed record. Ordinary completed leaves
+  without automatic provenance remain ordinary recorded completion.
+- A structural parent with an ambiguous terminal status and no completion
+  provenance requires an explicit policy/reopening review. It must not become
+  an invisible permanent override. In particular, preserving ordinary terminal
+  leaves is not permission to silently preserve a cancelled/skipped parent or a
+  completed parent with unfinished required descendants. Current canonical CRUD
+  already rejects terminal non-leaf states; migration and future parent-status
+  commands must establish explicit, visible semantics before admitting them.
+- Reopening, reparenting, restoring, removing a required relationship, and
+  changing a manual mode must evaluate affected old and new ancestry. No stale
+  automatically completed prerequisite may authorize scheduling or publication.
+- Percentage, elapsed/remaining time and quantity targets remain informational
+  for this rule. Reaching 100%, zero remaining or a quantity target is not a
+  lifecycle command. A configurable required-component policy would need its
+  own explicit contract; it must not be inferred from the independent sidecar.
+
+## Recurrence and execution boundaries
+
+A canonical recurring template is not evidence that any particular occurrence
+has been completed. One-off evaluation reports unresolved occurrence evidence
+for a required recurring branch instead of converting template statuses into
+achievement. A separate evaluation may use an explicitly qualified occurrence
+and the complete corresponding tree, with lifecycle supplied for that exact
+occurrence. Nested independent recurrence must not inherit proof from an outer
+occurrence merely because it is a descendant.
+
+An unqualified recurring node emits no lifecycle or provenance transition,
+including manual completion or reopening. Reporting unknown occurrence evidence
+only in an ancestor's counts is insufficient: the node's own decision must also
+withhold that mutation. An otherwise qualified one-off ancestor may still reopen
+when its required branch becomes unproven.
+
+Occurrence results never complete a permanent series or another occurrence.
+Authoritative occurrence outcomes, not a bounded execution-history window,
+must supply the evidence. This engine does not award time, settle execution
+commands, stop reservations, or infer completion from estimated duration.
+
+## Decision engine boundary
+
+The shared engine takes a complete normalized active forest, explicit policy,
+recorded lifecycle/provenance and evaluation scope. It validates duplicate IDs,
+missing parents, cycles and incomplete topology before producing decisions.
+Traversal must remain iterative for at least 5,000 levels. Counts must be
+checked, and the result must not depend on input order.
+
+Results describe proposed status/provenance, reasons and required-descendant
+counts. They are not authenticated read proof, a persisted completion receipt,
+or permission to release sensitive aggregate data. A caller must establish a
+coherent authoritative snapshot and apply decisions through the canonical
+mutation boundary.
+
+Implementation: [shared evaluator](../crates/dayweave-core/src/hierarchy_completion.rs)
+and [regressions](../crates/dayweave-core/tests/hierarchy_completion.rs). The
+types are Rust-only and do not change an existing wire or persistence schema.
+
+Verification on 2026-09-09: all 22 focused completion tests and all 187 core tests
+passed, with no failures or ignored tests. All-target/all-feature core Clippy
+passed with warnings denied. Coverage includes a 5,000-level completion/reopen
+chain, input-order independence, optional branches, non-vacuous completion,
+every open/skipped/cancelled leaf status, manual release/pinning, ambiguous
+terminal-parent rejection, qualified/nested recurrence boundaries, invalid
+topology and retained provenance. Independent semantic review identified and
+checked the terminal-parent and unqualified-occurrence regressions. These are
+pure-engine results, not server or physical-device acceptance.
+
+## Authoritative and native integration still required
+
+The server policy/read/command contract must bind explicit review to the item,
+policy and evaluated requirement evidence, with exact durable operation replay.
+It must preserve policy and completion provenance across legacy full-item
+replacement, proposal apply/undo, imports and snapshot restoration. No old
+submitted request may silently reset the new policy.
+
+All canonical writers must apply the same completion rules before stale status
+can authorize a dependent operation. Unlimited-depth derived updates must
+coexist with the existing 300-record/8-MiB atomic delta-group bounds. Transaction
+grouping, direct-mutation historical receipts, proposal preview/undo and native
+terminal-cursor hydration need integration tests; a background ancestor worker
+alone is not sufficient.
+
+The intended application strategy is synchronous evaluation under the existing
+execution/workspace lock, before the transaction commits. Keep the primary
+direct or compound delta group intact, close it, then partition derived ancestor
+changes into separately bounded, contiguous groups in the same transaction.
+This avoids exposing a committed child change alongside stale prerequisite
+completion. It still needs implementation and integration verification; the
+following are the identified writer boundaries, not completed integrations:
+
+| Writer | Required integration |
+| --- | --- |
+| [Direct item CRUD](../server/dayweave-api/src/persistence/item_repository.rs) | Finalize after the direct group, retain the exact direct-operation receipt, evaluate old and new ancestry, and publish derived status changes before commit. Do not replace the transaction-local group setting inside an unfinished primary group. |
+| [Proposal preview/apply/undo](../server/dayweave-api/src/persistence/proposal_application_repository.rs) | Evaluate only after the entire command batch, before final snapshot/diff/fence capture. Preview and undo simulation must use the same path. Preserve changed-item and undo-fence accounting even when an affected ancestor recomputes to an unchanged value. |
+| [Calendar/Tasks imports](../server/dayweave-api/src/persistence/google_sync_repository.rs) | Derive affected ancestry from changed item identity and old/new membership, not the topology-only parent-refresh iterator. Reconcile provider-mapping revisions when completion changes a mapped item after the direct import result. |
+| Native receipt settlement | An exact historical successful response may settle its original journal after newer canonical state arrives. Never require that newer state to still match the older draft; never replace newer status, deletion or privacy evidence with the historical receipt. |
+
+Both native delta loaders collect through a terminal cursor before installing a
+new complete forest. This is the relevant hydration boundary for multiple
+bounded groups in one server transaction; a response page by itself must not be
+treated as proof that all ancestor changes have arrived.
+
+Per-group bounds do not remove the total hydration bounds: macOS currently
+limits one catch-up to 20,000 changes/32 MiB retained data/100 pages; Android
+limits it to 25,600 changes/512 pages and a 24-MiB folded canonical cache.
+Repeated deep complete/reopen cascades can exhaust a
+fresh client's historical bootstrap budget even when its current forest is
+small enough. The integrated feature therefore needs a verified bounded
+current-state bootstrap strategy and a deep cold-client test, not merely larger
+page limits or a warm-cursor test. Truncated history must never masquerade as a
+complete forest.
+
+Existing full-authoring receipts require the exact reviewed draft and revision.
+An automatic side effect must not rewrite that response into an incompatible
+successful receipt. Canonical response fields are also compatibility-sensitive:
+Android rejects unknown fields, and macOS retains them as read-only. Completion
+policy and override commands need an independently versioned contract rather
+than widening old status journals or silently changing their wire bytes.
+
+Both native clients still need protected completion explanations, required-edge
+editing, reviewed override/resume-automatic controls, encrypted offline intent,
+conflict/retry/discard custody, explicit storage upgrades and refreshed server
+evidence. Required counts and blocker identities inherit subtree privacy. Owner
+acceptance, recurring-instance integration and deep cross-client mutation tests
+remain part of the full feature's completion gate.
