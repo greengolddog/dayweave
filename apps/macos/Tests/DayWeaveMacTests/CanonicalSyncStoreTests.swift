@@ -212,6 +212,121 @@ struct CanonicalSyncStoreTests {
         #expect(planner.canonicalTombstoneRevisions[itemID] == 2)
     }
 
+    @Test("cold bootstrap buffers a 5000-node child-first forest and retains bare recent trash across restart")
+    func currentBootstrapDeepForest() async throws {
+        let token = "canonical-current-deep-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let ids = (0..<5_000).map {
+            UUID(uuidString: String(format: "30000000-0000-4000-8000-%012llx", UInt64($0)))!
+        }
+        let deletedID = UUID()
+        let changes = ids.indices.reversed().map { index in
+            let item = Self.itemObject(
+                id: ids[index], revision: 12, status: "planned",
+                parentID: index == 0 ? nil : ids[index - 1],
+                isExecutable: index == ids.count - 1
+            )
+            return "{\"type\":\"upsert\",\"item\":\(item)}"
+        } + [#"{"type":"tombstone","tombstone":{"id":"\#(deletedID.uuidString.lowercased())","revision":8,"deleted_at":"2026-08-29T07:00:00Z","parent_id":null}}"#]
+        URLProtocolStub.storage.reset(key: token)
+        let pageStarts = Array(stride(from: 0, to: changes.count, by: 300))
+        for (pageIndex, start) in pageStarts.enumerated() {
+            let hasMore = pageIndex + 1 < pageStarts.count
+            let cursor = hasMore ? "snapshot-page-\(pageIndex + 1)" : "captured-head"
+            let body = changes[start..<min(start + 300, changes.count)].joined(separator: ",")
+            URLProtocolStub.storage.enqueue(key: token, .init(statusCode: 200, body: Data(
+                "{\"changes\":[\(body)],\"next_cursor\":\"\(cursor)\",\"has_more\":\(hasMore)}".utf8
+            )))
+        }
+        URLProtocolStub.storage.enqueue(key: token, .init(
+            statusCode: 404, headers: Self.trustedCanonicalMutationErrorHeaders,
+            body: Data(#"{"error":{"code":"not_found","message":"Published schedule was not found"}}"#.utf8)
+        ))
+        let planner = PlannerStore(
+            persistence: context.persistence, restoreFromPersistence: false, now: { now }
+        )
+        let sync = Self.makeSync(
+            planner: planner, token: token, now: now, scheduleReplicaRequiresDurableBinding: false
+        )
+        #expect(await sync.bootstrapForegroundActivation())
+        #expect(planner.canonicalItems.map(\.id) == ids)
+        #expect(planner.canonicalDeltaCursor == "captured-head")
+        #expect(planner.canonicalTrashEntry(id: deletedID)?.revision == 8)
+        #expect(planner.canonicalTrashEntry(id: deletedID)?.lastKnownItem == nil)
+        let restored = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restored.persistenceError == nil)
+        #expect(restored.canonicalItems.map(\.id) == ids)
+        #expect(restored.canonicalDeltaCursor == "captured-head")
+        #expect(restored.canonicalTrashEntry(id: deletedID)?.revision == 8)
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.allSatisfy { $0.method == "GET" })
+        #expect(requests.count == pageStarts.count + 1)
+        for (index, request) in requests.dropLast().enumerated() {
+            let query = Set(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+            #expect(query.contains(URLQueryItem(name: "bootstrap", value: "current")) == (index == 0))
+            if index > 0 {
+                #expect(query.contains(URLQueryItem(name: "cursor", value: "snapshot-page-\(index)")))
+            }
+        }
+    }
+
+    @Test("partial or unsupported cold snapshots never replace encrypted cache", arguments: [409, 422, 503])
+    func currentBootstrapFailurePreservesCache(statusCode: Int) async throws {
+        let token = "canonical-current-failed-\(statusCode)-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let cached = try Self.decodeItem(Self.itemObject(id: UUID(), revision: 2, isSensitive: true))
+        let planner = PlannerStore(
+            canonicalItems: [cached], canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence, restoreFromPersistence: false, now: { now }
+        )
+        planner.flushPersistence()
+        URLProtocolStub.storage.reset(key: token)
+        if statusCode != 422 {
+            URLProtocolStub.storage.enqueue(key: token, .init(statusCode: 200, body: Data(
+                "{\"changes\":[{\"type\":\"upsert\",\"item\":\(Self.itemObject(id: UUID(), revision: 1))}],\"next_cursor\":\"snapshot-partial\",\"has_more\":true}".utf8
+            )))
+        }
+        URLProtocolStub.storage.enqueue(key: token, .init(
+            statusCode: statusCode,
+            body: Data(#"{"error":{"code":"item_bootstrap_expired","message":"Snapshot unavailable"}}"#.utf8)
+        ))
+        let sync = Self.makeSync(
+            planner: planner, token: token, now: now, scheduleReplicaRequiresDurableBinding: false
+        )
+        #expect(!(await sync.bootstrapForegroundActivation()))
+        #expect(planner.canonicalItems == [cached])
+        #expect(planner.canonicalDeltaCursor == nil)
+        let restored = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restored.canonicalItems == [cached])
+        #expect(restored.canonicalDeltaCursor == nil)
+        #expect(URLProtocolStub.storage.requests(for: token).count == (statusCode == 422 ? 1 : 2))
+    }
+
+    @Test("empty cold current-state snapshot replaces cursorless stale cache")
+    func currentBootstrapEmptyReplacesCache() async throws {
+        let token = "canonical-current-empty-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let cached = try Self.decodeItem(Self.itemObject(id: UUID(), revision: 2))
+        let planner = PlannerStore(
+            canonicalItems: [cached], canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            restoreFromPersistence: false, now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"empty-head","has_more":false}"#.utf8)),
+            .init(statusCode: 200, body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8))
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+        await sync.sync()
+        #expect(!sync.status.isFailure)
+        #expect(planner.canonicalItems.isEmpty)
+        #expect(planner.canonicalDeltaCursor == "empty-head")
+    }
+
     @Test("aggregate delta change budget fails closed")
     func testDeltaChangeBudget() async throws {
         let token = "canonical-delta-budget-token"
@@ -3676,13 +3791,15 @@ struct CanonicalSyncStoreTests {
     private static func makeSync(
         planner: PlannerStore,
         token: String,
-        now: Date
+        now: Date,
+        scheduleReplicaRequiresDurableBinding: Bool = true
     ) -> CanonicalSyncStore {
         CanonicalSyncStore(
             planner: planner,
             configurationStore: FixedAPIConfigurationStore(baseURL: baseURLString),
             tokenStore: TestBearerTokenStore(token: token),
             session: URLProtocolStub.makeSession(),
+            scheduleReplicaRequiresDurableBinding: scheduleReplicaRequiresDurableBinding,
             now: { now }
         )
     }

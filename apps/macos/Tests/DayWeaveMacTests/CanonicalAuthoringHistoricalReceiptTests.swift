@@ -226,6 +226,55 @@ struct CanonicalAuthoringHistoricalReceiptTests {
         #expect(expired.canonicalTombstoneRevisions[Self.itemID] == 2)
     }
 
+    @Test("replacement bootstrap preserves submitted replace and trash replay eligibility")
+    func bootstrapKeepsSubmittedCustody() throws {
+        for operation in [CanonicalAuthoringOperation.replace, .trash] {
+            for missing in [false, true] {
+                let context = try Context()
+                defer { context.remove() }
+                let response = try item(revision: 2, deleted: operation == .trash)
+                let mutation = try submitted(operation, response: response)
+                let store = try context.store(items: [try item(revision: 1)], mutation: mutation)
+                let changes: [DayWeaveItemDeltaChange] = missing ? [] : [
+                    .upsert(try item(revision: 4, status: "completed", sensitive: true)),
+                ]
+                #expect(store.beginCanonicalSync())
+                _ = try store.replaceCanonicalStateDurably(changes: changes, nextCursor: "current-head")
+                store.endCanonicalSync()
+                #expect(store.pendingCanonicalAuthoringMutations == [mutation])
+                let resumed = PlannerStore(persistence: context.persistence, now: { Self.now })
+                #expect(resumed.loadState == .ready)
+                #expect(resumed.pendingCanonicalAuthoringMutations == [mutation])
+                #expect(resumed.pendingCanonicalAuthoringMutations.first?.disposition == .pending)
+                #expect(resumed.canonicalDeltaCursor == "current-head")
+            }
+        }
+    }
+
+    @Test("replacement bootstrap never renews same-revision unpinned trash retention")
+    func bootstrapRetainsOriginalTrashAnchor() throws {
+        let context = try Context()
+        defer { context.remove() }
+        let deleted = try item(revision: 2, deleted: true)
+        let old = DayWeaveCanonicalTrashEntry(id: Self.itemID, revision: 2,
+            deletedAt: Self.now, parentID: nil, lastKnownItem: deleted)
+        let replayDate = Self.now.addingTimeInterval(10 * 86_400)
+        let store = PlannerStore(canonicalTombstoneRevisions: [Self.itemID: 2],
+            canonicalConfigurationIdentifier: Self.configuration, canonicalTrash: [old],
+            persistence: context.persistence, restoreFromPersistence: false, now: { replayDate })
+        #expect(store.beginCanonicalSync())
+        _ = try store.replaceCanonicalStateDurably(changes: [.tombstone(.init(
+            id: Self.itemID, revision: 2, deletedAt: Self.now.addingTimeInterval(90 * 86_400), parentID: nil
+        ))], nextCursor: "current-head")
+        store.endCanonicalSync()
+        #expect(store.canonicalTrashEntry(id: Self.itemID)?.deletedAt == Self.now)
+        #expect(store.canonicalTrashEntry(id: Self.itemID)?.lastKnownItem == nil)
+        let expiredDate = Self.now.addingTimeInterval(PlannerStore.canonicalTrashRetentionInterval + 1)
+        let expired = PlannerStore(persistence: context.persistence, now: { expiredDate })
+        #expect(expired.loadState == .ready)
+        #expect(expired.canonicalTrashEntry(id: Self.itemID) == nil)
+    }
+
     private static let itemID = UUID(uuidString: "aa770000-0000-4000-8000-000000000001")!
     private static let otherID = UUID(uuidString: "aa770000-0000-4000-8000-000000000002")!
     nonisolated private static let now = Date(timeIntervalSince1970: 1_800_100_000)

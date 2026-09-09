@@ -2168,8 +2168,18 @@ struct DayWeaveAPIClient: Sendable {
         return envelope.mutation
     }
 
-    func itemDelta(cursor: String?, limit: Int = 200) async throws -> DayWeaveItemDeltaPage {
+    func itemDelta(
+        cursor: String?,
+        limit: Int = 200,
+        bootstrapCurrent: Bool = false
+    ) async throws -> DayWeaveItemDeltaPage {
+        guard !bootstrapCurrent || cursor == nil else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
         var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if bootstrapCurrent {
+            queryItems.append(URLQueryItem(name: "bootstrap", value: "current"))
+        }
         if let cursor, !cursor.isEmpty {
             queryItems.append(URLQueryItem(name: "cursor", value: cursor))
         }

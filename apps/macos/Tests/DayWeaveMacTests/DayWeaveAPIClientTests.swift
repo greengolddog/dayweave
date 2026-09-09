@@ -320,6 +320,35 @@ struct DayWeaveAPIClientTests {
         ]))
     }
 
+    @Test("current bootstrap is explicit and only applies to the first cursorless request")
+    func currentBootstrapQueryContract() async throws {
+        let client = makeClient(token: Self.apiToken)
+        for _ in 0..<3 {
+            URLProtocolStub.storage.enqueue(
+                key: Self.apiToken,
+                .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"opaque-head","has_more":false}"#.utf8))
+            )
+        }
+        _ = try await client.itemDelta(cursor: nil)
+        _ = try await client.itemDelta(cursor: nil, limit: 1, bootstrapCurrent: true)
+        _ = try await client.itemDelta(cursor: "opaque-snapshot-page", limit: 1)
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        let queries = requests.map {
+            Set(URLComponents(url: $0.url, resolvingAgainstBaseURL: false)?.queryItems ?? [])
+        }
+        #expect(queries == [
+            Set([URLQueryItem(name: "limit", value: "200")]),
+            Set([URLQueryItem(name: "limit", value: "1"), URLQueryItem(name: "bootstrap", value: "current")]),
+            Set([URLQueryItem(name: "limit", value: "1"), URLQueryItem(name: "cursor", value: "opaque-snapshot-page")]),
+        ])
+        for cursor in ["", "opaque-snapshot-page"] {
+            await #expect(throws: DayWeaveAPIError.requestEncodingFailed) {
+                _ = try await client.itemDelta(cursor: cursor, bootstrapCurrent: true)
+            }
+        }
+        #expect(URLProtocolStub.storage.requests(for: Self.apiToken).count == 3)
+    }
+
     @Test("canonical structural metadata is typed, exact, and cache-stable")
     func testCanonicalStructuralMetadataRoundTrip() async throws {
         let blockerID = UUID(uuidString: "dddddddd-3333-4333-8333-eeeeeeeeeeee")!

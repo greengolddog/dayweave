@@ -1925,6 +1925,19 @@ final class PlannerStore: ObservableObject {
         var retainedRestoreTombstones = canonicalTombstoneRevisions.filter {
             recoveryItemIDs.contains($0.key)
         }
+        let oldTrashByID = Dictionary(canonicalTrash.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first })
+        for change in changes {
+            guard case let .tombstone(tombstone) = change,
+                  let old = oldTrashByID[tombstone.id],
+                  old.revision == tombstone.revision,
+                  retainedRestoreTrashByID[tombstone.id] == nil else { continue }
+            // A complete replacement must not renew the first local retention
+            // anchor for the same deletion. Carry no unpinned old body and no
+            // omitted history into the new snapshot.
+            retainedRestoreTrashByID[tombstone.id] = old.withoutRetainedItemBody
+            retainedRestoreTombstones[tombstone.id] = tombstone.revision
+        }
         for mutation in pendingCanonicalAuthoringMutations
             where mutation.operation == .restore {
             guard let expectedRevision = mutation.expectedRevision else { continue }
@@ -1991,6 +2004,9 @@ final class PlannerStore: ObservableObject {
         }
         for index in pendingCanonicalAuthoringMutations.indices {
             let mutation = pendingCanonicalAuthoringMutations[index]
+            // Newer/missing current-state evidence cannot prove that an
+            // already submitted write failed. Keep its exact replay eligible.
+            guard !mutation.hasBeenSubmitted else { continue }
             switch mutation.operation {
             case .replace where finalActiveByID[mutation.itemID] == nil:
                 pendingCanonicalAuthoringMutations[index].disposition = .conflicted

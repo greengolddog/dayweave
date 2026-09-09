@@ -805,6 +805,7 @@ final class CanonicalSyncStore: ObservableObject {
         client: DayWeaveAPIClient,
         generation: UInt64
     ) async throws {
+        let initialCursor = planner.canonicalDeltaCursor
         func ensureCurrent() throws {
             guard foregroundItemIsCurrent(generation),
                   canonicalClientIsCurrent(client),
@@ -816,18 +817,23 @@ final class CanonicalSyncStore: ObservableObject {
         do {
             let result = try await loadDelta(
                 client: client,
-                from: planner.canonicalDeltaCursor,
+                from: initialCursor,
                 enforceItemCursorContract: true
             )
             try ensureCurrent()
-            _ = try planner.applyCanonicalDeltaDurably(
-                result.changes,
-                nextCursor: result.cursor
-            )
+            if initialCursor == nil {
+                _ = try planner.replaceCanonicalStateDurably(
+                    changes: result.changes, nextCursor: result.cursor
+                )
+            } else {
+                _ = try planner.applyCanonicalDeltaDurably(
+                    result.changes, nextCursor: result.cursor
+                )
+            }
         } catch let error as DayWeaveAPIError {
             guard case let .server(statusCode, _, _, _) = error,
                   statusCode == 422,
-                  planner.canonicalDeltaCursor != nil else { throw error }
+                  initialCursor != nil else { throw error }
             try ensureCurrent()
             let result = try await loadDelta(
                 client: client,
@@ -1566,15 +1572,21 @@ final class CanonicalSyncStore: ObservableObject {
         operationID: UUID,
         generation: UInt64
     ) async throws -> CanonicalDeltaCommitResult {
+        let initialCursor = planner.canonicalDeltaCursor
         do {
             let result = try await loadDelta(
                 client: client,
-                from: planner.canonicalDeltaCursor,
+                from: initialCursor,
                 enforceItemCursorContract: true
             )
             try ensureOperationCurrent(operationID: operationID, generation: generation)
             guard DayWeaveItemCursorContract.isValidTransportToken(result.cursor) else {
                 throw CanonicalSyncError.invalidDeltaSequence
+            }
+            if initialCursor == nil {
+                return try planner.replaceCanonicalStateDurably(
+                    changes: result.changes, nextCursor: result.cursor
+                )
             }
             return try planner.applyCanonicalDeltaDurably(
                 result.changes,
@@ -1583,7 +1595,7 @@ final class CanonicalSyncStore: ObservableObject {
         } catch let error as DayWeaveAPIError {
             guard case let .server(statusCode, _, _, _) = error,
                   statusCode == 422,
-                  planner.canonicalDeltaCursor != nil else {
+                  initialCursor != nil else {
                 throw error
             }
             try ensureOperationCurrent(operationID: operationID, generation: generation)
@@ -1854,18 +1866,23 @@ final class CanonicalSyncStore: ObservableObject {
         operationID: UUID,
         generation: UInt64
     ) async throws {
+        let initialCursor = planner.canonicalDeltaCursor
         do {
-            let result = try await loadDelta(client: client, from: planner.canonicalDeltaCursor)
+            let result = try await loadDelta(client: client, from: initialCursor)
             try ensureOperationCurrent(operationID: operationID, generation: generation)
-            planner.applyCanonicalDelta(result.changes, nextCursor: result.cursor)
+            if initialCursor == nil {
+                planner.replaceCanonicalState(changes: result.changes, nextCursor: result.cursor)
+            } else {
+                planner.applyCanonicalDelta(result.changes, nextCursor: result.cursor)
+            }
         } catch let error as DayWeaveAPIError {
             guard case let .server(statusCode, _, _, _) = error, statusCode == 422,
-                  planner.canonicalDeltaCursor != nil else {
+                  initialCursor != nil else {
                 throw error
             }
             try ensureOperationCurrent(operationID: operationID, generation: generation)
-            // A server restart can rotate the cursor scope. Build a complete replacement
-            // in memory first so an interrupted recovery never erases the offline cache.
+            // Rebuild an invalidated stream cursor from a complete current-state
+            // snapshot. An interrupted recovery never erases the offline cache.
             let result = try await loadDelta(client: client, from: nil)
             try ensureOperationCurrent(operationID: operationID, generation: generation)
             planner.replaceCanonicalState(changes: result.changes, nextCursor: result.cursor)
@@ -1887,7 +1904,12 @@ final class CanonicalSyncStore: ObservableObject {
                cursor.utf8.count > Self.maximumDeltaCursorBytes {
                 throw CanonicalSyncError.deltaResourceLimit
             }
-            let page = try await client.itemDelta(cursor: cursor, limit: 200)
+            // Opt in only on the first cold/replacement request. Snapshot
+            // continuations are opaque, and only the final ordinary delta
+            // cursor may be installed with the fully buffered forest.
+            let page = try await client.itemDelta(
+                cursor: cursor, limit: 200, bootstrapCurrent: cursor == nil
+            )
             if enforceItemCursorContract,
                !DayWeaveItemCursorContract.isValidTransportToken(page.nextCursor) {
                 throw CanonicalSyncError.invalidDeltaSequence
