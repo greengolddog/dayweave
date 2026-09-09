@@ -129,6 +129,13 @@ impl PostgresItemRepository {
 
 #[async_trait]
 impl ItemRepository for PostgresItemRepository {
+    async fn bootstrap(
+        &self,
+        position: Option<crate::items::ItemBootstrapPosition>,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<crate::items::ItemBootstrapPage, ItemRepositoryError> {
+        super::item_bootstrap_repository::bootstrap(&self.pool, self.scope, position).await
+    }
     async fn get_progress(
         &self,
         item_id: Uuid,

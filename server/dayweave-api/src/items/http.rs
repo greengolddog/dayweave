@@ -55,7 +55,7 @@ pub(crate) fn routes() -> Router<AppState> {
     security(("bearer_token" = [])),
     params(
         ("Accept" = String, Header, description = "Must be exactly text/event-stream"),
-        ("Last-Event-ID" = Option<String>, Header, description = "Exact opaque cursor from the last durably applied item delta page; omitted means the initial cursor")
+        ("Last-Event-ID" = Option<String>, Header, description = "Exact durably applied ordinary delta cursor or terminal snapshot cursor; intermediate snapshot cursors are rejected; omitted means the initial cursor")
     ),
     responses(
         (status = 200, description = "Content-free opaque item cursor invalidations", body = String, content_type = "text/event-stream"),
@@ -167,6 +167,8 @@ pub(crate) struct ItemListQuery {
 pub(crate) struct ItemDeltaQuery {
     pub cursor: Option<String>,
     pub limit: Option<usize>,
+    /// `current` starts a fixed replacement snapshot; allowed only without a cursor.
+    pub bootstrap: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -273,25 +275,46 @@ pub(crate) async fn list_items(
     responses(
         (status = 200, description = "Ordered item upserts and tombstones", body = ItemDeltaEnvelope),
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Current-state snapshot ticket is missing or expired", body = crate::error::ErrorEnvelope),
+        (status = 413, description = "Complete current-state snapshot exceeds bounded count or payload", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Current-state snapshot ticket capacity exhausted", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Malformed or unsupported cursor", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn item_delta(
     State(state): State<AppState>,
     query: Result<Query<ItemDeltaQuery>, QueryRejection>,
-) -> Result<Json<ItemDeltaEnvelope>, ApiError> {
+) -> Result<Response, ApiError> {
     let query = strict_query(query)?;
     let limit = bounded_limit(query.limit)?;
+    let bootstrap_current = match query.bootstrap.as_deref() {
+        None => false,
+        Some("current") if query.cursor.is_none() => true,
+        Some(_) => {
+            return Err(map_item_error(
+                ItemRepositoryError::BootstrapCursorInvalid.into(),
+            ));
+        }
+    };
     let page = state
         .items
-        .delta(query.cursor.as_deref(), limit)
+        .delta_with_bootstrap(query.cursor.as_deref(), limit, bootstrap_current)
         .await
         .map_err(map_item_error)?;
-    Ok(Json(ItemDeltaEnvelope {
+    let mut response = Json(ItemDeltaEnvelope {
         changes: page.changes,
         next_cursor: page.next_cursor,
         has_more: page.has_more,
-    }))
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -472,6 +495,7 @@ fn mutation_response(status: StatusCode, item: Item, replayed: bool) -> Response
     response
 }
 
+#[allow(clippy::too_many_lines)] // Exhaustive redacted mapping keeps legacy and snapshot codes auditable together.
 fn map_item_error(error: ItemServiceError) -> ApiError {
     match error {
         ItemServiceError::Domain(ItemDomainError::InvalidCustomRecurrenceAnchor {
@@ -547,6 +571,34 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
         .with_details(json!({ "item_id": item_id, "session_id": session_id })),
         ItemServiceError::Repository(ItemRepositoryError::InvalidCursor) => {
             ApiError::validation("delta cursor is invalid")
+        }
+        ItemServiceError::Repository(ItemRepositoryError::BootstrapExpired) => {
+            ApiError::item_bootstrap(
+                StatusCode::CONFLICT,
+                "item_bootstrap_expired",
+                "The current-state snapshot is missing or expired",
+            )
+        }
+        ItemServiceError::Repository(ItemRepositoryError::BootstrapTooLarge) => {
+            ApiError::item_bootstrap(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "item_bootstrap_too_large",
+                "The complete current-state snapshot exceeds delivery bounds",
+            )
+        }
+        ItemServiceError::Repository(ItemRepositoryError::BootstrapCapacity) => {
+            ApiError::item_bootstrap(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "item_bootstrap_capacity",
+                "Current-state snapshot capacity is temporarily exhausted",
+            )
+        }
+        ItemServiceError::Repository(ItemRepositoryError::BootstrapCursorInvalid) => {
+            ApiError::item_bootstrap(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "item_bootstrap_cursor_invalid",
+                "The current-state snapshot cursor or mode is invalid",
+            )
         }
         ItemServiceError::Repository(
             error @ (ItemRepositoryError::SelfParent

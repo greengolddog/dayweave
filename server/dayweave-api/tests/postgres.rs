@@ -39,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34
         ]
     );
 
@@ -77,6 +77,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0031_account_deletion_provider_cleanup.sql"),
         include_str!("../migrations/0032_provider_operation_admission.sql"),
         include_str!("../migrations/0033_item_progress.sql"),
+        include_str!("../migrations/0034_item_bootstrap.sql"),
     ]
     .join("\n");
     for table in [
@@ -110,6 +111,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "provider_admission_operations",
         "idempotency_keys",
         "item_changes",
+        "item_bootstrap_snapshots",
+        "item_bootstrap_members",
         "execution_sessions",
         "execution_state",
         "schedule_deferred_placements",
@@ -229,6 +232,10 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_changes_workspace_group_idx",
         "require_item_change_group",
         "item_changes_group_required",
+        "item_bootstrap_snapshots_complete",
+        "item_bootstrap_history_mutation_lock",
+        "item_bootstrap_pinned_change_guard",
+        "item_changes_workspace_sequence_unique",
         "ADD COLUMN review_ordinal smallint",
         "proposal_application_effects_review_ordinal_uq",
         "proposal_application_effects_review_complete",

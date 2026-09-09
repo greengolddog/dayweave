@@ -214,7 +214,49 @@ impl ItemService {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<EncodedDeltaPage, ItemServiceError> {
+        self.delta_with_bootstrap(cursor, limit, false).await
+    }
+
+    /// Explicit current-state replacement, or continuation of an issued snapshot.
+    /// Legacy absent-cursor history remains unchanged when `bootstrap_current` is false.
+    ///
+    /// # Errors
+    /// Rejects invalid scope/cursors, expired snapshots and resource exhaustion.
+    pub async fn delta_with_bootstrap(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        bootstrap_current: bool,
+    ) -> Result<EncodedDeltaPage, ItemServiceError> {
         let cursor_scope = self.repository.cursor_scope();
+        if cursor.is_some_and(|cursor| cursor.len() > MAX_CURSOR_TEXT_BYTES) {
+            return Err(ItemServiceError::InvalidCursor);
+        }
+        if bootstrap_current && cursor.is_some() {
+            return Err(ItemRepositoryError::BootstrapCursorInvalid.into());
+        }
+        let snapshot_cursor = cursor.is_some_and(|cursor| {
+            URL_SAFE_NO_PAD
+                .decode(cursor)
+                .is_ok_and(|bytes| bytes.starts_with(b"DWIB"))
+        });
+        if bootstrap_current || snapshot_cursor {
+            let position = cursor
+                .map(|cursor| decode_bootstrap_cursor(cursor, cursor_scope))
+                .transpose()?;
+            let page = self
+                .repository
+                .bootstrap(position, self.clock.now())
+                .await?;
+            return Ok(EncodedDeltaPage {
+                next_cursor: page.continuation.map_or_else(
+                    || encode_cursor(page.head, cursor_scope),
+                    |position| encode_bootstrap_cursor(position, cursor_scope),
+                ),
+                changes: page.changes,
+                has_more: page.continuation.is_some(),
+            });
+        }
         let after = cursor.map_or(Ok(0), |cursor| decode_cursor(cursor, cursor_scope))?;
         let page = self.repository.delta(after, limit).await?;
         Ok(EncodedDeltaPage {
@@ -238,6 +280,50 @@ impl ItemService {
             expires_at: now + ttl,
         })
     }
+}
+
+fn encode_bootstrap_cursor(position: super::ItemBootstrapPosition, scope: Uuid) -> String {
+    let mut bytes = Vec::with_capacity(44);
+    bytes.extend_from_slice(b"DWIB");
+    bytes.extend_from_slice(scope.as_bytes());
+    bytes.extend_from_slice(position.snapshot_id.as_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(position.after)
+            .expect("bounded snapshot ordinal")
+            .to_be_bytes(),
+    );
+    let checksum = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&checksum[..4]);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_bootstrap_cursor(
+    cursor: &str,
+    scope: Uuid,
+) -> Result<super::ItemBootstrapPosition, ItemRepositoryError> {
+    let invalid = || ItemRepositoryError::BootstrapCursorInvalid;
+    if cursor.len() > MAX_CURSOR_TEXT_BYTES {
+        return Err(invalid());
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| invalid())?;
+    if bytes.len() != 44
+        || &bytes[..4] != b"DWIB"
+        || bytes[4..20] != scope.as_bytes()[..]
+        || bytes[40..] != Sha256::digest(&bytes[..40])[..4]
+    {
+        return Err(invalid());
+    }
+    let snapshot_id = Uuid::from_slice(&bytes[20..36]).map_err(|_| invalid())?;
+    let after = u32::from_be_bytes(bytes[36..40].try_into().map_err(|_| invalid())?) as usize;
+    let position = super::ItemBootstrapPosition { snapshot_id, after };
+    if snapshot_id.is_nil()
+        || after == 0
+        || after > super::bootstrap::MAX_BOOTSTRAP_MEMBERS
+        || encode_bootstrap_cursor(position, scope) != cursor
+    {
+        return Err(invalid());
+    }
+    Ok(position)
 }
 
 #[derive(Clone, Debug, PartialEq)]

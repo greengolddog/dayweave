@@ -290,6 +290,9 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
     let authority = issue_deletion_authority(&credential_repository, now).await;
     let progress_item = seed_item(pool, scope, "Independent progress retained until purge").await;
     let unrelated_progress_item = seed_item(pool, unrelated_scope, "Unrelated progress").await;
+    let bootstrap_id = seed_bootstrap_capture(pool, scope, progress_item).await;
+    let unrelated_bootstrap_id =
+        seed_bootstrap_capture(pool, unrelated_scope, unrelated_progress_item).await;
     let progress_command = ItemProgressCommand {
         schema_version: 1,
         operation_id: Uuid::new_v4(),
@@ -752,6 +755,17 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         postgres_code(&fenced_progress_error).as_deref(),
         Some("DWDEL")
     );
+    let fenced_bootstrap_error =
+        sqlx::query("DELETE FROM item_bootstrap_members WHERE workspace_id=$1 AND snapshot_id=$2")
+            .bind(scope.workspace_id)
+            .bind(bootstrap_id)
+            .execute(pool)
+            .await
+            .expect_err("even bootstrap expiry cleanup respects the account fence");
+    assert_eq!(
+        postgres_code(&fenced_bootstrap_error).as_deref(),
+        Some("DWDEL")
+    );
     assert!(
         repository
             .begin_fence(confirmation.clone(), &drained)
@@ -975,6 +989,18 @@ async fn lifecycle_is_exact_fenced_and_purges_every_current_tenant_table_atomica
         "purging one owner cannot remove an unrelated workspace"
     );
     assert_all_current_tenant_tables_empty_and_guarded(pool, scope.workspace_id).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM item_bootstrap_members WHERE workspace_id=$1 AND snapshot_id=$2",
+        )
+        .bind(unrelated_scope.workspace_id)
+        .bind(unrelated_bootstrap_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1,
+        "account purge preserves an unrelated immutable bootstrap manifest"
+    );
     assert_eq!(
         PostgresItemRepository::new(pool.clone(), unrelated_scope)
             .get_progress(unrelated_progress_item)
@@ -1385,6 +1411,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
         "every provider-cleanup function must pin its search path and revoke PUBLIC execution"
     );
     assert_provider_admission_catalog_coverage(pool).await;
+    assert_bootstrap_catalog_coverage(pool).await;
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
@@ -1398,7 +1425,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     .expect("tenant table inventory");
     assert_eq!(
         tables.len(),
-        68,
+        70,
         "migration tenant-table inventory must be consciously updated"
     );
     for table in &tables {
@@ -1420,6 +1447,48 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     }
 
     assert_user_reference_guards(pool).await;
+}
+
+async fn assert_bootstrap_catalog_coverage(pool: &PgPool) {
+    let complete_capture: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_trigger trigger \
+         JOIN pg_class relation ON relation.oid=trigger.tgrelid \
+         JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace \
+         WHERE namespace.nspname=current_schema() \
+         AND relation.relname='item_bootstrap_snapshots' \
+         AND trigger.tgname='item_bootstrap_snapshots_complete' \
+         AND trigger.tgdeferrable AND trigger.tginitdeferred AND trigger.tgtype=5)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("bootstrap capture is sealed by a deferred insert constraint");
+    assert!(complete_capture);
+    let hardened: bool = sqlx::query_scalar(
+        "SELECT count(*)=6 AND bool_and(function.proconfig IS NOT NULL \
+         AND array_to_string(function.proconfig, ',') = \
+             'search_path=' || current_schema() || ', pg_catalog, pg_temp' \
+         AND NOT has_function_privilege('public', function.oid, 'EXECUTE')) \
+         FROM pg_proc function JOIN pg_namespace namespace ON namespace.oid=function.pronamespace \
+         WHERE namespace.nspname=current_schema() AND function.proname IN ( \
+             'guard_item_bootstrap_snapshot','guard_item_bootstrap_member', \
+             'verify_item_bootstrap_capture','lock_item_bootstrap_history_mutation', \
+             'reject_item_bootstrap_pinned_change','reject_item_bootstrap_truncate')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("bootstrap guard function hardening");
+    assert!(hardened);
+    let scoped_foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint constraint_row \
+         JOIN pg_class relation ON relation.oid=constraint_row.conrelid \
+         WHERE constraint_row.connamespace=current_schema()::regnamespace \
+         AND relation.relname='item_bootstrap_members' AND constraint_row.contype='f' \
+         AND cardinality(constraint_row.conkey)=2",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("both bootstrap membership foreign keys include workspace identity");
+    assert_eq!(scoped_foreign_keys, 2);
 }
 
 async fn assert_provider_admission_catalog_coverage(pool: &PgPool) {
@@ -1864,6 +1933,57 @@ async fn wait_until_backend_waits_on_advisory_lock(pool: &PgPool, backend_pid: i
     })
     .await
     .expect("fence insert must block on the earlier mutation's advisory guard");
+}
+
+async fn seed_bootstrap_capture(pool: &PgPool, scope: DatabaseScope, item_id: Uuid) -> Uuid {
+    let item = PostgresItemRepository::new(pool.clone(), scope)
+        .get(item_id, false)
+        .await
+        .expect("canonical bootstrap fixture body");
+    let snapshot_id = Uuid::new_v4();
+    let mut transaction = pool.begin().await.expect("bootstrap fixture transaction");
+    let sequence: i64 = sqlx::query_scalar(
+        "INSERT INTO item_changes(workspace_id,item_id,item_revision,change_kind,payload,change_group_id) \
+         VALUES ($1,$2,$3,'upsert',$4,$5) RETURNING sequence",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(i64::try_from(item.revision).unwrap())
+    .bind(serde_json::to_value(item).unwrap())
+    .bind(Uuid::new_v4())
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("exact canonical fixture history");
+    sqlx::query(
+        "WITH capture AS (SELECT clock_timestamp() AS created_at) \
+         INSERT INTO item_bootstrap_snapshots(id,workspace_id,user_id,head_sequence,created_at, \
+             cutoff_at,expires_at,member_count,payload_bytes) \
+         SELECT $1,$2,$3,$4,capture.created_at,capture.created_at-interval '720 hours', \
+             capture.created_at+interval '10 minutes',1,octet_length(change.payload::text) \
+         FROM capture,item_changes change WHERE change.sequence=$4",
+    )
+    .bind(snapshot_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(sequence)
+    .execute(&mut *transaction)
+    .await
+    .expect("bounded bootstrap fixture header");
+    sqlx::query(
+        "INSERT INTO item_bootstrap_members(snapshot_id,workspace_id,ordinal,change_sequence) \
+         VALUES ($1,$2,1,$3)",
+    )
+    .bind(snapshot_id)
+    .bind(scope.workspace_id)
+    .bind(sequence)
+    .execute(&mut *transaction)
+    .await
+    .expect("immutable bootstrap fixture member");
+    transaction
+        .commit()
+        .await
+        .expect("complete bootstrap fixture seals");
+    snapshot_id
 }
 
 async fn seed_item(pool: &PgPool, scope: DatabaseScope, title: &str) -> Uuid {

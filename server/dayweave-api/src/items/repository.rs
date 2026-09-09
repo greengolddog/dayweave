@@ -130,6 +130,14 @@ pub enum ItemRepositoryError {
     InvalidCursor,
     #[error("atomic item delta group exceeds its safe delivery bound")]
     DeltaGroupTooLarge,
+    #[error("current-state snapshot is missing or expired")]
+    BootstrapExpired,
+    #[error("current-state snapshot exceeds bounded delivery resources")]
+    BootstrapTooLarge,
+    #[error("current-state snapshot capacity is temporarily exhausted")]
+    BootstrapCapacity,
+    #[error("current-state snapshot cursor is invalid")]
+    BootstrapCursorInvalid,
     #[error(transparent)]
     InvalidItem(#[from] ItemDomainError),
     #[error("repository operation failed")]
@@ -139,6 +147,14 @@ pub enum ItemRepositoryError {
 #[async_trait]
 pub trait ItemRepository: Send + Sync {
     fn cursor_scope(&self) -> Uuid;
+
+    async fn bootstrap(
+        &self,
+        _position: Option<super::ItemBootstrapPosition>,
+        _now: DateTime<Utc>,
+    ) -> Result<super::ItemBootstrapPage, ItemRepositoryError> {
+        Err(ItemRepositoryError::Internal)
+    }
 
     async fn get_progress(
         &self,
@@ -256,6 +272,7 @@ struct MemoryState {
     idempotency: HashMap<(String, String), MemoryIdempotency>,
     changes: Vec<MemoryChange>,
     next_sequence: u64,
+    bootstraps: HashMap<Uuid, super::bootstrap::MemoryBootstrap>,
 }
 
 #[derive(Clone, Debug)]
@@ -447,6 +464,42 @@ fn validate_memory_group_completeness(
 impl ItemRepository for InMemoryItemRepository {
     fn cursor_scope(&self) -> Uuid {
         self.cursor_scope
+    }
+
+    async fn bootstrap(
+        &self,
+        position: Option<super::ItemBootstrapPosition>,
+        now: DateTime<Utc>,
+    ) -> Result<super::ItemBootstrapPage, ItemRepositoryError> {
+        let mut state = self.state.lock().await;
+        state
+            .bootstraps
+            .retain(|_, snapshot| snapshot.expires_at > now);
+        if let Some(position) = position {
+            return state
+                .bootstraps
+                .get(&position.snapshot_id)
+                .ok_or(ItemRepositoryError::BootstrapExpired)?
+                .page(position.after);
+        }
+        if let Some(snapshot) = state
+            .bootstraps
+            .values()
+            .find(|snapshot| snapshot.head == state.next_sequence)
+        {
+            return snapshot.page(0);
+        }
+        if state.bootstraps.len() >= super::bootstrap::MAX_BOOTSTRAP_TICKETS {
+            return Err(ItemRepositoryError::BootstrapCapacity);
+        }
+        let snapshot = super::bootstrap::MemoryBootstrap::capture(
+            state.items.values().cloned(),
+            state.next_sequence,
+            now,
+        )?;
+        let page = snapshot.page(0)?;
+        state.bootstraps.insert(snapshot.id, snapshot);
+        Ok(page)
     }
 
     async fn get_progress(

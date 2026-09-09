@@ -1,9 +1,11 @@
+pub(crate) mod bootstrap;
 mod domain;
 pub(crate) mod http;
 mod invalidation;
 mod repository;
 mod service;
 
+pub use bootstrap::{ItemBootstrapPage, ItemBootstrapPosition};
 pub use domain::{
     BlockedReasonKind, DeadlineKind, DeadlineStrength, DurationKind, DurationSource, Item,
     ItemDomainError, ItemKind, ItemStatus, NewItem, ReplaceItem, SplitPolicy,

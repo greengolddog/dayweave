@@ -17,6 +17,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn item_bootstrap(
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self::new(status, code, message)
+    }
     pub(crate) fn item_progress(
         status: StatusCode,
         code: &'static str,
