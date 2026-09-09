@@ -1,9 +1,9 @@
 # Independent item progress
 
 Status: backend and both native clients implemented and covered for the
-independent-component slice of `DOM-004` and `HIE-003`; controlled cross-client
-convergence and owner-device acceptance remain open. This is separate
-from [recorded descendant summaries](hierarchy-progress.md). Automatic parent
+independent-component slice of `DOM-004` and `HIE-003`; controlled transport/store
+convergence passes, while foreground timing and owner-device acceptance remain
+open. This is separate from [recorded descendant summaries](hierarchy-progress.md). Automatic parent
 completion and required-component policy remain subsequent authoritative work.
 
 ## Component contract
@@ -171,8 +171,10 @@ or live provider account was used.
   Clippy passed with warnings denied. Coverage includes concurrent two-revision
   CAS, permanent historical replay, forged audit/sidecar rejection, tenant and
   account-deletion fences, active execution and canonical-state noninterference.
-- The full macOS gate passed 975 tests in 61 suites with compiler warnings
-  treated as errors. The 29 progress tests cover strict transport, exact values,
+- The full macOS gate passed with 976 tests in 62 suites and compiler warnings
+  treated as errors; the opt-in live phase is intentionally skipped in this
+  default run and verified separately below. The 29 progress tests cover strict
+  transport, exact values,
   encrypted migration to snapshot 26, duplicate-key rejection, restart/replay,
   retained conflicts, privacy suspension and a synthetic three-mode editor
   whose persistent field labels were visually inspected. Pending and inherited
@@ -180,8 +182,9 @@ or live provider account was used.
   permits only monotonic privacy changes. Missing-item recovery is content-free,
   and discard binds the displayed operation ID rather than just the item.
   All 25 older snapshot labels reject injected progress state before migration.
-- Android passed 1,557 JVM tests in 123 suites, including 44 progress tests,
-  plus lint (zero errors; 29 pre-existing warnings) and both debug APK builds.
+- Android passed its JVM gate (1,567 tests in 126 suites, including 44 progress
+  tests, with one intentional opt-in skip) plus lint (zero errors; 29 pre-existing
+  warnings). Both debug APK builds passed at the implementation checkpoint.
   Nine inert Compose tests and the SQLCipher/Room 21-to-22 migration passed on
   an isolated emulator. These cover entry for a completed goal, exact editing,
   unknown time, unavailable-item recovery, lock cancellation and sticky
@@ -192,8 +195,17 @@ or live provider account was used.
   uncertainty blocks destructive credential replacement, reset and discard.
   A generic HTTP status is not accepted as definitive rejection.
 
-These are separate native and service checks, not proof of a real two-client
-session. Controlled client/service convergence, refresh/offline timing and
-owner-device acceptance remain open. General/weighted progress aggregation,
-execution-derived reconciliation, required-component policy and automatic
+- The [controlled native convergence gate](native-progress-convergence.md) passed
+  all six macOS/Android JVM phases against one real HTTP/PostgreSQL service:
+  independent encrypted offline edits, lost-response recovery, a genuine stale
+  conflict and explicit re-review, service restart, exact historical replay, and
+  agreement on the newer values. Independent SQL checks found exactly two
+  successful receipts and one sidecar; canonical state and child progress stayed
+  unchanged. Both temporary services stopped successfully.
+
+The controlled gate exercises production transports/stores, not running app UIs
+or physical devices. Foreground/reconnect and selected-detail refresh timing,
+production TLS/device authentication and owner-device acceptance remain open.
+General/weighted progress aggregation, execution-derived reconciliation,
+required-component policy and automatic
 completion must not be claimed by this independent-component checkpoint.

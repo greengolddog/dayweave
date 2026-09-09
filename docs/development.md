@@ -42,6 +42,13 @@ isolation, hierarchy cycle prevention, idempotency, audit/outbox writes, and
 delta tombstones locally, point the variable at a disposable PostgreSQL
 database before running `cargo test -p dayweave-api --test items_postgres`.
 
+For opt-in independent-progress convergence between the macOS transport/store,
+Android JVM transport/store and one real HTTP/PostgreSQL service, follow the
+[controlled native convergence gate](native-progress-convergence.md). Its runner
+creates and stops its own disposable services; it accepts no existing endpoint
+or database. The native phase tests are intentionally skipped in ordinary test
+runs unless the complete synthetic-run configuration is supplied.
+
 Build the direct macOS bundle with:
 
 ```sh
