@@ -17,6 +17,7 @@ struct ItemProgressPersistenceTests {
             for injected in [NSNull() as Any, try #require(fixture.root["itemProgressState"])] {
                 var root = fixture.root
                 root["schemaVersion"] = schema
+                root.removeValue(forKey: "itemCompletionState")
                 root["itemProgressState"] = injected
                 let encrypted = try fixture.write(JSONSerialization.data(withJSONObject: root))
                 #expect(throws: PlannerPersistenceError.self) { try fixture.persistence.load() }
@@ -32,15 +33,17 @@ struct ItemProgressPersistenceTests {
         var root = fixture.root
         root["schemaVersion"] = 25
         root.removeValue(forKey: "itemProgressState")
+        root.removeValue(forKey: "itemCompletionState")
         _ = try fixture.write(JSONSerialization.data(withJSONObject: root))
         let loaded = try fixture.persistence.load()
         let prior = try #require(loaded)
         let migrated = try prior.migratedToCurrentSchema()
-        #expect(migrated.schemaVersion == 26)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion)
         #expect(migrated.itemProgressState == .empty)
         var encoded = try fixture.object(migrated)
         encoded["schemaVersion"] = 25
         encoded.removeValue(forKey: "itemProgressState")
+        encoded.removeValue(forKey: "itemCompletionState")
         #expect(NSDictionary(dictionary: root).isEqual(to: encoded))
     }
 

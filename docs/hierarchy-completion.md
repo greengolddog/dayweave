@@ -3,9 +3,10 @@
 Status: implementation in progress for `HIE-004`. A pure iterative engine and
 the [versioned one-off server checkpoint](item-completion-api.md) implement
 completion policy and synchronous canonical reconciliation. Native completion
-controls are not yet implemented. The full requirement still includes visible
-manual overrides, durable cross-device behavior, qualified recurring instances,
-and native review on both platforms.
+review, required-edge/manual-mode controls, encrypted intent and qualified parent
+admission now pass native automated regression/build gates. The full requirement
+still includes controlled durable
+cross-client behavior, qualified recurring instances and owner-device acceptance.
 
 The accepted source is [requirements](product-requirements.md#43-hierarchy-goals-projects-routines-and-dependencies)
 and [discovery answers 203–207](discovery-answers.md). The detailed defaults below
@@ -103,7 +104,7 @@ topology and retained provenance. Independent semantic review identified and
 checked the terminal-parent and unqualified-occurrence regressions. These are
 pure-engine results, not server or physical-device acceptance.
 
-## Server checkpoint and remaining native integration
+## Server checkpoint and native integration in progress
 
 The [server policy/read/command contract](item-completion-api.md) binds explicit
 review to the item, policy and evaluated requirement/execution evidence, with
@@ -147,7 +148,7 @@ bootstrap budget even when its current forest is small enough. The separate
 [current-state bootstrap](item-sync.md#bounded-current-state-bootstrap) captures
 a bounded immutable current forest and recent tombstones, then resumes the
 ordinary stream at the captured head. Its history-heavy server and deep native
-tests are a prerequisite, not evidence that completion cascades are implemented.
+tests are a prerequisite, not evidence of native convergence after completion cascades.
 The integrated completion feature still needs cold-client acceptance after real
 required-descendant complete/reopen transactions. Truncated history must never
 masquerade as a complete forest.
@@ -156,15 +157,22 @@ Existing full-authoring receipts require the exact reviewed draft and revision.
 An automatic side effect must not rewrite that response into an incompatible
 successful receipt. Canonical response fields are also compatibility-sensitive:
 Android rejects unknown fields, and macOS retains them as read-only. Completion
-policy and override commands need an independently versioned contract rather
+policy and override commands use an independently versioned contract rather
 than widening old status journals or silently changing their wire bytes.
 
 Structural admission distinguishes policy-qualified parent completion from
 executable lifecycle. The shared `is_executing_state` predicate still includes
 Completed, Skipped and Cancelled; server parent/non-leaf guards now permit only
-provenance-qualified Completed parents. Native parent selection and Add Subtask
-guards still require the matching revision-bound policy integration. Do not
-broadly permit actively executing or ambiguous terminal parents.
+provenance-qualified Completed parents. The native development paths now use
+current completion GET authority for parent selection and attachment. Before
+the first child send, a fresh parent read is scoped to that exact queued intent
+and unchanged local evidence; the child cannot invalidate its own admission,
+but no other pending authority is waived. The proof does not authorize another
+child or policy review. Submitted child requests still replay exactly without
+fresh parent preflight. This does not add a parent-revision CAS field to the
+legacy request or permit terminal-item content replacement; the server's atomic
+parent guard remains authoritative. Do not broadly permit actively executing,
+ambiguous terminal or unqualified recurring parents.
 
 The native [historical receipt recovery](item-sync.md#historical-authoring-receipts)
 checkpoint addresses exact replay after newer state has arrived. Its store and
@@ -172,9 +180,33 @@ sync regressions are prerequisites only; they do not verify server completion
 cascades or proposal undo. Bounded cold-client hydration is a separate sync
 checkpoint, not an increase in the completed parent-policy scope.
 
-Both native clients still need protected completion explanations, required-edge
+Both native clients now contain protected completion explanations, required-edge
 editing, reviewed override/resume-automatic controls, encrypted offline intent,
-conflict/retry/discard custody, explicit storage upgrades and refreshed server
-evidence. Required counts and blocker identities inherit subtree privacy. Owner
-acceptance, recurring-instance integration and deep cross-client mutation tests
-remain part of the full feature's completion gate.
+conflict/retry/discard custody and explicit storage upgrades. Their current GET
+authority is process-local and invalidated by canonical/execution evidence or
+pending-authority changes, not merely the selected item revision. Restart and
+historical receipts do not restore it. Entered choices must survive stale review;
+only an explicit refresh/re-review can replace the baseline for a new request.
+Submitted bytes and operation identity remain unchanged.
+
+A successful receipt durably fences further review until complete canonical
+catch-up; it never locally fabricates lifecycle or overwrites newer canonical
+state. Outbox recovery is independent of visible detail. Completion-derived
+summaries, policy/reopening review and retained intent are always protected as
+sensitive, even after a fresh GET when the cached tree appears public. Version 1
+has no privacy or canonical-cursor witness, and remote sensitive descendants can
+change counts without changing the selected ancestor's revision. A fresh opaque
+review hash cannot prove local privacy completeness. This conservative rule
+does not change authorization, revision/evidence CAS or the closed wire, and
+continues across stale observations, refresh and restart. The
+[native API and migration boundary](item-completion-api.md#native-client-checkpoint)
+describes this checkpoint and its remaining acceptance limits.
+
+Full macOS warning-as-errors tests and Android JVM/lint/debug-build gates pass,
+including encrypted migration/restart, privacy, stale-review and first-send/exact
+replay coverage. The synthetic macOS review was visually inspected. Ten Android
+completion UI tests and its Room migration test compile but have not yet run on
+a device/emulator. Controlled cross-client mutation/cascade hydration,
+qualified recurring instances and owner-device acceptance remain part of the
+full feature's completion gate. Keep the separately verified pure-engine and
+server counts above distinct from native tests and unfinished acceptance gates.

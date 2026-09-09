@@ -76,6 +76,7 @@ import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.model.nextCanonicalTrashRetentionExpiryEpochMillis
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.model.fenceCompletionEvidence
 import com.greengolddog.dayweave.model.withInvalidTimedBreakNotificationAttemptAbandoned
 import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
@@ -3119,6 +3120,9 @@ class PlannerStore(
         current: DayWeaveUiState,
         allowDetachedInboxCapture: Boolean = false,
     ) {
+        require(current.itemCompletionLedger.pending.none {
+            it.disposition == com.greengolddog.dayweave.model.ItemCompletionDisposition.PENDING
+        } && !current.itemCompletionLedger.needsCanonicalCatchUp) { "Completion authority requires reconciliation" }
         require(current.pendingSchedulePublication == null)
         require(current.pendingProposalApplicationMutation == null)
         require(current.pendingCanonicalMutation == null)
@@ -3171,6 +3175,9 @@ class PlannerStore(
         current: DayWeaveUiState,
         id: String,
     ) {
+        require(current.itemCompletionLedger.pending.none {
+            it.disposition == com.greengolddog.dayweave.model.ItemCompletionDisposition.PENDING
+        } && !current.itemCompletionLedger.needsCanonicalCatchUp) { "Completion authority requires reconciliation" }
         require(current.pendingSchedulePublication == null)
         require(current.pendingProposalApplicationMutation == null)
         require(current.pendingCanonicalMutation == null)
@@ -3603,6 +3610,10 @@ class PlannerStore(
         val read = current.withCanonicalReadTombstones(items, recentlyDeleted)
         val activeIds = items.mapTo(hashSetOf()) { it.id }
         val refreshed = read.copy(canonicalItems = items, canonicalDeltaCursor = deltaCursor,
+            itemCompletionGetProofs = emptyMap(),
+            // Only a read begun after this exact receipt can discharge its catch-up latch.
+            itemCompletionLedger = if (current.itemCompletionLedger == expected.itemCompletionLedger)
+                current.itemCompletionLedger.copy(needsCanonicalCatchUp = false) else current.itemCompletionLedger,
             canonicalRecentlyDeleted = read.canonicalRecentlyDeleted.filterNot { it.id in activeIds })
         if (!changed) refreshed else refreshed.copy(
             canonicalRecentlyDeleted = refreshed.canonicalRecentlyDeleted,
@@ -3626,6 +3637,22 @@ class PlannerStore(
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
         val ledger = update(current).also(com.greengolddog.dayweave.model.ItemProgressLedger::requireValid)
         current.copy(itemProgressLedger = ledger)
+    }
+
+    /** Completion saves can change only their ledger and transient, current GET admission. */
+    internal fun mutateItemCompletion(update: (DayWeaveUiState) -> DayWeaveUiState): PlannerPersistenceReceipt? =
+        mutateDurably { current ->
+            val changed = update(current)
+            require(changed.copy(itemCompletionLedger = current.itemCompletionLedger,
+                itemCompletionGetProofs = current.itemCompletionGetProofs) == current)
+            changed.itemCompletionLedger.requireValid()
+            changed
+        }
+
+    /** Lock/account/visibility shutdown revokes read permission without abandoning any custody. */
+    internal fun invalidateItemCompletionReadProofs() = synchronized(persistenceLock) {
+        mutableState.value = mutableState.value.copy(itemCompletionGetProofs = emptyMap(),
+            itemCompletionEvidenceGeneration = Math.addExact(mutableState.value.itemCompletionEvidenceGeneration, 1))
     }
 
     /** Establishes an empty habit cache under the exact credential/workspace binding. */
@@ -5361,6 +5388,7 @@ class PlannerStore(
             current.pendingProposalApplicationMutation != null ||
             current.habitLedger.pendingMutations.isNotEmpty() ||
             current.itemProgressLedger.pending.isNotEmpty() ||
+            current.itemCompletionLedger.pending.isNotEmpty() || current.itemCompletionLedger.needsCanonicalCatchUp ||
             current.pendingGoogleCalendarOutbound != null ||
             current.pendingGoogleSchedulePublication?.stage?.let {
                 it != GoogleSchedulePublicationStage.ACCEPTED
@@ -6041,6 +6069,9 @@ class PlannerStore(
 
     /** Locally forgets all canonical execution state before credential destruction. */
     fun abandonCanonicalConnection(): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.itemCompletionLedger.pending.isEmpty() && !current.itemCompletionLedger.needsCanonicalCatchUp) {
+            "Every saved completion change must be explicitly resolved before disconnecting"
+        }
         require(current.itemProgressLedger.pending.isEmpty()) {
             "Every saved progress change must be explicitly resolved before disconnecting"
         }
@@ -6089,6 +6120,8 @@ class PlannerStore(
             recurrenceCompletionAnchors = emptyMap(),
             habitLedger = HabitLedgerSnapshot(),
             itemProgressLedger = com.greengolddog.dayweave.model.ItemProgressLedger(),
+            itemCompletionLedger = com.greengolddog.dayweave.model.ItemCompletionLedger(),
+            itemCompletionGetProofs = emptyMap(),
             pendingCanonicalMutation = null,
             canonicalExecutionSyncOrigin = null,
             canonicalExecutionConfigurationId = null,
@@ -7684,7 +7717,7 @@ class PlannerStore(
         // Transfer a verified digest/result only across an O(1) exact structural identity fence.
         transformed.inheritLocalScheduleCompositionMemo(previous)
         transformed.inheritPublishedScheduleValidationMemo(previous)
-        val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned()
+        val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned().fenceCompletionEvidence(previous)
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot
         currentGeneration += 1
@@ -7738,7 +7771,7 @@ class PlannerStore(
 
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
-            val snapshot = (persistedState ?: initialState)
+            val snapshot = (persistedState ?: initialState).copy(itemCompletionGetProofs = emptyMap(), itemCompletionEvidenceGeneration = 0)
                 .withCanonicalTrashRetention(nowEpochMillis())
                 .withPendingSensitivityHardened()
                 .withInvalidRecurrenceMoveSourcesAbandoned()
@@ -7884,7 +7917,16 @@ class PlannerStore(
                         it.requestJson == saved.requestJson && it.wasSensitive
                 })
             })
-            mutableState.value = current.copy(itemProgressLedger = retainedProgress)
+            val durableCompletion = mutableDurableState.value?.itemCompletionLedger
+                ?: com.greengolddog.dayweave.model.ItemCompletionLedger()
+            val retainedCompletion = durableCompletion.copy(pending = durableCompletion.pending.map { saved ->
+                saved.copy(wasSensitive = saved.wasSensitive || current.itemCompletionLedger.pending.any {
+                    it.operationId == saved.operationId && it.itemId == saved.itemId &&
+                        it.requestJson == saved.requestJson && it.wasSensitive
+                })
+            })
+            mutableState.value = current.copy(itemProgressLedger = retainedProgress,
+                itemCompletionLedger = retainedCompletion, itemCompletionGetProofs = emptyMap())
                 .withPendingSensitivityHardened()
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {

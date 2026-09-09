@@ -86,6 +86,7 @@ internal fun CanonicalAuthoringList(
     ) -> Unit,
     modifier: Modifier = Modifier,
     onOpenProgress: ((String) -> Unit)? = null,
+    onOpenCompletion: ((String) -> Unit)? = null,
 ) {
     val presentation = remember(
         state.canonicalItems,
@@ -163,6 +164,19 @@ internal fun CanonicalAuthoringList(
             }
         }
 
+        if (onOpenCompletion != null && state.itemCompletionLedger.pending.isNotEmpty()) {
+            item(key = "completion-policy-recovery") {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Saved completion recovery", style = MaterialTheme.typography.titleMedium)
+                    state.itemCompletionLedger.pending.forEach { pending ->
+                        TextButton(onClick = { onOpenCompletion(pending.itemId) },
+                            modifier = Modifier.testTag("item_completion_recovery_${pending.itemId}")) {
+                            Text("Review saved change · …${pending.operationId.takeLast(8)}")
+                        }
+                    }
+                }
+            }
+        }
         if (onOpenProgress != null) {
             val recoverable = state.itemProgressLedger.pending.filter { state.progressItem(it.itemId) == null }
             if (recoverable.isNotEmpty()) {
@@ -205,6 +219,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Inbox",
             onOpenProgress = openProgress,
+            onOpenCompletion = onOpenCompletion,
             rows = presentation.inbox,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is waiting for triage.",
@@ -234,6 +249,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Planned",
             onOpenProgress = openProgress,
+            onOpenCompletion = onOpenCompletion,
             rows = presentation.planned,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Move an item to Planned when it is ready for composition.",
@@ -261,6 +277,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Blocked",
             onOpenProgress = openProgress,
+            onOpenCompletion = onOpenCompletion,
             rows = presentation.blocked,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Nothing is currently waiting on a blocker.",
@@ -292,6 +309,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Conflicts",
             onOpenProgress = openProgress,
+            onOpenCompletion = onOpenCompletion,
             rows = presentation.conflicts,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "No authoring conflicts need review.",
@@ -319,6 +337,7 @@ internal fun CanonicalAuthoringList(
         canonicalSection(
             title = "Recently Deleted",
             onOpenProgress = null,
+            onOpenCompletion = null,
             rows = presentation.recentlyDeleted,
             activeRowsByItemId = activeRowsByItemId,
             emptyMessage = "Deleted items available for restore appear here.",
@@ -398,6 +417,7 @@ internal fun CanonicalAuthoringList(
 private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     title: String,
     onOpenProgress: ((String) -> Unit)?,
+    onOpenCompletion: ((String) -> Unit)?,
     rows: List<CanonicalAuthoringRow>,
     activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     emptyMessage: String,
@@ -435,6 +455,8 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     items(rows, key = { "$title:${it.itemId}" }) { row ->
         CanonicalAuthoringCard(
             row = row,
+            onOpenCompletion = onOpenCompletion?.takeIf { row.source == CanonicalAuthoringRowSource.CANONICAL &&
+                !row.hasUnsafeAncestry && !row.hasMissingParent && !row.hasHierarchyCycle }?.let { action -> { action(row.itemId) } },
             onOpenProgress = onOpenProgress?.takeIf { row.source == CanonicalAuthoringRowSource.CANONICAL &&
                 !row.hasUnsafeAncestry && !row.hasMissingParent && !row.hasHierarchyCycle }?.let { action -> { action(row.itemId) } },
             activeRowsByItemId = activeRowsByItemId,
@@ -456,6 +478,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
 private fun CanonicalAuthoringCard(
     row: CanonicalAuthoringRow,
     onOpenProgress: (() -> Unit)?,
+    onOpenCompletion: (() -> Unit)?,
     activeRowsByItemId: Map<String, CanonicalAuthoringRow>,
     actionsEnabled: Boolean,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
@@ -719,6 +742,11 @@ private fun CanonicalAuthoringCard(
                                 },
                             )
                         }
+                    }
+                }
+                if (onOpenCompletion != null) {
+                    TextButton(onClick = onOpenCompletion, modifier = Modifier.testTag("canonical_completion_${row.itemId}")) {
+                        Text("Completion policy")
                     }
                 }
                 if (onOpenProgress != null) {

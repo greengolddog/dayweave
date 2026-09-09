@@ -1,6 +1,17 @@
 package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.ItemCompletionLedger
+import com.greengolddog.dayweave.model.ItemCompletionObservation
+import com.greengolddog.dayweave.model.ItemCompletionReadProof
+import com.greengolddog.dayweave.model.ItemCompletionSnapshot
+import com.greengolddog.dayweave.model.ItemCompletionProvenance
+import com.greengolddog.dayweave.model.ItemCompletionProvenanceKind
+import com.greengolddog.dayweave.model.ItemCompletionReopening
+import com.greengolddog.dayweave.model.completionTestSnapshot
+import com.greengolddog.dayweave.model.completionLocalEvidence
+import com.greengolddog.dayweave.network.ItemCompletionTransport
+import com.greengolddog.dayweave.network.OkHttpItemCompletionTransport
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
@@ -122,6 +133,65 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CanonicalSyncManagerTest {
+    @Test
+    fun completionQualifiedParentRefreshesAfterQueuedChildRestartButSubmittedChildReplaysWithoutFreshProof() = runBlocking {
+        val parent = authoredRemote(TASK_ID, 7, isExecutable = false).copy(status = "completed")
+        val created = authoredRemote(BLOCK_ID, 1, parentId = TASK_ID)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange(type = "upsert", item = parent)), "completion-parent", false)
+            pages["completion-parent"] = RemoteItemDeltaPage(emptyList(), "completion-parent", false)
+            previewResult = itemsPreview(listOf(parent))
+        }
+        val store = PlannerStore(DayWeaveUiState())
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
+        val snapshot = completionTestSnapshot(1).let { it.copy(itemId = TASK_ID, state = it.state.copy(itemId = TASK_ID,
+            provenance = ItemCompletionProvenance(ItemCompletionProvenanceKind.AUTOMATIC,
+                ItemCompletionReopening("planned", null, null, null)))) }
+        assertTrue(requireNotNull(store.mutateItemCompletion { current -> current.copy(
+            itemCompletionLedger = ItemCompletionLedger(syncOrigin = current.canonicalSyncOrigin, configurationId = current.canonicalConfigurationId,
+                observations = mapOf(TASK_ID to ItemCompletionObservation(snapshot, clock.toString()))),
+            itemCompletionGetProofs = mapOf(TASK_ID to ItemCompletionReadProof(snapshot, current.completionLocalEvidence()))) }).awaitDurable())
+        assertTrue(requireNotNull(store.enqueueCanonicalCreate(authoredDraft().copy(parentId = TASK_ID), BLOCK_ID,
+            "99999999-9999-4999-8999-999999999992")).persistence.awaitDurable())
+        val restarted = PlannerStore(requireNotNull(store.durableState.value).copy(itemCompletionGetProofs = emptyMap()))
+        var parentGets = 0
+        val completion = object : ItemCompletionTransport {
+            override suspend fun get(configuration: AuthenticatedApiConfiguration, itemId: String): ItemCompletionSnapshot {
+                parentGets++
+                val child = restarted.state.value.pendingCanonicalAuthoringMutations.single()
+                assertFalse(child.isSubmitted)
+                assertEquals(configuration.configurationId, child.configurationId)
+                assertEquals(TASK_ID, itemId)
+                return snapshot
+            }
+            override suspend fun put(configuration: AuthenticatedApiConfiguration, itemId: String, requestJson: String) = error("Not a policy command")
+        }
+        transport.createHandler = { _, request ->
+            assertEquals(1, parentGets)
+            assertEquals(TASK_ID, request.parentId)
+            throw IOException("Synthetic lost child receipt")
+        }
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(restarted, transport, completionTransport = completion).refreshAndCompose())
+        val exact = restarted.state.value.pendingCanonicalAuthoringMutations.single()
+        assertTrue(exact.isSubmitted)
+        val replay = PlannerStore(requireNotNull(restarted.durableState.value).copy(itemCompletionGetProofs = emptyMap()))
+        transport.createHandler = { key, request ->
+            assertEquals(1, parentGets)
+            assertEquals(exact.idempotencyKey, key)
+            assertEquals(transport.createRequests.first().second, request)
+            created
+        }
+        transport.pages[null] = RemoteItemDeltaPage(listOf(parent, created).map { RemoteItemDeltaChange(type = "upsert", item = it) }, "completion-child", false)
+        transport.pages["completion-parent"] = requireNotNull(transport.pages[null])
+        transport.pages["completion-child"] = RemoteItemDeltaPage(emptyList(), "completion-child", false)
+        transport.previewResult = itemsPreview(listOf(parent, created))
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(replay, transport, completionTransport = completion).refreshAndCompose())
+        assertEquals(1, parentGets)
+        assertTrue(replay.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(setOf(TASK_ID, BLOCK_ID), replay.state.value.canonicalItems.map { it.id }.toSet())
+    }
+
     @Test
     fun cursorEpochResetFenceCannotCrossCredentialBinding() = runBlocking {
         val store = PlannerStore(DayWeaveUiState())
@@ -7517,6 +7587,7 @@ class CanonicalSyncManagerTest {
             UnfencedLocalCompositionLifecycle,
         cancelTimedBreakNotification: suspend () -> Boolean = { true },
         reconcileTimedBreakNotification: suspend () -> Unit = {},
+        completionTransport: ItemCompletionTransport = OkHttpItemCompletionTransport(),
     ) = CanonicalSyncManager(
         plannerStore = plannerStore,
         credentialStore = credentialStore,
@@ -7527,6 +7598,7 @@ class CanonicalSyncManagerTest {
         localCompositionLifecycleFence = localCompositionLifecycleFence,
         cancelTimedBreakNotification = cancelTimedBreakNotification,
         reconcileTimedBreakNotification = reconcileTimedBreakNotification,
+        completionTransport = completionTransport,
     )
 
     private suspend fun assertTerminalExecutionProjects(

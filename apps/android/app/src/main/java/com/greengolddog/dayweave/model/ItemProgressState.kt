@@ -21,6 +21,9 @@ internal fun DayWeaveUiState.progressItem(itemId: String): CanonicalItemSnapshot
 
 internal fun DayWeaveUiState.progressReviewIssue(itemId: String): String? {
     val item = progressItem(itemId) ?: return "A complete admitted item and safe hierarchy are required."
+    if (itemCompletionLedger.needsCanonicalCatchUp || itemCompletionLedger.pending.any { it.disposition == ItemCompletionDisposition.PENDING }) {
+        return "Resolve completion authority before reviewing independent progress."
+    }
     if (pendingCanonicalAuthoringMutations.isNotEmpty() || pendingCanonicalMutation != null || pendingProposalApplicationMutation != null) {
         return "Resolve the saved item changes before reviewing new progress."
     }
@@ -79,6 +82,7 @@ internal fun DayWeaveUiState.canFirstSendItemProgress(mutation: PendingItemProgr
     val item = progressItem(mutation.itemId) ?: return false
     val baseline = itemProgressLedger.observations[mutation.itemId] ?: return false
     return pendingCanonicalAuthoringMutations.isEmpty() && pendingCanonicalMutation == null && pendingProposalApplicationMutation == null &&
+        !itemCompletionLedger.needsCanonicalCatchUp && itemCompletionLedger.pending.none { it.disposition == ItemCompletionDisposition.PENDING } &&
         item.revision == mutation.expectedItemRevision && baseline.isGetProof &&
         baseline.snapshot.itemRevision == mutation.expectedItemRevision && baseline.snapshot.revision == mutation.expectedProgressRevision
 }

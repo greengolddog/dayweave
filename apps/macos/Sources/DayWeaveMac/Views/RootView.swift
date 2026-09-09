@@ -2884,6 +2884,7 @@ private struct CanonicalInboxInspector: View {
                     }
 
                     ItemProgressPanel(itemID: row.itemID, sensitive: row.isSensitive)
+                    ItemCompletionPanel(itemID: row.itemID, sensitive: row.isSensitive)
 
                     if !row.dependencyCauses.isEmpty {
                         InspectorSection(title: row.blockingDependencyCauses.isEmpty
@@ -6722,6 +6723,7 @@ private struct ScheduleProfileSettingsEditor: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var itemProgress: ItemProgressStore
+    @EnvironmentObject private var itemCompletion: ItemCompletionStore
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
@@ -6808,6 +6810,9 @@ struct SettingsView: View {
             }
             Section("Independent progress outbox") {
                 ItemProgressOutboxView()
+            }
+            Section("Completion recovery") {
+                ItemCompletionOutboxView()
             }
             Section("Appearance") {
                 Picker("Theme", selection: appearanceModeBinding) {
@@ -7554,6 +7559,7 @@ struct SettingsView: View {
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
+                itemCompletion.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7604,6 +7610,7 @@ struct SettingsView: View {
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
+                itemCompletion.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
             } catch {
@@ -7630,6 +7637,7 @@ struct SettingsView: View {
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
+                itemCompletion.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
                 dayWeaveEnrollmentCode = ""
@@ -7673,6 +7681,7 @@ struct SettingsView: View {
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
+                itemCompletion.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7751,6 +7760,7 @@ struct SettingsView: View {
         googleSchedulePublication.configurationDidChange()
         canonicalSync.configurationDidChange()
         itemProgress.configurationDidChange()
+        itemCompletion.configurationDidChange()
         await executionSync.configurationDidChange()
         guard appLock.isContentAvailable,
               durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
@@ -7776,6 +7786,7 @@ struct SettingsView: View {
         googleSchedulePublication.configurationDidChange()
         canonicalSync.configurationDidChange()
         itemProgress.configurationDidChange()
+        itemCompletion.configurationDidChange()
         executionSync.startForegroundPolling()
         return true
     }
@@ -7812,6 +7823,7 @@ struct SettingsView: View {
                 googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
+                itemCompletion.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }

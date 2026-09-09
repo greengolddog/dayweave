@@ -278,6 +278,7 @@ struct CanonicalStructuralAuthoringTests {
         raw["schemaVersion"] = 24
         // This historical fixture predates independent progress, even though built with today's initializer.
         raw.removeValue(forKey: "itemProgressState")
+        raw.removeValue(forKey: "itemCompletionState")
         var entries = try #require(raw["pendingCanonicalAuthoringMutations"] as? [[String: Any]])
         entries[0].removeValue(forKey: "structuralRequestShapeVersion")
         var draft = try #require(entries[0]["draft"] as? [String: Any])

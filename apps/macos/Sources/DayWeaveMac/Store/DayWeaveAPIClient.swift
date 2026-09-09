@@ -667,6 +667,13 @@ enum DayWeaveDiagnosticSanitizer {
 }
 
 extension DayWeaveAPIClient: ItemProgressTransport {}
+extension DayWeaveAPIClient: ItemCompletionTransport {}
+
+protocol ItemCompletionTransport: Sendable {
+    var configurationIdentifier: String { get }
+    func itemCompletion(_ itemID: UUID) async throws -> ItemCompletionSnapshot
+    func putItemCompletion(_ itemID: UUID, requestBody: Data) async throws -> ItemCompletionReceipt
+}
 
 protocol ItemProgressTransport: Sendable {
     var configurationIdentifier: String { get }
@@ -3099,6 +3106,38 @@ struct DayWeaveAPIClient: Sendable {
         }
     }
 
+    func itemCompletion(_ itemID: UUID) async throws -> ItemCompletionSnapshot {
+        guard itemID != Self.nilUUID else { throw ItemCompletionError.invalidData }
+        let result: ItemCompletionSnapshot = try await send(method: "GET",
+            pathComponents: ["v1", "items", itemID.uuidString.lowercased(), "completion"], requiredStatusCode: 200)
+        guard result.itemID == itemID else { throw ItemCompletionError.invalidData }
+        return result
+    }
+
+    func putItemCompletion(_ itemID: UUID, requestBody: Data) async throws -> ItemCompletionReceipt {
+        let command = try ItemCompletionValidation.decode(ItemCompletionCommand.self, from: requestBody)
+        guard command.isValid(for: itemID) else { throw ItemCompletionError.invalidData }
+        let result: ItemCompletionReceipt = try await send(method: "PUT",
+            pathComponents: ["v1", "items", itemID.uuidString.lowercased(), "completion"],
+            body: requestBody, requiredStatusCode: 200)
+        guard result.matches(itemID: itemID, command: command) else { throw ItemCompletionError.invalidData }
+        return result
+    }
+
+    private static func completionHeader(_ name: String, response: HTTPURLResponse) throws -> String? {
+        try completionHeader(name, fields: response.allHeaderFields)
+    }
+
+    static func completionHeader(_ name: String, fields: [AnyHashable: Any]) throws -> String? {
+        let values = fields.filter {
+            ($0.key as? String)?.caseInsensitiveCompare(name) == .orderedSame
+        }.map(\.value)
+        guard values.count <= 1 else { throw ItemCompletionError.invalidData }
+        guard let value = values.first else { return nil }
+        guard let value = value as? String else { throw ItemCompletionError.invalidData }
+        return value
+    }
+
     func itemProgress(_ itemID: UUID) async throws -> ItemProgressSnapshot {
         guard itemID != Self.nilUUID else { throw ItemProgressError.invalidData }
         let result: ItemProgressSnapshot = try await send(method: "GET",
@@ -3243,6 +3282,36 @@ struct DayWeaveAPIClient: Sendable {
 
         let data = result.data
         let httpResponse = result.response
+        let isItemCompletion = pathComponents.count == 4 && pathComponents[0] == "v1"
+            && pathComponents[1] == "items" && pathComponents[3] == "completion"
+        if isItemCompletion {
+            guard data.count <= 64 * 1_024,
+                  Self.isStrictJSONMediaType(try Self.completionHeader("content-type", response: httpResponse)),
+                  try Self.completionHeader("cache-control", response: httpResponse)?.lowercased() == "no-store, max-age=0",
+                  try Self.completionHeader("pragma", response: httpResponse)?.lowercased() == "no-cache",
+                  StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: data) else {
+                throw ItemCompletionError.invalidData
+            }
+            let replay = try Self.completionHeader("idempotency-replayed", response: httpResponse)?.lowercased()
+            if httpResponse.statusCode == 200 {
+                if method == "GET" {
+                    guard replay == nil else { throw ItemCompletionError.invalidData }
+                } else {
+                    guard let replay, replay == "true" || replay == "false",
+                          let receipt = try? JSONDecoder().decode(ItemCompletionReceipt.self, from: data),
+                          receipt.replayed == (replay == "true") else { throw ItemCompletionError.invalidData }
+                }
+            } else {
+                guard replay == nil else { throw ItemCompletionError.invalidData }
+                if let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data),
+                   ItemCompletionJournal.definitiveStatuses[envelope.error.code] == httpResponse.statusCode {
+                    throw ItemCompletionError.definitive(envelope.error.code)
+                }
+                // An uncertain error cannot discard reviewed custody or expose
+                // untrusted diagnostic text from the private reopening tuple.
+                throw ItemCompletionError.unavailable
+            }
+        }
         let isItemProgress = pathComponents.count == 4 && pathComponents[0] == "v1"
             && pathComponents[1] == "items" && pathComponents[3] == "progress"
         if isItemProgress {

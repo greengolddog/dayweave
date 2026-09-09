@@ -53,6 +53,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var executionSync: ExecutionSyncStore
     @StateObject private var habitSync: HabitSyncStore
     @StateObject private var itemProgress: ItemProgressStore
+    @StateObject private var itemCompletion: ItemCompletionStore
     @StateObject private var googleIntegration: GoogleIntegrationStore
     @StateObject private var googleOutbound: GoogleOutboundStore
     @StateObject private var googleSchedulePublication: GoogleSchedulePublicationStore
@@ -100,6 +101,8 @@ struct DayWeaveMacApp: App {
         _canonicalSync = StateObject(wrappedValue: canonicalSync)
         let itemProgress = ItemProgressStore(planner: store, canonicalSync: canonicalSync, authCoordinator: authCoordinator)
         _itemProgress = StateObject(wrappedValue: itemProgress)
+        let itemCompletion = ItemCompletionStore(planner: store, canonicalSync: canonicalSync, authCoordinator: authCoordinator)
+        _itemCompletion = StateObject(wrappedValue: itemCompletion)
         let executionSync = ExecutionSyncStore(
             planner: store,
             habitCompositionProvider: habitSync,
@@ -157,7 +160,8 @@ struct DayWeaveMacApp: App {
             executionSync: executionSync,
             canonicalSync: canonicalSync,
             habitSync: habitSync,
-            itemProgress: itemProgress
+            itemProgress: itemProgress,
+            itemCompletion: itemCompletion
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
@@ -182,6 +186,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(executionSync)
                 .environmentObject(habitSync)
                 .environmentObject(itemProgress)
+                .environmentObject(itemCompletion)
                 .environmentObject(googleIntegration)
                 .environmentObject(googleOutbound)
                 .environmentObject(googleSchedulePublication)
@@ -396,6 +401,7 @@ struct DayWeaveMacApp: App {
                    onboarding.progress.privacyAcknowledged {
                 SettingsView()
                         .environmentObject(itemProgress)
+                        .environmentObject(itemCompletion)
                         .environmentObject(store)
                         .environmentObject(codex)
                         .environmentObject(suggestionSync)

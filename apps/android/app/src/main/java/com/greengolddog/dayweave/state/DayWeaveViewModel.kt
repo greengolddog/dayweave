@@ -115,6 +115,27 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val habitSyncState: StateFlow<HabitSyncState> = habitSyncManager.state
     val itemProgressSyncState = itemProgressSyncManager.state
+    private val itemCompletionSyncManager get() = dayWeaveApplication.itemCompletionSyncManager
+    val itemCompletionSyncState = itemCompletionSyncManager.state
+    suspend fun observeItemCompletion(itemId: String) = dayWeaveApplication.observeSelectedItemCompletion(itemId)
+    suspend fun collectForegroundItemCompletion() = dayWeaveApplication.runForegroundItemCompletionSync()
+    fun replayItemCompletion(): Boolean {
+        dayWeaveApplication.requestItemCompletionReplay()
+        return dayWeaveApplication.launchCanonicalAction { dayWeaveApplication.replayItemCompletionOwned() }
+    }
+    suspend fun saveItemCompletion(itemId: String, reviewed: com.greengolddog.dayweave.model.ItemCompletionSnapshot,
+        requiredForParent: Boolean, mode: com.greengolddog.dayweave.model.ItemCompletionMode, replacingOperationId: String?,
+    ): Boolean {
+        val action = dayWeaveApplication.launchCanonicalResultAction {
+            itemCompletionSyncManager.stage(itemId, reviewed, requiredForParent, mode, replacingOperationId)
+        } ?: return false
+        val saved = action.await()
+        if (saved) replayItemCompletion()
+        return saved
+    }
+    fun discardReviewedItemCompletion(operationId: String): Boolean = dayWeaveApplication.launchCanonicalAction {
+        itemCompletionSyncManager.discardReviewed(operationId)
+    }
 
     suspend fun observeItemProgress(itemId: String) = dayWeaveApplication.observeSelectedItemProgress(itemId)
 

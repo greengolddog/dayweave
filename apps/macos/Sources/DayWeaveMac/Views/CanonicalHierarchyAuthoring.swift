@@ -1,5 +1,14 @@
 import Foundation
 
+/// First-send authority for one exact child intent, never a general review or
+/// picker permission. Its lifetime is the synchronous preflight after a GET.
+struct ItemCompletionParentAdmission {
+    let mutation: DayWeavePendingCanonicalAuthoringMutation
+    let snapshot: ItemCompletionSnapshot
+    let configurationIdentifier: String
+    let evidenceGeneration: UInt64
+}
+
 @MainActor
 final class CanonicalHierarchyAuthoringCache {
     private struct Key: Equatable {
@@ -11,6 +20,11 @@ final class CanonicalHierarchyAuthoringCache {
         let binding: String?
         let activeItemID: UUID?
         let hasPendingExecutionCommand: Bool
+        let completion: ItemCompletionState
+        let completionEvidenceGeneration: UInt64
+        let completionReadAdmissions: [UUID: ItemCompletionReadAdmission]
+        let cursor: String?
+        let trustedStorage: Bool
     }
     private var key: Key?
     private var cached: Set<UUID> = []
@@ -21,7 +35,12 @@ final class CanonicalHierarchyAuthoringCache {
             statusMutations: store.pendingCanonicalMutations, sensitivityMutations: store.pendingCanonicalSensitivityMutations,
             trash: store.canonicalTrash, binding: store.canonicalConfigurationIdentifier,
             activeItemID: store.executionState.activeSession?.itemID,
-            hasPendingExecutionCommand: store.executionState.pendingCommand != nil)
+            hasPendingExecutionCommand: store.executionState.pendingCommand != nil,
+            completion: store.itemCompletionState,
+            completionEvidenceGeneration: store.itemCompletionEvidenceGeneration,
+            completionReadAdmissions: store.itemCompletionReadAdmissions,
+            cursor: store.canonicalDeltaCursor,
+            trustedStorage: store.canPersistPlan && store.persistenceError == nil)
         if key == next { return cached }
         cached = store.canonicalAuthoringEligibleParentIDs()
         key = next
@@ -76,6 +95,11 @@ extension PlannerStore {
             + [executionState.activeSession?.itemID].compactMap({ $0 }) {
             nodes.removeValue(forKey: id)
         }
+        nodes = nodes.filter { _, value in
+            if case .unknown = value.kind { return false }
+            if case .unknown = value.status { return false }
+            return true
+        }
         var children: [UUID: [UUID]] = [:]
         var queue: [UUID] = []
         for (id, node) in nodes {
@@ -90,9 +114,13 @@ extension PlannerStore {
             guard admitted.insert(id).inserted else { continue }
             queue.append(contentsOf: children[id] ?? [])
         }
+        // GET observations are bounded; do not scan the canonical forest once
+        // for every completed row in a large cached hierarchy.
+        let completionQualified = Set(itemCompletionReadAdmissions.keys.filter { itemCompletionQualifiesParent($0) })
         return admitted.filter { id in
             guard let status = nodes[id]?.status else { return false }
             return status == .inbox || status == .planned || status == .blocked
+                || (status == .completed && completionQualified.contains(id))
         }
     }
 }

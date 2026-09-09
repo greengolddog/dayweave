@@ -447,6 +447,7 @@ private fun DayWeaveRoot(
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val habitSyncState by viewModel.habitSyncState.collectAsStateWithLifecycle()
     val itemProgressSyncState by viewModel.itemProgressSyncState.collectAsStateWithLifecycle()
+    val itemCompletionSyncState by viewModel.itemCompletionSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val googleCalendarImportState by
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
@@ -507,6 +508,9 @@ private fun DayWeaveRoot(
                 it.disposition == com.greengolddog.dayweave.model.CanonicalAuthoringDisposition.PENDING
         }
     var showQuickCapture by remember { mutableStateOf(false) }
+    var completionItemId by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
+        mutableStateOf<String?>(null)
+    }
     var progressItemId by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
         mutableStateOf<String?>(null)
     }
@@ -677,6 +681,7 @@ private fun DayWeaveRoot(
                         null
                     },
                     itemProgressRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundItemProgress else null,
+                    itemCompletionRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundItemCompletion else null,
                     polling = {
                         // Polling remains the durable fallback for old servers and missed publishes.
                         while (isActive) {
@@ -1105,6 +1110,7 @@ private fun DayWeaveRoot(
                 },
                 onOpenCanonicalEditor = { canonicalEditorRoute = it },
                 onOpenProgress = { progressItemId = it },
+                onOpenCompletion = { completionItemId = it },
                 onTrashCanonicalItem = { itemId ->
                     viewModel.trashCanonicalItem(itemId, confirmed = true)
                 },
@@ -1280,11 +1286,22 @@ private fun DayWeaveRoot(
                     onOpenEditor = { canonicalEditorRoute = it },
                     onBack = { viewModel.navigate(AppDestination.MORE) },
                     onOpenProgress = { progressItemId = it },
+                    onOpenCompletion = { completionItemId = it },
                     modifier = Modifier.padding(innerPadding),
                 )
             }
             }
         }
+    }
+
+    completionItemId?.let { itemId ->
+        com.greengolddog.dayweave.ui.authoring.ItemCompletionReviewSheet(
+            state, itemId, itemCompletionSyncState, !accountRecoveryState.deviceAuthorizationSuppressed,
+            viewModel::observeItemCompletion, viewModel::saveItemCompletion,
+            onRetry = { viewModel.replayItemCompletion() },
+            onDiscardReviewed = { viewModel.discardReviewedItemCompletion(it) },
+            onDismiss = { completionItemId = null },
+        )
     }
 
     progressItemId?.let { itemId ->
@@ -1918,6 +1935,7 @@ internal suspend fun runForegroundInvalidationWorkers(
     scheduleInvalidations: (suspend () -> Unit)? = null,
     habitInvalidations: (suspend () -> Unit)? = null,
     itemProgressRefresh: (suspend () -> Unit)? = null,
+    itemCompletionRefresh: (suspend () -> Unit)? = null,
     polling: suspend () -> Unit,
 ) = supervisorScope {
     listOfNotNull(
@@ -1926,6 +1944,7 @@ internal suspend fun runForegroundInvalidationWorkers(
         scheduleInvalidations,
         habitInvalidations,
         itemProgressRefresh,
+        itemCompletionRefresh,
     ).forEach {
         collectInvalidations ->
         launch {

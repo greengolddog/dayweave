@@ -2584,7 +2584,7 @@ internal fun DayWeaveUiState.withCanonicalTrashRetention(
     val pinned = retainedMutations.asSequence()
         .filter { it.operation == CanonicalAuthoringOperation.RESTORE }
         .map(PendingCanonicalAuthoringMutation::itemId)
-        .toSet() + itemProgressLedger.pending.map { it.itemId }
+        .toSet() + itemProgressLedger.pending.map { it.itemId } + itemCompletionLedger.pending.map { it.itemId }
     val bounded = anchoredDeleted.boundedCanonicalTrash(referenceEpochMillis, pinned)
     return if (bounded == canonicalRecentlyDeleted &&
         retainedMutations == pendingCanonicalAuthoringMutations) {
@@ -2604,7 +2604,7 @@ internal fun DayWeaveUiState.nextCanonicalTrashRetentionExpiryEpochMillis(
     val pinned = pendingCanonicalAuthoringMutations.asSequence()
         .filter { it.operation == CanonicalAuthoringOperation.RESTORE }
         .map(PendingCanonicalAuthoringMutation::itemId)
-        .toSet() + itemProgressLedger.pending.map { it.itemId }
+        .toSet() + itemProgressLedger.pending.map { it.itemId } + itemCompletionLedger.pending.map { it.itemId }
     val deletedById = canonicalRecentlyDeleted.associateBy(CanonicalRecentlyDeletedRecord::id)
     val deadlines = buildList {
         canonicalRecentlyDeleted.forEach { record ->

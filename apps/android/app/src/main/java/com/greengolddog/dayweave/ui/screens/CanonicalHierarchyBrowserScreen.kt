@@ -66,6 +66,7 @@ internal fun CanonicalHierarchyBrowserScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     onOpenProgress: ((String) -> Unit)? = null,
+    onOpenCompletion: ((String) -> Unit)? = null,
 ) {
     var query by remember(kind) { mutableStateOf("") }
     var collapsedIds by remember(kind) { mutableStateOf(emptySet<String>()) }
@@ -182,6 +183,9 @@ internal fun CanonicalHierarchyBrowserScreen(
             onOpenProgress = onOpenProgress?.takeIf { sourceState.progressItem(selected.itemId) != null }?.let { action ->
                 { selectedId = null; action(selected.itemId) }
             },
+            onOpenCompletion = onOpenCompletion?.takeIf { sourceState.progressItem(selected.itemId) != null }?.let { action ->
+                { selectedId = null; action(selected.itemId) }
+            },
         )
     }
 }
@@ -199,6 +203,9 @@ internal fun hierarchySourceKey(state: DayWeaveUiState): List<Any?> = listOf(
     state.canonicalItems, state.pendingCanonicalAuthoringMutations, state.canonicalRecentlyDeleted,
     state.pendingCanonicalMutation, state.scheduleCompositionProfile, state.canonicalExecutionSession,
     state.terminalExecutionOutcomes, state.pendingProposalApplicationMutation, state.pendingExecutionCommand,
+    state.itemCompletionLedger, state.itemCompletionGetProofs, state.canonicalExecutionRevision,
+    state.canonicalExecutionSyncOrigin, state.canonicalExecutionConfigurationId,
+    state.pendingExecutionDeferIntent, state.pendingSchedulePublication,
 )
 
 /** Never promote an unbound legacy canonical cache into an admitted hierarchy. */
@@ -309,6 +316,7 @@ private fun HierarchyItemDetails(
     onDismiss: () -> Unit,
     onOpenEditor: (CanonicalItemEditorRoute) -> Unit,
     onOpenProgress: (() -> Unit)?,
+    onOpenCompletion: (() -> Unit)?,
 ) {
     val route = row.editorRoute()
     AlertDialog(
@@ -341,6 +349,11 @@ private fun HierarchyItemDetails(
         },
         confirmButton = {
             Column {
+                if (onOpenCompletion != null) {
+                    TextButton(onClick = onOpenCompletion, modifier = Modifier.testTag("hierarchy_completion_policy")) {
+                        Text("Completion policy")
+                    }
+                }
                 if (onOpenProgress != null) {
                     TextButton(onClick = onOpenProgress, modifier = Modifier.testTag("hierarchy_independent_progress")) {
                         Text("Independent progress")

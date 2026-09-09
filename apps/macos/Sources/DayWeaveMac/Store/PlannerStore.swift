@@ -365,25 +365,30 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var canonicalItems: [DayWeaveCanonicalItem] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != canonicalItems { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var itemProgressState: ItemProgressState {
         didSet { scheduleAutosave() }
     }
-    @Published private(set) var canonicalDeltaCursor: String? {
+    @Published private(set) var itemCompletionState: ItemCompletionState {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var itemCompletionEvidenceGeneration: UInt64 = 0
+    @Published private(set) var itemCompletionReadAdmissions: [UUID: ItemCompletionReadAdmission] = [:]
+    @Published private(set) var canonicalDeltaCursor: String? {
+        didSet { if oldValue != canonicalDeltaCursor { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
+    }
     @Published private(set) var canonicalTombstoneRevisions: [UUID: UInt64] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != canonicalTombstoneRevisions { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var completedOccurrenceIDs: Set<UUID> {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var pendingCanonicalMutations: [PendingCanonicalMutation] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != pendingCanonicalMutations { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != pendingCanonicalSensitivityMutations { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var recurrenceSessionOutcomes: [RecurrenceSessionOutcome] {
         didSet { scheduleAutosave() }
@@ -393,7 +398,7 @@ final class PlannerStore: ObservableObject {
     }
     @Published private(set) var pendingExecutionDeferIntent:
         DayWeavePendingExecutionDeferIntent? {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != pendingExecutionDeferIntent { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var deferredExecutionPublicationSessionIDs: Set<UUID> {
         didSet { scheduleAutosave() }
@@ -402,7 +407,7 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var canonicalConfigurationIdentifier: String? {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != canonicalConfigurationIdentifier { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var schedulePreviewProvenance: SchedulePreviewProvenance? {
         didSet { scheduleAutosave() }
@@ -429,7 +434,7 @@ final class PlannerStore: ObservableObject {
     }
     @Published private(set) var pendingProposalApplicationMutation:
         DayWeavePendingProposalApplicationMutation? {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != pendingProposalApplicationMutation { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var proposalApplicationReceipts:
         [DayWeaveStoredProposalApplicationReceipt] {
@@ -437,10 +442,10 @@ final class PlannerStore: ObservableObject {
     }
     @Published private(set) var pendingCanonicalAuthoringMutations:
         [DayWeavePendingCanonicalAuthoringMutation] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != pendingCanonicalAuthoringMutations { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var canonicalTrash: [DayWeaveCanonicalTrashEntry] {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != canonicalTrash { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var googleOutboundRecoveryJournal:
         GoogleOutboundRecoveryJournal? {
@@ -454,7 +459,7 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var executionState: DayWeaveExecutionDurableState {
-        didSet { scheduleAutosave() }
+        didSet { if oldValue != executionState { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
     }
     @Published private(set) var scheduleProfile: ScheduleProfile {
         didSet { scheduleAutosave() }
@@ -561,6 +566,7 @@ final class PlannerStore: ObservableObject {
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
         itemProgressState: ItemProgressState = .empty,
+        itemCompletionState: ItemCompletionState = .empty,
         scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
@@ -698,6 +704,7 @@ final class PlannerStore: ObservableObject {
         let initialCanonicalAuthoringMutations = restoredSnapshot?.pendingCanonicalAuthoringMutations
             ?? pendingCanonicalAuthoringMutations
         let initialItemProgressState = restoredSnapshot?.itemProgressState ?? itemProgressState
+        let initialItemCompletionState = restoredSnapshot?.itemCompletionState ?? itemCompletionState
         let initialCanonicalTrash = restoredSnapshot?.canonicalTrash ?? canonicalTrash
         let retentionReferenceDate = now()
         let boundedCanonicalAuthoringMutations = Self.boundedCanonicalAuthoringMutations(
@@ -710,6 +717,7 @@ final class PlannerStore: ObservableObject {
             pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(
                 boundedCanonicalAuthoringMutations
             ).union(initialItemProgressState.journals.map(\.itemID))
+                .union(initialItemCompletionState.journals.map(\.itemID))
         )
         let restoredCanonicalRetentionNeedsRewrite = restoredSnapshot != nil
             && (initialCanonicalTrash != boundedCanonicalTrash
@@ -767,6 +775,12 @@ final class PlannerStore: ObservableObject {
         let initialExecutionState = restoredSnapshot?.executionState ?? executionState
         self.executionState = initialExecutionState
         self.itemProgressState = initialItemProgressState
+        self.itemCompletionState = initialItemCompletionState
+        if !initialItemCompletionState.isValid
+            || (initialItemCompletionState.configurationIdentifier != nil
+                && initialItemCompletionState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
+            restorationError = .snapshotDecodingFailed
+        }
         if !initialItemProgressState.isValid
             || (initialItemProgressState.configurationIdentifier != nil
                 && initialItemProgressState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
@@ -911,7 +925,9 @@ final class PlannerStore: ObservableObject {
         let boundedTrash = Self.boundedCanonicalTrash(
             canonicalTrash,
             referenceDate: retentionReferenceDate,
-            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations).union(itemProgressState.journals.map(\.itemID))
+            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+                .union(itemProgressState.journals.map(\.itemID))
+                .union(itemCompletionState.journals.map(\.itemID))
         )
 
         do {
@@ -969,6 +985,44 @@ final class PlannerStore: ObservableObject {
         }
     }
 
+    /// Completion intent and its post-receipt catch-up fence commit together.
+    /// Canonical lifecycle is installed only by the terminal delta reader.
+    func commitItemCompletionState(_ replacement: ItemCompletionState, replacing prior: ItemCompletionState) throws {
+        guard hasEncryptedPersistence, canPersistPlan else { throw ItemCompletionError.persistenceRequired }
+        guard itemCompletionState == prior, replacement.isValid,
+              replacement.configurationIdentifier == nil
+                || replacement.configurationIdentifier == canonicalConfigurationIdentifier else {
+            throw ItemCompletionError.configurationChanged
+        }
+        itemCompletionState = replacement
+        flushPersistence()
+        if let persistenceError {
+            itemCompletionState = prior
+            throw persistenceError
+        }
+        if replacement.needsCanonicalCatchUp { invalidateItemCompletionReadEvidence() }
+    }
+
+    func invalidateItemCompletionReadEvidence() {
+        itemCompletionEvidenceGeneration &+= 1
+        itemCompletionReadAdmissions.removeAll()
+    }
+
+    func admitItemCompletionRead(_ snapshot: ItemCompletionSnapshot, generation: UInt64) throws {
+        guard generation == itemCompletionEvidenceGeneration,
+              itemCompletionState.configurationIdentifier == canonicalConfigurationIdentifier,
+              !itemCompletionState.needsCanonicalCatchUp,
+              canonicalItems.first(where: { $0.id == snapshot.itemID })?.revision == snapshot.itemRevision else {
+            throw ItemCompletionError.staleReview
+        }
+        // A GET can discover remote evidence drift before a body delta arrives.
+        if itemCompletionReadAdmissions.values.contains(where: { $0.evidenceHash != snapshot.evidenceHash }) {
+            invalidateItemCompletionReadEvidence()
+        }
+        itemCompletionReadAdmissions[snapshot.itemID] = .init(
+            generation: itemCompletionEvidenceGeneration, snapshot: snapshot)
+    }
+
     /// A nil value means the encrypted planner snapshot is not trustworthy, so
     /// another store must not evict occurrence authority using an empty move set.
     var habitRetentionProtectedPlannerOccurrenceIDs: Set<UUID>? {
@@ -978,6 +1032,7 @@ final class PlannerStore: ObservableObject {
 
     var canMutatePlan: Bool {
         canPersistPlan
+            && !itemCompletionState.needsCanonicalCatchUp
             && !isCanonicalSyncLocked
             && pendingExecutionDeferIntent == nil
             && !hasGoogleSchedulePublicationAuthorityFence
@@ -1247,6 +1302,8 @@ final class PlannerStore: ObservableObject {
               pendingSchedulePublication == nil,
               pendingProposalApplicationMutation == nil,
               itemProgressState.journals.isEmpty,
+              itemCompletionState.journals.isEmpty,
+              !itemCompletionState.needsCanonicalCatchUp,
               !pendingCanonicalAuthoringMutations.contains(where: {
                   $0.hasBeenSubmitted || $0.configurationIdentifier != nil || $0.disposition == .conflicted
               }) else {
@@ -1281,6 +1338,8 @@ final class PlannerStore: ObservableObject {
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
         itemProgressState = .empty
+        itemCompletionState = .empty
+        invalidateItemCompletionReadEvidence()
         pendingCanonicalAuthoringMutations = preservedCreates
         if let anchor = onboardingFirstItemAnchor,
            preservedCreates.contains(where: {
@@ -1536,7 +1595,8 @@ final class PlannerStore: ObservableObject {
     }
 
     private var hasCanonicalRemoteState: Bool {
-        itemProgressState.configurationIdentifier != nil || !canonicalItems.isEmpty
+        itemProgressState.configurationIdentifier != nil || itemCompletionState.configurationIdentifier != nil
+            || !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
             || !canonicalTombstoneRevisions.isEmpty
@@ -2910,7 +2970,8 @@ final class PlannerStore: ObservableObject {
     func canonicalAuthoringDraftHierarchyIsCurrent(
         _ draft: DayWeaveCanonicalItemDraft,
         itemID: UUID,
-        requiresCommittedParent: Bool
+        requiresCommittedParent: Bool,
+        completionParentAdmission: ItemCompletionParentAdmission? = nil
     ) -> Bool {
         guard let parentID = draft.parentID else { return true }
         let items = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
@@ -2945,8 +3006,16 @@ final class PlannerStore: ObservableObject {
                       let item = items[candidate], item.deletedAt == nil else { return false }
                 value = DayWeaveCanonicalItemDraft(item: item)
             }
+            if case .unknown = value.kind { return false }
+            if case .unknown = value.status { return false }
             if candidate == parentID,
-               value.status != .inbox && value.status != .planned && value.status != .blocked { return false }
+               value.status != .inbox && value.status != .planned && value.status != .blocked {
+                guard value.status == .completed,
+                      completionParentAdmission == nil || (
+                        requiresCommittedParent && completionParentAdmission?.mutation.itemID == itemID
+                            && completionParentAdmission?.mutation.draft == draft),
+                      itemCompletionQualifiesParent(candidate, admission: completionParentAdmission) else { return false }
+            }
             current = value.parentID
         }
         return true
@@ -3004,7 +3073,9 @@ final class PlannerStore: ObservableObject {
             let boundedTrash = Self.boundedCanonicalTrash(
                 canonicalTrash,
                 referenceDate: retentionReferenceDate,
-                pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations).union(itemProgressState.journals.map(\.itemID))
+                pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+                    .union(itemProgressState.journals.map(\.itemID))
+                    .union(itemCompletionState.journals.map(\.itemID))
             )
             try persistence.preflightSave(makeSnapshot(
                 canonicalTrashOverride: boundedTrash,
@@ -3173,7 +3244,9 @@ final class PlannerStore: ObservableObject {
     }
 
     private var pendingCanonicalRecoveryItemIDs: Set<UUID> {
-        Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations).union(itemProgressState.journals.map(\.itemID))
+        Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations)
+            .union(itemProgressState.journals.map(\.itemID))
+            .union(itemCompletionState.journals.map(\.itemID))
     }
 
     private func reconcileSelectedCanonicalItem() {
@@ -4306,6 +4379,13 @@ final class PlannerStore: ObservableObject {
                 hardenedProgress = true
             }
         }
+        for index in itemCompletionState.journals.indices {
+            if !itemCompletionState.journals[index].wasSensitive,
+               itemCompletionRequiresSensitivePresentation(itemCompletionState.journals[index].itemID) {
+                itemCompletionState.journals[index].wasSensitive = true
+                hardenedProgress = true
+            }
+        }
         return hardenedProgress
     }
 
@@ -5032,7 +5112,8 @@ final class PlannerStore: ObservableObject {
     }
 
     var hasExecutionCredentialReplacementBlocker: Bool {
-        !itemProgressState.journals.isEmpty || executionState.hasCredentialReplacementBlocker
+        !itemProgressState.journals.isEmpty || !itemCompletionState.journals.isEmpty
+            || itemCompletionState.needsCanonicalCatchUp || executionState.hasCredentialReplacementBlocker
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
             || pendingSchedulePublication != nil
@@ -5282,6 +5363,8 @@ final class PlannerStore: ObservableObject {
 
     private func quarantineCredentialBoundState(preservingDeviceID: Bool) {
         itemProgressState = .empty
+        itemCompletionState = .empty
+        invalidateItemCompletionReadEvidence()
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
         blocks.removeAll {
@@ -6492,7 +6575,8 @@ final class PlannerStore: ObservableObject {
                 googleSchedulePublicationRecoveryJournal,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState,
-            itemProgressState: itemProgressState
+            itemProgressState: itemProgressState,
+            itemCompletionState: itemCompletionState
         )
     }
 

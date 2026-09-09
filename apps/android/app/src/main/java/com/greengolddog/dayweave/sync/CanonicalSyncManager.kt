@@ -1,6 +1,14 @@
 package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.ItemCompletionLedger
+import com.greengolddog.dayweave.model.ItemCompletionObservation
+import com.greengolddog.dayweave.model.ItemCompletionReadProof
+import com.greengolddog.dayweave.model.completionLocalEvidence
+import com.greengolddog.dayweave.model.hasQualifiedCompletedParent
+import com.greengolddog.dayweave.model.withCompletionObservation
+import com.greengolddog.dayweave.network.ItemCompletionTransport
+import com.greengolddog.dayweave.network.OkHttpItemCompletionTransport
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalItemDraft
@@ -91,6 +99,7 @@ import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -176,6 +185,8 @@ class CanonicalSyncManager(
     private val newPublicationIdempotencyKey: () -> String = { UUID.randomUUID().toString() },
     private val cancelTimedBreakNotification: suspend () -> Boolean = { true },
     private val reconcileTimedBreakNotification: suspend () -> Unit = {},
+    private val completionTransport: ItemCompletionTransport = OkHttpItemCompletionTransport(),
+    private val completionParentReadAllowed: () -> Boolean = { true },
 ) {
     private val operationMutex = Mutex()
     private val focusTransitionMutex = Mutex()
@@ -1053,6 +1064,7 @@ class CanonicalSyncManager(
                     mutation = bound.mutation
                 }
                 ensureConfigurationCurrent(configuration)
+                refreshCompletedParentForFirstSend(configuration, mutation)
                 val submitted = try {
                     plannerStore.markCanonicalAuthoringSubmitted(mutation.id)
                 } catch (_: IllegalArgumentException) {
@@ -1105,6 +1117,40 @@ class CanonicalSyncManager(
             it.disposition == CanonicalAuthoringDisposition.PENDING
         }
         return CanonicalAuthoringPushSummary(appliedCount, conflictedCount, deferredCount)
+    }
+
+    private suspend fun refreshCompletedParentForFirstSend(
+        configuration: AuthenticatedApiConfiguration,
+        mutation: PendingCanonicalAuthoringMutation,
+    ) {
+        require(!mutation.isSubmitted)
+        val expected = plannerStore.state.value
+        val parentId = mutation.draft?.parentId ?: if (mutation.operation == CanonicalAuthoringOperation.RESTORE) {
+            expected.canonicalRecentlyDeleted.firstOrNull { it.id == mutation.itemId }?.parentId
+        } else null
+        val parent = expected.canonicalItems.singleOrNull { it.id == parentId && it.status == "completed" } ?: return
+        require(completionParentReadAllowed())
+        val evidence = expected.completionLocalEvidence()
+        val snapshot = completionTransport.get(configuration, parent.id).also { it.requireValid() }
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        ensureConfigurationCurrent(configuration)
+        require(snapshot.itemId == parent.id && snapshot.itemRevision == parent.revision)
+        val receipt = plannerStore.mutateItemCompletion { current ->
+            require(completionParentReadAllowed() && current.completionLocalEvidence() == evidence &&
+                current.pendingCanonicalAuthoringMutations.singleOrNull { it.id == mutation.id } == mutation)
+            val ledger = current.itemCompletionLedger.let {
+                if (it.syncOrigin == null) ItemCompletionLedger(syncOrigin = configuration.baseUrl.toString(),
+                    configurationId = requireNotNull(configuration.configurationId)) else it
+            }.withCompletionObservation(ItemCompletionObservation(snapshot, now().truncatedTo(java.time.temporal.ChronoUnit.MICROS).toString()))
+            current.copy(itemCompletionLedger = ledger, itemCompletionGetProofs = mapOf(
+                parent.id to ItemCompletionReadProof(snapshot, evidence, mutation))).also {
+                require(it.hasQualifiedCompletedParent(parent.id, mutation.itemId, evidence))
+            }
+        } ?: throw LocalPlannerStorageException()
+        if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+        require(completionParentReadAllowed())
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        ensureConfigurationCurrent(configuration)
     }
 
     private suspend fun persistCanonicalAuthoringPreflight(
@@ -4373,6 +4419,7 @@ class CanonicalSyncManager(
         val origin = configuration.baseUrl.toString()
         val configurationId = configuration.configurationId
         val hasCanonicalCache = current.canonicalSyncOrigin != null ||
+            current.itemCompletionLedger.syncOrigin != null || current.itemCompletionLedger.pending.isNotEmpty() ||
             current.itemProgressLedger.syncOrigin != null ||
             current.itemProgressLedger.observations.isNotEmpty() || current.itemProgressLedger.pending.isNotEmpty() ||
             current.canonicalDeltaCursor != null || current.canonicalItems.isNotEmpty() ||

@@ -1,10 +1,12 @@
 # Authoritative parent completion
 
-This server checkpoint implements the one-off portion of [parent completion](hierarchy-completion.md).
-It does not finish `HIE-004`: native review/override controls, encrypted offline
-completion intent, qualified recurring-instance integration, and owner-device
-acceptance remain separate gates. Do not describe the full feature as released
-or deploy this server checkpoint as a completed native experience.
+The verified server checkpoint implements the one-off portion of
+[parent completion](hierarchy-completion.md). Native review/override controls,
+encrypted completion intent and policy-qualified parent admission now pass the
+native automated regression/build gates described below. This does
+not finish `HIE-004`: controlled cross-client convergence, qualified recurring
+instances and owner-device acceptance remain separate gates. Do not describe
+the full feature as released or treat server coverage as native acceptance.
 
 ## Review and commands
 
@@ -112,21 +114,63 @@ installing a complete forest. The existing [bounded current-state bootstrap](ite
 and historical-receipt recovery are prerequisites, not native acceptance of this
 new completion policy.
 
-The existing native Add Subtask/parent-selection guards still reject terminal
-parents. They must be updated to use fresh, revision-bound completion policy
-before exposing policy-qualified completed parents. Server admission alone is
-not evidence that this native workflow is usable.
+## Native client checkpoint
 
-The next native slice is a separate completion review and encrypted intent
-ledger, then qualified Add Subtask/parent selection. It must invalidate review
-permission after any admitted canonical or execution change, not merely a change
-to the selected item's revision. Preserve entered fields while requiring a fresh
-review; never silently replace the evidence in an already-submitted request.
-An exact historical receipt settles only its original intent and is not a current
-GET proof or permission to overwrite the current forest. Complete canonical
-catch-up must remain available while that intent is being recovered. Keep legacy
-terminal-item content editing read-only rather than widening its existing draft
-contract as part of policy controls.
+macOS and Android now have separate completion models, strict GET/PUT transports,
+protected review controls, encrypted intent and recovery integration. Required-edge
+editing is independent of full-item replacement; manual modes remain limited to
+structural parents or retained managed state. Completed-item content editing is
+still read-only. These are verified implementation slices, not a finished
+native release or acceptance of the full completion requirement.
+
+A saved observation is not permission to write. Current review requires a
+process-local GET proof bound to the exact connection, canonical item revision,
+and complete local canonical/execution evidence generation. Canonical or execution
+changes and pending authority transitions invalidate that proof, even when the
+selected item's revision is unchanged. A restart, lock or account change cannot
+restore permission from encrypted observations or successful PUT receipts. The
+server's opaque evidence hash is retained, never recreated from local counts.
+
+Review retains the exact chosen requiredness and mode with item/policy CAS and
+the original evidence hash. Submitted request bytes and operation identity are
+immutable across retries and restart. A definitive no-effect result permits
+explicit re-review or discard; ambiguous failures retain custody. Stale reviews
+must preserve entered choices while requiring an explicit fresh review, not
+silently replace the evidence inside an already-submitted request. Foreground
+detail refresh and the outbox have separate lifetimes, so recovery does not
+depend on leaving an item inspector open.
+
+Receipt settlement removes only its exact intent and durably records the need
+for canonical catch-up. It does not install lifecycle from the receipt or
+overwrite a newer item, trash entry or deletion record. The catch-up path remains
+available under that recovery fence and clears it only after a terminal
+delta/current-bootstrap result is durable. Another completion review needs a
+new GET after catch-up.
+
+Completed-parent selection and new child attachment require revision-matching
+completion provenance, not the status label alone. Immediately before the first
+send, the authoring pipeline refreshes the selected Completed parent's completion
+under its existing operation. The resulting proof is scoped to that exact
+still-unsubmitted child intent and unchanged local evidence; it excludes only
+that intent from pending-authority checks and grants no general policy review
+or unrelated child permission. Submitted children retain exact replay without
+fresh parent preflight. Unknown or malformed ancestry, conflicting/pending
+authority and active execution remain fenced. There is no parent-revision CAS
+field in the existing child-create request: atomic server parent admission is
+the final authority, not a guarantee supplied by the preceding GET.
+
+Completion-derived summaries, policy and reopening review, and retained intent
+are always protected as sensitive on both native clients, including a fresh GET
+over an apparently public local tree. Version 1 carries neither a privacy witness
+nor a canonical-cursor binding: a remote sensitive descendant can change ancestor
+counts without changing that ancestor's item revision. The opaque evidence hash
+does not establish that the local subtree contains every privacy-relevant change.
+A fresh GET therefore cannot relax aggregate privacy. This conservative
+presentation and intent rule does not change authentication, revision/evidence
+CAS, or scoped parent admission, and does not add fields to the closed wire.
+Protection also survives stale observations, refreshed review and restart.
+Lock/account boundaries clear transient review authority; unavailable items
+remain recoverable without exposing their old content in the outbox.
 
 ## Migration and retention
 
@@ -155,9 +199,20 @@ scrubbed by existing maintenance after undo expiry while immutable hashes remain
 tables participate in deletion fencing and scoped purge inventories; this
 does not activate the otherwise unfinished account-deletion workflow.
 
+The native development slice adds macOS encrypted snapshot schema 27 and Android
+encrypted JSON payload V23. Predecessor snapshots migrate to an empty completion
+ledger while retaining existing canonical, progress and integration journals;
+they cannot inject completion authority by relabeling a new payload. Current
+snapshots require the completion ledger's explicit nested fields, exact request
+custody, enclosing connection binding and sensitivity facts. Runtime GET proof
+is never restored. Pending completion identity participates in existing retention,
+credential replacement and account teardown fences. Automated migration and
+recovery coverage is listed below; Android instrumented migration execution
+and owner-device verification remain open.
+
 ## Verification
 
-The complete `dayweave-api` regression passes against an isolated live PostgreSQL
+The prior server checkpoint's complete `dayweave-api` regression passes against an isolated live PostgreSQL
 instance: 597 default tests and all 29 separately gated tests (626 passed, zero
 failures). This includes 392 server-library tests, five completion HTTP tests,
 five completion PostgreSQL tests, all 29 proposal application tests, and the real
@@ -175,5 +230,29 @@ its stored hash remain unchanged before a successful real undo.
 All-target `dayweave-api` Clippy with warnings denied and workspace formatting
 checks pass. Staged/history/outgoing credential scans gate commit and push;
 private database files and diagnostic logs are not repository artifacts.
-Native controls and cross-client/device acceptance remain unfinished; these
-server checks do not establish completion of the full feature.
+The native checkpoint passes these automated gates:
+
+- macOS: all 1,061 tests across 70 suites, including 50 completion tests, with
+  compiler warnings treated as errors. A synthetic completion review was rendered
+  and visually inspected; it used no owner data or live service.
+- Android: 1,645 passing JVM tests across 134 suites, with one additional opt-in
+  test skipped. Lint reports zero errors and 29 warnings. Both debug APKs and the
+  Android instrumentation sources build successfully. The ten completion UI tests
+  and Room 22→23 migration test are compiled, not yet executed on a device/emulator.
+- Shared wire: 24 valid and 105 invalid cases in
+  [fixtures/item-completion](../fixtures/item-completion/README.md) pass native
+  admission and seven Rust producer/contract tests. All-target server Clippy
+  with warnings denied and workspace formatting checks also pass.
+
+Coverage includes predecessor upgrades without changing existing exact intent,
+offline/ambiguous restart replay, definitive conflict custody, stale global
+evidence and pending-intent ABA, durable terminal catch-up, privacy revocation,
+always-protected completion evidence, and real native authoring pipelines for
+first-send parent preflight and exact submitted child replay. These tests do not
+replace a two-client/service run or instrumented native interaction acceptance.
+
+Controlled two-client/service convergence must still exercise competing policy
+changes, lost receipts/restarts and complete native hydration after real
+complete/reopen cascades. Qualified recurring-instance integration, production
+device-auth/TLS behavior and owner-device acceptance remain open. None of the
+server results above establish completion of these native or full-feature gates.

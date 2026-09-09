@@ -219,6 +219,7 @@ class DayWeaveApplication : Application() {
             if (itemProgressRefreshCoordinatorDelegate.isInitialized()) {
                 itemProgressRefreshCoordinator.cancelAndDrainActiveSessions()
             }
+            if (itemCompletionRefreshCoordinatorDelegate.isInitialized()) itemCompletionRefreshCoordinator.cancelAndDrainActiveSessions()
             if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
                 canonicalItemInvalidationManager.cancelAndDrainActiveSession()
             }
@@ -268,6 +269,7 @@ class DayWeaveApplication : Application() {
                     habitSyncManager.quarantineBindingState()
                 }
                 if (itemProgressSyncManagerDelegate.isInitialized()) itemProgressSyncManager.quarantineBindingState()
+                if (itemCompletionSyncManagerDelegate.isInitialized()) itemCompletionSyncManager.quarantineBindingState()
                 if (deviceSessionManagerDelegate.isInitialized()) {
                     deviceSessionManager.quarantineBindingState()
                 }
@@ -406,6 +408,7 @@ class DayWeaveApplication : Application() {
             transport = canonicalPlannerTransport,
             localScheduleComposer = RustScheduleComposer(),
             localCompositionLifecycleFence = localScheduleCompositionLauncher,
+            completionParentReadAllowed = ::itemProgressForegroundAllowed,
             cancelTimedBreakNotification =
                 ::cancelTimedBreakNotificationForAuthoritativeTransition,
             reconcileTimedBreakNotification =
@@ -499,6 +502,56 @@ class DayWeaveApplication : Application() {
         if (!canonicalActionGate.tryEnter()) return ItemProgressRefreshResult.DEFERRED
         return try {
             if (itemProgressSyncManager.replay(isCurrent)) ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
+        } finally { canonicalActionGate.leave() }
+    }
+
+    private val itemCompletionSyncManagerDelegate = lazy {
+        com.greengolddog.dayweave.sync.ItemCompletionSyncManager(plannerStore, apiCredentialStore,
+            com.greengolddog.dayweave.network.OkHttpItemCompletionTransport())
+    }
+    val itemCompletionSyncManager get() = itemCompletionSyncManagerDelegate.value
+    private val itemCompletionRefreshCoordinatorDelegate = lazy {
+        ItemProgressRefreshCoordinator(apiCredentialStore, ::itemProgressForegroundAllowed,
+            ::refreshSelectedItemCompletionOwned, ::replayForegroundItemCompletion)
+    }
+    private val itemCompletionRefreshCoordinator get() = itemCompletionRefreshCoordinatorDelegate.value
+    suspend fun observeSelectedItemCompletion(itemId: String) = itemCompletionRefreshCoordinator.runSelectedDetail(itemId)
+    fun requestItemCompletionReplay() { itemCompletionRefreshCoordinator.requestOutboxReplay() }
+    suspend fun runForegroundItemCompletionSync() {
+        if (!itemProgressForegroundAllowed()) return
+        try { itemCompletionRefreshCoordinator.runForegroundActivation(foregroundNetworkReconnects(this)) }
+        finally { itemCompletionSyncManager.quarantineBindingState() }
+    }
+
+    private suspend fun catchUpItemCompletion(isCurrent: () -> Boolean): Boolean =
+        !plannerStore.state.value.itemCompletionLedger.needsCanonicalCatchUp ||
+            canonicalSyncManager.refreshItemProgressCanonicalEvidence(isCurrent)
+
+    private suspend fun refreshSelectedItemCompletionOwned(itemId: String, isCurrent: () -> Boolean): ItemProgressRefreshResult {
+        if (!isCurrent() || !itemProgressForegroundAllowed()) return ItemProgressRefreshResult.FAILED
+        if (!canonicalActionGate.tryEnter()) return ItemProgressRefreshResult.DEFERRED
+        return try {
+            if (!catchUpItemCompletion(isCurrent)) ItemProgressRefreshResult.FAILED
+            else if (itemCompletionSyncManager.load(itemId, isCurrent)) ItemProgressRefreshResult.SUCCESS
+            else if (plannerStore.state.value.itemCompletionLedger.needsCanonicalCatchUp && catchUpItemCompletion(isCurrent) &&
+                itemCompletionSyncManager.load(itemId, isCurrent)) ItemProgressRefreshResult.SUCCESS
+            else ItemProgressRefreshResult.FAILED
+        } finally { canonicalActionGate.leave() }
+    }
+
+    /** Caller owns the canonical action gate. Replay never requires opening item detail. */
+    suspend fun replayItemCompletionOwned(isCurrent: () -> Boolean = ::itemProgressForegroundAllowed): Boolean {
+        if (!isCurrent()) return false
+        // Submitted bytes replay even while canonical catch-up is blocked by other custody.
+        catchUpItemCompletion(isCurrent)
+        val replayed = itemCompletionSyncManager.replay(isCurrent)
+        return catchUpItemCompletion(isCurrent) && replayed
+    }
+    private suspend fun replayForegroundItemCompletion(isCurrent: () -> Boolean): ItemProgressRefreshResult {
+        if (!isCurrent() || !itemProgressForegroundAllowed()) return ItemProgressRefreshResult.FAILED
+        if (!canonicalActionGate.tryEnter()) return ItemProgressRefreshResult.DEFERRED
+        return try {
+            if (replayItemCompletionOwned(isCurrent)) ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
         } finally { canonicalActionGate.leave() }
     }
 
@@ -1185,6 +1238,9 @@ class DayWeaveApplication : Application() {
         energySignalGenerationFence.close()
         privatePresentationAllowed.set(false)
         if (itemProgressRefreshCoordinatorDelegate.isInitialized()) itemProgressRefreshCoordinator.cancelActiveSessions()
+        if (itemCompletionRefreshCoordinatorDelegate.isInitialized()) itemCompletionRefreshCoordinator.cancelActiveSessions()
+        if (itemCompletionSyncManagerDelegate.isInitialized()) itemCompletionSyncManager.quarantineBindingState()
+        else plannerStore.invalidateItemCompletionReadProofs()
         if (energySignalManagerDelegate.isInitialized()) {
             energySignalManager.quarantineForPrivacyBoundary()
         }

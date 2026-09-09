@@ -2155,6 +2155,13 @@ data class DayWeaveUiState(
     val canonicalDeltaCursor: String? = null,
     /** Bound independent progress observations and exact encrypted replay custody. */
     val itemProgressLedger: ItemProgressLedger = ItemProgressLedger(),
+    /** Completion policy and exact reviewed commands are distinct from informational progress. */
+    val itemCompletionLedger: ItemCompletionLedger = ItemCompletionLedger(),
+    /** Cache/restart can never mint a fresh completion GET permission. */
+    @kotlinx.serialization.Transient
+    val itemCompletionGetProofs: Map<String, ItemCompletionReadProof> = emptyMap(),
+    @kotlinx.serialization.Transient
+    val itemCompletionEvidenceGeneration: Long = 0,
     /** Non-null only between durable staging and a strictly validated publish receipt. */
     val pendingSchedulePublication: PendingSchedulePublication? = null,
     /** A persisted dirty bit keeps an exact in-flight publish replayable but never authoritative. */
@@ -2916,8 +2923,15 @@ fun DayWeaveUiState.withPendingSensitivityHardened(): DayWeaveUiState {
             pending.copy(wasSensitive = true)
         } else pending
     }
+    val hardenedCompletion = itemCompletionLedger.pending.map { pending ->
+        if (!pending.wasSensitive && completionReviewSensitive(pending.itemId)) {
+            changed = true
+            pending.copy(wasSensitive = true)
+        } else pending
+    }
     return if (changed) copy(schedule = hardenedSchedule,
-        itemProgressLedger = itemProgressLedger.copy(pending = hardenedProgress)) else this
+        itemProgressLedger = itemProgressLedger.copy(pending = hardenedProgress),
+        itemCompletionLedger = itemCompletionLedger.copy(pending = hardenedCompletion)) else this
 }
 
 private fun EnergyLevel.rank(): Int = when (this) {

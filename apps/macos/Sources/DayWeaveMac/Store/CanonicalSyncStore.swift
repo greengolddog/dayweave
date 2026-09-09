@@ -205,7 +205,13 @@ final class CanonicalSyncStore: ObservableObject {
     /// Read-only canonical catch-up for an item-progress GET whose joined item
     /// revision differs. Never publishes a schedule merely for editing progress.
     func refreshItemProgressCanonicalEvidence() async {
-        guard !isSyncing, let client = makeClient(reportFailure: false), planner.beginCanonicalSync() else { return }
+        _ = await refreshItemCompletionCanonicalEvidence()
+    }
+
+    /// Returns true only after a complete canonical delta/bootstrap is durable.
+    /// Recovery may use this while completion's lifecycle catch-up fence is set.
+    func refreshItemCompletionCanonicalEvidence() async -> Bool {
+        guard !isSyncing, let client = makeClient(reportFailure: false), planner.beginCanonicalSync() else { return false }
         let id = UUID()
         let generation = configurationGeneration
         activeSyncID = id
@@ -225,7 +231,8 @@ final class CanonicalSyncStore: ObservableObject {
                 lastPreview = nil
                 clearTransientLocalComposition()
             }
-        } catch { /* The progress review remains read-only until a verified catch-up. */ }
+            return true
+        } catch { return false }
     }
 
     /// Starts content-free foreground item delivery beside a lightweight
@@ -2665,11 +2672,27 @@ final class CanonicalSyncStore: ObservableObject {
             if !mutation.hasBeenSubmitted {
                 // Current item/hierarchy admission is required only for a first
                 // send. Once submitted, revision drift cannot suppress exact replay.
-                guard try canonicalAuthoringPreflightIsCurrent(mutation) else { continue }
-                mutation = try planner.bindCanonicalAuthoringMutation(
-                    mutation.id,
-                    configurationIdentifier: client.configurationIdentifier
-                )
+                let completedParentID = mutation.draft?.parentID.flatMap { parentID in
+                    planner.canonicalItem(id: parentID)?.status == .completed ? parentID : nil
+                }
+                let parentAdmission: ItemCompletionParentAdmission?
+                if let completedParentID {
+                    // Binding invalidates the global evidence generation. Freeze
+                    // it before the GET, not between that GET and its preflight.
+                    mutation = try planner.bindCanonicalAuthoringMutation(
+                        mutation.id, configurationIdentifier: client.configurationIdentifier)
+                    parentAdmission = try await canonicalAuthoringParentAdmission(
+                        mutation, parentID: completedParentID, client: client,
+                        operationID: operationID, generation: generation)
+                } else {
+                    parentAdmission = nil
+                }
+                guard try canonicalAuthoringPreflightIsCurrent(
+                    mutation, completionParentAdmission: parentAdmission) else { continue }
+                if completedParentID == nil {
+                    mutation = try planner.bindCanonicalAuthoringMutation(
+                        mutation.id, configurationIdentifier: client.configurationIdentifier)
+                }
                 mutation = try planner.markCanonicalAuthoringMutationSubmitted(mutation.id)
             }
             guard mutation.configurationIdentifier == client.configurationIdentifier else {
@@ -2780,8 +2803,45 @@ final class CanonicalSyncStore: ObservableObject {
         return parentIDs
     }
 
+    private func canonicalAuthoringParentAdmission(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation,
+        parentID: UUID,
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> ItemCompletionParentAdmission {
+        guard canonicalClientIsCurrent(client) else { throw ItemCompletionError.configurationChanged }
+        let evidenceGeneration = planner.itemCompletionEvidenceGeneration
+        let transport: any ItemCompletionTransport = client
+        let snapshot = try await transport.itemCompletion(parentID)
+        try ensureOperationCurrent(operationID: operationID, generation: generation)
+        guard canonicalClientIsCurrent(client) else { throw ItemCompletionError.configurationChanged }
+        let admission = ItemCompletionParentAdmission(mutation: mutation, snapshot: snapshot,
+            configurationIdentifier: client.configurationIdentifier, evidenceGeneration: evidenceGeneration)
+        guard planner.itemCompletionQualifiesParent(parentID, admission: admission) else {
+            // An unavailable read/revision is not a definitive rejection of the
+            // never-submitted child. Keep the exact journal for a later refresh.
+            throw ItemCompletionError.staleReview
+        }
+        var next = planner.itemCompletionState
+        let prior = next
+        next.configurationIdentifier = client.configurationIdentifier
+        try next.observe(snapshot, at: now())
+        // Persist this GET as an observation only. Pending child intent means it
+        // must not grant general completion review or new-child UI authority.
+        if let index = next.observations.firstIndex(where: { $0.snapshot.itemID == parentID }) {
+            next.observations[index].isReadProof = false
+        }
+        try planner.commitItemCompletionState(next, replacing: prior)
+        guard planner.itemCompletionQualifiesParent(parentID, admission: admission) else {
+            throw ItemCompletionError.staleReview
+        }
+        return admission
+    }
+
     private func canonicalAuthoringPreflightIsCurrent(
-        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation,
+        completionParentAdmission: ItemCompletionParentAdmission? = nil
     ) throws -> Bool {
         let diagnostic: String?
         switch mutation.operation {
@@ -2793,9 +2853,10 @@ final class CanonicalSyncStore: ObservableObject {
                       !planner.canonicalAuthoringDraftHierarchyIsCurrent(
                           draft,
                           itemID: mutation.itemID,
-                          requiresCommittedParent: true
+                          requiresCommittedParent: true,
+                          completionParentAdmission: completionParentAdmission
                       ) {
-                "The selected parent is no longer available for this item. Choose an active Inbox or Planned parent before retrying."
+                "The selected parent is no longer available for this item. Review an eligible parent before retrying."
             } else {
                 nil
             }
@@ -2807,7 +2868,8 @@ final class CanonicalSyncStore: ObservableObject {
                    !planner.canonicalAuthoringDraftHierarchyIsCurrent(
                        draft,
                        itemID: mutation.itemID,
-                       requiresCommittedParent: true
+                       requiresCommittedParent: true,
+                       completionParentAdmission: completionParentAdmission
                    ) {
                     diagnostic = "The selected parent is no longer available for this item. Review the latest hierarchy before retrying."
                 } else if mutation.operation == .trash,

@@ -92,6 +92,7 @@ internal fun InboxScreen(
     ) -> Unit,
     modifier: Modifier = Modifier,
     onOpenProgress: ((String) -> Unit)? = null,
+    onOpenCompletion: ((String) -> Unit)? = null,
 ) {
     var tab by remember { mutableIntStateOf(0) }
     Column(modifier = modifier) {
@@ -145,6 +146,7 @@ internal fun InboxScreen(
                 onNewDetailed = onNewCanonicalItem,
                 onOpenEditor = onOpenCanonicalEditor,
                 onOpenProgress = onOpenProgress,
+                onOpenCompletion = onOpenCompletion,
                 onTrashConfirmed = onTrashCanonicalItem,
                 onRestore = onRestoreCanonicalItem,
                 onDiscard = onDiscardCanonicalMutation,

@@ -5,6 +5,7 @@ internal class CanonicalHierarchyParentAuthority private constructor(
     private val nodes: Map<String, Node>,
     private val unsafeIds: Set<String>,
     private val hasActiveExecution: Boolean,
+    private val qualifiedCompletedParent: (String, String) -> Boolean,
 ) {
     internal data class Node(val id: String, val title: String, val parentId: String?, val status: String)
 
@@ -13,7 +14,8 @@ internal class CanonicalHierarchyParentAuthority private constructor(
         if (hasActiveExecution) return "Only detached Inbox capture is available during active execution"
         val parent = nodes[parentId] ?: return "The selected parent is unavailable or not admitted"
         if (parentId in unsafeIds) return "The selected ancestry is incomplete or has unresolved local changes"
-        if (parent.status !in setOf("inbox", "planned", "blocked")) {
+        if (parent.status !in setOf("inbox", "planned", "blocked") &&
+            !(parent.status == "completed" && qualifiedCompletedParent(parentId, childId))) {
             return "The selected parent is executing or terminal"
         }
         var cursor: String? = parentId
@@ -33,7 +35,8 @@ internal class CanonicalHierarchyParentAuthority private constructor(
             children[pending.removeFirst()].orEmpty().forEach { if (excluded.add(it.id)) pending.add(it.id) }
         }
         return nodes.values.filter {
-            it.id !in excluded && it.id !in unsafeIds && it.status in setOf("inbox", "planned", "blocked")
+            it.id !in excluded && it.id !in unsafeIds && (it.status in setOf("inbox", "planned", "blocked") ||
+                it.status == "completed" && qualifiedCompletedParent(it.id, excludingItemId))
         }.sortedWith(compareBy({ it.title.lowercase() }, { it.id.lowercase() }))
     }
 
@@ -112,7 +115,10 @@ internal class CanonicalHierarchyParentAuthority private constructor(
                 if (invalid) unsafe.addAll(path)
                 resolved.addAll(path)
             }
-            return CanonicalHierarchyParentAuthority(nodes, unsafe, state.canonicalExecutionSession != null)
+            val evidence by lazy(state::completionLocalEvidence)
+            return CanonicalHierarchyParentAuthority(nodes, unsafe, state.canonicalExecutionSession != null) { parent, child ->
+                state.hasQualifiedCompletedParent(parent, child, evidence)
+            }
         }
     }
 }

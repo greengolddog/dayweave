@@ -1,0 +1,2423 @@
+{
+  "schema_version": 1,
+  "valid": [
+    {
+      "name": "default_leaf_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "automatic_blocked_parent_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "manual_complete_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "planned",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "keep_open_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "dependency_reopen_without_reason",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 9,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "manual_external_reopen",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 4,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "external",
+            "blocked_by_item_id": null,
+            "blocked_reason": "Synthetic external confirmation"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "manual_inbox_reopen",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 2,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "inbox",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "state_int64_revision_limit",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 9223372036854775807,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "utc_offset_millisecond_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 4,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.125+00:00"
+      }
+    },
+    {
+      "name": "whole_second_state",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 2,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12Z"
+      }
+    },
+    {
+      "name": "reason_1000_unicode_scalars",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "manual",
+            "blocked_by_item_id": null,
+            "blocked_reason": "🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "default_leaf_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "automatic_blocked_parent_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 8,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 1,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": {
+            "kind": "automatic",
+            "reopen": {
+              "status": "blocked",
+              "blocked_reason_kind": "dependency",
+              "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+              "blocked_reason": "Waiting for a synthetic prerequisite"
+            }
+          },
+          "updated_at": "2026-09-09T10:11:12.123456Z"
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 2,
+          "completed": 2,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "manual_complete_open_descendant_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 8,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 1,
+          "required_for_parent": true,
+          "mode": "complete",
+          "provenance": {
+            "kind": "manual",
+            "reopen": {
+              "status": "planned",
+              "blocked_reason_kind": null,
+              "blocked_by_item_id": null,
+              "blocked_reason": null
+            }
+          },
+          "updated_at": "2026-09-09T10:11:12.123456Z"
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 1,
+          "completed": 0,
+          "incomplete": 1,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "keep_open_completed_descendant_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 8,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 1,
+          "required_for_parent": false,
+          "mode": "keep_open",
+          "provenance": null,
+          "updated_at": "2026-09-09T10:11:12.123456Z"
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 1,
+          "completed": 1,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "unresolved_recurring_leaf_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": true
+      }
+    },
+    {
+      "name": "unresolved_required_branch_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 1,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 1
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "bounded_descendants_snapshot",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 9223372036854775807,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 6,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": "2026-09-09T10:11:12.123456Z"
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 19999,
+          "completed": 10000,
+          "incomplete": 9998,
+          "occurrence_evidence_required": 1
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "review_keep_open_command",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "review_manual_complete_command",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 0,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": true,
+        "mode": "complete",
+        "reopening": null
+      }
+    },
+    {
+      "name": "review_explicit_reopening_command",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 0,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": true,
+        "mode": "complete",
+        "reopening": {
+          "status": "blocked",
+          "blocked_reason_kind": "external",
+          "blocked_by_item_id": null,
+          "blocked_reason": "Synthetic reviewed prior state"
+        }
+      }
+    },
+    {
+      "name": "command_int64_revision_limits",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 9223372036854775807,
+        "expected_completion_revision": 9223372036854775807,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "review_keep_open_receipt",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": false,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    },
+    {
+      "name": "review_keep_open_historical_replay",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": true,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "snapshot_counts_exceed_native_bound",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 20001,
+          "completed": 20001,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "state_missing_item_id",
+      "kind": "state",
+      "value": {
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_missing_revision",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_missing_required_for_parent",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_missing_mode",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_missing_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_missing_updated_at",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null
+      }
+    },
+    {
+      "name": "state_unknown_field",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null,
+        "extra": true
+      }
+    },
+    {
+      "name": "state_nil_item",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000000",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_malformed_item",
+      "kind": "state",
+      "value": {
+        "item_id": "not-a-uuid",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_negative_revision",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": -1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "state_fractional_revision",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1.5,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "state_string_revision",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": "1",
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "state_revision_overflow",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 9223372036854775808,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "default_state_cannot_be_optional",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": false,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "default_state_cannot_keep_open",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "keep_open",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "default_state_cannot_have_timestamp",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "default_state_cannot_have_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 0,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": null
+      }
+    },
+    {
+      "name": "positive_state_requires_timestamp",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": null
+      }
+    },
+    {
+      "name": "state_timestamp_nanoseconds",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456789Z"
+      }
+    },
+    {
+      "name": "state_timestamp_non_utc",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T13:11:12.123456+03:00"
+      }
+    },
+    {
+      "name": "state_timestamp_missing_zone",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12"
+      }
+    },
+    {
+      "name": "state_timestamp_invalid_date",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "2026-02-30T10:11:12Z"
+      }
+    },
+    {
+      "name": "state_timestamp_nonfinite",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": null,
+        "updated_at": "infinity"
+      }
+    },
+    {
+      "name": "state_unknown_mode",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "paused",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "complete_requires_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": null,
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "automatic_rejects_manual_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "planned",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "complete_rejects_automatic_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "keep_open_rejects_provenance",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "keep_open",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "provenance_unknown_kind",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "imported",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "provenance_unknown_field",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          },
+          "extra": true
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "provenance_missing_reopen",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic"
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_missing_blocked_reason_kind",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_missing_blocked_by_item_id",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_missing_blocked_reason",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_unknown_field",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite",
+            "extra": true
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_completed",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "completed",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_skipped",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "skipped",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_cancelled",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "cancelled",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_scheduled",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "scheduled",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_in_progress",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "in_progress",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_forbidden_paused",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "complete",
+        "provenance": {
+          "kind": "manual",
+          "reopen": {
+            "status": "paused",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "blocked_requires_reason_kind",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": null,
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "dependency_requires_blocker",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": null,
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "dependency_rejects_self",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000001",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "dependency_rejects_nil",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000000",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "manual_reason_required",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "manual",
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "external_reason_required",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "external",
+            "blocked_by_item_id": null,
+            "blocked_reason": null
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "manual_rejects_blocker",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "manual",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "open_rejects_blocker_tuple",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "planned",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "Waiting for a synthetic prerequisite"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_reason_empty",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": ""
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_reason_leading_space",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": " synthetic"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_reason_trailing_unicode_space",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "synthetic "
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_reason_control",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "synthetic\nreason"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "reopen_reason_1001_unicode_scalars",
+      "kind": "state",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "revision": 1,
+        "required_for_parent": true,
+        "mode": "automatic",
+        "provenance": {
+          "kind": "automatic",
+          "reopen": {
+            "status": "blocked",
+            "blocked_reason_kind": "dependency",
+            "blocked_by_item_id": "00000000-0000-0000-0000-000000000002",
+            "blocked_reason": "🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪🧪"
+          }
+        },
+        "updated_at": "2026-09-09T10:11:12.123456Z"
+      }
+    },
+    {
+      "name": "snapshot_missing_schema_version",
+      "kind": "snapshot",
+      "value": {
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_item_id",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_item_revision",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_state",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_evidence_hash",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_counts",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_missing_occurrence_evidence_required",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        }
+      }
+    },
+    {
+      "name": "snapshot_unknown_field",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false,
+        "extra": true
+      }
+    },
+    {
+      "name": "snapshot_unknown_schema",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 2,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_item_state_mismatch",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000002",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_item_revision_zero",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 0,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_item_revision_overflow",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 9223372036854775808,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_hash_without_prefix",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_hash_uppercase",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_hash_trailing_newline",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_partition_mismatch",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 1,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_negative",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": -1,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_fractional",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0.5,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_int64_overflow",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 9223372036854775808,
+          "completed": 9223372036854775808,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_sum_overflow",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 9223372036854775807,
+          "completed": 9223372036854775807,
+          "incomplete": 9223372036854775807,
+          "occurrence_evidence_required": 2
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_missing_category",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_counts_unknown_field",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0,
+          "extra": 0
+        },
+        "occurrence_evidence_required": false
+      }
+    },
+    {
+      "name": "snapshot_own_occurrence_requires_boolean",
+      "kind": "snapshot",
+      "value": {
+        "schema_version": 1,
+        "item_id": "00000000-0000-0000-0000-000000000001",
+        "item_revision": 7,
+        "state": {
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "revision": 0,
+          "required_for_parent": true,
+          "mode": "automatic",
+          "provenance": null,
+          "updated_at": null
+        },
+        "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "counts": {
+          "required_descendants": 0,
+          "completed": 0,
+          "incomplete": 0,
+          "occurrence_evidence_required": 0
+        },
+        "occurrence_evidence_required": "true"
+      }
+    },
+    {
+      "name": "command_missing_schema_version",
+      "kind": "command",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_operation_id",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_expected_item_revision",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_expected_completion_revision",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_expected_evidence_hash",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_required_for_parent",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_mode",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_missing_reopening",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open"
+      }
+    },
+    {
+      "name": "command_unknown_field",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null,
+        "extra": true
+      }
+    },
+    {
+      "name": "command_unknown_schema",
+      "kind": "command",
+      "value": {
+        "schema_version": 2,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_nil_operation",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000000",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_item_revision_zero",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 0,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_completion_revision_negative",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": -1,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_completion_revision_overflow",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 9223372036854775808,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_item_revision_fractional",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7.25,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_hash_uppercase",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_hash_trailing_newline",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111\n",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": null
+      }
+    },
+    {
+      "name": "command_reopen_missing_nullable",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": {
+          "status": "planned",
+          "blocked_reason_kind": null,
+          "blocked_by_item_id": null
+        }
+      }
+    },
+    {
+      "name": "command_reopen_self_dependency",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": {
+          "status": "blocked",
+          "blocked_reason_kind": "dependency",
+          "blocked_by_item_id": "00000000-0000-0000-0000-000000000001",
+          "blocked_reason": null
+        }
+      }
+    },
+    {
+      "name": "command_reopen_terminal",
+      "kind": "command",
+      "value": {
+        "schema_version": 1,
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "expected_item_revision": 7,
+        "expected_completion_revision": 2,
+        "expected_evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required_for_parent": false,
+        "mode": "keep_open",
+        "reopening": {
+          "status": "completed",
+          "blocked_reason_kind": null,
+          "blocked_by_item_id": null,
+          "blocked_reason": null
+        }
+      }
+    },
+    {
+      "name": "receipt_missing_operation_id",
+      "kind": "receipt",
+      "value": {
+        "replayed": false,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    },
+    {
+      "name": "receipt_missing_replayed",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    },
+    {
+      "name": "receipt_missing_completion",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": false
+      }
+    },
+    {
+      "name": "receipt_unknown_field",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": false,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        },
+        "extra": true
+      }
+    },
+    {
+      "name": "receipt_nil_operation",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000000",
+        "replayed": false,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    },
+    {
+      "name": "receipt_replayed_requires_boolean",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": "false",
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000001",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    },
+    {
+      "name": "receipt_nested_item_mismatch",
+      "kind": "receipt",
+      "value": {
+        "operation_id": "00000000-0000-0000-0000-000000000100",
+        "replayed": false,
+        "completion": {
+          "schema_version": 1,
+          "item_id": "00000000-0000-0000-0000-000000000001",
+          "item_revision": 8,
+          "state": {
+            "item_id": "00000000-0000-0000-0000-000000000002",
+            "revision": 3,
+            "required_for_parent": false,
+            "mode": "keep_open",
+            "provenance": null,
+            "updated_at": "2026-09-09T10:11:12.123456Z"
+          },
+          "evidence_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "counts": {
+            "required_descendants": 1,
+            "completed": 1,
+            "incomplete": 0,
+            "occurrence_evidence_required": 0
+          },
+          "occurrence_evidence_required": false
+        }
+      }
+    }
+  ]
+}
