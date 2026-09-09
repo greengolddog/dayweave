@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
+import com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot
 import com.greengolddog.dayweave.model.HabitOccurrenceSnapshot
@@ -409,7 +410,7 @@ class CanonicalSyncManager(
                     ensureConfigurationCurrent(configuration)
                     require(active())
                     val receipt = plannerStore.installItemProgressCanonicalEvidence(expected, canonical.items,
-                        canonical.cursor, ::active)
+                        canonical.cursor, ::active, canonical.deleted)
                     receipt?.awaitDurable() == true && active()
                 }
             } catch (error: CancellationException) { throw error }
@@ -525,6 +526,7 @@ class CanonicalSyncManager(
                         preservationState = expected,
                     ).copy(
                         configurationId = configuration.configurationId,
+                        recentlyDeleted = canonical.deleted,
                         message = "Installed published schedule revision ${revision.revisionNumber}",
                     )
                     val receipt = plannerStore.installCurrentPublishedSchedule(
@@ -886,7 +888,7 @@ class CanonicalSyncManager(
                     expectedHorizonStart = parseTimestamp(request.horizonStart).toInstant(),
                     expectedHorizonEnd = parseTimestamp(request.horizonEnd).toInstant(),
                     availability = request.availability,
-                ).copy(configurationId = configuration.configurationId)
+                ).copy(configurationId = configuration.configurationId, recentlyDeleted = canonical.deleted)
                 return AcceptedCanonicalPreview(request, update)
             } catch (error: RemoteSnapshotChangedException) {
                 if (attempt == MAX_SNAPSHOT_ATTEMPTS) throw error
@@ -1248,6 +1250,15 @@ class CanonicalSyncManager(
         accepted: AcceptedCanonicalPreview,
     ): CanonicalPlanUpdate {
         ensureConfigurationCurrent(configuration)
+        if (accepted.update.recentlyDeleted.isNotEmpty()) {
+            // The candidate's read-only tombstones are not part of its frozen wire schema.
+            // Save the complete admitted preflight before staging so a restarted first send
+            // cannot lose that recovery metadata. This never settles submitted authoring.
+            require(plannerStore.state.value.pendingCanonicalAuthoringMutations.none {
+                it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING
+            })
+            persistCanonicalAuthoringPreflight(configuration, accepted.update)
+        }
         val idempotencyKey = newPublicationIdempotencyKey()
         val pending = try {
             val canonicalKey = UUID.fromString(idempotencyKey)
@@ -1264,7 +1275,7 @@ class CanonicalSyncManager(
                 configurationId = configuration.configurationId,
                 preparedAt = now().toString(),
                 request = buildSchedulePublishHttpRequest(configuration, publishRequest),
-                candidate = accepted.update,
+                candidate = accepted.update.copy(recentlyDeleted = emptyList()),
             ).also(plannerStore::validateSchedulePublication)
         } catch (error: IllegalArgumentException) {
             throw SchedulePublicationContractException(error)
@@ -2764,8 +2775,8 @@ class CanonicalSyncManager(
             loadDeltaPages(configuration, firstCursor, initialItems)
         } catch (error: PlannerApiException.Validation) {
             if (firstCursor == null || error.statusCode != 422) throw error
-            // A server restore or repository replacement intentionally invalidates its opaque
-            // cursor scope. Rebuild from the beginning instead of merging across repositories.
+            // Recover an invalid incremental cursor through a complete current-state snapshot.
+            // Server restart/restore alone does not imply a changed workspace cursor scope.
             loadDeltaPages(configuration, null, emptyList())
         }
     }
@@ -2776,6 +2787,7 @@ class CanonicalSyncManager(
         initialItems: List<CanonicalItemSnapshot>,
     ): CanonicalDeltaSnapshot {
         val items = initialItems.associateByTo(linkedMapOf(), CanonicalItemSnapshot::id)
+        val deleted = linkedMapOf<String, CanonicalRecentlyDeletedRecord>()
         if (items.size != initialItems.size) throw RemotePlannerMappingException()
         var retainedBytes = initialItems.sumOf(::estimatedCanonicalItemBytes)
         if (retainedBytes > MAX_CANONICAL_CACHE_ESTIMATED_BYTES) {
@@ -2789,7 +2801,8 @@ class CanonicalSyncManager(
             if (++pageCount > MAX_DELTA_PAGES) throw RemotePlannerMappingException()
             if (cursor != null && !validCursor(cursor)) throw RemotePlannerMappingException()
             if (!seenCursors.add(cursor)) throw RemotePlannerMappingException()
-            val page = transport.itemDelta(configuration, cursor)
+            val page = if (cursor == null) transport.itemDeltaBootstrap(configuration)
+                else transport.itemDelta(configuration, cursor)
             if (
                 page.changes.size > maximumItemDeltaResponseChanges(MAX_DELTA_PAGE_SIZE) ||
                     !validCursor(page.nextCursor) ||
@@ -2800,9 +2813,9 @@ class CanonicalSyncManager(
             changeCount += page.changes.size
             if (changeCount > MAX_DELTA_CHANGES) throw RemotePlannerMappingException()
             page.changes.forEach { change ->
-                retainedBytes += applyDeltaChange(items, change)
+                retainedBytes += applyDeltaChange(items, deleted, change)
                 if (
-                    items.size > MAX_CANONICAL_ITEMS || retainedBytes < 0 ||
+                    items.size + deleted.size > MAX_CANONICAL_ITEMS || retainedBytes < 0 ||
                     retainedBytes > MAX_CANONICAL_CACHE_ESTIMATED_BYTES
                 ) {
                     throw RemotePlannerMappingException()
@@ -2818,17 +2831,23 @@ class CanonicalSyncManager(
                 compareBy({ it.parentId.orEmpty() }, { it.siblingOrder }, { it.id }),
             ),
             cursor = requireNotNull(cursor),
+            deleted = deleted.values.toList(),
         )
     }
 
     private fun applyDeltaChange(
         items: MutableMap<String, CanonicalItemSnapshot>,
+        deleted: MutableMap<String, CanonicalRecentlyDeletedRecord>,
         change: RemoteItemDeltaChange,
     ): Long = when (change.type) {
             "upsert" -> {
                 if (change.tombstone != null) throw RemotePlannerMappingException()
                 val incoming = mapCanonicalItem(change.item ?: throw RemotePlannerMappingException())
                 val existing = items[incoming.id]
+                val previousDeleted = deleted[incoming.id]
+                if (previousDeleted != null && incoming.revision <= previousDeleted.revision) {
+                    throw RemotePlannerMappingException()
+                }
                 if (existing != null && incoming.revision < existing.revision) {
                     throw RemotePlannerMappingException()
                 }
@@ -2836,8 +2855,10 @@ class CanonicalSyncManager(
                     throw RemotePlannerMappingException()
                 }
                 items[incoming.id] = incoming
+                deleted.remove(incoming.id)
                 estimatedCanonicalItemBytes(incoming) -
-                    (existing?.let(::estimatedCanonicalItemBytes) ?: 0L)
+                    (existing?.let(::estimatedCanonicalItemBytes) ?: 0L) -
+                    (previousDeleted?.let(::estimatedCanonicalTombstoneBytes) ?: 0L)
             }
             "tombstone" -> {
                 if (change.item != null) throw RemotePlannerMappingException()
@@ -2847,11 +2868,25 @@ class CanonicalSyncManager(
                 validateTimestamp(tombstone.deletedAt)
                 if (tombstone.revision <= 0) throw RemotePlannerMappingException()
                 val existing = items[tombstone.id]
+                val previousDeleted = deleted[tombstone.id]
                 if (existing != null && tombstone.revision <= existing.revision) {
                     throw RemotePlannerMappingException()
                 }
                 items.remove(tombstone.id)
-                -(existing?.let(::estimatedCanonicalItemBytes) ?: 0L)
+                val record = CanonicalRecentlyDeletedRecord(id = tombstone.id,
+                    revision = tombstone.revision, deletedAt = tombstone.deletedAt,
+                    parentId = tombstone.parentId,
+                    retentionAnchorAt = minOf(Instant.parse(tombstone.deletedAt), now()).toString())
+                if (previousDeleted != null && (record.revision < previousDeleted.revision ||
+                        record.revision == previousDeleted.revision &&
+                        (record.deletedAt != previousDeleted.deletedAt || record.parentId != previousDeleted.parentId))) {
+                    throw RemotePlannerMappingException()
+                }
+                deleted[record.id] = record.copy(retentionAnchorAt = listOfNotNull(
+                    record.retentionAnchorAt, previousDeleted?.retentionAnchorAt).minBy(Instant::parse))
+                estimatedCanonicalTombstoneBytes(record) -
+                    (existing?.let(::estimatedCanonicalItemBytes) ?: 0L) -
+                    (previousDeleted?.let(::estimatedCanonicalTombstoneBytes) ?: 0L)
             }
             else -> throw RemotePlannerMappingException()
         }
@@ -2874,6 +2909,11 @@ class CanonicalSyncManager(
             item.updatedAt,
             item.completedAt,
             item.deletedAt,
+        ).sumOf { it.length.toLong() }
+
+    private fun estimatedCanonicalTombstoneBytes(record: CanonicalRecentlyDeletedRecord): Long =
+        CANONICAL_ITEM_OBJECT_OVERHEAD_BYTES + 2L * listOfNotNull(
+            record.id, record.parentId, record.deletedAt, record.retentionAnchorAt,
         ).sumOf { it.length.toLong() }
 
     private fun compositionPlanningZone(
@@ -4545,6 +4585,7 @@ class CanonicalSyncManager(
     private data class CanonicalDeltaSnapshot(
         val items: List<CanonicalItemSnapshot>,
         val cursor: String,
+        val deleted: List<CanonicalRecentlyDeletedRecord>,
     )
 
     private data class AcceptedCanonicalPreview(

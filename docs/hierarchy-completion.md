@@ -139,12 +139,15 @@ treated as proof that all ancestor changes have arrived.
 Per-group bounds do not remove the total hydration bounds: macOS currently
 limits one catch-up to 20,000 changes/32 MiB retained data/100 pages; Android
 limits it to 25,600 changes/512 pages and a 24-MiB folded canonical cache.
-Repeated deep complete/reopen cascades can exhaust a
-fresh client's historical bootstrap budget even when its current forest is
-small enough. The integrated feature therefore needs a verified bounded
-current-state bootstrap strategy and a deep cold-client test, not merely larger
-page limits or a warm-cursor test. Truncated history must never masquerade as a
-complete forest.
+Repeated deep complete/reopen cascades can exhaust a fresh client's historical
+bootstrap budget even when its current forest is small enough. The separate
+[current-state bootstrap](item-sync.md#bounded-current-state-bootstrap) captures
+a bounded immutable current forest and recent tombstones, then resumes the
+ordinary stream at the captured head. Its history-heavy server and deep native
+tests are a prerequisite, not evidence that completion cascades are implemented.
+The integrated completion feature still needs cold-client acceptance after real
+required-descendant complete/reopen transactions. Truncated history must never
+masquerade as a complete forest.
 
 Existing full-authoring receipts require the exact reviewed draft and revision.
 An automatic side effect must not rewrite that response into an incompatible
@@ -164,7 +167,8 @@ guards; do not broadly permit actively executing or ambiguous terminal parents.
 The native [historical receipt recovery](item-sync.md#historical-authoring-receipts)
 checkpoint addresses exact replay after newer state has arrived. Its store and
 sync regressions are prerequisites only; they do not verify server completion
-cascades, proposal undo or deep cold-client hydration.
+cascades or proposal undo. Bounded cold-client hydration is a separate sync
+checkpoint, not an increase in the completed parent-policy scope.
 
 Both native clients still need protected completion explanations, required-edge
 editing, reviewed override/resume-automatic controls, encrypted offline intent,

@@ -199,6 +199,235 @@ class CanonicalSyncManagerTest {
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
 
     @Test
+    fun coldCurrentBootstrapAcceptsThreeHundredChangesAndInstallsOnlyTerminalForest() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState(canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1"))
+        val before = store.state.value
+        val children = (1..300).map { index ->
+            remoteItem().copy(id = "70000000-0000-4000-8000-${index.toString().padStart(12, '0')}", parentId = TASK_ID)
+        }
+        val continuation = "opaque_snapshot+/="
+        val transport = FakeCanonicalTransport().apply {
+            deltaHandler = { cursor ->
+                when (cursor) {
+                    null -> RemoteItemDeltaPage(children.map { RemoteItemDeltaChange("upsert", item = it) }, continuation, true)
+                    continuation -> {
+                        assertEquals(before, store.state.value)
+                        assertEquals(before, store.durableState.value)
+                        RemoteItemDeltaPage(listOf(
+                            RemoteItemDeltaChange("upsert", item = remoteItem().copy(isExecutable = false)),
+                            RemoteItemDeltaChange("tombstone", tombstone = RemoteItemTombstone(CALENDAR_ITEM_ID, 9,
+                                "2026-09-01T06:00:00Z"))), "terminal-current", false)
+                    }
+                    "terminal-current" -> RemoteItemDeltaPage(emptyList(), "terminal-next", false)
+                    else -> error("Unexpected synthetic cursor")
+                }
+            }
+        }
+        val manager = manager(store, transport)
+        assertTrue(manager.refreshItemProgressCanonicalEvidence { true })
+        assertEquals(301, store.state.value.canonicalItems.size)
+        assertEquals("terminal-current", store.state.value.canonicalDeltaCursor)
+        val deleted = store.state.value.canonicalRecentlyDeleted.single()
+        assertEquals(CALENDAR_ITEM_ID, deleted.id)
+        assertNull(deleted.lastKnownItem)
+        assertTrue(deleted.isSensitive)
+        assertTrue(manager.refreshItemProgressCanonicalEvidence { true })
+        assertEquals(1, transport.bootstrapRequests)
+        assertEquals(listOf(null, continuation, "terminal-current"), transport.deltaCursors)
+        assertTrue(transport.previewRequests.isEmpty())
+    }
+
+    @Test
+    fun coldBootstrapPreservesEarliestAnchorForRepeatedFutureDatedTombstone() = runBlocking {
+        val deletion = clock.plus(Duration.ofDays(90)).toString()
+        val retained = com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord(
+            id = TASK_ID, revision = 9, deletedAt = deletion, retentionAnchorAt = clock.toString())
+        val later = clock.plus(Duration.ofDays(10))
+        val store = PlannerStore(DayWeaveUiState(canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1", canonicalRecentlyDeleted = listOf(retained)),
+            nowEpochMillis = { later.toEpochMilli() })
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange("tombstone",
+                tombstone = RemoteItemTombstone(TASK_ID, 9, deletion))), "clamped-current", false)
+        }
+        assertTrue(manager(store, transport, currentInstant = later).refreshItemProgressCanonicalEvidence { true })
+        assertEquals(retained, store.state.value.canonicalRecentlyDeleted.single())
+        assertEquals(retained, requireNotNull(store.durableState.value).canonicalRecentlyDeleted.single())
+    }
+
+    @Test
+    fun fiveThousandChildFirstSnapshotInstallsOnlyItsCompleteTerminalForest() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState(canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1"))
+        val before = store.state.value
+        fun childId(index: Int) = "70000000-0000-4000-8000-${index.toString().padStart(12, '0')}"
+        val children = (1..5_000).map { index ->
+            remoteItem().copy(id = childId(index),
+                parentId = if (index == 1) TASK_ID else childId(index - 1),
+                isExecutable = index == 5_000)
+        }
+        val chunks = children.reversed().chunked(300) + listOf(listOf(remoteItem().copy(isExecutable = false)))
+        val transport = FakeCanonicalTransport().apply {
+            chunks.forEachIndexed { index, chunk ->
+                pages[if (index == 0) null else "snapshot-$index+/="] = RemoteItemDeltaPage(
+                    chunk.map { RemoteItemDeltaChange("upsert", item = it) },
+                    if (index == chunks.lastIndex) "deep-current-terminal" else "snapshot-${index + 1}+/=",
+                    index != chunks.lastIndex,
+                )
+            }
+            deltaHandler = { cursor ->
+                assertEquals(before, store.state.value)
+                assertEquals(before, store.durableState.value)
+                requireNotNull(pages[cursor])
+            }
+        }
+        assertTrue(manager(store, transport).refreshItemProgressCanonicalEvidence { true })
+        assertEquals(5_001, store.state.value.canonicalItems.size)
+        val byId = store.state.value.canonicalItems.associateBy { it.id }
+        val visited = mutableSetOf<String>()
+        var ancestor: String? = childId(5_000)
+        while (ancestor != null) {
+            val item = requireNotNull(byId[ancestor])
+            assertTrue(visited.add(item.id))
+            assertEquals(item.id == childId(5_000), item.isExecutable)
+            ancestor = item.parentId
+        }
+        assertEquals(byId.keys, visited)
+        assertEquals(5_001, visited.size)
+        assertEquals("deep-current-terminal", store.state.value.canonicalDeltaCursor)
+        assertEquals(1, transport.bootstrapRequests)
+        assertEquals(chunks.size, transport.deltaCursors.size)
+        assertTrue(transport.previewRequests.isEmpty())
+    }
+
+    @Test
+    fun expiredOrRejectedSnapshotContinuationNeverFallsBackOrReleasesSubmittedCustody() = runBlocking {
+        for (status in listOf(409, 413, 503, 422)) {
+            val mutation = submittedReplayCreate()
+            val store = PlannerStore(replayState(mutation).copy(canonicalItems = listOf(replayBase().copy(isSensitive = true))))
+            val before = store.state.value
+            val transport = FakeCanonicalTransport().apply {
+                createResult = authoredRemote(TASK_ID, 1)
+                deltaHandler = { cursor ->
+                    if (cursor == null) RemoteItemDeltaPage(listOf(RemoteItemDeltaChange("upsert",
+                        item = authoredRemote(TASK_ID, 9, "Uncommitted snapshot body"))), "expires+/=", true)
+                    else if (status == 422) throw PlannerApiException.Validation(status)
+                    else throw PlannerApiException.Http(status)
+                }
+            }
+            assertTrue(CanonicalRefreshOutcome.SUCCESS != manager(store, transport).refreshAndCompose())
+            assertEquals(before, store.state.value)
+            assertEquals(before, store.durableState.value)
+            assertEquals(1, transport.bootstrapRequests)
+            assertEquals(listOf(null, "expires+/="), transport.deltaCursors)
+            assertEquals(mutation.idempotencyKey, transport.createRequests.single().first)
+            assertTrue(transport.previewRequests.isEmpty())
+        }
+    }
+
+    @Test
+    fun recentSnapshotTrashIsDurableBeforePublicationAndSurvivesRestartedFirstSend() = runBlocking {
+        val temporary = org.junit.rules.TemporaryFolder().also { it.create() }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val directory = temporary.root.toPath().resolve("bootstrap-publication")
+            fun repository(prepare: Boolean) = com.greengolddog.dayweave.data.RoomPlannerStateRepository(
+                NativeConvergenceSnapshotDao(NativeConvergenceDisk(directory, "synthetic-bootstrap-binding", prepare)),
+            ) { clock.toEpochMilli() }
+            val firstRepository = repository(true)
+            firstRepository.save(DayWeaveUiState())
+            val store = PlannerStore(DayWeaveUiState(), firstRepository, scope)
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val first = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange("tombstone",
+                    tombstone = RemoteItemTombstone(TASK_ID, 9, "2026-09-01T06:00:00Z"))), "bootstrap-published", false)
+                previewResult = itemsPreview(emptyList())
+                publicationError = IOException("Synthetic request did not reach server")
+            }
+            assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE, manager(store, first).refreshAndCompose())
+            val durable = requireNotNull(firstRepository.load())
+            val pending = requireNotNull(durable.pendingSchedulePublication)
+            assertTrue(pending.candidate.recentlyDeleted.isEmpty())
+            assertEquals(9L, durable.canonicalRecentlyDeleted.single().revision)
+            val restarted = PlannerStore(DayWeaveUiState(), repository(false), scope)
+            withTimeout(3_000) { restarted.loadState.first { it == PlannerLoadState.READY } }
+            val firstSuccessfulSend = FakeCanonicalTransport()
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(restarted, firstSuccessfulSend).refreshAndCompose())
+            assertEquals(first.publicationRequests.single(), firstSuccessfulSend.publicationRequests.single())
+            assertTrue(firstSuccessfulSend.deltaCursors.isEmpty())
+            assertEquals(durable.canonicalRecentlyDeleted, restarted.state.value.canonicalRecentlyDeleted)
+            assertNull(restarted.state.value.pendingSchedulePublication)
+        } finally { scope.cancel(); temporary.delete() }
+    }
+
+    @Test
+    fun freshEqualRevisionTombstoneCannotContradictHistoricalReceipt() = runBlocking {
+        for (trash in listOf(false, true)) {
+            val mutation = if (trash) submittedReplayCreate().copy(operation = CanonicalAuthoringOperation.TRASH,
+                draft = null, expectedRevision = 7, baseItem = replayBase()) else submittedReplayCreate()
+            val store = PlannerStore(replayState(mutation).copy(canonicalItems = if (trash) listOf(replayBase()) else emptyList()))
+            val before = store.state.value
+            val response = if (trash) authoredRemote(TASK_ID, 8).copy(deletedAt = "2026-09-01T07:01:00Z",
+                updatedAt = "2026-09-01T07:01:00Z", isExecutable = false) else authoredRemote(TASK_ID, 1)
+            val transport = FakeCanonicalTransport().apply {
+                createResult = response
+                trashResult = response
+                pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange("tombstone",
+                    tombstone = RemoteItemTombstone(TASK_ID, response.revision, "2026-09-01T07:02:00Z"))),
+                    "contradictory-current", false)
+                previewResult = itemsPreview(emptyList())
+            }
+            assertTrue(CanonicalRefreshOutcome.SUCCESS != manager(store, transport).refreshAndCompose())
+            assertEquals(before, store.state.value)
+            assertEquals(before, store.durableState.value)
+            assertTrue(transport.publicationRequests.isEmpty())
+        }
+    }
+
+    @Test
+    fun ancientSnapshotOmissionCannotResurrectAnHistoricalReceipt() = runBlocking {
+        val mutation = submittedReplayCreate()
+        val store = PlannerStore(replayState(mutation).copy(canonicalItems = listOf(replayBase())))
+        val transport = FakeCanonicalTransport().apply {
+            createResult = authoredRemote(TASK_ID, 1)
+            pages[null] = RemoteItemDeltaPage(emptyList(), "ancient-omitted", false)
+            pages["ancient-omitted"] = RemoteItemDeltaPage(emptyList(), "ancient-omitted", false)
+            previewResult = itemsPreview(emptyList())
+        }
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
+        assertEquals(1, transport.bootstrapRequests)
+        assertTrue(store.state.value.canonicalItems.isEmpty())
+        assertTrue(store.state.value.canonicalRecentlyDeleted.isEmpty())
+        assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+    }
+
+    @Test
+    fun failedSnapshotTrashPreflightSaveCannotStageOrSendPublication() = runBlocking {
+        val initial = DayWeaveUiState(canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1", canonicalDeltaCursor = "previous",
+            canonicalItems = listOf(replayBase()))
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repository = object : PlannerStateRepository {
+                override suspend fun load() = initial
+                override suspend fun save(state: DayWeaveUiState) { throw IOException("Synthetic storage failure") }
+            }
+            val store = PlannerStore(DayWeaveUiState(), repository, scope)
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val transport = FakeCanonicalTransport().apply {
+                pages["previous"] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange("tombstone",
+                    tombstone = RemoteItemTombstone(TASK_ID, 9, "2026-09-01T06:00:00Z"))), "validated", false)
+                previewResult = itemsPreview(emptyList())
+            }
+            assertEquals(CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE, manager(store, transport).refreshAndCompose())
+            assertTrue(transport.publicationRequests.isEmpty())
+            assertNull(store.state.value.pendingSchedulePublication)
+            assertEquals(initial, store.durableState.value)
+        } finally { scope.cancel() }
+    }
+
+    @Test
     fun explicitLegacyEquivalentStructureRemainsAuthorable() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val explicit = remoteItem(split = false).copy(
@@ -5206,6 +5435,7 @@ class CanonicalSyncManagerTest {
         assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, transport).refreshAndCompose())
         assertEquals(1, transport.replacementRequests.size)
         assertEquals(listOf(null, "repaired-current"), transport.deltaCursors)
+        assertEquals(1, transport.bootstrapRequests)
         assertEquals(9L, store.state.value.canonicalItems.single().revision)
     }
 
@@ -5225,6 +5455,7 @@ class CanonicalSyncManagerTest {
         assertTrue(store.state.value.canonicalItems.isEmpty())
         assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
         assertEquals("deleted-current", store.state.value.canonicalDeltaCursor)
+        assertEquals(2L, store.state.value.canonicalRecentlyDeleted.single().revision)
     }
 
     private fun submittedReplayCreate() = PendingCanonicalAuthoringMutation(
@@ -7709,6 +7940,8 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
     val pages = mutableMapOf<String?, RemoteItemDeltaPage>()
     val queuedPages = mutableMapOf<String?, ArrayDeque<RemoteItemDeltaPage>>()
     val deltaCursors = mutableListOf<String?>()
+    var bootstrapRequests = 0
+    var deltaHandler: (suspend (String?) -> RemoteItemDeltaPage)? = null
     var previewResult: RemoteSchedulePreview? = null
     var previewRequest: SchedulePreviewRequest? = null
     val queuedPreviews = ArrayDeque<RemoteSchedulePreview>()
@@ -7776,7 +8009,13 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         deltaStarted?.complete(Unit)
         deltaGate?.await()
         deltaError?.let { throw it }
+        deltaHandler?.let { return it(cursor) }
         return queuedPages[cursor]?.removeFirstOrNull() ?: requireNotNull(pages[cursor])
+    }
+
+    override suspend fun itemDeltaBootstrap(configuration: AuthenticatedApiConfiguration): RemoteItemDeltaPage {
+        bootstrapRequests += 1
+        return itemDelta(configuration, null)
     }
 
     override suspend fun currentSchedule(

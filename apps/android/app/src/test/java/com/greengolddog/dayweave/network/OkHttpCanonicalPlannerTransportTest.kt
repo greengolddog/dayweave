@@ -57,6 +57,19 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun currentBootstrapIsExplicitAndContinuationDoesNotRepeatTheMode() = runBlocking {
+        repeat(3) {
+            server.enqueue(jsonResponse("""{"changes":[],"next_cursor":"opaque+/=","has_more":false}"""))
+        }
+        transport.itemDeltaBootstrap(configuration())
+        assertEquals("limit=50&bootstrap=current", server.takeRequest().url.encodedQuery)
+        transport.itemDelta(configuration(), "opaque+/=")
+        assertEquals("limit=50&cursor=opaque%2B%2F%3D", server.takeRequest().url.encodedQuery)
+        transport.itemDelta(configuration(), null)
+        assertEquals("limit=50", server.takeRequest().url.encodedQuery)
+    }
+
+    @Test
     fun structuralNullKeysAreAtomicAndFutureValuesRemainExact() = runBlocking {
         server.enqueue(
             jsonResponse(

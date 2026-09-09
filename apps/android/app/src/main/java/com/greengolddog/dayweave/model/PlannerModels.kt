@@ -1118,6 +1118,8 @@ data class CanonicalPlanUpdate(
     val planOccurrenceMembership: List<PublishedOccurrenceMembershipSnapshot> = emptyList(),
     val hasExactPlanOccurrenceMembership: Boolean = false,
     val message: String,
+    /** Read evidence only; never changes an existing serialized publication candidate or request. */
+    @Transient val recentlyDeleted: List<CanonicalRecentlyDeletedRecord> = emptyList(),
 )
 
 /**

@@ -668,6 +668,11 @@ interface CanonicalPlannerTransport {
         cursor: String?,
     ): RemoteItemDeltaPage
 
+    /** Starts a bounded current-state snapshot; opaque continuation cursors use ordinary delta. */
+    suspend fun itemDeltaBootstrap(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteItemDeltaPage = itemDelta(configuration, null)
+
     /**
      * Cheap foreground invalidation probe. Existing transports remain source-compatible while the
      * production transport asks for one change instead of materializing a normal delta page.
@@ -729,6 +734,10 @@ class OkHttpCanonicalPlannerTransport(
         cursor: String?,
     ): RemoteItemDeltaPage = itemDelta(configuration, cursor, MAX_DELTA_PAGE_SIZE)
 
+    override suspend fun itemDeltaBootstrap(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteItemDeltaPage = itemDelta(configuration, null, MAX_DELTA_PAGE_SIZE, bootstrapCurrent = true)
+
     override suspend fun itemDeltaProbe(
         configuration: AuthenticatedApiConfiguration,
         cursor: String?,
@@ -738,12 +747,15 @@ class OkHttpCanonicalPlannerTransport(
         configuration: AuthenticatedApiConfiguration,
         cursor: String?,
         limit: Int,
+        bootstrapCurrent: Boolean = false,
     ): RemoteItemDeltaPage {
         require(limit in 1..MAX_DELTA_PAGE_SIZE)
+        require(!bootstrapCurrent || cursor == null)
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/items/delta")
             .addQueryParameter("limit", limit.toString())
             .apply { if (cursor != null) addQueryParameter("cursor", cursor) }
+            .apply { if (bootstrapCurrent) addQueryParameter("bootstrap", "current") }
             .build()
         return execute(requestBuilder(configuration, url.toString()).get().build())
     }

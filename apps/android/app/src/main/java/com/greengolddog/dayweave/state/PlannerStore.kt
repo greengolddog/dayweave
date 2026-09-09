@@ -1521,7 +1521,7 @@ class PlannerStore(
                     }
                 }
             val authoringOverlay = canonicalAuthoringRefreshOverlay(
-                current = current,
+                current = current.withCanonicalReadTombstones(update.items, update.recentlyDeleted),
                 freshItems = update.items,
                 sameBinding = sameBinding,
             )
@@ -2907,15 +2907,24 @@ class PlannerStore(
                         "Fresh equal revisions contradict the immutable receipt"
                     }
                 }
+                authoritativeRefresh.recentlyDeleted.firstOrNull { it.id == response.id }?.let {
+                    require(it.revision >= response.revision) { "Fresh deletion predates the immutable receipt" }
+                    if (it.revision == response.revision) require(response.deletedAt != null &&
+                        it.deletedAt.sameInstant(response.deletedAt) && it.parentId == response.parentId) {
+                        "Fresh equal revisions contradict the immutable receipt deletion"
+                    }
+                }
                 // Replays can return a superseded response. Old preflights could also retain old
                 // draft bases after advancing the cursor. Feed the complete fresh forest into
                 // both sides of reconciliation, never projecting the historical response itself.
                 // The original journal protects privacy until this entire exact save succeeds.
                 val freshIds = authoritativeRefresh.items.mapTo(hashSetOf()) { it.id }
-                val reconciliation = current.copy(
+                val readCurrent = current.withCanonicalReadTombstones(authoritativeRefresh.items,
+                    authoritativeRefresh.recentlyDeleted)
+                val reconciliation = readCurrent.copy(
                     pendingCanonicalAuthoringMutations = withoutMutation,
                     canonicalItems = authoritativeRefresh.items,
-                    canonicalRecentlyDeleted = current.canonicalRecentlyDeleted.filterNot { it.id in freshIds },
+                    canonicalRecentlyDeleted = readCurrent.canonicalRecentlyDeleted.filterNot { it.id in freshIds },
                     // A local-only designation depended on the journal being settled.
                     // Neither the old receipt nor a newer item silently renews that review.
                     onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeUnless {
@@ -3536,12 +3545,50 @@ class PlannerStore(
     private fun <T> List<T>.replaceAt(index: Int, replacement: T): List<T> =
         mapIndexed { currentIndex, value -> if (currentIndex == index) replacement else value }
 
+    /** Whole-read evidence only: never overlays a stale active body across an admitted deletion. */
+    private fun DayWeaveUiState.withCanonicalReadTombstones(
+        items: List<CanonicalItemSnapshot>,
+        deleted: List<CanonicalRecentlyDeletedRecord>,
+    ): DayWeaveUiState {
+        require(deleted.size <= 10_000 && deleted.map { it.id }.distinct().size == deleted.size)
+        val activeById = items.associateBy { it.id }
+        val previousActiveById = canonicalItems.associateBy { it.id }
+        val retained = canonicalRecentlyDeleted.associateByTo(linkedMapOf()) { it.id }
+        for (record in deleted) {
+            record.requireValid()
+            require(record.retentionAnchorAt != null && record.lastKnownItem == null)
+            require(record.id !in activeById)
+            previousActiveById[record.id]?.let {
+                require(record.revision > it.revision) { "Read deletion predates cached active evidence" }
+            }
+            val previous = retained[record.id]
+            previous?.takeIf { it.revision == record.revision }?.let {
+                require(it.deletedAt.sameInstant(record.deletedAt) && it.parentId == record.parentId) {
+                    "Equal deletion revisions have contradictory evidence"
+                }
+            }
+            retained[record.id] = listOfNotNull(previous).upsertRecentlyDeleted(record).single()
+        }
+        for (item in items) {
+            retained[item.id]?.let {
+                require(item.revision > it.revision) { "Read active item does not supersede deleted evidence" }
+            }
+        }
+        val deletedIds = deleted.mapTo(hashSetOf()) { it.id }
+        return copy(canonicalItems = canonicalItems.filterNot { it.id in deletedIds },
+            // The authoring overlay decides when an active observation may release restore
+            // metadata. Submitted restore custody must retain its record until exact settlement.
+            canonicalRecentlyDeleted = retained.values.toList())
+            .withCanonicalTrashRetention(nowEpochMillis())
+    }
+
     /** Admits read-only canonical catch-up without previewing, publishing, or mutating execution. */
     internal fun installItemProgressCanonicalEvidence(
         expected: DayWeaveUiState,
         items: List<CanonicalItemSnapshot>,
         deltaCursor: String,
         isCurrent: () -> Boolean,
+        recentlyDeleted: List<CanonicalRecentlyDeletedRecord> = emptyList(),
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
         require(isCurrent())
         require(current.canonicalSyncOrigin == expected.canonicalSyncOrigin &&
@@ -3553,9 +3600,12 @@ class PlannerStore(
         // must not be narrowed through selected-item authoring eligibility here.
         items.forEach { require(it.deletedAt == null); it.requireValidStructuralMetadata() }
         val changed = current.canonicalItems != items
-        val refreshed = current.copy(canonicalItems = items, canonicalDeltaCursor = deltaCursor)
+        val read = current.withCanonicalReadTombstones(items, recentlyDeleted)
+        val activeIds = items.mapTo(hashSetOf()) { it.id }
+        val refreshed = read.copy(canonicalItems = items, canonicalDeltaCursor = deltaCursor,
+            canonicalRecentlyDeleted = read.canonicalRecentlyDeleted.filterNot { it.id in activeIds })
         if (!changed) refreshed else refreshed.copy(
-            canonicalRecentlyDeleted = current.canonicalRecentlyDeleted.filterNot { deleted -> items.any { it.id == deleted.id } },
+            canonicalRecentlyDeleted = refreshed.canonicalRecentlyDeleted,
             onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeIf { anchor ->
                 items.any { it.id == anchor.itemId && it.revision == anchor.canonicalRevision }
             },

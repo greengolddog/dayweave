@@ -107,6 +107,99 @@ instead of publishing a partial or stale projection.
 
 ## Delivery and recovery semantics
 
+### Bounded current-state bootstrap
+
+A cold client or explicit cursor-replacement recovery opts in with
+`GET /v1/items/delta?bootstrap=current&limit=200`, with no `cursor`. Plain
+cursorless requests retain the legacy historical stream; old clients and
+ordinary incremental cursors do not change behavior. Unsupported bootstrap
+values, or combining the mode with a cursor, fail closed. Upgrade the server
+before deploying clients that use this mode: a new cold client does not fall
+back to lifetime history after a generic error from an older server.
+
+The response remains exactly `changes`, `next_cursor`, and `has_more`. The
+snapshot contains every nontrashed current item, including completed and
+cancelled work, plus bodyless tombstones inside a fixed server-clock 720-hour
+recovery window. Older tombstones are omitted only from this replacement view;
+the historical stream is not pruned. Local restore/replay journals retain their
+minimum recovery evidence even if an old deletion is absent from the snapshot.
+
+PostgreSQL migration `0034` adds short-lived, workspace/owner-scoped immutable
+manifests referencing exact canonical change sequences, not copies of item
+payloads. Capture joins current item revisions to their unique change rows
+under the canonical workspace lock. A fixed head and cutoff make every page
+consistent across concurrent writes. Scoped foreign keys, original-transaction
+membership and deferred completeness checks seal each manifest. Live manifests
+pin their source rows against mutation. Account-deletion fences and the guarded
+purge inventory include both manifest tables.
+
+Each snapshot is bounded to 20,000 records and 32 MiB, with at most 300 records
+and 8 MiB of compact change payload per page. This is a replacement batch, not
+a fabricated historical atomic change group; all snapshot pages must be
+buffered before admission. Native aggregate limits remain unchanged and may
+reject a snapshot that exceeds their own retained-state budget. Tickets expire
+after ten minutes, with at most sixteen live tickets per workspace; repeated
+initial reads reuse a valid owner/workspace/head ticket instead of consuming
+capacity for lost replies. Expired manifests are cleaned during a subsequent
+capture, or by the scoped account purge.
+
+Intermediate cursors identify a manifest and ordinal. Continue using only the
+returned `cursor`, without repeating `bootstrap=current`. They are opaque and
+must not become a durable complete-cache cursor or an SSE `Last-Event-ID` (the
+stream rejects them with `400`). Only the terminal page returns an ordinary
+delta cursor at the captured head. The next incremental drain returns all
+changes committed after that head, including changes made while the snapshot
+was downloading.
+
+Missing/expired tickets return `409 item_bootstrap_expired`; oversized snapshots
+return `413 item_bootstrap_too_large`; ticket exhaustion returns
+`503 item_bootstrap_capacity`; malformed/wrong-scope snapshot cursors or mode
+combinations return `422 item_bootstrap_cursor_invalid`. Failed or incomplete
+downloads never replace the encrypted offline cache. A retry may start a new
+snapshot; it must not concatenate pages from different tickets.
+
+Both clients fold the complete terminal read before replacing current state.
+macOS preserves submitted authoring retry eligibility and same-deletion local
+retention anchors. Android carries bodyless deletion evidence through the
+existing encrypted trash store, including canonical refresh and historical
+receipt recovery. Before staging a new schedule publication, any such evidence
+is durably installed with the complete preflight; it is not added to the exact
+serialized publication journal. This preserves recovery across a restart even
+when the first successful publication response is not an idempotent replay.
+
+Verification on 2026-09-09:
+
+- PostgreSQL-backed API gates passed 568 default tests plus all 29 explicitly
+  opt-in database tests, with zero failures. All-target API Clippy passed with
+  warnings denied. The focused fixture has 35,014 historical revisions and a
+  5,000-item current chain plus one recent tombstone delivered in seventeen
+  pages. It covers concurrent reparent/delete, repository restart, lossless
+  post-head catch-up, corrupted source evidence, deferred manifest sealing,
+  scoped membership, history pinning and expiry cleanup. Separate tests cover
+  real count/byte/page bounds and ticket scope/tampering/capacity/reuse.
+- The macOS full runner reported 1,011 tests in 65 suites with no failures and
+  one unrelated opt-in progress test skipped. The new opt-in bootstrap test ran
+  against a real loopback PostgreSQL-backed item service: the actual native
+  loader admitted all 5,000 levels and bodyless trash, preserved the encrypted
+  state across restart and resumed an empty ordinary delta at the same head.
+  Unit coverage additionally checks interrupted downloads, stale cursorless
+  cache replacement, submitted journal custody and retention anchors.
+- Android passed 1,618 JVM tests in 130 suites, with one unrelated opt-in skip;
+  lint reported zero errors and 29 existing warnings. Coverage includes a
+  deepest-first 5,000-level chain, a separate 300-sibling page, terminal-only
+  installation, failure custody, historical receipt/deletion contradictions,
+  bodyless restore recovery and encrypted publication restart. These are JVM
+  transport/store checks, not an APK/emulator or physical-device acceptance run.
+
+The real native fixture is deliberately item-only. It does not verify schedule
+composition, completion-cascade writers, production TLS/device authentication,
+Google or assistant integrations, or owner-device acceptance. No owner data,
+credentials or provider accounts are used. The guarded native test consumes a
+private `DAYWEAVE_NATIVE_BOOTSTRAP_CONFIG`; its synthetic secrets and database
+artifacts are never repository inputs.
+
+### Incremental invalidation
+
 After a direct `ItemService` create, replace, trash, or restore returns a
 successful commit or exact replay, it performs a content-free process-local
 poke. The poke does no repository I/O, so a successfully committed mutation
@@ -130,14 +223,14 @@ A client should:
 2. treat any valid invalidation only as a request to synchronize;
 3. call `/v1/items/delta` with its durable cursor and apply pages until
    `has_more` is false;
-4. atomically apply each page and store that page's `next_cursor`; and
+4. atomically apply the fully buffered drain and store its terminal `next_cursor`; and
 5. use only that stored delta cursor as `Last-Event-ID` on reconnect.
 
 Clients may keep their existing bounded item-delta poll as a fallback. A `404`
 during a mixed-version rollout may disable stream attempts for the current app
 activation without disabling polling. A `400`/`409` requires explicit binding
 or rebootstrap recovery rather than silently replacing encrypted local state.
-The endpoint adds no database schema or migration.
+The content-free stream itself adds no database schema or migration.
 
 ## Historical authoring receipts
 
@@ -173,8 +266,9 @@ fields/revisions or remove another saved intent to hide uncertainty.
 If the refreshed hierarchy cannot represent a remaining saved draft, retain
 all affected journals rather than partially installing the refresh or silently
 rewriting that draft.
-The existing hydration limits remain in force; this is not the future bounded
-current-state bootstrap required for deep completion cascades.
+The existing hydration limits remain in force. Cold historical-receipt recovery
+uses the bounded current-state bootstrap described above; it does not implement
+server parent-completion cascades or their policy controls.
 
 A delayed equal-revision trash receipt must preserve the earliest local
 retention anchor. Server deletion timestamps may be ahead of the local clock,
