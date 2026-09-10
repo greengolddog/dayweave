@@ -62,6 +62,7 @@ import com.greengolddog.dayweave.model.PublishedScheduleRevisionHintSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
+import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.SuggestionDisposition
@@ -82,6 +83,7 @@ import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.hasValidRecurrenceSourceFor
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
+import com.greengolddog.dayweave.model.quarantineRoutineOccurrences
 import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
 import com.greengolddog.dayweave.model.habitPolicyFingerprintOrNull
 import com.greengolddog.dayweave.model.recurrenceIdentityType
@@ -1394,6 +1396,7 @@ class PlannerStore(
             if (!sameBinding) {
                 require(
                         current.canonicalItems.isEmpty() &&
+                        current.routineOccurrenceLedger.syncOrigin == null &&
                         current.canonicalDeltaCursor == null &&
                         current.pendingSchedulePublication == null &&
                         current.pendingCanonicalMutation == null &&
@@ -3120,6 +3123,7 @@ class PlannerStore(
         current: DayWeaveUiState,
         allowDetachedInboxCapture: Boolean = false,
     ) {
+        require(!current.routineOccurrenceLedger.hasRecoveryCustody) { "Occurrence authority requires reconciliation" }
         require(current.itemCompletionLedger.pending.none {
             it.disposition == com.greengolddog.dayweave.model.ItemCompletionDisposition.PENDING
         } && !current.itemCompletionLedger.needsCanonicalCatchUp) { "Completion authority requires reconciliation" }
@@ -3175,6 +3179,7 @@ class PlannerStore(
         current: DayWeaveUiState,
         id: String,
     ) {
+        require(!current.routineOccurrenceLedger.hasRecoveryCustody) { "Occurrence authority requires reconciliation" }
         require(current.itemCompletionLedger.pending.none {
             it.disposition == com.greengolddog.dayweave.model.ItemCompletionDisposition.PENDING
         } && !current.itemCompletionLedger.needsCanonicalCatchUp) { "Completion authority requires reconciliation" }
@@ -3654,6 +3659,20 @@ class PlannerStore(
         mutableState.value = mutableState.value.copy(itemCompletionGetProofs = emptyMap(),
             itemCompletionEvidenceGeneration = Math.addExact(mutableState.value.itemCompletionEvidenceGeneration, 1))
     }
+
+    /** Exact encrypted save of the occurrence sidecar; canonical templates/lifecycle stay separate. */
+    internal fun mutateRoutineOccurrences(
+        update: (DayWeaveUiState) -> RoutineOccurrenceLedger,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val ledger = update(current).also(RoutineOccurrenceLedger::requireValid)
+        require(ledger.syncOrigin == null || ledger.syncOrigin == current.canonicalSyncOrigin &&
+            ledger.configurationId == current.canonicalConfigurationId)
+        current.copy(routineOccurrenceLedger = ledger)
+    }
+
+    /** Cached protected history can be forgotten only after every intent and receipt is resolved. */
+    internal fun quarantineRoutineOccurrenceLedger(): PlannerPersistenceReceipt? =
+        mutateRoutineOccurrences { it.routineOccurrenceLedger.quarantineRoutineOccurrences() }
 
     /** Establishes an empty habit cache under the exact credential/workspace binding. */
     fun bindHabitLedger(
@@ -5389,6 +5408,7 @@ class PlannerStore(
             current.habitLedger.pendingMutations.isNotEmpty() ||
             current.itemProgressLedger.pending.isNotEmpty() ||
             current.itemCompletionLedger.pending.isNotEmpty() || current.itemCompletionLedger.needsCanonicalCatchUp ||
+            current.routineOccurrenceLedger.hasRecoveryCustody ||
             current.pendingGoogleCalendarOutbound != null ||
             current.pendingGoogleSchedulePublication?.stage?.let {
                 it != GoogleSchedulePublicationStage.ACCEPTED
@@ -6069,6 +6089,9 @@ class PlannerStore(
 
     /** Locally forgets all canonical execution state before credential destruction. */
     fun abandonCanonicalConnection(): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(!current.routineOccurrenceLedger.hasRecoveryCustody) {
+            "Every saved occurrence change and receipt must be resolved before disconnecting"
+        }
         require(current.itemCompletionLedger.pending.isEmpty() && !current.itemCompletionLedger.needsCanonicalCatchUp) {
             "Every saved completion change must be explicitly resolved before disconnecting"
         }
@@ -6121,6 +6144,7 @@ class PlannerStore(
             habitLedger = HabitLedgerSnapshot(),
             itemProgressLedger = com.greengolddog.dayweave.model.ItemProgressLedger(),
             itemCompletionLedger = com.greengolddog.dayweave.model.ItemCompletionLedger(),
+            routineOccurrenceLedger = RoutineOccurrenceLedger(),
             itemCompletionGetProofs = emptyMap(),
             pendingCanonicalMutation = null,
             canonicalExecutionSyncOrigin = null,
@@ -7718,7 +7742,16 @@ class PlannerStore(
         transformed.inheritLocalScheduleCompositionMemo(previous)
         transformed.inheritPublishedScheduleValidationMemo(previous)
         val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned().fenceCompletionEvidence(previous)
-            .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
+            .also {
+                requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations)
+                if (it.routineOccurrenceLedger !== previous.routineOccurrenceLedger ||
+                    it.canonicalSyncOrigin != previous.canonicalSyncOrigin ||
+                    it.canonicalConfigurationId != previous.canonicalConfigurationId) {
+                    val ledger = it.routineOccurrenceLedger.also(RoutineOccurrenceLedger::requireValid)
+                    require(ledger.syncOrigin == null || ledger.syncOrigin == it.canonicalSyncOrigin &&
+                        ledger.configurationId == it.canonicalConfigurationId)
+                }
+            }
         mutableState.value = snapshot
         currentGeneration += 1
         scheduleCanonicalTrashCleanupLocked(snapshot)
@@ -7779,7 +7812,12 @@ class PlannerStore(
                 .withInvalidTimedBreakNotificationAttemptAbandoned()
                 .withBoundedAssistantMessages()
                 .withInvalidLocalScheduleCompositionAbandoned()
-                .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
+                .also {
+                    requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations)
+                    val ledger = it.routineOccurrenceLedger.also(RoutineOccurrenceLedger::requireValid)
+                    require(ledger.syncOrigin == null || ledger.syncOrigin == it.canonicalSyncOrigin &&
+                        ledger.configurationId == it.canonicalConfigurationId)
+                }
             mutableState.value = snapshot
             currentGeneration += 1
             persistenceStatus = PersistenceStatus.READY
@@ -7926,7 +7964,9 @@ class PlannerStore(
                 })
             })
             mutableState.value = current.copy(itemProgressLedger = retainedProgress,
-                itemCompletionLedger = retainedCompletion, itemCompletionGetProofs = emptyMap())
+                itemCompletionLedger = retainedCompletion, itemCompletionGetProofs = emptyMap(),
+                // Receipt settlement and journal removal roll back together on failed disk IO.
+                routineOccurrenceLedger = mutableDurableState.value?.routineOccurrenceLedger ?: RoutineOccurrenceLedger())
                 .withPendingSensitivityHardened()
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {

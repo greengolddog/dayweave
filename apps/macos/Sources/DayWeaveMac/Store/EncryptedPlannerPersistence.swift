@@ -452,7 +452,9 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 27
+    /// Version 28 adds bounded occurrence observations and exact recovery
+    /// intent; persisted data never supplies a process-local fresh GET lease.
+    static let currentSchemaVersion = 28
 
     let schemaVersion: Int
     let savedAt: Date
@@ -505,6 +507,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let executionState: DayWeaveExecutionDurableState?
     let itemProgressState: ItemProgressState?
     let itemCompletionState: ItemCompletionState?
+    let routineOccurrenceState: RoutineOccurrenceState?
 
     init(
         schemaVersion: Int = Self.currentSchemaVersion,
@@ -548,7 +551,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty,
         itemProgressState: ItemProgressState? = nil,
-        itemCompletionState: ItemCompletionState? = nil
+        itemCompletionState: ItemCompletionState? = nil,
+        routineOccurrenceState: RoutineOccurrenceState? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.savedAt = savedAt
@@ -609,12 +613,21 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
         self.itemProgressState = itemProgressState ?? (schemaVersion >= 26 ? .empty : nil)
-        self.itemCompletionState = itemCompletionState ?? (schemaVersion == Self.currentSchemaVersion ? .empty : nil)
+        self.itemCompletionState = itemCompletionState ?? (schemaVersion >= 27 ? .empty : nil)
+        self.routineOccurrenceState = routineOccurrenceState ?? (schemaVersion >= 28 ? .empty : nil)
     }
 
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         if schemaVersion < 26 && itemProgressState != nil { throw .snapshotDecodingFailed }
         if schemaVersion < 27 && itemCompletionState != nil { throw .snapshotDecodingFailed }
+        if schemaVersion < 28 && routineOccurrenceState != nil { throw .snapshotDecodingFailed }
+        if schemaVersion >= 27 {
+            guard let itemCompletionState, itemCompletionState.isValid,
+                  itemCompletionState.configurationIdentifier == nil
+                    || itemCompletionState.configurationIdentifier == canonicalConfigurationIdentifier else {
+                throw .snapshotDecodingFailed
+            }
+        }
         if schemaVersion >= 26 {
             guard let itemProgressState, itemProgressState.isValid,
                   itemProgressState.configurationIdentifier == nil
@@ -631,6 +644,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
             : self.publishedScheduleProof
         switch schemaVersion {
         case Self.currentSchemaVersion:
+            guard let routineOccurrenceState, routineOccurrenceState.isValid,
+                  routineOccurrenceState.configurationIdentifier == nil
+                    || routineOccurrenceState.configurationIdentifier == canonicalConfigurationIdentifier else {
+                throw .snapshotDecodingFailed
+            }
             guard let itemCompletionState, itemCompletionState.isValid,
                   itemCompletionState.configurationIdentifier == nil
                     || itemCompletionState.configurationIdentifier == canonicalConfigurationIdentifier else {
@@ -778,7 +796,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
-        case 21, 22, 23, 24, 25, 26:
+        case 21, 22, 23, 24, 25, 26, 27:
             // Canonical structural metadata was previously nested or implicit,
             // while unknown-field retention could forward-capture the complete
             // server wire shape. The schema-aware item decoder either infers a
@@ -830,7 +848,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 localCaptureDiagnostics: localCaptureDiagnostics,
                 executionState: executionState,
                 itemProgressState: itemProgressState,
-                itemCompletionState: .empty
+                itemCompletionState: itemCompletionState ?? .empty,
+                routineOccurrenceState: .empty
             ).migratedToCurrentSchema()
         case 20:
             // Schema 20 predates generated-schedule Google Calendar authority.
@@ -1905,6 +1924,15 @@ struct EncryptedPlannerPersistence: Sendable {
             if probe.schemaVersion < 27,
                let fields = try JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
                fields.keys.contains("itemCompletionState") { throw PlannerPersistenceError.snapshotDecodingFailed }
+            if probe.schemaVersion < 28,
+               let fields = try JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
+               fields.keys.contains(where: { key in
+                   let normalized = key.replacingOccurrences(of: "_", with: "").lowercased()
+                   return normalized.contains("routineoccurrence")
+                       || normalized == "minimumcatchuprevisions" || normalized == "needsremoteschedulecatchup"
+                       || (normalized.hasPrefix("occurrence") && ["state", "proof", "evidence", "lease", "epoch", "cursor", "head", "catchup"]
+                           .contains(where: normalized.contains))
+               }) { throw PlannerPersistenceError.snapshotDecodingFailed }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
             // Only schemas that predate the sensitivity field may default it.

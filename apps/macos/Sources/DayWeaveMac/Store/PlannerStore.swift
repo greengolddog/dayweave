@@ -373,6 +373,9 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var itemCompletionState: ItemCompletionState {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var routineOccurrenceState: RoutineOccurrenceState {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var itemCompletionEvidenceGeneration: UInt64 = 0
     @Published private(set) var itemCompletionReadAdmissions: [UUID: ItemCompletionReadAdmission] = [:]
     @Published private(set) var canonicalDeltaCursor: String? {
@@ -567,6 +570,7 @@ final class PlannerStore: ObservableObject {
         executionState: DayWeaveExecutionDurableState = .empty,
         itemProgressState: ItemProgressState = .empty,
         itemCompletionState: ItemCompletionState = .empty,
+        routineOccurrenceState: RoutineOccurrenceState = .empty,
         scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
@@ -705,6 +709,7 @@ final class PlannerStore: ObservableObject {
             ?? pendingCanonicalAuthoringMutations
         let initialItemProgressState = restoredSnapshot?.itemProgressState ?? itemProgressState
         let initialItemCompletionState = restoredSnapshot?.itemCompletionState ?? itemCompletionState
+        let initialRoutineOccurrenceState = restoredSnapshot?.routineOccurrenceState ?? routineOccurrenceState
         let initialCanonicalTrash = restoredSnapshot?.canonicalTrash ?? canonicalTrash
         let retentionReferenceDate = now()
         let boundedCanonicalAuthoringMutations = Self.boundedCanonicalAuthoringMutations(
@@ -718,6 +723,7 @@ final class PlannerStore: ObservableObject {
                 boundedCanonicalAuthoringMutations
             ).union(initialItemProgressState.journals.map(\.itemID))
                 .union(initialItemCompletionState.journals.map(\.itemID))
+                .union(initialRoutineOccurrenceState.recoveryPinnedItemIDs)
         )
         let restoredCanonicalRetentionNeedsRewrite = restoredSnapshot != nil
             && (initialCanonicalTrash != boundedCanonicalTrash
@@ -776,6 +782,12 @@ final class PlannerStore: ObservableObject {
         self.executionState = initialExecutionState
         self.itemProgressState = initialItemProgressState
         self.itemCompletionState = initialItemCompletionState
+        self.routineOccurrenceState = initialRoutineOccurrenceState
+        if !initialRoutineOccurrenceState.isValid
+            || (initialRoutineOccurrenceState.configurationIdentifier != nil
+                && initialRoutineOccurrenceState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
+            restorationError = .snapshotDecodingFailed
+        }
         if !initialItemCompletionState.isValid
             || (initialItemCompletionState.configurationIdentifier != nil
                 && initialItemCompletionState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
@@ -928,6 +940,7 @@ final class PlannerStore: ObservableObject {
             pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
                 .union(itemProgressState.journals.map(\.itemID))
                 .union(itemCompletionState.journals.map(\.itemID))
+                .union(routineOccurrenceState.recoveryPinnedItemIDs)
         )
 
         do {
@@ -1001,6 +1014,24 @@ final class PlannerStore: ObservableObject {
             throw persistenceError
         }
         if replacement.needsCanonicalCatchUp { invalidateItemCompletionReadEvidence() }
+    }
+
+    /// Exact preimage plus encrypted file CAS. Receipt settlement, its minimum
+    /// catch-up revisions and remote scheduling latch either all persist or the
+    /// complete occurrence preimage remains in memory and on disk.
+    func commitRoutineOccurrenceState(_ replacement: RoutineOccurrenceState, replacing prior: RoutineOccurrenceState) throws {
+        guard hasEncryptedPersistence, canPersistPlan else { throw RoutineOccurrenceStateError.persistenceRequired }
+        guard routineOccurrenceState == prior, replacement.isValid,
+              replacement.configurationIdentifier == nil
+                || replacement.configurationIdentifier == canonicalConfigurationIdentifier else {
+            throw RoutineOccurrenceStateError.configurationChanged
+        }
+        routineOccurrenceState = replacement
+        flushPersistence()
+        if let persistenceError {
+            routineOccurrenceState = prior
+            throw persistenceError
+        }
     }
 
     func invalidateItemCompletionReadEvidence() {
@@ -1304,6 +1335,7 @@ final class PlannerStore: ObservableObject {
               itemProgressState.journals.isEmpty,
               itemCompletionState.journals.isEmpty,
               !itemCompletionState.needsCanonicalCatchUp,
+              !routineOccurrenceState.hasUnresolvedCustody,
               !pendingCanonicalAuthoringMutations.contains(where: {
                   $0.hasBeenSubmitted || $0.configurationIdentifier != nil || $0.disposition == .conflicted
               }) else {
@@ -1339,6 +1371,7 @@ final class PlannerStore: ObservableObject {
         proposalApplicationReceipts = []
         itemProgressState = .empty
         itemCompletionState = .empty
+        routineOccurrenceState = .empty
         invalidateItemCompletionReadEvidence()
         pendingCanonicalAuthoringMutations = preservedCreates
         if let anchor = onboardingFirstItemAnchor,
@@ -1596,6 +1629,7 @@ final class PlannerStore: ObservableObject {
 
     private var hasCanonicalRemoteState: Bool {
         itemProgressState.configurationIdentifier != nil || itemCompletionState.configurationIdentifier != nil
+            || routineOccurrenceState.configurationIdentifier != nil
             || !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
@@ -3076,6 +3110,7 @@ final class PlannerStore: ObservableObject {
                 pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
                     .union(itemProgressState.journals.map(\.itemID))
                     .union(itemCompletionState.journals.map(\.itemID))
+                    .union(routineOccurrenceState.recoveryPinnedItemIDs)
             )
             try persistence.preflightSave(makeSnapshot(
                 canonicalTrashOverride: boundedTrash,
@@ -3247,6 +3282,7 @@ final class PlannerStore: ObservableObject {
         Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations)
             .union(itemProgressState.journals.map(\.itemID))
             .union(itemCompletionState.journals.map(\.itemID))
+            .union(routineOccurrenceState.recoveryPinnedItemIDs)
     }
 
     private func reconcileSelectedCanonicalItem() {
@@ -5113,6 +5149,7 @@ final class PlannerStore: ObservableObject {
 
     var hasExecutionCredentialReplacementBlocker: Bool {
         !itemProgressState.journals.isEmpty || !itemCompletionState.journals.isEmpty
+            || routineOccurrenceState.hasUnresolvedCustody
             || itemCompletionState.needsCanonicalCatchUp || executionState.hasCredentialReplacementBlocker
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
@@ -5364,6 +5401,7 @@ final class PlannerStore: ObservableObject {
     private func quarantineCredentialBoundState(preservingDeviceID: Bool) {
         itemProgressState = .empty
         itemCompletionState = .empty
+        routineOccurrenceState = .empty
         invalidateItemCompletionReadEvidence()
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
@@ -6576,7 +6614,8 @@ final class PlannerStore: ObservableObject {
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState,
             itemProgressState: itemProgressState,
-            itemCompletionState: itemCompletionState
+            itemCompletionState: itemCompletionState,
+            routineOccurrenceState: routineOccurrenceState
         )
     }
 

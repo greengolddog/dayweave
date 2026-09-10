@@ -2157,6 +2157,8 @@ data class DayWeaveUiState(
     val itemProgressLedger: ItemProgressLedger = ItemProgressLedger(),
     /** Completion policy and exact reviewed commands are distinct from informational progress. */
     val itemCompletionLedger: ItemCompletionLedger = ItemCompletionLedger(),
+    /** Separate ledger-instance authority; never projects occurrence outcomes into templates. */
+    val routineOccurrenceLedger: RoutineOccurrenceLedger = RoutineOccurrenceLedger(),
     /** Cache/restart can never mint a fresh completion GET permission. */
     @kotlinx.serialization.Transient
     val itemCompletionGetProofs: Map<String, ItemCompletionReadProof> = emptyMap(),

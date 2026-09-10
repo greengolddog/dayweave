@@ -134,9 +134,56 @@ normalized by a platform JSON round-trip before validation. Additional native
 tests exercise raw duplicate keys, bounded deep trees, transport metadata,
 historical receipt binding and cancellation. The corpus contains no owner data.
 
-This checkpoint does not yet connect the transports to native protected review
-controls, encrypted caches/outboxes, terminal convergence or local composition.
+The wire checkpoint does not yet connect the transports to native protected
+review controls, live terminal convergence or local composition. The subsequent
+encrypted custody foundation is described below.
 No template status is changed to represent an occurrence outcome.
+
+## Native encrypted custody foundation
+
+The separate occurrence state is embedded in the existing protected planner
+snapshot: schema 28 on macOS and Room 24 / JSON_V24 on Android. The database
+upgrade adds no plaintext columns. Older-format snapshots cannot inject the new
+authority; existing completion, progress, authoring and publication requests retain
+their exact saved content through migration. Persisted observations are historical
+display data, never fresh GET permission or current-source planning evidence.
+
+There is at most one unresolved command per ledger instance, because different
+members of that instance share an aggregate revision. The journal retains the
+instance/member/operation identities, typed command and original request bytes.
+Submitted ambiguous requests cannot be discarded as if no write happened. An
+exact receipt removes only its matching journal and durably records the minimum
+instance revision that a subsequent read must reach. Receipt settlement and that
+catch-up target are one encrypted write; a failed save retains the prior custody.
+An older or equal-revision receipt does not replace a newer review observation.
+
+The observation cache is bounded to 256 complete instances, 20,000 retained
+members and an 8 MiB serialized occurrence-state budget. Up to 64 commands share
+a 1 MiB original-request budget. Journal and receipt-target observations are
+pinned; only unpinned observations can be evicted. The containing planner's
+existing envelope limits remain unchanged. Cache eviction does not imply loss of
+an instance's server history, nor does consuming a terminal cursor imply every
+instance remains cached.
+
+Terminal installation checks an exact pre-read state capture, correct list/delta
+mode, cursor progression and cycles, globally increasing change sequences and
+immutable per-instance history. The entire supplied chain is bounded to 128
+pages, 32 MiB of compact serialized wire data and 40,000 member visits. Every
+outstanding receipt target must be covered by snapshots from that read chain;
+existing cache or receipt snapshots cannot substitute. Incomplete, contradictory,
+oversized or stale chains leave both the prior cache and cursor intact.
+
+A changed terminal checkpoint durably requires remote schedule catch-up,
+including changes that preserve all visible statuses. Clearing that latch requires
+an exact captured state, no unresolved command/receipt targets and a terminal
+checkpoint; the caller must additionally prove a fresh authenticated remote
+composition completed against that capture. These pure persistence transitions
+do not themselves fetch data, publish schedules or grant local helper authority.
+
+The live protected review/replay coordinator, foreground/reconnect handling,
+schedule invalidation wiring and routine controls remain the next integration
+phase. They must supply process-local review leases and operation generations;
+serialized state alone cannot authorize a fresh edit or a local composition.
 
 ## Verification
 
@@ -177,11 +224,25 @@ These runs use synthetic fixtures and mock HTTP services. They do not claim
 native/service convergence, physical-device interaction, a new installable APK
 or a production deployment for occurrence completion.
 
+The subsequent encrypted-custody checkpoint passes 1,100 executed macOS tests
+with warnings denied, including 17 new persistence tests; three opt-in
+integration tests are skipped (1,103 total). Its focused occurrence gate passes
+41 tests across wire, transport and persistence. Android verification for this
+checkpoint passes 1,697 JVM tests, including 23 new state/persistence regressions;
+two opt-in integration tests are skipped (1,699 total). Room's generated schema
+24 retains the single encrypted snapshot table. The new SQLCipher migration
+instrumentation test compiles; it has not yet run on an emulator or physical
+device. These are durable-model and encrypted-store gates, not live routine
+replay, two-client/service convergence or owner-device acceptance.
+Android lint completes with zero errors and the same 29 warnings in existing
+files; none are in the occurrence additions. Temporary macOS test-runtime copies
+were moved to Trash after verification; the installed toolchain was unchanged.
+
 ## Remaining integration
 
-- Native macOS/Android protected review, encrypted per-instance cache/outbox,
-  frozen exact replay and terminal-only convergence; the strict models and
-  transports above are implemented separately from those integrations.
+- Native macOS/Android protected review, live frozen-request replay and
+  terminal-only convergence; strict transports and encrypted custody transitions
+  are separate foundations, not yet a connected user workflow.
 - Native local-composition and pending-publication fencing against the occurrence
   head; helper v1 cannot consume this authority, while helper v2 still requires
   an admitted current-source witness and native adapter integration.

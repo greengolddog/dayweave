@@ -4,6 +4,8 @@ import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemProgressLedger
 import com.greengolddog.dayweave.model.ItemCompletionLedger
+import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
+import com.greengolddog.dayweave.model.decodeExactRoutineOccurrence
 import com.greengolddog.dayweave.model.decodeExactItemCompletion
 import com.greengolddog.dayweave.model.decodeExactItemProgress
 import com.greengolddog.dayweave.model.requireStrictItemProgressJson
@@ -70,8 +72,9 @@ class RoomPlannerStateRepository(
         // Inspect the original bytes before any older migration can erase an injected authority.
         validateItemProgressSnapshotShape(persistedSnapshot)
         validateItemCompletionSnapshotShape(persistedSnapshot)
+        validateRoutineOccurrenceSnapshotShape(persistedSnapshot)
         val snapshot = if (persistedSnapshot.payloadFormat in setOf(
-                PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V21,
+                PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V21,
             )) {
             persistedSnapshot
         } else {
@@ -80,6 +83,7 @@ class RoomPlannerStateRepository(
             )
         }
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V24,
             PlannerSnapshotFormats.JSON_V23,
             PlannerSnapshotFormats.JSON_V22,
             PlannerSnapshotFormats.JSON_V21,
@@ -254,6 +258,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V24 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V23 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V22 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
@@ -274,6 +279,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V24 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V23 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V22 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V21 ||
@@ -301,8 +307,9 @@ class RoomPlannerStateRepository(
         } ?: notificationHardened
         validateItemProgressState(hardened)
         validateItemCompletionState(hardened)
+        validateRoutineOccurrenceState(hardened)
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V23 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V24 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -330,18 +337,19 @@ class RoomPlannerStateRepository(
         retainedState.habitLedger.requireValid()
         validateItemProgressState(retainedState)
         validateItemCompletionState(retainedState)
+        validateRoutineOccurrenceState(retainedState)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V23,
+                payloadFormat = PlannerSnapshotFormats.JSON_V24,
             ),
         )
     }
 
     private fun validateItemProgressSnapshotShape(snapshot: PlannerSnapshotEntity) {
-        val hasProgress = snapshot.payloadFormat in setOf(PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V23)
+        val hasProgress = snapshot.payloadFormat in setOf(PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24)
         if (hasProgress) {
             try {
                 // Do not let tree decoding erase equivalent duplicate authority keys. Other
@@ -386,7 +394,7 @@ class RoomPlannerStateRepository(
         val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
         if (root.containsKey("itemCompletionGetProofs") || root.containsKey("itemCompletionEvidenceGeneration"))
             throw SerializationException("Completion GET admission is runtime-only")
-        if (snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V23) {
+        if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24)) {
             if (root.containsKey("itemCompletionLedger")) throw SerializationException("Legacy snapshot contains completion authority")
             return
         }
@@ -403,6 +411,33 @@ class RoomPlannerStateRepository(
             if (ledger.syncOrigin != null) require(ledger.syncOrigin == state.canonicalSyncOrigin &&
                 ledger.configurationId == state.canonicalConfigurationId)
         } catch (error: Exception) { throw SerializationException("Completion recovery crosses its canonical binding", error) }
+    }
+
+    private fun validateRoutineOccurrenceSnapshotShape(snapshot: PlannerSnapshotEntity) {
+        val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
+        if (root.keys.any { it in setOf("routineOccurrenceGetProofs", "routineOccurrenceReadProofs",
+                "routineOccurrenceEvidenceGeneration", "routineOccurrenceReviewLease") }) {
+            throw SerializationException("Occurrence GET admission is runtime-only")
+        }
+        if (snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V24) {
+            if (root.containsKey("routineOccurrenceLedger")) {
+                throw SerializationException("Legacy snapshot contains occurrence authority")
+            }
+            return
+        }
+        val raw = root["routineOccurrenceLedger"] as? JsonObject
+            ?: throw SerializationException("Current occurrence ledger is required")
+        try { decodeExactRoutineOccurrence<RoutineOccurrenceLedger>(raw.toString()).requireValid() }
+        catch (error: Exception) { throw SerializationException("Occurrence recovery state is invalid", error) }
+    }
+
+    private fun validateRoutineOccurrenceState(state: DayWeaveUiState) {
+        try {
+            val ledger = state.routineOccurrenceLedger
+            ledger.requireValid()
+            if (ledger.syncOrigin != null) require(ledger.syncOrigin == state.canonicalSyncOrigin &&
+                ledger.configurationId == state.canonicalConfigurationId)
+        } catch (error: Exception) { throw SerializationException("Occurrence recovery crosses its canonical binding", error) }
     }
 
     /**

@@ -18,6 +18,7 @@ struct ItemCompletionPersistenceTests {
         for schema in 1...26 {
             for injected in [NSNull() as Any, try #require(original["itemCompletionState"])] {
                 var root = original; root["schemaVersion"] = schema
+                root.removeValue(forKey: "routineOccurrenceState")
                 if schema < 26 { root.removeValue(forKey: "itemProgressState") }
                 root["itemCompletionState"] = injected
                 let encrypted = try fixture.write(JSONSerialization.data(withJSONObject: root))
@@ -49,14 +50,16 @@ struct ItemCompletionPersistenceTests {
             entityKind: .task, operation: .upsert, intentExpiresAt: F.date.addingTimeInterval(1_800), createdAt: F.date)
         try fixture.planner.saveGoogleOutboundRecoveryJournal(outbound)
         var prior = try fixture.object(); prior["schemaVersion"] = 26; prior.removeValue(forKey: "itemCompletionState")
+        prior.removeValue(forKey: "routineOccurrenceState")
         _ = try fixture.write(JSONSerialization.data(withJSONObject: prior))
         let loaded = try #require(try fixture.persistence.load())
         let migrated = try loaded.migratedToCurrentSchema()
-        #expect(migrated.schemaVersion == 27 && migrated.itemCompletionState == .empty)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion && migrated.itemCompletionState == .empty)
         #expect(migrated.itemProgressState?.journals == [progressJournal])
         #expect(migrated.pendingCanonicalAuthoringMutations == [submitted])
         #expect(migrated.googleOutboundRecoveryJournal == outbound)
         var result = try fixture.object(migrated); result["schemaVersion"] = 26; result.removeValue(forKey: "itemCompletionState")
+        result.removeValue(forKey: "routineOccurrenceState")
         #expect(NSDictionary(dictionary: prior).isEqual(to: result))
     }
 

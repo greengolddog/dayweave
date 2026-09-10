@@ -74,11 +74,13 @@ object PlannerSnapshotFormats {
     const val JSON_V22 = "json-v22-independent-item-progress"
     /** Exact completion policy intent; an older binary cannot safely ignore pending authority. */
     const val JSON_V23 = "json-v23-item-completion-policy"
+    /** Complete occurrence observations and exact member intents live in the encrypted snapshot. */
+    const val JSON_V24 = "json-v24-routine-occurrence-ledger"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 23,
+    version = 24,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -259,6 +261,11 @@ object PlannerDatabaseMigrations {
     val MIGRATION_22_23 = object : Migration(22, 23) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /** No plaintext changes; rollback must not erase unresolved occurrence write/receipt custody. */
+    val MIGRATION_23_24 = object : Migration(23, 24) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -321,6 +328,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_20_21,
                 PlannerDatabaseMigrations.MIGRATION_21_22,
                 PlannerDatabaseMigrations.MIGRATION_22_23,
+                PlannerDatabaseMigrations.MIGRATION_23_24,
             )
             .build()
     }

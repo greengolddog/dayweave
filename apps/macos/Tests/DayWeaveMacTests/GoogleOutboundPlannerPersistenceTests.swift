@@ -210,6 +210,7 @@ struct GoogleOutboundPlannerPersistenceTests {
         // The schema19 fixture cannot contain a field introduced only by schema26.
         legacyObject.removeValue(forKey: "itemProgressState")
         legacyObject.removeValue(forKey: "itemCompletionState")
+        legacyObject.removeValue(forKey: "routineOccurrenceState")
         var legacyJournal = try #require(
             legacyObject["googleOutboundRecoveryJournal"] as? [String: Any]
         )
