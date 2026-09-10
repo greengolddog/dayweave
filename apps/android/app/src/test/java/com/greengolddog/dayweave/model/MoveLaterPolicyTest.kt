@@ -10,6 +10,27 @@ import org.junit.Test
 
 class MoveLaterPolicyTest {
     @Test
+    fun managedOccurrenceMoveRefusesHelperV1ProvenanceAndUnresolvedOccurrenceCustody() {
+        val source = block(BLOCK_ID, "2026-09-01T08:00:00Z", "2026-09-01T09:00:00Z").copy(occurrenceId = OCCURRENCE_ID)
+        val current = state(source).copy(canonicalItems = listOf(item().copy(recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}")))
+        val target = Instant.parse("2026-09-01T10:00:00Z")
+        val reference = Instant.parse("2026-09-01T07:00:00Z")
+        assertTrue(current.assessMoveLater(BLOCK_ID, target, reference) != null)
+        val proof = requireNotNull(current.publishedScheduleProof)
+        val local = current.copy(localScheduleCompositionProvenance = LocalScheduleCompositionProvenanceSnapshot(
+            syncOrigin = proof.syncOrigin, configurationId = proof.configurationId, deltaCursor = "synthetic",
+            localInputFingerprint = "local-sha256:" + "a".repeat(64), scheduleRequestFingerprint = "sha256:" + "a".repeat(64),
+            stateInputFingerprint = "sha256:" + "a".repeat(64), generatedAt = proof.asOf, asOf = proof.asOf,
+            horizonStart = proof.revision.horizonStart, horizonEnd = proof.revision.horizonEnd,
+            timezoneName = proof.revision.timezoneName, sourceItemRevisions = mapOf(ITEM_ID to 7L)))
+        assertEquals(null, local.assessMoveLater(BLOCK_ID, target, reference))
+        val pending = routineStateTestLedger().copy(pending = listOf(routineStateTestIntent(true)))
+        assertEquals(null, current.copy(routineOccurrenceLedger = pending).assessMoveLater(BLOCK_ID, target, reference))
+        assertEquals(null, current.copy(routineOccurrenceLedger = pending.copy(pending = emptyList(), needsRemoteScheduleCatchUp = true))
+            .assessMoveLater(BLOCK_ID, target, reference))
+    }
+
+    @Test
     fun oneShotMoveWarnsAboutDeadlineButDoesNotClaimExactFixedOverlap() {
         val source = block(
             id = BLOCK_ID,

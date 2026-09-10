@@ -415,7 +415,9 @@ struct RootView: View {
                 } label: {
                     Label("Compose on Mac", systemImage: "wand.and.stars")
                 }
-                .help("Compose seven days from the encrypted cache on this Mac without publishing to Google Calendar")
+                .help(store.requiresRemoteRoutineOccurrenceComposition
+                    ? "Routine occurrence completion requires Sync & compose to use current occurrence evidence."
+                    : "Compose seven days from the encrypted cache on this Mac without publishing to Google Calendar")
                 .disabled(
                     !store.canMutatePlan
                         || canonicalSync.isSyncing
@@ -1215,6 +1217,7 @@ private struct LocalCompositionBanner: View {
                     .font(.caption)
                     .foregroundStyle(statusIsFailure ? .red : .secondary)
                     .lineLimit(2)
+                    .privacySensitive(store.requiresRemoteRoutineOccurrenceComposition)
                 Text(provenanceSummary ?? "Uses the encrypted cache; stays on this Mac and is not published to Google Calendar.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -1267,6 +1270,9 @@ private struct LocalCompositionBanner: View {
     }
 
     private var statusMessage: String {
+        if store.requiresRemoteRoutineOccurrenceComposition {
+            return "Routine occurrence completion needs current server evidence. Use Sync instead to compose the schedule."
+        }
         if case .ready = canonicalSync.localCompositionStatus,
            store.localScheduleCompositionProvenance != nil {
             return "An on-device schedule is installed from the encrypted cache."
@@ -3814,6 +3820,10 @@ private struct BlockInspector: View {
                 }
 
 
+                if let selection = routineOccurrenceSelection {
+                    RoutineOccurrencePanel(selection: selection)
+                }
+
                 if !dependencyCauses.isEmpty {
                     InspectorSection(title: dependencyBlockersAreActive
                         ? "Dependency blockers"
@@ -3929,6 +3939,11 @@ private struct BlockInspector: View {
             .padding(18)
         }
         .privacySensitive(block.isSensitive)
+    }
+
+    private var routineOccurrenceSelection: RoutineOccurrenceSelection? {
+        RoutineOccurrenceSelection(block: block,
+            currentSeriesKind: block.recurrenceSeriesItemID.flatMap { store.canonicalItem(id: $0)?.kind })
     }
 
     private var dependencyCauses: [CanonicalDependencyCause] {
@@ -6724,6 +6739,7 @@ private struct ScheduleProfileSettingsEditor: View {
 struct SettingsView: View {
     @EnvironmentObject private var itemProgress: ItemProgressStore
     @EnvironmentObject private var itemCompletion: ItemCompletionStore
+    @EnvironmentObject private var routineOccurrences: RoutineOccurrenceStore
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
@@ -6813,6 +6829,9 @@ struct SettingsView: View {
             }
             Section("Completion recovery") {
                 ItemCompletionOutboxView()
+            }
+            Section("Routine occurrence recovery") {
+                RoutineOccurrenceOutboxView()
             }
             Section("Appearance") {
                 Picker("Theme", selection: appearanceModeBinding) {
@@ -7560,6 +7579,7 @@ struct SettingsView: View {
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
                 itemCompletion.configurationDidChange()
+                routineOccurrences.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7611,6 +7631,7 @@ struct SettingsView: View {
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
                 itemCompletion.configurationDidChange()
+                routineOccurrences.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
             } catch {
@@ -7638,6 +7659,7 @@ struct SettingsView: View {
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
                 itemCompletion.configurationDidChange()
+                routineOccurrences.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
                 dayWeaveEnrollmentCode = ""
@@ -7682,6 +7704,7 @@ struct SettingsView: View {
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
                 itemCompletion.configurationDidChange()
+                routineOccurrences.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
@@ -7761,6 +7784,7 @@ struct SettingsView: View {
         canonicalSync.configurationDidChange()
         itemProgress.configurationDidChange()
         itemCompletion.configurationDidChange()
+        routineOccurrences.configurationDidChange()
         await executionSync.configurationDidChange()
         guard appLock.isContentAvailable,
               durableAuth.recoveryPrivacyGeneration == privacyGeneration else {
@@ -7787,6 +7811,7 @@ struct SettingsView: View {
         canonicalSync.configurationDidChange()
         itemProgress.configurationDidChange()
         itemCompletion.configurationDidChange()
+        routineOccurrences.configurationDidChange()
         executionSync.startForegroundPolling()
         return true
     }
@@ -7824,6 +7849,7 @@ struct SettingsView: View {
                 canonicalSync.configurationDidChange()
                 itemProgress.configurationDidChange()
                 itemCompletion.configurationDidChange()
+                routineOccurrences.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }

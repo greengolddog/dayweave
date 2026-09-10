@@ -448,6 +448,7 @@ private fun DayWeaveRoot(
     val habitSyncState by viewModel.habitSyncState.collectAsStateWithLifecycle()
     val itemProgressSyncState by viewModel.itemProgressSyncState.collectAsStateWithLifecycle()
     val itemCompletionSyncState by viewModel.itemCompletionSyncState.collectAsStateWithLifecycle()
+    val routineOccurrenceSyncState by viewModel.routineOccurrenceSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val googleCalendarImportState by
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
@@ -510,6 +511,9 @@ private fun DayWeaveRoot(
     var showQuickCapture by remember { mutableStateOf(false) }
     var completionItemId by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
         mutableStateOf<String?>(null)
+    }
+    var routineOccurrenceSelection by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
+        mutableStateOf<com.greengolddog.dayweave.sync.RoutineOccurrenceSelection?>(null)
     }
     var progressItemId by remember(state.canonicalConfigurationId, deviceAuthState.baseUrl, deviceAuthState.sessionId) {
         mutableStateOf<String?>(null)
@@ -682,6 +686,7 @@ private fun DayWeaveRoot(
                     },
                     itemProgressRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundItemProgress else null,
                     itemCompletionRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundItemCompletion else null,
+                    routineOccurrenceRefresh = if (deviceAuthState.isConfigured) viewModel::collectForegroundRoutineOccurrences else null,
                     polling = {
                         // Polling remains the durable fallback for old servers and missed publishes.
                         while (isActive) {
@@ -1089,6 +1094,7 @@ private fun DayWeaveRoot(
                 state = state,
                 reference = plannerClockReference,
                 currentZone = plannerClockZone,
+                onReviewOccurrence = { routineOccurrenceSelection = it },
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.INBOX -> InboxScreen(
@@ -1292,6 +1298,14 @@ private fun DayWeaveRoot(
             }
             }
         }
+    }
+
+    routineOccurrenceSelection?.let { selection ->
+        com.greengolddog.dayweave.ui.authoring.RoutineOccurrenceReviewSheet(
+            state, selection, routineOccurrenceSyncState, !accountRecoveryState.deviceAuthorizationSuppressed,
+            viewModel::observeRoutineOccurrence, viewModel::saveRoutineOccurrence,
+            onRetry = { viewModel.replayRoutineOccurrences(it) },
+            onDiscard = { viewModel.discardRoutineOccurrence(it) }, onDismiss = { routineOccurrenceSelection = null })
     }
 
     completionItemId?.let { itemId ->
@@ -1936,6 +1950,7 @@ internal suspend fun runForegroundInvalidationWorkers(
     habitInvalidations: (suspend () -> Unit)? = null,
     itemProgressRefresh: (suspend () -> Unit)? = null,
     itemCompletionRefresh: (suspend () -> Unit)? = null,
+    routineOccurrenceRefresh: (suspend () -> Unit)? = null,
     polling: suspend () -> Unit,
 ) = supervisorScope {
     listOfNotNull(
@@ -1945,6 +1960,7 @@ internal suspend fun runForegroundInvalidationWorkers(
         habitInvalidations,
         itemProgressRefresh,
         itemCompletionRefresh,
+        routineOccurrenceRefresh,
     ).forEach {
         collectInvalidations ->
         launch {

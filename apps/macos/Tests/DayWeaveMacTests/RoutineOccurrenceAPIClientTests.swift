@@ -38,6 +38,29 @@ struct RoutineOccurrenceAPIClientTests {
         #expect(query.first(where: { $0.name == "limit" })?.value == "12")
     }
 
+    @Test("selected uncached occurrence lookup binds explicit series and planner identity")
+    func lookup() async throws {
+        try enqueue(F.snapshot())
+        #expect(try await client().lookupRoutineOccurrence(seriesItemID: F.rootID, occurrenceID: F.plannerID) == F.snapshot())
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.token).first)
+        #expect(request.url.path == "/gateway/v1/routine-occurrences/lookup")
+        let query = try #require(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems)
+        #expect(query.first(where: { $0.name == "series_item_id" })?.value == F.rootID.uuidString.lowercased())
+        #expect(query.first(where: { $0.name == "occurrence_id" })?.value == F.plannerID.uuidString.lowercased())
+        #expect(request.body == nil && request.headers["Authorization"] == "Bearer \(Self.token)")
+        try enqueue(F.snapshot())
+        await #expect(throws: RoutineOccurrenceError.invalidData) {
+            try await client().lookupRoutineOccurrence(seriesItemID: F.childID, occurrenceID: F.plannerID)
+        }
+        try enqueue(F.snapshot(), extra: ["Idempotency-Replayed": "false"])
+        await #expect(throws: RoutineOccurrenceError.invalidData) {
+            try await client().lookupRoutineOccurrence(seriesItemID: F.rootID, occurrenceID: F.plannerID)
+        }
+        await #expect(throws: RoutineOccurrenceError.invalidData) {
+            try await client().lookupRoutineOccurrence(seriesItemID: F.rootID, occurrenceID: F.instanceID)
+        }
+    }
+
     @Test("PUT sends unchanged reviewed bytes and validates exact historical replay")
     func exactReplay() async throws {
         let body = Data(" \n".utf8) + (try F.command().bytes()) + Data("\n ".utf8)

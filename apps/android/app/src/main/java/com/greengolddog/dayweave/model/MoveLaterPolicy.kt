@@ -185,6 +185,7 @@ fun DayWeaveUiState.assessMoveLater(
     moveStart: Instant,
     referenceNow: Instant = Instant.now(),
 ): MoveLaterAssessment? {
+    if (routineOccurrenceLedger.hasRecoveryCustody) return null
     if (moveStart.nano != 0 || moveStart <= referenceNow) return null
     val focused = schedule.firstOrNull { it.id == blockId } ?: return null
     if (!focused.isRepresentableMoveLaterSource()) return null
@@ -200,6 +201,9 @@ fun DayWeaveUiState.assessMoveLater(
             session.plannedBlockId == focused.id
     }
     val isExecutionMove = focused.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
+    // Whole-occurrence placement intent still goes through fresh remote composition/publication.
+    // A helper-v1 display must not substitute for that published source or lifecycle authority.
+    if (requiresRemoteRoutineOccurrenceComposition() && localScheduleCompositionProvenance != null) return null
     if (isExecutionMove && lease == null) return null
 
     val movedIds: Set<String>

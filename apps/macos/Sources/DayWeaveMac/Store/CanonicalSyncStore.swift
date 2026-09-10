@@ -81,12 +81,18 @@ final class CanonicalSyncStore: ObservableObject {
     private let scheduleStreamSleep: @Sendable (Duration) async throws -> Void
     private let scheduleReplicaRequiresDurableBinding: Bool
     private var configurationGeneration: UInt64 = 0
-    private var activeSyncID: UUID?
+    private var activeSyncID: UUID? {
+        didSet { activeSyncOccurrenceGeneration = planner.routineOccurrencePlanningGeneration }
+    }
+    private var activeSyncOccurrenceGeneration: UInt64 = 0
     private var activeSyncTask: Task<Void, Never>?
     private var activeSyncScheduleProfile: ScheduleProfile?
     private var lastSuccessfulSyncID: UUID?
     private var lastFreshCompositionSyncID: UUID?
-    private var activeLocalCompositionID: UUID?
+    private var activeLocalCompositionID: UUID? {
+        didSet { activeLocalOccurrenceGeneration = planner.routineOccurrencePlanningGeneration }
+    }
+    private var activeLocalOccurrenceGeneration: UInt64 = 0
     private var activeLocalCompositionTask: Task<LocalScheduleComposition, Error>?
     private var activeLocalCompositionScheduleProfile: ScheduleProfile?
     private var foregroundItemPollTask: Task<Void, Never>?
@@ -4214,6 +4220,7 @@ final class CanonicalSyncStore: ObservableObject {
         guard !Task.isCancelled,
               activeSyncID == operationID,
               configurationGeneration == generation,
+              activeSyncOccurrenceGeneration == planner.routineOccurrencePlanningGeneration,
               activeSyncScheduleProfile == planner.scheduleProfile else {
             throw CanonicalSyncError.operationSuperseded
         }
@@ -4224,6 +4231,9 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     private func requireLocalCompositionPreflight() throws -> HabitCompositionCheckpoint? {
+        guard !planner.requiresRemoteRoutineOccurrenceComposition else {
+            throw LocalCompositionCoordinatorError.occurrenceRemoteCompositionRequired
+        }
         guard !Task.isCancelled,
               activeSyncID == nil,
               activeSyncTask == nil,
@@ -4302,6 +4312,8 @@ final class CanonicalSyncStore: ObservableObject {
         guard !Task.isCancelled,
               activeLocalCompositionID == operationID,
               configurationGeneration == generation,
+              activeLocalOccurrenceGeneration == planner.routineOccurrencePlanningGeneration,
+              !planner.requiresRemoteRoutineOccurrenceComposition,
               activeLocalCompositionScheduleProfile == planner.scheduleProfile,
               activeSyncID == nil,
               planner.isCanonicalSyncLocked else {
@@ -4457,6 +4469,7 @@ private struct LocalCompositionMutationFence: Sendable {
 }
 
 private enum LocalCompositionCoordinatorError: LocalizedError {
+    case occurrenceRemoteCompositionRequired
     case busy
     case persistenceUnavailable
     case incompleteCanonicalCache
@@ -4475,6 +4488,8 @@ private enum LocalCompositionCoordinatorError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .occurrenceRemoteCompositionRequired:
+            "Recurring task and routine history requires fresh remote composition. Use Sync; the on-device helper has no current occurrence authority."
         case .busy:
             "Wait for the active canonical, execution, or on-device composition operation to finish."
         case .persistenceUnavailable:

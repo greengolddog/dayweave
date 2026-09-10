@@ -416,4 +416,21 @@ struct RoutineOccurrenceState: Codable, Equatable, Sendable {
         var next = self; next.needsRemoteScheduleCatchUp = false
         guard next.isValid else { throw RoutineOccurrenceStateError.invalidData }; self = next
     }
+
+    /// A cold read can recover a stale delta token or a receipt target outside
+    /// that delta. The old durable checkpoint survives every failed attempt.
+    mutating func installColdTerminalChanges(_ pages: [RoutineOccurrencePage], replacing expected: Self,
+        configurationIdentifier: String, at date: Date) throws {
+        try requireBinding(configurationIdentifier)
+        guard self == expected else { throw RoutineOccurrenceStateError.staleState }
+        var cold = expected
+        cold.terminalDeltaCursor = nil
+        let capture = cold
+        try cold.installTerminalChanges(pages, replacing: capture,
+            configurationIdentifier: configurationIdentifier, at: date, isCurrentState: true)
+        cold.needsRemoteScheduleCatchUp = expected.needsRemoteScheduleCatchUp
+            || cold.terminalDeltaCursor != expected.terminalDeltaCursor
+        guard cold.isValid else { throw RoutineOccurrenceStateError.invalidData }
+        self = cold
+    }
 }

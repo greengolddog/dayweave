@@ -2111,6 +2111,40 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun routineLatchRejectsHistoricalWitnessAndAcceptsGenuinelyFreshSameRevisionDedupe() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())), "cursor-1", false)
+            pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-1", false)
+            previewResult = preview()
+            publicationHandler = { request ->
+                val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+                RemoteSchedulePublishResponse(RemotePublishedScheduleRevision(
+                    id = "77777777-7777-4777-8777-777777777777", revision = "7:77777777-7777-4777-8777-777777777777",
+                    revisionNumber = 7uL, inputDigest = decoded.expectedInputDigest,
+                    horizonStart = decoded.schedule.horizonStart, horizonEnd = decoded.schedule.horizonEnd,
+                    timezoneName = decoded.schedule.timezoneName, publishedAt = "2020-01-01T00:00:00Z"), replayed = false)
+            }
+        }
+        val canonical = manager(store, transport)
+        val oldWitness = requireNotNull(canonical.refreshRoutineOccurrenceSchedule())
+        val oldProof = requireNotNull(store.state.value.publishedScheduleProof)
+        requireNotNull(store.mutateRoutineOccurrences { current ->
+            com.greengolddog.dayweave.model.RoutineOccurrenceLedger(syncOrigin = current.canonicalSyncOrigin,
+                configurationId = current.canonicalConfigurationId, deltaCursor = "DWR1.synthetic-current", needsRemoteScheduleCatchUp = true)
+        }).awaitDurable()
+        val occurrences = RoutineOccurrenceSyncManager(store, CanonicalCredentialStore(),
+            com.greengolddog.dayweave.network.OkHttpRoutineOccurrenceTransport(), now = { clock })
+        assertFalse(occurrences.catchUpSchedule { oldWitness })
+        assertTrue(store.state.value.routineOccurrenceLedger.needsRemoteScheduleCatchUp)
+        assertTrue(occurrences.catchUpSchedule { canonical.refreshRoutineOccurrenceSchedule() })
+        assertFalse(store.state.value.routineOccurrenceLedger.needsRemoteScheduleCatchUp)
+        assertEquals(oldProof.revision.id, store.state.value.publishedScheduleProof?.revision?.id)
+        assertEquals(2, transport.publicationRequests.size)
+        assertTrue(transport.publicationRequests.first() != transport.publicationRequests.last())
+    }
+
+    @Test
     fun publicationTimestampBeyondBoundedFutureSkewKeepsExactJournal() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {

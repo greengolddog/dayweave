@@ -54,6 +54,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var habitSync: HabitSyncStore
     @StateObject private var itemProgress: ItemProgressStore
     @StateObject private var itemCompletion: ItemCompletionStore
+    @StateObject private var routineOccurrences: RoutineOccurrenceStore
     @StateObject private var googleIntegration: GoogleIntegrationStore
     @StateObject private var googleOutbound: GoogleOutboundStore
     @StateObject private var googleSchedulePublication: GoogleSchedulePublicationStore
@@ -103,6 +104,8 @@ struct DayWeaveMacApp: App {
         _itemProgress = StateObject(wrappedValue: itemProgress)
         let itemCompletion = ItemCompletionStore(planner: store, canonicalSync: canonicalSync, authCoordinator: authCoordinator)
         _itemCompletion = StateObject(wrappedValue: itemCompletion)
+        let routineOccurrences = RoutineOccurrenceStore(planner: store, canonicalSync: canonicalSync, authCoordinator: authCoordinator)
+        _routineOccurrences = StateObject(wrappedValue: routineOccurrences)
         let executionSync = ExecutionSyncStore(
             planner: store,
             habitCompositionProvider: habitSync,
@@ -161,7 +164,8 @@ struct DayWeaveMacApp: App {
             canonicalSync: canonicalSync,
             habitSync: habitSync,
             itemProgress: itemProgress,
-            itemCompletion: itemCompletion
+            itemCompletion: itemCompletion,
+            routineOccurrences: routineOccurrences
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
@@ -187,6 +191,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(habitSync)
                 .environmentObject(itemProgress)
                 .environmentObject(itemCompletion)
+                .environmentObject(routineOccurrences)
                 .environmentObject(googleIntegration)
                 .environmentObject(googleOutbound)
                 .environmentObject(googleSchedulePublication)
@@ -402,6 +407,7 @@ struct DayWeaveMacApp: App {
                 SettingsView()
                         .environmentObject(itemProgress)
                         .environmentObject(itemCompletion)
+                        .environmentObject(routineOccurrences)
                         .environmentObject(store)
                         .environmentObject(codex)
                         .environmentObject(suggestionSync)

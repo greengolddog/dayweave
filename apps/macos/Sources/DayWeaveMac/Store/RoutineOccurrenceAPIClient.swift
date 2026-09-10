@@ -2,6 +2,7 @@ import Foundation
 
 protocol RoutineOccurrenceTransport: Sendable {
     var configurationIdentifier: String { get }
+    func lookupRoutineOccurrence(seriesItemID: UUID, occurrenceID: UUID) async throws -> RoutineOccurrenceSnapshot
     func routineOccurrence(instanceID: UUID) async throws -> RoutineOccurrenceSnapshot
     func routineOccurrences(cursor: String?, limit: Int) async throws -> RoutineOccurrencePage
     func routineOccurrenceDelta(cursor: String?, limit: Int) async throws -> RoutineOccurrencePage
@@ -9,6 +10,20 @@ protocol RoutineOccurrenceTransport: Sendable {
 }
 
 extension DayWeaveAPIClient: RoutineOccurrenceTransport {
+    func lookupRoutineOccurrence(seriesItemID: UUID, occurrenceID: UUID) async throws -> RoutineOccurrenceSnapshot {
+        try RoutineOccurrenceValidation.require(seriesItemID != RoutineOccurrenceValidation.nilID
+            && occurrenceID.uuid.6 >> 4 == 5 && occurrenceID.uuid.8 >> 6 == 2)
+        let result: RoutineOccurrenceSnapshot = try await sendRoutineOccurrence(method: "GET",
+            pathComponents: ["v1", "routine-occurrences", "lookup"], queryItems: [
+                .init(name: "series_item_id", value: seriesItemID.uuidString.lowercased()),
+                .init(name: "occurrence_id", value: occurrenceID.uuidString.lowercased())
+            ])
+        try RoutineOccurrenceValidation.require(result.isValid
+            && result.aggregate.manifest.seriesItemID == seriesItemID
+            && result.aggregate.manifest.occurrenceID == occurrenceID)
+        return result
+    }
+
     func routineOccurrence(instanceID: UUID) async throws -> RoutineOccurrenceSnapshot {
         try RoutineOccurrenceValidation.require(instanceID != RoutineOccurrenceValidation.nilID)
         let result: RoutineOccurrenceSnapshot = try await sendRoutineOccurrence(method: "GET",

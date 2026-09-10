@@ -148,9 +148,9 @@ normalized by a platform JSON round-trip before validation. Additional native
 tests exercise raw duplicate keys, bounded deep trees, transport metadata,
 historical receipt binding and cancellation. The corpus contains no owner data.
 
-The wire checkpoint does not yet connect the transports to native protected
-review controls, live terminal convergence or local composition. The subsequent
-encrypted custody foundation is described below.
+The wire checkpoint itself covers transport, not a connected user workflow.
+The subsequent encrypted custody and connected review checkpoints are described
+below; qualified native local composition remains unfinished.
 No template status is changed to represent an occurrence outcome.
 
 ## Native encrypted custody foundation
@@ -194,10 +194,51 @@ checkpoint; the caller must additionally prove a fresh authenticated remote
 composition completed against that capture. These pure persistence transitions
 do not themselves fetch data, publish schedules or grant local helper authority.
 
-The live protected review/replay coordinator, foreground/reconnect handling,
-schedule invalidation wiring and routine controls remain the next integration
-phase. They must supply process-local review leases and operation generations;
-serialized state alone cannot authorize a fresh edit or a local composition.
+The connected review/replay coordinators described below supply foreground and
+reconnect handling, schedule invalidation, process-local leases and operation
+generations. Serialized state alone cannot authorize a fresh edit or local
+composition.
+
+## Connected native review and recovery
+
+The macOS calendar inspector and Android protected occurrence sheet resolve the
+producer-issued recurring root and planner identity through exact lookup. They
+show the complete member tree, including members with no calendar block, with
+required-descendant counts, leaf Done/Skipped/exact reopening and qualified
+required-edge/parent policy choices. Trees are flattened iteratively rather than
+rendered recursively. Known Habit/Event roots do not enter this separate review.
+Recovery remains reachable when the source or calendar placement disappears:
+macOS Settings lists saved requests, while Android Calendar exposes bound saved
+occurrence history. All occurrence-derived content remains protected, even when
+the canonical template itself is public.
+
+Historical encrypted observations cannot authorize a new edit after restart.
+Current review leases bind selection ownership, credential configuration, privacy,
+canonical/execution evidence and a monotonic process-local occurrence generation.
+The first delivery re-reads exact current evidence and saves the submitted marker
+before PUT. A submitted request can replay its original bytes without a current
+template, selected block or preliminary GET. Only a named definitive PUT rejection
+makes submitted intent discardable; a GET failure never proves that PUT had no
+effect. Receipt settlement preserves newer observations and creates durable
+minimum-revision catch-up targets.
+
+Terminal reads run even while a command remains unresolved. Installation requires
+the exact captured ledger and read coverage of every receipt target. A failed
+delta can try one bounded cold list without replacing its previous durable cursor
+or dropping custody. Changed history, including status-preserving policy changes,
+requires a fresh authenticated remote composition before the schedule catch-up
+latch clears. Recovering an old publication receipt is insufficient. Android's
+fresh-composition witness also permits a genuinely new publication request that
+deduplicates to the same current revision; a changed revision ID is not used as a
+substitute for fresh composition.
+
+Helper v1 remains unavailable for recurring Task/Routine authority until the
+authenticated current-source witness and native v2 adapters are implemented.
+Native preview/install/publication and fresh execution-Defer checks are fenced
+against occurrence reads and mutations; already frozen publication and execution
+requests retain exact replay custody. An empty never-managed occurrence checkpoint
+does not by itself disable local composition for a nonrecurring workspace. This
+does not implement per-step partial inactive deferral, cadence or semantic rebase.
 
 ## Verification
 
@@ -252,7 +293,7 @@ Android lint completes with zero errors and the same 29 warnings in existing
 files; none are in the occurrence additions. Temporary macOS test-runtime copies
 were moved to Trash after verification; the installed toolchain was unchanged.
 
-## Remaining integration
+## Exact lookup verification
 
 The exact-calendar lookup checkpoint passes all 679 API tests against a new
 disposable PostgreSQL database, with database-only cases enabled and zero ignored
@@ -265,20 +306,50 @@ harmless source edits and historical review after definition drift or missing
 source. Workspace all-target/all-feature Clippy with warnings denied and
 formatting pass. The owned database was stopped and its absence verified.
 
-This checkpoint does not yet verify connected native routine controls or
+The lookup server gate alone does not establish native interaction or
 two-client/service convergence.
 
-- Native macOS/Android protected review, live frozen-request replay and
-  terminal-only convergence; strict transports and encrypted custody transitions
-  are separate foundations, not yet a connected user workflow.
-- Native local-composition and pending-publication fencing against the occurrence
-  head; helper v1 cannot consume this authority, while helper v2 still requires
-  an admitted current-source witness and native adapter integration.
+## Connected native verification
+
+The connected client checkpoint passes 1,122 executed macOS tests with warnings
+denied (three opt-in skips; 1,125 total) and 1,717 Android JVM tests (two opt-in
+skips; 1,719 total). The focused macOS occurrence run passes 58 tests across five
+suites. New coverage includes exact uncached lookup, encrypted first-send/restart
+custody, lost replies, sibling instance CAS, historical receipts without rollback,
+late privacy/selection/canonical changes, terminal revision coverage and bounded
+cold recovery. Android additionally exercises a real canonical-sync coordinator
+with mocked HTTP transport to prove that a fresh new-key publish can clear the
+latch even when the service deduplicates to the same revision ID and timestamp.
+Existing whole-occurrence moves still go through remote composition/publication;
+helper-v1 local provenance and unresolved occurrence custody cannot authorize them.
+Managed execution-Defer review loses permission after occurrence invalidation or
+restart, while already submitted bytes retain their exact replay path.
+
+Android lint has zero errors and 34 warnings in existing dependency/platform/UI
+files; none are in the occurrence additions. The three new inert-host Compose
+tests and existing Room migration test compile, and both debug app and test APKs
+assemble. Instrumentation has not run on an emulator or physical device. The
+retained macOS test-runtime copy was moved to Trash after verification; the
+installed toolchain and owner services were unchanged.
+
+These are deterministic native transport/store/presentation and build gates, not
+a two-native-client live-service convergence run, visual acceptance, production
+device authentication/TLS trial, final signed release or owner-device acceptance.
+
+## Remaining integration
+
+- Controlled macOS/Android first-admission and two-client/service convergence,
+  including competing member choices, actual lost successful replies, process
+  restarts and independent immutable SQL verification; physical UI/lifecycle
+  and owner-device acceptance remain open.
+- Authenticated current-source witness and native helper-v2 adapter integration.
+  Existing native local-composition and publication fences conservatively require
+  remote composition; helper v1 cannot consume occurrence authority.
   The private API retains first-source revisions and opaque current eligibility,
   not a current-source planning witness. A native client must not guess that
   witness from its canonical cache or mutate template statuses to feed helper v1.
-  Initial native controls need remote recomposition and a local-composition fence
-  until the versioned local bridge has fully qualified evidence and native fences.
+  The connected controls use remote recomposition until the versioned local
+  bridge has fully qualified evidence and native installation fences.
 - Explicit review/rebase for semantic template changes. Harmless title/notes/
   estimate changes can retain authority; tree/rule changes do not silently rebind
   history. Ineligible initial terminal or execution-owned template states withhold

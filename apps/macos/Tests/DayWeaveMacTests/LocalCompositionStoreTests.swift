@@ -126,6 +126,27 @@ struct LocalCompositionStoreTests {
         }
     }
 
+    @Test("recurring task and routine source blocks helper v1 before any occurrence is cached")
+    func managedRecurrenceRequiresRemoteAuthority() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))
+        for kind in [DayWeaveCanonicalItemKind.task, .routine] {
+            var item = try LocalCompositionFixture.item(revision: 1)
+            item.kind = kind
+            item.recurrence = .object(["type": .string("daily")])
+            let context = try Self.makePlanner(now: now, item: item)
+            defer { try? FileManager.default.removeItem(at: context.directory) }
+            let composer = RecordingLocalComposer()
+            let store = Self.makeStore(planner: context.planner, composer: composer, now: now)
+            #expect(context.planner.routineOccurrenceState == .empty)
+            #expect(context.planner.requiresRemoteRoutineOccurrenceComposition)
+            #expect(!store.canRecomposeLocally)
+            #expect(!(await store.recomposeLocally()))
+            #expect(await composer.calls() == 0)
+            #expect(store.localCompositionStatus.message.contains("remote composition"))
+            #expect(context.planner.pendingSchedulePublication == nil)
+        }
+    }
+
     @Test("active habits require an exact complete and idle habit checkpoint")
     func habitCheckpointPreflightFailsClosed() async throws {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-30T08:00:00Z"))

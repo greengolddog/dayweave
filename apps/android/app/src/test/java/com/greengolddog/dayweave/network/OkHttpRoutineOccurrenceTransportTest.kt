@@ -29,6 +29,29 @@ class OkHttpRoutineOccurrenceTransportTest {
     @Before fun start() { server = MockWebServer(); server.start() }
     @After fun close() { server.close() }
 
+    @Test fun lookupBindsBothPlannerIdentitiesAndRetainsDistinctLedgerPathIdentity(): Unit = runBlocking {
+        server.enqueue(response(ITEM_PROGRESS_JSON.encodeToString(routineTestSnapshot())))
+        val snapshot = transport.lookup(configuration(), ROUTINE_ROOT, ROUTINE_PLANNER_ID)
+        assertEquals(ROUTINE_INSTANCE, snapshot.aggregate.manifest.id)
+        val lookup = server.takeRequest()
+        assertEquals("/synthetic/v1/routine-occurrences/lookup", lookup.url.encodedPath)
+        assertEquals(ROUTINE_ROOT, lookup.url.queryParameter("series_item_id"))
+        assertEquals(ROUTINE_PLANNER_ID, lookup.url.queryParameter("occurrence_id"))
+        assertEquals("no-store, max-age=0", lookup.headers["Cache-Control"])
+        server.enqueue(response(ITEM_PROGRESS_JSON.encodeToString(routineTestSnapshot())))
+        assertThrows(RoutineOccurrenceApiException.Uncertain::class.java) { runBlocking {
+            transport.lookup(configuration(), ROUTINE_CHILD, ROUTINE_PLANNER_ID)
+        } }
+        server.enqueue(response(ITEM_PROGRESS_JSON.encodeToString(routineTestSnapshot())))
+        assertThrows(RoutineOccurrenceApiException.Uncertain::class.java) { runBlocking {
+            transport.lookup(configuration(), ROUTINE_ROOT, "10000000-0000-5000-8000-000000000002")
+        } }
+        server.enqueue(response(ITEM_PROGRESS_JSON.encodeToString(routineTestSnapshot()), listOf("false")))
+        assertThrows(RoutineOccurrenceApiException.Uncertain::class.java) { runBlocking {
+            transport.lookup(configuration(), ROUTINE_ROOT, ROUTINE_PLANNER_ID)
+        } }
+    }
+
     @Test fun getAndExactPutBindLedgerIdentityAndPrivacyHeadersWithoutRequiringPragma() = runBlocking {
         server.enqueue(response(ITEM_PROGRESS_JSON.encodeToString(routineTestSnapshot())))
         assertEquals(routineTestSnapshot(),transport.get(configuration(),ROUTINE_INSTANCE))

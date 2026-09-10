@@ -12,6 +12,7 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
+import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
 import com.greengolddog.dayweave.network.DeviceAuthBindingFence
 import com.greengolddog.dayweave.network.AccountRecoveryManager
 import com.greengolddog.dayweave.network.ApiBindingOperationGate
@@ -140,7 +141,10 @@ class DayWeaveApplication : Application() {
     private val localScheduleCompositionLauncher = LocalScheduleCompositionLauncher(
         scope = persistenceScope,
         actionGate = canonicalActionGate,
-        compose = { generation -> canonicalSyncManager.composeLocally(generation) },
+        compose = { generation ->
+            if (plannerStore.state.value.requiresRemoteRoutineOccurrenceComposition()) canonicalSyncManager.refreshAndCompose()
+            else canonicalSyncManager.composeLocally(generation)
+        },
     )
     internal val scheduleCompositionProfileUpdateCoordinator by lazy {
         ScheduleCompositionProfileUpdateCoordinator(
@@ -220,6 +224,7 @@ class DayWeaveApplication : Application() {
                 itemProgressRefreshCoordinator.cancelAndDrainActiveSessions()
             }
             if (itemCompletionRefreshCoordinatorDelegate.isInitialized()) itemCompletionRefreshCoordinator.cancelAndDrainActiveSessions()
+            if (routineOccurrenceRefreshCoordinatorDelegate.isInitialized()) routineOccurrenceRefreshCoordinator.cancelAndDrainActiveSessions()
             if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
                 canonicalItemInvalidationManager.cancelAndDrainActiveSession()
             }
@@ -270,6 +275,11 @@ class DayWeaveApplication : Application() {
                 }
                 if (itemProgressSyncManagerDelegate.isInitialized()) itemProgressSyncManager.quarantineBindingState()
                 if (itemCompletionSyncManagerDelegate.isInitialized()) itemCompletionSyncManager.quarantineBindingState()
+                if (routineOccurrenceSyncManagerDelegate.isInitialized()) {
+                    routineOccurrenceSyncManager.quarantineBindingState()
+                } else {
+                    plannerStore.invalidateRoutineOccurrenceAuthority()
+                }
                 if (deviceSessionManagerDelegate.isInitialized()) {
                     deviceSessionManager.quarantineBindingState()
                 }
@@ -553,6 +563,53 @@ class DayWeaveApplication : Application() {
         return try {
             if (replayItemCompletionOwned(isCurrent)) ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
         } finally { canonicalActionGate.leave() }
+    }
+
+    private val routineOccurrenceSyncManagerDelegate = lazy {
+        com.greengolddog.dayweave.sync.RoutineOccurrenceSyncManager(plannerStore, apiCredentialStore,
+            com.greengolddog.dayweave.network.OkHttpRoutineOccurrenceTransport(), protectedWorkAllowed = ::itemProgressForegroundAllowed)
+    }
+    val routineOccurrenceSyncManager get() = routineOccurrenceSyncManagerDelegate.value
+    private val routineOccurrenceRefreshCoordinatorDelegate = lazy {
+        ItemProgressRefreshCoordinator(apiCredentialStore, ::itemProgressForegroundAllowed,
+            refreshSelected = { key, current ->
+                if (!canonicalActionGate.tryEnter()) ItemProgressRefreshResult.DEFERRED else try {
+                    if (routineOccurrenceSyncManager.load(com.greengolddog.dayweave.sync.RoutineOccurrenceSelection.fromKey(key), current))
+                        ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
+                } finally { canonicalActionGate.leave() }
+            }, replayOutbox = { current ->
+                if (!canonicalActionGate.tryEnter()) ItemProgressRefreshResult.DEFERRED else try {
+                    if (replayRoutineOccurrencesOwned(current)) ItemProgressRefreshResult.SUCCESS else ItemProgressRefreshResult.FAILED
+                } finally { canonicalActionGate.leave() }
+            })
+    }
+    private val routineOccurrenceRefreshCoordinator get() = routineOccurrenceRefreshCoordinatorDelegate.value
+    suspend fun observeSelectedRoutineOccurrence(selection: com.greengolddog.dayweave.sync.RoutineOccurrenceSelection) {
+        val selectedGeneration = routineOccurrenceSyncManager.select(selection)
+        try { routineOccurrenceRefreshCoordinator.runSelectedDetail(selection.key) }
+        finally { routineOccurrenceSyncManager.clearSelection(selectedGeneration) }
+    }
+    fun requestRoutineOccurrenceReplay() { routineOccurrenceRefreshCoordinator.requestOutboxReplay() }
+    suspend fun runForegroundRoutineOccurrenceSync() {
+        if (!itemProgressForegroundAllowed()) return
+        try { routineOccurrenceRefreshCoordinator.runForegroundActivation(foregroundNetworkReconnects(this)) }
+        finally { routineOccurrenceSyncManager.quarantineBindingState() }
+    }
+    suspend fun replayRoutineOccurrencesOwned(isCurrent: () -> Boolean = ::itemProgressForegroundAllowed, cold: Boolean = false): Boolean {
+        if (!isCurrent()) return false
+        val replayed = routineOccurrenceSyncManager.replay(isCurrent)
+        // A failed replay still permits bounded current history convergence while custody remains.
+        if (!routineOccurrenceSyncManager.refresh(isCurrent, cold)) return false
+        val ledger = plannerStore.state.value.routineOccurrenceLedger
+        if (ledger.needsRemoteScheduleCatchUp && ledger.pending.isEmpty() && ledger.minimumCatchUpRevisions.isEmpty()) {
+            // Historical publication recovery cannot acknowledge a newly observed lifecycle head.
+            if (plannerStore.state.value.pendingSchedulePublication != null &&
+                canonicalSyncManager.refreshAndCompose() != CanonicalRefreshOutcome.SUCCESS) return false
+            if (!routineOccurrenceSyncManager.catchUpSchedule(isCurrent) {
+                    canonicalSyncManager.refreshRoutineOccurrenceSchedule()
+                }) return false
+        }
+        return replayed && isCurrent()
     }
 
     private val habitInvalidationManagerDelegate = lazy {
@@ -1239,8 +1296,17 @@ class DayWeaveApplication : Application() {
         privatePresentationAllowed.set(false)
         if (itemProgressRefreshCoordinatorDelegate.isInitialized()) itemProgressRefreshCoordinator.cancelActiveSessions()
         if (itemCompletionRefreshCoordinatorDelegate.isInitialized()) itemCompletionRefreshCoordinator.cancelActiveSessions()
-        if (itemCompletionSyncManagerDelegate.isInitialized()) itemCompletionSyncManager.quarantineBindingState()
-        else plannerStore.invalidateItemCompletionReadProofs()
+        if (itemCompletionSyncManagerDelegate.isInitialized()) {
+            itemCompletionSyncManager.quarantineBindingState()
+        } else {
+            plannerStore.invalidateItemCompletionReadProofs()
+        }
+        if (routineOccurrenceRefreshCoordinatorDelegate.isInitialized()) routineOccurrenceRefreshCoordinator.cancelActiveSessions()
+        if (routineOccurrenceSyncManagerDelegate.isInitialized()) {
+            routineOccurrenceSyncManager.quarantineBindingState()
+        } else {
+            plannerStore.invalidateRoutineOccurrenceAuthority()
+        }
         if (energySignalManagerDelegate.isInitialized()) {
             energySignalManager.quarantineForPrivacyBoundary()
         }

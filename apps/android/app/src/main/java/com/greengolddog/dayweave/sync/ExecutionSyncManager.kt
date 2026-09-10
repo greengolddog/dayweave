@@ -633,6 +633,8 @@ class ExecutionSyncManager(
                             "The selected five-minute slot is too close for a fresh assessment.",
                         )
                     }
+                    val occurrenceGeneration = plannerStore.state.value.routineOccurrenceAuthorityGeneration
+                    require(!plannerStore.state.value.routineOccurrenceLedger.hasRecoveryCustody)
                     val assessment = transport.assessDefer(
                         configuration,
                         DeferAssessmentHttpRequest(
@@ -643,10 +645,12 @@ class ExecutionSyncManager(
                         ),
                     )
                     ensureConfigurationCurrent(configuration)
+                    require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == occurrenceGeneration)
                     val receipt = try {
                         plannerStore.recordExecutionDeferAssessment(
                             intent.sessionId,
                             assessment,
+                            expectedOccurrenceGeneration = occurrenceGeneration,
                         )
                     } catch (error: IllegalArgumentException) {
                         throw InvalidExecutionProtocolException(error)
@@ -654,6 +658,7 @@ class ExecutionSyncManager(
                     if (receipt == null || !receipt.awaitDurable()) {
                         throw LocalExecutionStorageException()
                     }
+                    require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == occurrenceGeneration)
                     updateConnected(
                         if (assessment.approvalRequired) {
                             "Move assessed · explicit approval is required"

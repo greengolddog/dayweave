@@ -49,6 +49,7 @@ sealed class RoutineOccurrenceApiException(message: String) : IOException(messag
 }
 
 interface RoutineOccurrenceTransport {
+    suspend fun lookup(configuration: AuthenticatedApiConfiguration, seriesItemId: String, occurrenceId: String): RoutineOccurrenceSnapshot
     suspend fun get(configuration: AuthenticatedApiConfiguration, instanceId: String): RoutineOccurrenceSnapshot
     suspend fun put(configuration: AuthenticatedApiConfiguration, instanceId: String, memberId: String, requestJson: String): RoutineOccurrenceMutationResult
     suspend fun list(configuration: AuthenticatedApiConfiguration, cursor: String? = null, limit: Int = 50): RoutineOccurrencePage
@@ -59,6 +60,22 @@ interface RoutineOccurrenceTransport {
 class OkHttpRoutineOccurrenceTransport(
     private val client: OkHttpClient = OkHttpCanonicalPlannerTransport.defaultClient(),
 ) : RoutineOccurrenceTransport {
+    override suspend fun lookup(configuration: AuthenticatedApiConfiguration, seriesItemId: String, occurrenceId: String): RoutineOccurrenceSnapshot = admittedIO {
+        verify {
+            requireCanonicalUuid(seriesItemId, "occurrence series")
+            requireCanonicalUuid(occurrenceId, "planner occurrence")
+            require(java.util.UUID.fromString(occurrenceId).version() == 5)
+        }
+        val builder = request(configuration, "lookup")
+        val url = builder.build().url.newBuilder().addQueryParameter("series_item_id", seriesItemId)
+            .addQueryParameter("occurrence_id", occurrenceId).build()
+        val (body, _) = execute(configuration, builder.url(url).get().build())
+        decode<RoutineOccurrenceSnapshot>(body).also { snapshot ->
+            verify { snapshot.requireValid(); require(snapshot.aggregate.manifest.seriesItemId == seriesItemId &&
+                snapshot.aggregate.manifest.occurrenceId == occurrenceId) }
+        }
+    }
+
     override suspend fun get(configuration: AuthenticatedApiConfiguration, instanceId: String): RoutineOccurrenceSnapshot = admittedIO {
         verify { requireCanonicalUuid(instanceId, "occurrence instance") }
         val (body, _) = execute(configuration, request(configuration, instanceId).get().build())

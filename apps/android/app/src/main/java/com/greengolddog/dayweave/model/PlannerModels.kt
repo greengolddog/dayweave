@@ -1185,6 +1185,7 @@ data class LocalScheduleCompositionProvenanceSnapshot(
     }.isSuccess
 
     fun matchesState(state: DayWeaveUiState): Boolean {
+        if (state.requiresRemoteRoutineOccurrenceComposition()) return false
         if (state.hasMemoizedLocalScheduleCompositionValidation(this)) return true
         if (!hasValidShape()) return false
         if (!state.scheduleCompositionProfile.hasValidShape()) return false
@@ -1388,6 +1389,8 @@ data class ScheduleCompositionProfileSnapshot(
 
 @Serializable
 private data class LocalScheduleMutableInputSnapshot(
+    val routineOccurrenceLedger: RoutineOccurrenceLedger,
+    val routineOccurrenceAuthorityGeneration: Long,
     val scheduleCompositionProfile: ScheduleCompositionProfileSnapshot,
     val canonicalItems: List<CanonicalItemSnapshot>,
     val schedule: List<ScheduleItem>,
@@ -1425,6 +1428,8 @@ fun DayWeaveUiState.localScheduleCompositionStateFingerprint(): String {
     localScheduleCompositionFingerprintMemo.get()?.let { return it }
     LOCAL_COMPOSITION_FINGERPRINT_COMPUTATIONS.incrementAndGet()
     val snapshot = LocalScheduleMutableInputSnapshot(
+        routineOccurrenceLedger = routineOccurrenceLedger,
+        routineOccurrenceAuthorityGeneration = routineOccurrenceAuthorityGeneration,
         scheduleCompositionProfile = scheduleCompositionProfile,
         canonicalItems = canonicalItems.sortedBy(CanonicalItemSnapshot::id),
         schedule = schedule,
@@ -2159,6 +2164,11 @@ data class DayWeaveUiState(
     val itemCompletionLedger: ItemCompletionLedger = ItemCompletionLedger(),
     /** Separate ledger-instance authority; never projects occurrence outcomes into templates. */
     val routineOccurrenceLedger: RoutineOccurrenceLedger = RoutineOccurrenceLedger(),
+    /** Runtime reads/privacy changes fence planning even when a remote review preserves status. */
+    @kotlinx.serialization.Transient
+    val routineOccurrenceAuthorityGeneration: Long = 0,
+    @kotlinx.serialization.Transient
+    val routineOccurrenceDeferAdmission: RoutineOccurrenceDeferAdmission? = null,
     /** Cache/restart can never mint a fresh completion GET permission. */
     @kotlinx.serialization.Transient
     val itemCompletionGetProofs: Map<String, ItemCompletionReadProof> = emptyMap(),
@@ -2291,6 +2301,8 @@ data class DayWeaveUiState(
     private fun hasSameLocalScheduleCompositionInputsByReference(
         previous: DayWeaveUiState,
     ): Boolean =
+        routineOccurrenceLedger === previous.routineOccurrenceLedger &&
+            routineOccurrenceAuthorityGeneration == previous.routineOccurrenceAuthorityGeneration &&
         scheduleCompositionProfile == previous.scheduleCompositionProfile &&
             canonicalItems === previous.canonicalItems &&
             schedule === previous.schedule &&
@@ -2616,7 +2628,7 @@ data class DayWeaveUiState(
         reference: Instant = Instant.now(),
         currentZone: ZoneId = ZoneId.systemDefault(),
     ): Boolean {
-        if (pendingSchedulePublication != null) return false
+        if (pendingSchedulePublication != null || routineOccurrenceLedger.hasRecoveryCustody) return false
         if (canonicalSyncOrigin == null) return true
         val effectiveZone = scheduleCompositionProfile.effectivePlanningZone(currentZone)
             ?: return false
@@ -2685,7 +2697,7 @@ data class DayWeaveUiState(
 
     /** Exact publication authority for one unchanged canonical server block. */
     fun hasPublishedExecutionAuthority(block: ScheduleItem): Boolean {
-        if (pendingSchedulePublication != null || block.sessionIndex == null) return false
+        if (pendingSchedulePublication != null || block.sessionIndex == null || routineOccurrenceLedger.hasRecoveryCustody) return false
         val proof = publishedScheduleProof ?: return false
         if (
             !proof.matchesCurrentStateAndPlan(this) ||

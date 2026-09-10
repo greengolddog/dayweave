@@ -8,6 +8,45 @@ import Testing
 @Suite("Foreground service coordination")
 @MainActor
 struct DayWeaveServiceCoordinatorTests {
+    @Test("occurrence recovery runs once before foreground composition and suspends at privacy boundaries")
+    func routineOccurrenceLifecycle() async {
+        let events = ServiceEventLog()
+        let occurrences = RoutineOccurrenceServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: ProposalRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: true,
+                reportedResult: true, events: events),
+            executionSync: ExecutionServiceDouble(events: events),
+            canonicalSync: CanonicalServiceDouble(events: events), routineOccurrences: occurrences)
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        #expect(events.values == ["occurrence.activate", "occurrence.replay",
+            "execution.refresh", "canonical.bootstrap", "canonical.poll", "execution.poll"])
+        coordinator.deactivate()
+        #expect(events.values.last == "occurrence.suspend")
+        #expect(!coordinator.servicesAreActive)
+    }
+
+    @Test("held occurrence recovery cannot resume execution after privacy deactivation")
+    func heldOccurrenceRecoveryStopsAtPrivacyBoundary() async {
+        let events = ServiceEventLog()
+        let occurrences = RoutineOccurrenceServiceDouble(events: events, holdReplay: true)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: ProposalRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: true,
+                reportedResult: true, events: events),
+            executionSync: ExecutionServiceDouble(events: events),
+            canonicalSync: CanonicalServiceDouble(events: events), routineOccurrences: occurrences)
+        coordinator.activate()
+        await occurrences.waitUntilHeld()
+        coordinator.deactivate()
+        let stoppedEvents = events.values
+        occurrences.release()
+        await Task.yield()
+        #expect(!coordinator.servicesAreActive)
+        #expect(events.values == stoppedEvents)
+        #expect(!events.values.contains("execution.refresh"))
+    }
+
     @Test("startup recovers proposal and Google outbound journals before reconciliation")
     func startupRecoversPendingJournalsInOrder() async {
         let events = ServiceEventLog()
@@ -422,6 +461,33 @@ private final class ProgressServiceDouble: ItemProgressServiceSynchronizing {
     func activate() { events.values.append("progress.activate") }
     func suspendForPrivacyBoundary() { events.values.append("progress.suspend") }
     func replayPending() async -> Bool { events.values.append("progress.replay"); return true }
+}
+
+@MainActor
+private final class RoutineOccurrenceServiceDouble: RoutineOccurrenceServiceSynchronizing {
+    private let events: ServiceEventLog
+    private let holdReplay: Bool
+    private var held: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+
+    init(events: ServiceEventLog, holdReplay: Bool = false) { self.events = events; self.holdReplay = holdReplay }
+    func activate() { events.values.append("occurrence.activate") }
+    func suspendForPrivacyBoundary() { events.values.append("occurrence.suspend") }
+    func replayPending() async -> Bool {
+        events.values.append("occurrence.replay")
+        if holdReplay {
+            await withCheckedContinuation { continuation in
+                held = continuation
+                let waiting = entered; entered = nil; waiting?.resume()
+            }
+        }
+        return true
+    }
+    func waitUntilHeld() async {
+        if held != nil { return }
+        await withCheckedContinuation { entered = $0 }
+    }
+    func release() { let continuation = held; held = nil; continuation?.resume() }
 }
 
 @MainActor

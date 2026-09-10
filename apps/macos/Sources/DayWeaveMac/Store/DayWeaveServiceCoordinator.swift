@@ -18,6 +18,14 @@ protocol ItemCompletionServiceSynchronizing: AnyObject {
 extension ItemCompletionStore: ItemCompletionServiceSynchronizing {}
 
 @MainActor
+protocol RoutineOccurrenceServiceSynchronizing: AnyObject {
+    func activate()
+    func suspendForPrivacyBoundary()
+    @discardableResult func replayPending() async -> Bool
+}
+extension RoutineOccurrenceStore: RoutineOccurrenceServiceSynchronizing {}
+
+@MainActor
 protocol ProposalApplicationRecovering: AnyObject {
     var hasPendingRecovery: Bool { get }
 
@@ -97,6 +105,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     private let habitSync: (any HabitServiceSynchronizing)?
     private let itemProgress: (any ItemProgressServiceSynchronizing)?
     private let itemCompletion: (any ItemCompletionServiceSynchronizing)?
+    private let routineOccurrences: (any RoutineOccurrenceServiceSynchronizing)?
     private var activationTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     // A blocked startup is inactive but still has foreground permission.
@@ -111,7 +120,8 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         canonicalSync: any CanonicalServiceSynchronizing,
         habitSync: (any HabitServiceSynchronizing)? = nil,
         itemProgress: (any ItemProgressServiceSynchronizing)? = nil,
-        itemCompletion: (any ItemCompletionServiceSynchronizing)? = nil
+        itemCompletion: (any ItemCompletionServiceSynchronizing)? = nil,
+        routineOccurrences: (any RoutineOccurrenceServiceSynchronizing)? = nil
     ) {
         self.proposalApplications = proposalApplications
         self.googleOutbound = googleOutbound
@@ -121,6 +131,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         self.habitSync = habitSync
         self.itemProgress = itemProgress
         self.itemCompletion = itemCompletion
+        self.routineOccurrences = routineOccurrences
     }
 
     func activate() {
@@ -146,6 +157,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         habitSync?.suspendForPrivacyBoundary()
         itemProgress?.suspendForPrivacyBoundary()
         itemCompletion?.suspendForPrivacyBoundary()
+        routineOccurrences?.suspendForPrivacyBoundary()
     }
 
     /// Resolves a user-visible pending journal and resumes the full foreground
@@ -236,6 +248,9 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         guard operationIsCurrent(generation) else { return false }
         itemCompletion?.activate()
         _ = await itemCompletion?.replayPending()
+        guard operationIsCurrent(generation) else { return false }
+        routineOccurrences?.activate()
+        _ = await routineOccurrences?.replayPending()
         guard operationIsCurrent(generation) else { return false }
         let executionOutcome = await executionSync.refresh()
         guard operationIsCurrent(generation) else { return false }

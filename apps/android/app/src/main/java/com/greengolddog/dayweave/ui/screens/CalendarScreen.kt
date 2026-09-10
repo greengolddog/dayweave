@@ -25,6 +25,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import com.greengolddog.dayweave.sync.RoutineOccurrenceSelection
+import com.greengolddog.dayweave.ui.authoring.routineOccurrenceSelection
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
@@ -57,6 +60,7 @@ fun CalendarScreen(
     reference: Instant,
     currentZone: ZoneId,
     modifier: Modifier = Modifier,
+    onReviewOccurrence: ((RoutineOccurrenceSelection) -> Unit)? = null,
 ) {
     val use24HourFormat = DateFormat.is24HourFormat(LocalContext.current)
     val isCurrentPlan = state.isCanonicalPlanCurrent(reference, currentZone)
@@ -110,6 +114,19 @@ fun CalendarScreen(
                     contentDescription = "Firm schedule preview",
                     tint = MaterialTheme.colorScheme.secondary,
                 )
+            }
+        }
+
+        if (onReviewOccurrence != null && state.routineOccurrenceLedger.observations.isNotEmpty() &&
+            state.routineOccurrenceLedger.syncOrigin == state.canonicalSyncOrigin &&
+            state.routineOccurrenceLedger.configurationId == state.canonicalConfigurationId) {
+            item { Text("Private occurrence history", style = MaterialTheme.typography.titleMedium) }
+            items(state.routineOccurrenceLedger.observations.values.toList(), key = { it.snapshot.aggregate.manifest.id }) { observation ->
+                val manifest = observation.snapshot.aggregate.manifest
+                TextButton(onClick = { onReviewOccurrence(RoutineOccurrenceSelection(manifest.seriesItemId, manifest.occurrenceId)) }) {
+                    Text(if (state.routineOccurrenceLedger.pending.any { it.instanceId == manifest.id })
+                        "Review saved occurrence change" else "Open protected occurrence history")
+                }
             }
         }
 
@@ -213,6 +230,11 @@ fun CalendarScreen(
                                 modifier = Modifier.size(16.dp),
                                 tint = MaterialTheme.colorScheme.tertiary,
                             )
+                        }
+                    }
+                    state.routineOccurrenceSelection(item)?.let { selection ->
+                        if (onReviewOccurrence != null) TextButton(onClick = { onReviewOccurrence(selection) }) {
+                            Text("Review this occurrence")
                         }
                     }
                 }

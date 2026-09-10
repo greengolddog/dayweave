@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.ItemCompletionLedger
 import com.greengolddog.dayweave.model.ItemCompletionObservation
 import com.greengolddog.dayweave.model.ItemCompletionReadProof
 import com.greengolddog.dayweave.model.completionLocalEvidence
+import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
 import com.greengolddog.dayweave.model.hasQualifiedCompletedParent
 import com.greengolddog.dayweave.model.withCompletionObservation
 import com.greengolddog.dayweave.network.ItemCompletionTransport
@@ -191,6 +192,7 @@ class CanonicalSyncManager(
 ) {
     private val operationMutex = Mutex()
     private val focusTransitionMutex = Mutex()
+    private var latestFreshOccurrenceScheduleWitness: RoutineOccurrenceRemoteScheduleWitness? = null
     private val mutableState = MutableStateFlow(stateFrom(credentialStore.snapshot()))
     private val mutationJson = Json {
         encodeDefaults = true
@@ -316,6 +318,18 @@ class CanonicalSyncManager(
             }
         }
         change()
+    }
+
+    /** Receipt recovery/current-head reads cannot produce this process-local fresh-compose witness. */
+    suspend fun refreshRoutineOccurrenceSchedule(): RoutineOccurrenceRemoteScheduleWitness? {
+        val generation = plannerStore.state.value.routineOccurrenceAuthorityGeneration
+        val previousOperation = latestFreshOccurrenceScheduleWitness?.operationId
+        if (refreshAndCompose() != CanonicalRefreshOutcome.SUCCESS) return null
+        return latestFreshOccurrenceScheduleWitness?.takeIf {
+            it.authorityGeneration == generation && it.operationId != previousOperation &&
+                plannerStore.state.value.routineOccurrenceAuthorityGeneration == generation &&
+                plannerStore.state.value.publishedScheduleProof?.revision?.id == it.publicationId
+        }
     }
 
     suspend fun refreshAndCompose(): CanonicalRefreshOutcome {
@@ -794,6 +808,9 @@ class CanonicalSyncManager(
         origin: String,
         configurationId: String,
     ) {
+        if (expected.requiresRemoteRoutineOccurrenceComposition()) {
+            throw LocalCompositionUnavailableException("Recurring work requires a fresh remote composition.")
+        }
         if (durable == null || durable != expected) {
             throw LocalCompositionUnavailableException(
                 "Wait for encrypted planner changes to finish saving, then compose again.",
@@ -882,6 +899,7 @@ class CanonicalSyncManager(
         forceCanonicalRebuild: Boolean = false,
     ): AcceptedCanonicalPreview {
         for (attempt in 1..MAX_SNAPSHOT_ATTEMPTS) {
+            val occurrenceGeneration = plannerStore.state.value.routineOccurrenceAuthorityGeneration
             val canonical = loadDelta(configuration, forceCanonicalRebuild)
             val profile = plannerStore.state.value.scheduleCompositionProfile
             if (!profile.hasValidShape()) throw RemotePlannerMappingException()
@@ -894,6 +912,7 @@ class CanonicalSyncManager(
             )
             val preview = transport.preview(configuration, request)
             ensureConfigurationCurrent(configuration)
+            require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == occurrenceGeneration)
             try {
                 val update = mapPreview(
                     preview = preview,
@@ -906,7 +925,7 @@ class CanonicalSyncManager(
                     expectedHorizonEnd = parseTimestamp(request.horizonEnd).toInstant(),
                     availability = request.availability,
                 ).copy(configurationId = configuration.configurationId, recentlyDeleted = canonical.deleted)
-                return AcceptedCanonicalPreview(request, update)
+                return AcceptedCanonicalPreview(request, update, occurrenceGeneration)
             } catch (error: RemoteSnapshotChangedException) {
                 if (attempt == MAX_SNAPSHOT_ATTEMPTS) throw error
                 // Neither transient delta nor preview has touched durable state. Pull again from
@@ -1302,6 +1321,7 @@ class CanonicalSyncManager(
         accepted: AcceptedCanonicalPreview,
     ): CanonicalPlanUpdate {
         ensureConfigurationCurrent(configuration)
+        require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == accepted.occurrenceGeneration)
         if (accepted.update.recentlyDeleted.isNotEmpty()) {
             // The candidate's read-only tombstones are not part of its frozen wire schema.
             // Save the complete admitted preflight before staging so a restarted first send
@@ -1333,22 +1353,33 @@ class CanonicalSyncManager(
             throw SchedulePublicationContractException(error)
         }
         val staged = try {
+            require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == accepted.occurrenceGeneration)
             plannerStore.stageSchedulePublication(pending)
         } catch (error: IllegalArgumentException) {
             throw CanonicalConfigurationChangedException()
         }
         if (staged == null || !staged.awaitDurable()) throw LocalPlannerStorageException()
         ensureConfigurationCurrent(configuration)
+        require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == accepted.occurrenceGeneration)
         if (plannerStore.state.value.pendingSchedulePublication != pending) {
             throw CanonicalConfigurationChangedException()
         }
-        return resumeSchedulePublication(configuration, pending)
+        val update = resumeSchedulePublication(configuration, pending)
+        val current = plannerStore.state.value
+        if (current.routineOccurrenceAuthorityGeneration == accepted.occurrenceGeneration && current.pendingSchedulePublication == null) {
+            current.publishedScheduleProof?.let { proof ->
+                latestFreshOccurrenceScheduleWitness = RoutineOccurrenceRemoteScheduleWitness(accepted.occurrenceGeneration,
+                    proof.revision.id, pending.idempotencyKey, configuration.baseUrl.toString(), requireNotNull(configuration.configurationId))
+            }
+        }
+        return update
     }
 
     private suspend fun resumeSchedulePublication(
         configuration: AuthenticatedApiConfiguration,
         pending: PendingSchedulePublication,
     ): CanonicalPlanUpdate {
+        val occurrenceGeneration = plannerStore.state.value.routineOccurrenceAuthorityGeneration
         try {
             plannerStore.validateSchedulePublication(pending)
         } catch (error: IllegalArgumentException) {
@@ -1373,6 +1404,7 @@ class CanonicalSyncManager(
             throw CanonicalConfigurationChangedException()
         }
         val revision = validateSchedulePublishResponse(pending, response, receivedAt)
+        require(plannerStore.state.value.routineOccurrenceAuthorityGeneration == occurrenceGeneration)
         if (response.replayed) {
             val resolved = try {
                 plannerStore.resolveReplayedSchedulePublication(pending, revision)
@@ -4644,6 +4676,7 @@ class CanonicalSyncManager(
     private data class AcceptedCanonicalPreview(
         val request: SchedulePreviewRequest,
         val update: CanonicalPlanUpdate,
+        val occurrenceGeneration: Long,
     )
 
     private data class CanonicalAuthoringPushSummary(

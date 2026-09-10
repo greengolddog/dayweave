@@ -377,6 +377,7 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var itemCompletionEvidenceGeneration: UInt64 = 0
+    @Published private(set) var routineOccurrencePlanningGeneration: UInt64 = 0
     @Published private(set) var itemCompletionReadAdmissions: [UUID: ItemCompletionReadAdmission] = [:]
     @Published private(set) var canonicalDeltaCursor: String? {
         didSet { if oldValue != canonicalDeltaCursor { invalidateItemCompletionReadEvidence() }; scheduleAutosave() }
@@ -1032,6 +1033,36 @@ final class PlannerStore: ObservableObject {
             routineOccurrenceState = prior
             throw persistenceError
         }
+        if replacement != prior {
+            // Acknowledging an already completed fresh composition must not
+            // invalidate the very publication which discharged this latch.
+            var acknowledged = prior
+            acknowledged.needsRemoteScheduleCatchUp = false
+            if replacement == acknowledged && prior.needsRemoteScheduleCatchUp {
+                routineOccurrencePlanningGeneration &+= 1
+            } else {
+                let changed = replacement.observations.map(\.snapshot) != prior.observations.map(\.snapshot)
+                    || replacement.journals != prior.journals
+                    || replacement.minimumCatchUpRevisions != prior.minimumCatchUpRevisions
+                    || replacement.terminalDeltaCursor != prior.terminalDeltaCursor
+                    || replacement.needsRemoteScheduleCatchUp != prior.needsRemoteScheduleCatchUp
+                invalidateRoutineOccurrencePlanningEvidence(authorityChanged: changed)
+            }
+        }
+    }
+
+    /// V1 has no authenticated current-source occurrence witness. Historical
+    /// manifests, cache size and opaque cursors never supply that authority.
+    var requiresRemoteRoutineOccurrenceComposition: Bool {
+        !routineOccurrenceState.observations.isEmpty || routineOccurrenceState.hasUnresolvedCustody
+            || canonicalItems.contains {
+                $0.deletedAt == nil && ($0.kind == .task || $0.kind == .routine) && $0.recurrence != nil
+            }
+    }
+
+    func invalidateRoutineOccurrencePlanningEvidence(authorityChanged: Bool = false) {
+        routineOccurrencePlanningGeneration &+= 1
+        if authorityChanged || localScheduleCompositionProvenance != nil { invalidateCanonicalPreview() }
     }
 
     func invalidateItemCompletionReadEvidence() {
@@ -1209,6 +1240,16 @@ final class PlannerStore: ObservableObject {
               pendingProposalApplicationMutation == nil,
               googleOutboundRecoveryJournal == nil,
               !hasGoogleSchedulePublicationAuthorityFence else { return false }
+        isCanonicalSyncLocked = true
+        return true
+    }
+
+    /// Private occurrence reads and submitted exact retries retain their own
+    /// custody even while an unrelated authoring or Defer intent is pending.
+    /// Fresh occurrence writes additionally require the live review gates.
+    @discardableResult
+    func beginRoutineOccurrenceSync() -> Bool {
+        guard canPersistPlan, !isCanonicalSyncLocked else { return false }
         isCanonicalSyncLocked = true
         return true
     }
@@ -1399,6 +1440,9 @@ final class PlannerStore: ObservableObject {
     }
 
     var canonicalPreviewFreshnessIssue: String? {
+        if routineOccurrenceState.hasUnresolvedCustody {
+            return "Synchronize occurrence history and a fresh remote schedule before changing schedule blocks."
+        }
         guard isCanonicalPreviewValidatedForCurrentLaunch else {
             return "Sync or compose on this device in this app session before changing canonical schedule blocks."
         }
@@ -1409,6 +1453,9 @@ final class PlannerStore: ObservableObject {
         let timezoneName: String
         let requiresLocalProfileTimezone: Bool
         if let provenance = localScheduleCompositionProvenance {
+            guard !requiresRemoteRoutineOccurrenceComposition else {
+                return "Recurring tasks and routines require remote composition with current occurrence evidence. Use Sync."
+            }
             guard schedulePreviewProvenance == nil,
                   provenance.hasValidShape,
                   provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
@@ -3551,7 +3598,8 @@ final class PlannerStore: ObservableObject {
         guard hasEncryptedPersistence, canPersistPlan else {
             throw PlannerLocalCompositionError.encryptedPersistenceRequired
         }
-        guard isCanonicalSyncLocked, pendingSchedulePublication == nil else {
+        guard isCanonicalSyncLocked, pendingSchedulePublication == nil,
+              !requiresRemoteRoutineOccurrenceComposition else {
             throw PlannerLocalCompositionError.mutationFenceUnavailable
         }
         let currentRevisions = Dictionary(

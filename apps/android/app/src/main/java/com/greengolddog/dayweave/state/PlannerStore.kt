@@ -63,6 +63,9 @@ import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
+import com.greengolddog.dayweave.model.fenceRoutineOccurrenceAuthority
+import com.greengolddog.dayweave.model.RoutineOccurrenceDeferAdmission
+import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.SuggestionDisposition
@@ -434,7 +437,7 @@ class PlannerStore(
     private val canonicalTrashCleanupScheduler = cleanupScheduler
         ?: scope?.let(::CoroutineCanonicalTrashCleanupScheduler)
     private val mutableState = MutableStateFlow(
-        initialState
+        initialState.copy(routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0)
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
@@ -3661,6 +3664,15 @@ class PlannerStore(
     }
 
     /** Exact encrypted save of the occurrence sidecar; canonical templates/lifecycle stay separate. */
+    internal fun invalidateRoutineOccurrenceAuthority() = synchronized(persistenceLock) {
+        mutableState.value = mutableState.value.copy(
+            routineOccurrenceAuthorityGeneration = Math.addExact(mutableState.value.routineOccurrenceAuthorityGeneration, 1),
+            routineOccurrenceDeferAdmission = null,
+            localScheduleCompositionProvenance = null,
+            pendingSchedulePublicationInvalidated = mutableState.value.pendingSchedulePublicationInvalidated || mutableState.value.pendingSchedulePublication != null,
+            pendingExecutionDeferIntent = mutableState.value.pendingExecutionDeferIntent?.copy(assessment = null, approvedAssessmentDigest = null))
+    }
+
     internal fun mutateRoutineOccurrences(
         update: (DayWeaveUiState) -> RoutineOccurrenceLedger,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
@@ -5209,12 +5221,19 @@ class PlannerStore(
     fun recordExecutionDeferAssessment(
         sessionId: String,
         assessment: ExecutionDeferAssessmentSnapshot,
+        expectedOccurrenceGeneration: Long? = null,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
         val intent = current.pendingExecutionDeferIntent
             ?: throw IllegalArgumentException("No move-later intent is pending")
         require(intent.sessionId == sessionId) { "A different move-later intent is pending" }
-        current.requireCurrentExecutionDeferAssessment(intent, assessment, requireFresh = true)
-        current.copy(
+        val admitted = if (current.requiresRemoteRoutineOccurrenceComposition()) {
+            require(expectedOccurrenceGeneration == current.routineOccurrenceAuthorityGeneration)
+            current.copy(routineOccurrenceDeferAdmission = RoutineOccurrenceDeferAdmission(assessment.assessmentDigest,
+                requireNotNull(expectedOccurrenceGeneration), assessment.sourceScheduleRevisionId,
+                current.canonicalSyncOrigin, current.canonicalConfigurationId))
+        } else current
+        admitted.requireCurrentExecutionDeferAssessment(intent, assessment, requireFresh = true)
+        admitted.copy(
             pendingExecutionDeferIntent = intent.copy(
                 assessment = assessment,
                 // A replacement response never inherits approval, even if another assessment had
@@ -7391,6 +7410,14 @@ class PlannerStore(
         assessment: ExecutionDeferAssessmentSnapshot,
         requireFresh: Boolean,
     ) {
+        require(!routineOccurrenceLedger.hasRecoveryCustody) { "Occurrence history requires remote schedule catch-up" }
+        if (requireFresh && requiresRemoteRoutineOccurrenceComposition()) {
+            require(routineOccurrenceDeferAdmission == RoutineOccurrenceDeferAdmission(assessment.assessmentDigest,
+                routineOccurrenceAuthorityGeneration, assessment.sourceScheduleRevisionId, canonicalSyncOrigin, canonicalConfigurationId)) {
+                "A fresh remote occurrence-aware move assessment is required"
+            }
+            require(publishedScheduleProof?.revision?.id == assessment.sourceScheduleRevisionId)
+        }
         fun requireUuid(raw: String) {
             val parsed = UUID.fromString(raw)
             require(parsed != NIL_UUID && parsed.toString() == raw)
@@ -7742,6 +7769,7 @@ class PlannerStore(
         transformed.inheritLocalScheduleCompositionMemo(previous)
         transformed.inheritPublishedScheduleValidationMemo(previous)
         val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned().fenceCompletionEvidence(previous)
+            .fenceRoutineOccurrenceAuthority(previous)
             .also {
                 requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations)
                 if (it.routineOccurrenceLedger !== previous.routineOccurrenceLedger ||
@@ -7804,7 +7832,8 @@ class PlannerStore(
 
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
-            val snapshot = (persistedState ?: initialState).copy(itemCompletionGetProofs = emptyMap(), itemCompletionEvidenceGeneration = 0)
+            val snapshot = (persistedState ?: initialState).copy(itemCompletionGetProofs = emptyMap(), itemCompletionEvidenceGeneration = 0,
+                routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0)
                 .withCanonicalTrashRetention(nowEpochMillis())
                 .withPendingSensitivityHardened()
                 .withInvalidRecurrenceMoveSourcesAbandoned()

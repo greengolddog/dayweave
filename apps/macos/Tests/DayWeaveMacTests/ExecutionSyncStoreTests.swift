@@ -1064,6 +1064,139 @@ struct ExecutionSyncStoreTests {
         #expect(relaunched.executionState.terminalOutcomes[paused.id]?.session == deferred)
     }
 
+    @Test("managed recurring Defer loses review permission after a read boundary or restart", arguments: [false, true])
+    func managedDeferRequiresFreshApprovalAfterAuthorityBoundary(restart: Bool) async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_246))
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        let original = Self.deferAssessment(session: paused, executionRevision: paused.revision,
+            moveStart: moveStart, digestByte: "d", approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300))
+        let replacement = Self.deferAssessment(session: paused, executionRevision: paused.revision,
+            moveStart: moveStart, digestByte: "e", approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300))
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block(); block.status = .paused
+        var recurring = try Self.canonicalItem()
+        recurring.recurrence = .object(["type": .string("daily")])
+        let planner = Self.planner(persistence: context.persistence, blocks: [block],
+            canonicalItems: [recurring], executionState: durable)
+        #expect(planner.requiresRemoteRoutineOccurrenceComposition)
+        let transport = ExecutionTransportDouble(snapshots: [], pages: [],
+            assessmentReplies: [.assessment(original), .assessment(replacement)])
+        let sync = Self.controller(planner: planner, transport: transport)
+
+        #expect(await sync.deferWork(Self.blockID, moveStart: moveStart) == .approvalRequired)
+        #expect(sync.pendingDeferApproval == original)
+        if restart {
+            // Model a crash after durable approval but before any command bytes
+            // exist. Persisted consent cannot recreate process-local admission.
+            let intent = try #require(planner.pendingExecutionDeferIntent)
+            let approved = try #require(intent.approvingAssessment(digest: original.assessmentDigest))
+            try planner.persistExecutionDeferIntent(approved)
+        } else {
+            planner.invalidateRoutineOccurrencePlanningEvidence()
+        }
+        let currentPlanner = restart
+            ? PlannerStore(persistence: context.persistence, now: { Self.baseDate }) : planner
+        let currentSync = restart ? Self.controller(planner: currentPlanner, transport: transport) : sync
+        #expect(currentPlanner.persistenceError == nil)
+        #expect(currentPlanner.requiresRemoteRoutineOccurrenceComposition)
+        #expect(currentPlanner.pendingExecutionDeferIntent?.assessment == original)
+        #expect(currentSync.pendingDeferApproval == nil)
+
+        #expect(await currentSync.approveDeferredWork(Self.blockID,
+            assessmentDigest: original.assessmentDigest) == .approvalRequired)
+        #expect(currentPlanner.pendingExecutionDeferIntent?.assessment == replacement)
+        #expect(currentPlanner.pendingExecutionDeferIntent?.approvedAssessmentDigest == nil)
+        #expect(currentSync.pendingDeferApproval == replacement)
+        #expect(currentPlanner.executionState.pendingCommand == nil)
+        #expect(currentPlanner.executionState.activeSession == paused)
+        #expect(await transport.receivedCommands().isEmpty)
+        #expect(await transport.receivedAssessmentRequests().count == 2)
+        #expect(try context.persistence.load()?.pendingExecutionDeferIntent == currentPlanner.pendingExecutionDeferIntent)
+    }
+
+    @Test("managed recurring Defer keeps submitted bytes through occurrence catch-up and expired restart")
+    func managedDeferSubmittedReplaySurvivesOccurrenceInvalidation() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_247))
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        let assessment = Self.deferAssessment(session: paused, executionRevision: paused.revision,
+            moveStart: moveStart, digestByte: "e", approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300))
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block(); block.status = .paused
+        var recurring = try Self.canonicalItem()
+        recurring.recurrence = .object(["type": .string("daily")])
+        let planner = Self.planner(persistence: context.persistence, blocks: [block],
+            canonicalItems: [recurring], executionState: durable)
+        #expect(planner.requiresRemoteRoutineOccurrenceComposition)
+        let pausedSnapshot = DayWeaveExecutionSnapshot(revision: paused.revision, activeSession: paused)
+        let firstTransport = ExecutionTransportDouble(snapshots: [pausedSnapshot, pausedSnapshot],
+            pages: [.init(sessions: [paused], nextOffset: nil)],
+            commandReplies: [.failure(.transport(.networkConnectionLost))],
+            assessmentReplies: [.assessment(assessment)])
+        // The same controller owns the fresh assessment and its first send.
+        let firstSync = Self.controller(planner: planner, transport: firstTransport)
+        #expect(await firstSync.deferWork(Self.blockID, moveStart: moveStart) == .approvalRequired)
+        #expect(await firstSync.approveDeferredWork(Self.blockID,
+            assessmentDigest: assessment.assessmentDigest) == .transientNetworkFailure)
+        let sent = try #require((await firstTransport.receivedCommands()).first)
+        let pending = try #require(planner.executionState.pendingCommand)
+        #expect(pending.encodedRequest == sent.body)
+        #expect(planner.pendingExecutionDeferIntent?.approvedAssessmentDigest == assessment.assessmentDigest)
+
+        // A separate occurrence head may advance while the Defer reply is
+        // ambiguous. Its durable latch revokes fresh review, not exact custody.
+        let occurrenceState = RoutineOccurrenceState(configurationIdentifier: Self.canonicalConfiguration,
+            observations: [.init(snapshot: RoutineOccurrenceTestFixtures.snapshot(), observedAt: Self.baseDate)],
+            terminalDeltaCursor: "synthetic-managed-defer-terminal", needsRemoteScheduleCatchUp: true)
+        try planner.commitRoutineOccurrenceState(occurrenceState, replacing: .empty)
+        planner.invalidateRoutineOccurrencePlanningEvidence()
+        #expect(planner.executionState.pendingCommand == pending)
+        let expiredNow = assessment.expiresAt.addingTimeInterval(1)
+        let restored = PlannerStore(persistence: context.persistence, now: { expiredNow })
+        #expect(restored.persistenceError == nil)
+        #expect(restored.requiresRemoteRoutineOccurrenceComposition)
+        #expect(restored.routineOccurrenceState == occurrenceState)
+        #expect(restored.executionState.pendingCommand?.encodedRequest == sent.body)
+        let deferredAt = paused.updatedAt.addingTimeInterval(1)
+        let deferred = try Self.session(id: paused.id, status: .deferred, revision: paused.revision + 1,
+            sessionIndex: paused.sessionIndex, plannedBlockID: Self.blockID, startedAt: paused.startedAt,
+            updatedAt: deferredAt, accumulatedSeconds: paused.accumulatedSeconds,
+            actualSeconds: assessment.actualSeconds, runningSince: nil, pausedAt: paused.pausedAt,
+            pauseUntil: nil, moveStart: assessment.moveStart, moveEnd: assessment.moveEnd, endedAt: deferredAt)
+        let deferredSnapshot = DayWeaveExecutionSnapshot(revision: paused.revision + 1, activeSession: nil)
+        let replayTransport = ExecutionTransportDouble(snapshots: [deferredSnapshot, deferredSnapshot],
+            pages: [.init(sessions: [deferred], nextOffset: nil)],
+            commandReplies: [.mutation(try Self.mutation(revision: paused.revision + 1,
+                active: nil, changed: deferred, replayed: true))])
+        let replaySync = Self.controller(planner: restored, transport: replayTransport, now: { expiredNow })
+
+        #expect(replaySync.pendingDeferApproval == nil)
+        #expect(await replaySync.refresh() == .success)
+        #expect(await replayTransport.receivedCommands() == [sent])
+        #expect(await replayTransport.receivedAssessmentRequests().isEmpty)
+        #expect(restored.executionState.pendingCommand == nil)
+        #expect(restored.pendingExecutionDeferIntent == nil)
+        #expect(restored.executionState.terminalOutcomes[paused.id]?.session == deferred)
+        #expect(restored.routineOccurrenceState == occurrenceState)
+        #expect(try context.persistence.load()?.routineOccurrenceState == occurrenceState)
+    }
+
     @Test("a lost Defer response replays exact bytes after relaunch and closes the saved move")
     func lostDeferResponseReplaysExactlyAfterRelaunch() async throws {
         let context = try Self.persistenceContext()

@@ -16,6 +16,26 @@ const val MAX_ROUTINE_OCCURRENCE_TERMINAL_PAGES = 128
 const val MAX_ROUTINE_OCCURRENCE_TERMINAL_BYTES = 32 * 1024 * 1024
 const val MAX_ROUTINE_OCCURRENCE_TERMINAL_MEMBER_VISITS = 40_000
 
+/** A live remote Defer assessment; never serialized or rebuilt from a saved approval. */
+data class RoutineOccurrenceDeferAdmission(val assessmentDigest: String, val authorityGeneration: Long,
+    val publicationId: String, val syncOrigin: String?, val configurationId: String?)
+
+/** Helper v1 has no authenticated current-source lifecycle witness. Never synthesize one. */
+internal fun DayWeaveUiState.requiresRemoteRoutineOccurrenceComposition(): Boolean =
+    routineOccurrenceLedger.observations.isNotEmpty() ||
+        routineOccurrenceLedger.hasRecoveryCustody || canonicalItems.any {
+            it.deletedAt == null && it.kind in setOf("task", "routine") && it.recurrenceJson != null
+        }
+
+internal fun DayWeaveUiState.fenceRoutineOccurrenceAuthority(previous: DayWeaveUiState): DayWeaveUiState {
+    if (routineOccurrenceLedger == previous.routineOccurrenceLedger) return this
+    return copy(routineOccurrenceAuthorityGeneration = Math.addExact(previous.routineOccurrenceAuthorityGeneration, 1),
+        routineOccurrenceDeferAdmission = null,
+        localScheduleCompositionProvenance = null,
+        pendingExecutionDeferIntent = pendingExecutionDeferIntent?.copy(assessment = null, approvedAssessmentDigest = null),
+        pendingSchedulePublicationInvalidated = pendingSchedulePublicationInvalidated || pendingSchedulePublication != null)
+}
+
 @Serializable
 enum class RoutineOccurrenceDisposition { PENDING, REVIEW_REQUIRED, INSTANCE_MISSING, REJECTED }
 
@@ -231,7 +251,9 @@ internal fun RoutineOccurrenceLedger.installRoutineOccurrenceTerminal(
     startingCursor: String? = expected.deltaCursor,
 ): RoutineOccurrenceLedger {
     requireValid(); require(this == expected && syncOrigin != null)
-    require(startingCursor == expected.deltaCursor && isCurrentList == (startingCursor == null))
+    // A cold current-state recovery may begin at null while retaining an old terminal cursor.
+    // The old checkpoint remains durable until this complete replacement chain is admitted.
+    require(if (isCurrentList) startingCursor == null else startingCursor != null && startingCursor == expected.deltaCursor)
     require(pages.size in 1..MAX_ROUTINE_OCCURRENCE_TERMINAL_PAGES)
     // Bound the entire supplied wire chain before semantic merge or the cross-page instance map.
     var memberVisits = 0L
@@ -328,7 +350,7 @@ private fun requireRoutineBinding(origin: String, configuration: String) {
 
 /** Counts serialized UTF-8 without allocating a whole extra copy of the protected ledger. */
 @OptIn(ExperimentalSerializationApi::class)
-private fun <T> routineStateEncodedBytes(serializer: SerializationStrategy<T>, value: T, maximum: Int): Long {
+internal fun <T> routineStateEncodedBytes(serializer: SerializationStrategy<T>, value: T, maximum: Int): Long {
     var size = 0L
     val output = object : OutputStream() {
         override fun write(value: Int) { add(1) }

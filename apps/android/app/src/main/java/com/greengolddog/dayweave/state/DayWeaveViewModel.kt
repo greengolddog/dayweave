@@ -117,6 +117,29 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val itemProgressSyncState = itemProgressSyncManager.state
     private val itemCompletionSyncManager get() = dayWeaveApplication.itemCompletionSyncManager
     val itemCompletionSyncState = itemCompletionSyncManager.state
+    private val routineOccurrenceSyncManager get() = dayWeaveApplication.routineOccurrenceSyncManager
+    val routineOccurrenceSyncState = routineOccurrenceSyncManager.state
+    suspend fun observeRoutineOccurrence(selection: com.greengolddog.dayweave.sync.RoutineOccurrenceSelection) =
+        dayWeaveApplication.observeSelectedRoutineOccurrence(selection)
+    suspend fun collectForegroundRoutineOccurrences() = dayWeaveApplication.runForegroundRoutineOccurrenceSync()
+    fun replayRoutineOccurrences(cold: Boolean = false): Boolean {
+        dayWeaveApplication.requestRoutineOccurrenceReplay()
+        return dayWeaveApplication.launchCanonicalAction { dayWeaveApplication.replayRoutineOccurrencesOwned(cold = cold) }
+    }
+    suspend fun saveRoutineOccurrence(selection: com.greengolddog.dayweave.sync.RoutineOccurrenceSelection,
+        reviewed: com.greengolddog.dayweave.model.RoutineOccurrenceSnapshot, memberId: String,
+        action: com.greengolddog.dayweave.model.RoutineOccurrenceAction,
+    ): Boolean {
+        val work = dayWeaveApplication.launchCanonicalResultAction { routineOccurrenceSyncManager.stage(selection, reviewed, memberId, action) }
+            ?: return false
+        val saved = work.await()
+        if (saved) replayRoutineOccurrences()
+        return saved
+    }
+    fun discardRoutineOccurrence(operationId: String): Boolean = dayWeaveApplication.launchCanonicalAction {
+        routineOccurrenceSyncManager.discard(operationId)
+        dayWeaveApplication.requestRoutineOccurrenceReplay()
+    }
     suspend fun observeItemCompletion(itemId: String) = dayWeaveApplication.observeSelectedItemCompletion(itemId)
     suspend fun collectForegroundItemCompletion() = dayWeaveApplication.runForegroundItemCompletionSync()
     fun replayItemCompletion(): Boolean {

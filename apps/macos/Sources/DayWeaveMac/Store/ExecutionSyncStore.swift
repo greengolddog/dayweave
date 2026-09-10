@@ -176,6 +176,7 @@ final class ExecutionSyncStore: ObservableObject {
     private var scheduledBreakDeadlineIdentifier: String?
     private var breakNotificationReconciliationIsSuppressed = false
     private var deferredPublicationCoordinator: (@MainActor @Sendable () async -> Bool)?
+    private var deferOccurrenceAdmission: (digest: String, generation: UInt64, publicationID: UUID?)?
 
     init(
         planner: PlannerStore,
@@ -1027,6 +1028,7 @@ final class ExecutionSyncStore: ObservableObject {
                       currentIntent.isSameRequest(as: assessedIntent),
                       let currentAssessment = currentIntent.assessment,
                       currentAssessment == assessment,
+                      self.occurrenceAssessmentIsCurrent(currentAssessment),
                       self.assessmentMatches(
                           currentAssessment,
                           snapshot: snapshot,
@@ -1149,7 +1151,7 @@ final class ExecutionSyncStore: ObservableObject {
         guard let intent = planner.pendingExecutionDeferIntent,
               intent.approvalIsRequired,
               let assessment = intent.assessment,
-              assessment.expiresAt > now() else { return nil }
+              assessment.expiresAt > now(), occurrenceAssessmentIsCurrent(assessment) else { return nil }
         return assessment
     }
 
@@ -1183,13 +1185,25 @@ final class ExecutionSyncStore: ObservableObject {
                     actualSeconds: paused.accumulatedSeconds
                 )
                 do {
+                    let occurrenceGeneration = planner.routineOccurrencePlanningGeneration
+                    let publicationID = planner.publishedScheduleProof?.revisionID
+                    guard !planner.routineOccurrenceState.hasUnresolvedCustody,
+                          planner.localScheduleCompositionProvenance == nil
+                            || !planner.requiresRemoteRoutineOccurrenceComposition else {
+                        throw ExecutionSyncControllerError.invalidLocalState(
+                            "Synchronize occurrence history and a fresh remote schedule before assessing this move."
+                        )
+                    }
                     let assessment = try await connection.transport.assessExecutionDefer(request)
                     try ensureCurrent(
                         connection,
                         operationID: operationID,
                         generation: generation
                     )
-                    guard assessmentMatches(
+                    guard occurrenceGeneration == planner.routineOccurrencePlanningGeneration,
+                          publicationID == planner.publishedScheduleProof?.revisionID,
+                          !planner.routineOccurrenceState.hasUnresolvedCustody,
+                          assessmentMatches(
                         assessment,
                         snapshot: .init(
                             revision: planner.executionState.revision,
@@ -1206,6 +1220,7 @@ final class ExecutionSyncStore: ObservableObject {
                     try planner.persistExecutionDeferIntent(
                         intent.replacingAssessment(assessment)
                     )
+                    deferOccurrenceAdmission = (assessment.assessmentDigest, occurrenceGeneration, publicationID)
                     setConnected(
                         assessment.approvalRequired
                             ? "Move assessed · explicit approval is required"
@@ -1271,7 +1286,7 @@ final class ExecutionSyncStore: ObservableObject {
         session: DayWeaveExecutionSession,
         block: ScheduleBlock
     ) -> Bool {
-        assessmentMatches(
+        occurrenceAssessmentIsCurrent(assessment) && assessmentMatches(
             assessment,
             snapshot: .init(
                 revision: planner.executionState.revision,
@@ -1280,6 +1295,19 @@ final class ExecutionSyncStore: ObservableObject {
             session: session,
             block: block
         )
+    }
+
+    private func occurrenceAssessmentIsCurrent(_ assessment: DayWeaveDeferAssessment) -> Bool {
+        guard !planner.routineOccurrenceState.hasUnresolvedCustody else { return false }
+        // Existing exact command bytes retain their independent replay path.
+        // Fresh occurrence-aware Defer must be assessed in this process against
+        // the current origin and operation generation, including after restart.
+        guard planner.requiresRemoteRoutineOccurrenceComposition else { return true }
+        guard let admission = deferOccurrenceAdmission else { return false }
+        return admission.digest == assessment.assessmentDigest
+            && admission.generation == planner.routineOccurrencePlanningGeneration
+            && admission.publicationID == planner.publishedScheduleProof?.revisionID
+            && planner.localScheduleCompositionProvenance == nil
     }
 
     private func assessmentMatches(
@@ -1311,6 +1339,7 @@ final class ExecutionSyncStore: ObservableObject {
 
     @discardableResult
     private func clearDeferAssessmentEvidence() -> Bool {
+        deferOccurrenceAdmission = nil
         guard let intent = planner.pendingExecutionDeferIntent else { return true }
         let cleared = intent.replacingAssessment(nil)
         if cleared == intent { return true }
