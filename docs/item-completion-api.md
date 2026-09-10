@@ -3,9 +3,10 @@
 The verified server checkpoint implements the one-off portion of
 [parent completion](hierarchy-completion.md). Native review/override controls,
 encrypted completion intent and policy-qualified parent admission now pass the
-native automated regression/build gates described below. This does
-not finish `HIE-004`: controlled cross-client convergence, qualified recurring
-instances and owner-device acceptance remain separate gates. Do not describe
+native automated regression/build gates described below. A controlled nine-phase
+cross-client/service run on a four-to-five-item tree also passed on 2026-09-10.
+This does not finish `HIE-004`: deep native cascade acceptance, qualified recurring
+instances and physical-device acceptance remain separate gates. Do not describe
 the full feature as released or treat server coverage as native acceptance.
 
 ## Review and commands
@@ -227,16 +228,18 @@ fixtures now complete their schema upgrades before using current write
 repositories; the proposal fixture proves that the historical snapshot and
 its stored hash remain unchanged before a successful real undo.
 
-All-target `dayweave-api` Clippy with warnings denied and workspace formatting
-checks pass. Staged/history/outgoing credential scans gate commit and push;
+At that prior server checkpoint, all-target `dayweave-api` Clippy with warnings
+denied and workspace formatting checks passed. Staged/history/outgoing credential scans gate commit and push;
 private database files and diagnostic logs are not repository artifacts.
-The native checkpoint passes these automated gates:
+The 2026-09-10 full native regression gates passed after the harness addition:
 
-- macOS: all 1,061 tests across 70 suites, including 50 completion tests, with
-  compiler warnings treated as errors. A synthetic completion review was rendered
+- macOS: 1,059 executed tests passed across 71 suites, including 50 completion
+  regressions; three opt-in tests were skipped (1,062 total). Compiler warnings
+  are treated as errors. The completion opt-in ran separately in the nine-phase
+  live gate below. A synthetic completion review was previously rendered
   and visually inspected; it used no owner data or live service.
-- Android: 1,645 passing JVM tests across 134 suites, with one additional opt-in
-  test skipped. Lint reports zero errors and 29 warnings. Both debug APKs and the
+- Android: 1,649 passing JVM tests across 136 suites, with two opt-in tests
+  skipped (1,651 total). Lint reports zero errors and 29 warnings. Both debug APKs and the
   Android instrumentation sources build successfully. The ten completion UI tests
   and Room 22→23 migration test are compiled, not yet executed on a device/emulator.
 - Shared wire: 24 valid and 105 invalid cases in
@@ -248,11 +251,26 @@ Coverage includes predecessor upgrades without changing existing exact intent,
 offline/ambiguous restart replay, definitive conflict custody, stale global
 evidence and pending-intent ABA, durable terminal catch-up, privacy revocation,
 always-protected completion evidence, and real native authoring pipelines for
-first-send parent preflight and exact submitted child replay. These tests do not
-replace a two-client/service run or instrumented native interaction acceptance.
+first-send parent preflight and exact submitted child replay. These regression
+results remain distinct from live convergence and instrumented native acceptance.
 
-Controlled two-client/service convergence must still exercise competing policy
-changes, lost receipts/restarts and complete native hydration after real
-complete/reopen cascades. Qualified recurring-instance integration, production
-device-auth/TLS behavior and owner-device acceptance remain open. None of the
-server results above establish completion of these native or full-feature gates.
+On 2026-09-10, the complete
+[controlled native completion convergence](native-completion-convergence.md)
+command passed all nine macOS/Android phases against one fresh PostgreSQL-backed
+service. The four-to-five-item scenario verifies competing reviews and a real
+stale 409, a lost successful receipt, encrypted restart and exact historical
+replay, durable post-receipt canonical catch-up, optional requiredness, real
+automatic completion, and native child creation that reopens both ancestors
+with exact provenance. Final scoped SQL verifies four successful reviewed
+operations, eight effects and six evaluations, including the unchanged original
+lost-response receipt. API, PostgreSQL and idle-sleep guard shutdown and removal of the retained
+test runtime all passed before the command reported success.
+
+This is a production-store/transport test, not a physical-device run. The two
+independent stores share one legitimately enrolled synthetic device principal;
+Android uses the production snapshot codec through a test-only AES-GCM file DAO,
+not physical Room/SQLCipher or Keystore instrumentation. Deep native cascades and
+large/cold-client acceptance, qualified recurring-instance integration, physical
+UI/privacy-lock interaction, production device-auth/TLS behavior and owner
+acceptance remain open. The controlled small-tree result does not close those
+native or full-feature gates.

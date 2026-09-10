@@ -4,9 +4,10 @@ Status: implementation in progress for `HIE-004`. A pure iterative engine and
 the [versioned one-off server checkpoint](item-completion-api.md) implement
 completion policy and synchronous canonical reconciliation. Native completion
 review, required-edge/manual-mode controls, encrypted intent and qualified parent
-admission now pass native automated regression/build gates. The full requirement
-still includes controlled durable
-cross-client behavior, qualified recurring instances and owner-device acceptance.
+admission now pass native automated regression/build gates. Controlled durable
+cross-client completion/reopening on a four-to-five-item tree passed on 2026-09-10.
+The full requirement still includes deep native cascade acceptance, qualified
+recurring instances and physical-device/owner acceptance.
 
 The accepted source is [requirements](product-requirements.md#43-hierarchy-goals-projects-routines-and-dependencies)
 and [discovery answers 203–207](discovery-answers.md). The detailed defaults below
@@ -116,8 +117,9 @@ All canonical writers now use the same synchronous completion boundary.
 Unlimited-depth derived updates coexist with the existing 300-record/8-MiB
 atomic delta-group bounds. Server transaction grouping and historical receipts
 have focused live tests; final verification is recorded in the API checkpoint.
-Native terminal-cursor hydration after these actual cascades remains open. A
-background ancestor worker alone is not sufficient.
+Native terminal-cursor hydration is now verified after the controlled small-tree
+complete/reopen transactions described below; deep native cascade acceptance
+remains open. A background ancestor worker alone is not sufficient.
 
 The application strategy is synchronous evaluation under the existing
 execution/workspace lock, before the transaction commits. Keep the primary
@@ -148,10 +150,10 @@ bootstrap budget even when its current forest is small enough. The separate
 [current-state bootstrap](item-sync.md#bounded-current-state-bootstrap) captures
 a bounded immutable current forest and recent tombstones, then resumes the
 ordinary stream at the captured head. Its history-heavy server and deep native
-tests are a prerequisite, not evidence of native convergence after completion cascades.
-The integrated completion feature still needs cold-client acceptance after real
-required-descendant complete/reopen transactions. Truncated history must never
-masquerade as a complete forest.
+tests alone are a prerequisite, not evidence of native convergence after completion
+cascades. The separate verified small-tree run does not establish large/cold-client
+acceptance after deep required-descendant complete/reopen transactions. Truncated
+history must never masquerade as a complete forest.
 
 Existing full-authoring receipts require the exact reviewed draft and revision.
 An automatic side effect must not rewrite that response into an incompatible
@@ -202,11 +204,25 @@ continues across stale observations, refresh and restart. The
 [native API and migration boundary](item-completion-api.md#native-client-checkpoint)
 describes this checkpoint and its remaining acceptance limits.
 
-Full macOS warning-as-errors tests and Android JVM/lint/debug-build gates pass,
-including encrypted migration/restart, privacy, stale-review and first-send/exact
-replay coverage. The synthetic macOS review was visually inspected. Ten Android
-completion UI tests and its Room migration test compile but have not yet run on
-a device/emulator. Controlled cross-client mutation/cascade hydration,
-qualified recurring instances and owner-device acceptance remain part of the
-full feature's completion gate. Keep the separately verified pure-engine and
-server counts above distinct from native tests and unfinished acceptance gates.
+The 2026-09-10 full macOS warnings-as-errors and Android JVM/lint/debug-build
+gates passed, including encrypted migration/restart, privacy, stale-review and
+first-send/exact replay coverage. Exact totals and skips are recorded in the
+[API checkpoint](item-completion-api.md#verification). The synthetic macOS review
+was previously visually inspected. Ten Android completion UI tests and its
+Room migration test compile but have not yet run on a device/emulator.
+
+The [controlled native convergence gate](native-completion-convergence.md) passed
+as one complete command on 2026-09-10: all nine native phases, exact final SQL
+receipt/effect/provenance assertions and owned service/runtime cleanup. It uses
+the real native stores/transports and HTTP service to verify competing policy
+reviews, lost replies and restart replay, the durable canonical catch-up fence,
+optional branches, required-leaf completion and new-child-driven ancestor
+reopening. The tree grows from four to five items; this is not a deep cascade.
+
+Both stores share one real enrolled synthetic device principal. Android's JVM
+AES-GCM test DAO exercises the production snapshot codec, not physical
+Room/SQLCipher or Keystore. Qualified recurring instances, deep native cascades
+and large/cold-client acceptance, physical UI/privacy-lock interaction,
+independent-device authentication/TLS and owner acceptance remain open. Keep
+the pure-engine, server, native regression and controlled small-tree
+evidence distinct from these unfinished full-feature gates.

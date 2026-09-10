@@ -6,11 +6,21 @@ fail() {
   exit 1
 }
 
+dw_retain_runtime="${DAYWEAVE_TESTING_RETAIN_RUNTIME-0}"
+case "$dw_retain_runtime" in
+  0|1) ;;
+  *) fail 'DAYWEAVE_TESTING_RETAIN_RUNTIME must be absent, 0, or 1' ;;
+esac
+
 dw_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 dw_package_dir="$dw_script_dir/../apps/macos"
 dw_testing_copy=""
+dw_testing_retained=0
 
 cleanup() {
+  if test "$dw_testing_retained" = 1; then
+    return
+  fi
   case "${dw_testing_copy:-}" in
     /tmp/dayweave-testing-frameworks.*)
       chmod -R u+rwX "$dw_testing_copy" 2>/dev/null || true
@@ -18,7 +28,20 @@ cleanup() {
       ;;
   esac
 }
-trap cleanup EXIT INT TERM
+interrupted() {
+  local dw_signal_status=$1
+  # EXIT traps do not re-enter when a signal interrupts the EXIT handler itself.
+  # Clean directly, and do not let a second catchable signal skip that cleanup.
+  trap - EXIT
+  trap '' HUP INT TERM
+  dw_testing_retained=0
+  cleanup
+  exit "$dw_signal_status"
+}
+trap cleanup EXIT
+trap 'interrupted 129' HUP
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
 
 # macOS 26.x CLT can type-check `import Testing` while still omitting Testing
 # from the test runner's runtime search paths. Always use an isolated framework
@@ -33,7 +56,12 @@ if test ! -d "$dw_testing_source"; then
   # SwiftPM reports its legacy XCTest default as non-parallel. Many DayWeave
   # integration tests intentionally share the main actor, so serialize the
   # runner to prevent unrelated suites from starving their deterministic gates.
-  exec swift test --package-path "$dw_package_dir" --no-parallel "$@"
+  if test "$dw_retain_runtime" = 0; then
+    exec swift test --package-path "$dw_package_dir" --no-parallel "$@"
+  fi
+  swift test --package-path "$dw_package_dir" --no-parallel "$@"
+  printf '%s\n' 'DAYWEAVE_TESTING_RUNTIME=system'
+  exit 0
 fi
 
 dw_testing_copy=$(mktemp -d /tmp/dayweave-testing-frameworks.XXXXXX)
@@ -60,3 +88,11 @@ DYLD_FRAMEWORK_PATH="$dw_runtime_frameworks" \
     -Xlinker -rpath \
     -Xlinker "$dw_testing_copy" \
     "$@"
+
+if test "$dw_retain_runtime" = 1; then
+  # A successful prebuild may be reused with --skip-build while its embedded
+  # rpath remains present. The caller owns cleanup of this exact generated
+  # directory; no caller-provided runtime path is ever accepted by this wrapper.
+  printf 'DAYWEAVE_TESTING_RUNTIME=%s\n' "$dw_testing_copy"
+  dw_testing_retained=1
+fi
