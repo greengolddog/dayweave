@@ -98,12 +98,15 @@ unchanged. Controlled 5,000-level traversal, native helper-protocol composition
 and server preview/publication recomputation pass; the shared Rust gate passes
 302 tests with retained resource-bound and shallow-output coverage.
 
-This is not qualified recurring completion. The durable exact-publication
-occurrence/member manifest, occurrence-scoped policy/lifecycle evidence and
-replay/delta integration, scheduling-ledger fence and native occurrence review
-remain unfinished. A materialized plan or template status cannot substitute
-for that authority, and this prerequisite does not narrow `HIE-004` or count as
-deep native completion-cascade acceptance.
+That prerequisite alone is not qualified recurring completion. The separate
+[occurrence-member checkpoint](routine-occurrence-completion.md) adds immutable
+publication-qualified manifests, independent reviewed outcomes/policy, permanent
+replay and whole-instance deltas, a lifecycle-aware scheduler and publication/
+execution fences. Its native review, encrypted replicas/outboxes, local-composition
+fences, completion-relative cadence and end-to-end acceptance remain unfinished.
+A materialized plan or template status cannot substitute for that authority, and
+neither checkpoint narrows `HIE-004` or counts as deep native completion-cascade
+acceptance.
 
 ## Decision engine boundary
 

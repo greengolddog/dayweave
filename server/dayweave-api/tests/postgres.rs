@@ -39,7 +39,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
         ]
     );
 
@@ -79,6 +79,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0033_item_progress.sql"),
         include_str!("../migrations/0034_item_bootstrap.sql"),
         include_str!("../migrations/0035_item_completion.sql"),
+        include_str!("../migrations/0036_routine_occurrences.sql"),
     ]
     .join("\n");
     for table in [
@@ -118,6 +119,12 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_completion_evaluations",
         "item_completion_effects",
         "item_completion_operations",
+        "routine_occurrences",
+        "routine_occurrence_members",
+        "routine_occurrence_state",
+        "routine_occurrence_changes",
+        "routine_occurrence_operations",
+        "routine_occurrence_publications",
         "proposal_application_completion_evidence",
         "proposal_application_completion_states",
         "execution_sessions",

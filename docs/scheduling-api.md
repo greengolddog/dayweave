@@ -46,13 +46,22 @@ and exact active, paused, or deferred reservations. It is bound into the digest
 and durable publication snapshot but is not exposed in the public preview
 schema.
 
-Private durable publication evidence uses schema v5 and retains the exact
+Private durable publication evidence uses schema v5 (an unused occurrence ledger)
+or v6 (a positive occurrence-ledger head), and retains the exact
 normalized `PlanRequest` passed to the solver, including availability, fixed
 blocks, scheduler config, and recurrence context. That private policy capsule is
 bound to the immutable published revision and its digests and is not exposed in
-the public preview or revision response. A future server-side Defer assessment
-must reload this v5 capsule; it must not accept a caller-supplied substitute that
+the public preview or revision response. Server-side Defer assessment reloads
+this supported capsule; it must not accept a caller-supplied substitute that
 omits constraints or otherwise weakens the policy that produced the schedule.
+
+V6 additionally retains the complete private recurring-member lifecycle context.
+Preview binds it and its ledger head to the digest; publication and assessed Defer
+recheck it under the occurrence lock. Legacy v5 readers remain supported, with
+no lifecycle context or an exactly empty one. V6 requires a positive head, even
+for an empty horizon. The strict public preview contract and helper v1 remain
+unchanged. See [occurrence completion](routine-occurrence-completion.md) for
+admission, first-publication catch-up, native gaps and the per-member API.
 
 Caller-requested exact positioning uses `manual_placements`, never
 `previous_assignments`. Each proposal has a fresh UUID, the exact current
@@ -196,7 +205,7 @@ exactly one detail; supersedes the old current revision; seals the draft as
 published; and writes the receipt and audit row, all in one transaction.
 Content insertion is allowed only while the parent is draft, and blocks/details
 become immutable after the seal. A fresh key whose solver-versioned publication
-content and private v5 evidence are identical to the current revision binds to
+content and private versioned evidence are identical to the current revision binds to
 that existing revision without revision churn.
 An expected-digest mismatch or canonical item change during the transaction is
 `409 schedule_publication_stale`. That stable code proves no publication was
@@ -208,7 +217,7 @@ must retain the exact journal for operator recovery or retry.
 pauses the active session, then posts the exact paused execution revision,
 session ID, target start, and optional corrected actual duration to
 `POST /v1/execution/defer-assessments`. Assessment requires the current private
-v5 planning policy, exact item and Calendar projections, the immutable source
+supported planning policy, exact item and Calendar projections, the immutable source
 schedule origin, and the current execution ledger. It returns the server-derived
 actual duration, normalized whole-minute credit, remaining duration and target
 end, a content-free conflict list, a five-minute expiry, and a canonical
@@ -274,7 +283,7 @@ closed when that proof is required.
 approvals return `409 schedule_publication_stale` (or `422` for malformed
 shape) and commit nothing. Conflict-free and safely carried-forward placements
 must not be echoed as approvals. Accepted facts, authorization origin, and
-digests are stored in private v5 revision evidence, on every affected block,
+digests are stored in private revision evidence, on every affected block,
 and in content-free publication audit metadata.
 
 Both first publication and exact idempotent replay return `200`; `replayed` is
@@ -337,7 +346,7 @@ The successful JSON object has exactly two top-level members:
 ```
 
 `schedule` is byte-for-JSON-value equivalent to the public
-`ComposeScheduleResult` returned by preview and sealed into the immutable v5
+`ComposeScheduleResult` returned by preview and sealed into the immutable
 publication. Private planning policy, execution evidence, Calendar projection
 stamps, sensitivity maps, and manual-placement state remain sibling evidence
 and are never copied into this envelope. The server strictly decodes the whole
@@ -459,11 +468,11 @@ previews and publishes one fresh revision. Operators must complete that fresh
 publication before enabling remote MCP access. Legacy drafts remain drafts and
 may be discarded normally; they are never promoted by the migration.
 
-Published revisions with earlier private evidence versions remain readable and
+Published revisions with pre-v5 private evidence versions remain readable and
 immutable, and existing idempotency receipts retain their documented replay
 behavior. Those revisions do not contain the authoritative normalized
-`PlanRequest`, however, so they cannot be used for future server-side Defer
-assessment; the native app must publish a fresh v5 revision first.
+`PlanRequest`, however, so they cannot be used for server-side Defer
+assessment; the native app must publish a fresh supported revision first.
 
 The publication `idempotency_key` is a random client-generated UUID and a
 non-secret correlation identifier, not a bearer capability. It is intentionally
@@ -814,16 +823,18 @@ source-item scans.
 The core additionally checks the exact retained-plus-generated item count
 against 10,000 before cloning work items or allocating clone IDs. That guard
 does not independently bound raw `expand_occurrences`: its public topology
-validation is not a substitute for shared preflight. This prerequisite changes
-neither the public request/response shape nor helper v1, local fingerprint v1,
-publication schema `/5`, existing digests or exact historical receipt replay.
+validation is not a substitute for shared preflight. That depth-safety checkpoint
+did not change the public request/response shape, helper v1, local fingerprint v1,
+then-current publication schema `/5`, existing digests or exact receipt replay.
 Controlled 5,000-level core/helper composition and server preview/private
 publication recomputation pass, including source-order invariance and retained
 resource limits. Habit ownership hydration and carry-source probes also apply
 shared preflight before raw expansion; a work-budget failure rejects the
 composition and is never evidence for converting a durable carry to Skip.
-It does not provide an authoritative occurrence-member completion ledger or
-native qualified recurring-instance completion.
+The separate [occurrence-member checkpoint](routine-occurrence-completion.md)
+now adds authoritative member history and private publication schema `/6` when
+the occurrence ledger has a positive head. Native qualified recurring-instance
+completion remains unfinished.
 
 Tasks with recurrence become recurring tasks. Habits require recurrence;
 routines may have it. Authorable forms are `daily`, `weekly`, `monthly`,

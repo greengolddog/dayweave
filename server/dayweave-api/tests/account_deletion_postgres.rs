@@ -1447,6 +1447,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     assert_provider_admission_catalog_coverage(pool).await;
     assert_bootstrap_catalog_coverage(pool).await;
     assert_completion_catalog_coverage(pool).await;
+    assert_routine_occurrence_catalog_coverage(pool).await;
 
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name FROM information_schema.columns \
@@ -1460,7 +1461,7 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     .expect("tenant table inventory");
     assert_eq!(
         tables.len(),
-        76,
+        82,
         "migration tenant-table inventory must be consciously updated"
     );
     for table in &tables {
@@ -1482,6 +1483,34 @@ async fn assert_account_deletion_catalog_coverage(pool: &PgPool) {
     }
 
     assert_user_reference_guards(pool).await;
+}
+
+async fn assert_routine_occurrence_catalog_coverage(pool: &PgPool) {
+    let tables = [
+        "routine_occurrences",
+        "routine_occurrence_members",
+        "routine_occurrence_state",
+        "routine_occurrence_changes",
+        "routine_occurrence_operations",
+        "routine_occurrence_publications",
+    ];
+    let purge:String = sqlx::query_scalar("SELECT pg_get_functiondef('purge_fenced_personal_account_scope(uuid,bigint,bytea)'::regprocedure)")
+        .fetch_one(pool).await.expect("guarded occurrence purge inventory");
+    for table in tables {
+        assert!(
+            purge.matches(&format!("'{table}'")).count() >= 2,
+            "{table} must be locked and deleted by guarded purge"
+        );
+        let guarded:bool = sqlx::query_scalar("SELECT count(*)=2 FROM pg_trigger trigger JOIN pg_class relation ON relation.oid=trigger.tgrelid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=current_schema() AND relation.relname=$1 AND NOT trigger.tgisinternal AND trigger.tgname IN ('account_deletion_fence_guard','routine_occurrence_no_truncate')")
+            .bind(table).fetch_one(pool).await.expect("occurrence fence and truncate guards");
+        assert!(guarded, "{table} must fence mutations and reject truncate");
+    }
+    let seals:i64 = sqlx::query_scalar("SELECT count(*) FROM pg_trigger trigger JOIN pg_class relation ON relation.oid=trigger.tgrelid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname=current_schema() AND trigger.tgname IN ('routine_occurrence_manifest_complete','routine_occurrence_change_complete','routine_occurrence_operation_complete','routine_occurrence_publication_complete') AND trigger.tgdeferrable AND trigger.tginitdeferred")
+        .fetch_one(pool).await.expect("occurrence atomic seals");
+    assert_eq!(seals, 4);
+    let hardened:bool = sqlx::query_scalar("SELECT count(*)=14 AND bool_and(function.proconfig IS NOT NULL AND array_to_string(function.proconfig, ',')='search_path='||current_schema()||', pg_catalog, pg_temp' AND NOT has_function_privilege('public',function.oid,'EXECUTE')) FROM pg_proc function JOIN pg_namespace namespace ON namespace.oid=function.pronamespace WHERE namespace.nspname=current_schema() AND function.proname IN ('guard_routine_occurrence_immutable','guard_routine_occurrence_manifest','guard_routine_occurrence_member','verify_routine_occurrence_manifest','guard_routine_occurrence_change','guard_routine_occurrence_state','verify_routine_occurrence_change','verify_routine_occurrence_operation','verify_routine_occurrence_publication','reject_routine_occurrence_truncate','valid_routine_occurrence_timestamp','valid_routine_occurrence_member_state','valid_routine_occurrence_aggregate','valid_routine_occurrence_snapshot')")
+        .fetch_one(pool).await.expect("occurrence functions pin search path and revoke public execution");
+    assert!(hardened);
 }
 
 async fn assert_completion_catalog_coverage(pool: &PgPool) {

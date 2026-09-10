@@ -471,6 +471,15 @@ fn map_publication_error(error: SchedulePublicationError) -> ApiError {
 
 fn map_compose_error(error: &ComposeScheduleError) -> ApiError {
     match error {
+        ComposeScheduleError::OccurrenceEvidenceChanged => {
+            ApiError::conflict("Routine occurrence evidence changed during preview; retry")
+        }
+        ComposeScheduleError::OccurrenceReviewRequired => ApiError::conflict(
+            "A published routine occurrence no longer matches its template; review is required",
+        ),
+        ComposeScheduleError::OccurrenceEvidenceUnavailable => {
+            ApiError::unavailable("Routine occurrence authority is temporarily unavailable")
+        }
         ComposeScheduleError::SchedulerResourceLimit => ApiError::scheduler_resource_limit(
             "Schedule preview exceeds the bounded scheduler work budget",
         ),
@@ -496,6 +505,7 @@ fn map_publish_compose_error(error: &ComposeScheduleError) -> ApiError {
         error,
         ComposeScheduleError::CalendarProjectionIncomplete
             | ComposeScheduleError::ExecutionEvidenceChanged
+            | ComposeScheduleError::OccurrenceEvidenceChanged
             | ComposeScheduleError::AuthoritativeManualPlacementChanged(_)
     ) {
         return ApiError::schedule_publication_stale(

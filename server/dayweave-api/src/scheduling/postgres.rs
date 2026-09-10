@@ -9,8 +9,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Datelike as _, Duration, Utc};
 use dayweave_core::{
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
-    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, PlanRequest, ScheduleBlockKind,
-    Scheduler,
+    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, OccurrenceLifecycleContext,
+    PlanRequest, ScheduleBlockKind, Scheduler,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,7 +27,9 @@ use crate::{
         AuthoritativeHabitRecurrence, DatabaseScope, PublishedHabitEvidenceError,
         authoritative_habit_recurrence_tx, fetch_item_batch_tx, insert_proposal_tx,
         lock_canonical_item_space, lock_execution_and_canonical_item_space,
-        lock_habit_change_space, proposal_from_row, record_published_habit_occurrences_tx,
+        lock_habit_change_space, lock_routine_occurrence_space, proposal_from_row,
+        record_published_habit_occurrences_tx, record_published_routine_occurrences_tx,
+        routine_occurrence_planning_evidence_tx,
     },
     proposals::{PROPOSAL_CHANGE_SET_SCHEMA_V1, ProposalCommand},
 };
@@ -36,15 +38,15 @@ use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp, ComposeScheduleResult, ConflictQuery,
     ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary,
     MANUAL_PLACEMENT_PUBLICATION_SCHEMA, ManualPlacementAssessmentOutput, ManualPlacementInput,
-    ManualPlacementViolationOutput, PlacementAlternative, PlacementExplanation, PlacementReason,
-    PlanOperationKind, PlanningSimulationPort, PreviousAssignmentInput, PreviousBlockInput,
-    ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
-    ProposalSubmissionSpec, RetainedManualPlacementCatalog, SCHEDULER_PUBLICATION_SCHEMA,
-    ScheduleAccess, ScheduleBlockView, ScheduleConflict, ScheduleDetail,
-    ScheduleInvalidationConfig, ScheduleInvalidationOpenError, ScheduleQuery, ScheduleQueryPort,
-    ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationConsumption, SimulationIssue,
-    SimulationProposalEvidence, SimulationRequest, SimulationResult,
-    has_postgres_timestamp_precision,
+    ManualPlacementViolationOutput, OCCURRENCE_PUBLICATION_SCHEMA, PlacementAlternative,
+    PlacementExplanation, PlacementReason, PlanOperationKind, PlanningSimulationPort,
+    PreviousAssignmentInput, PreviousBlockInput, ProposalSubmissionError, ProposalSubmissionPort,
+    ProposalSubmissionResult, ProposalSubmissionSpec, RetainedManualPlacementCatalog,
+    SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess, ScheduleBlockView, ScheduleConflict,
+    ScheduleDetail, ScheduleInvalidationConfig, ScheduleInvalidationOpenError, ScheduleQuery,
+    ScheduleQueryPort, ScheduleView, SchedulingPortError, SimulatedBlockMove,
+    SimulationConsumption, SimulationIssue, SimulationProposalEvidence, SimulationRequest,
+    SimulationResult, has_postgres_timestamp_precision,
     invalidation::{ScheduleInvalidationHub, ScheduleInvalidationStream},
     materialize_proposal,
     proposal_bridge::{
@@ -255,6 +257,7 @@ pub(crate) struct PublishedPlanningPolicy {
     pub(crate) source_item_revisions: BTreeMap<Uuid, u64>,
     pub(crate) calendar_projection_stamps: Vec<CalendarProjectionStamp>,
     pub(crate) planning_request: PlanRequest,
+    pub(crate) occurrence_lifecycle: OccurrenceLifecycleContext,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -349,6 +352,14 @@ impl std::fmt::Debug for PostgresSchedulingRepository {
 }
 
 impl PostgresSchedulingRepository {
+    /// Uses the same fixed workspace and pool as publication admission.
+    #[must_use]
+    pub(crate) fn routine_occurrence_repository(
+        &self,
+    ) -> crate::persistence::PostgresRoutineOccurrenceRepository {
+        crate::persistence::PostgresRoutineOccurrenceRepository::new(self.pool.clone(), self.scope)
+    }
+
     #[must_use]
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self {
@@ -785,6 +796,9 @@ impl PostgresSchedulingRepository {
         lock_habit_change_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
+        lock_routine_occurrence_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_occurrence_publication_error)?;
         lock_owner(&mut transaction, self.scope)
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
@@ -823,6 +837,13 @@ impl PostgresSchedulingRepository {
         if current_habit_recurrence.change_head != spec.result.habit_change_head {
             return Err(SchedulePublicationError::StaleComposition);
         }
+        assert_occurrence_lifecycle_tx(
+            &mut transaction,
+            self.scope,
+            &spec.result.planning_request,
+            &spec.result.occurrence_lifecycle,
+        )
+        .await?;
 
         let current_planning_evidence =
             authoritative_planning_evidence_tx(&mut transaction, self.scope.workspace_id)
@@ -925,6 +946,15 @@ impl PostgresSchedulingRepository {
                         SchedulePublicationError::Unavailable
                     }
                 })?;
+                record_published_routine_occurrences_tx(
+                    &mut transaction,
+                    self.scope,
+                    parent_id.ok_or(SchedulePublicationError::Unavailable)?,
+                    &spec.result,
+                    published_at,
+                )
+                .await
+                .map_err(map_occurrence_publication_error)?;
                 bind_publication_key_tx(
                     &mut transaction,
                     self.scope,
@@ -973,7 +1003,7 @@ impl PostgresSchedulingRepository {
         .bind(horizon_start)
         .bind(horizon_end)
         .bind(&spec.timezone_name)
-        .bind(SCHEDULER_PUBLICATION_SCHEMA)
+        .bind(spec.result.publication_schema())
         .bind(spec.input_digest.as_slice())
         .bind(publication_hash.as_slice())
         .bind(self.scope.user_id)
@@ -1046,6 +1076,16 @@ impl PostgresSchedulingRepository {
             }
             PublishedHabitEvidenceError::Unavailable => SchedulePublicationError::Unavailable,
         })?;
+
+        record_published_routine_occurrences_tx(
+            &mut transaction,
+            self.scope,
+            revision_id,
+            &spec.result,
+            published_at,
+        )
+        .await
+        .map_err(map_occurrence_publication_error)?;
 
         sqlx::query(
             "INSERT INTO schedule_revision_details (workspace_id, user_id, \
@@ -1153,9 +1193,10 @@ impl PostgresSchedulingRepository {
     }
 }
 
-/// Loads the exact private v5 policy capsule from the current immutable
+/// Loads the exact supported private policy capsule from the current immutable
 /// publication. Callers must separately fence canonical items, Calendar, and
 /// the current revision before authorizing a mutation from this snapshot.
+#[allow(clippy::too_many_lines)] // Decode one immutable policy and its exact initial-admission witness together.
 pub(crate) async fn published_planning_policy_tx(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -1207,15 +1248,11 @@ pub(crate) async fn published_planning_policy_tx(
     let snapshot: Value = row
         .try_get("result_snapshot")
         .map_err(|_| SchedulePublicationError::Unavailable)?;
-    if solver_version != SCHEDULER_PUBLICATION_SCHEMA
-        || snapshot.get("schema_version").and_then(Value::as_u64) != Some(5)
-        || snapshot
-            .get("scheduler_publication_schema")
-            .and_then(Value::as_str)
-            != Some(SCHEDULER_PUBLICATION_SCHEMA)
-    {
+    if !supported_policy_snapshot(&solver_version, &snapshot) {
         return Err(SchedulePublicationError::StaleComposition);
     }
+    let occurrence_lifecycle = snapshot_occurrence_lifecycle(&solver_version, &snapshot)
+        .ok_or(SchedulePublicationError::StaleComposition)?;
     let planning_request: PlanRequest = serde_json::from_value(
         snapshot
             .get("planning_request")
@@ -1245,6 +1282,15 @@ pub(crate) async fn published_planning_policy_tx(
     {
         return Err(SchedulePublicationError::StaleComposition);
     }
+    let occurrence_lifecycle = adopt_initial_occurrence_admission_tx(
+        transaction,
+        scope,
+        revision_id,
+        &planning_request,
+        occurrence_lifecycle,
+        &snapshot,
+    )
+    .await?;
     Ok(PublishedPlanningPolicy {
         revision_id,
         revision_number,
@@ -1253,10 +1299,11 @@ pub(crate) async fn published_planning_policy_tx(
         source_item_revisions,
         calendar_projection_stamps,
         planning_request,
+        occurrence_lifecycle,
     })
 }
 
-/// Share-locks the current publication and proves it is still the v5 policy
+/// Share-locks the current publication and proves it is still the supported policy
 /// capsule loaded earlier in the transaction.
 pub(crate) async fn assert_current_planning_policy_tx(
     transaction: &mut Transaction<'_, Postgres>,
@@ -1274,7 +1321,9 @@ pub(crate) async fn assert_current_planning_policy_tx(
     .await
     .map_err(|_| SchedulePublicationError::Unavailable)?;
     if current.as_ref().map(|value| value.0) != Some(expected_revision_id)
-        || current.as_ref().map(|value| value.1.as_str()) != Some(SCHEDULER_PUBLICATION_SCHEMA)
+        || !current
+            .as_ref()
+            .is_some_and(|value| supported_planning_schema(&value.1))
     {
         return Err(SchedulePublicationError::StaleComposition);
     }
@@ -2608,8 +2657,8 @@ fn durable_snapshot(
         })
         .collect::<Result<Vec<_>, SchedulePublicationError>>()?;
     let snapshot = json!({
-        "schema_version": 5,
-        "scheduler_publication_schema": SCHEDULER_PUBLICATION_SCHEMA,
+        "schema_version": if result.publication_schema() == OCCURRENCE_PUBLICATION_SCHEMA { 6 } else { 5 },
+        "scheduler_publication_schema": result.publication_schema(),
         "compose": result,
         "planning_request": &result.planning_request,
         "execution_planning": &result.planning_evidence,
@@ -2617,6 +2666,7 @@ fn durable_snapshot(
             "source_item_sensitivity": result.source_item_sensitivity,
             "calendar_projection_stamps": result.calendar_projection_stamps,
             "habit_change_head": result.habit_change_head,
+            "occurrence_lifecycle": result.occurrence_lifecycle,
         },
         "conflicts": conflicts,
         "manual_placement_approvals": manual_placement_approvals,
@@ -3121,7 +3171,9 @@ async fn current_published_assignments_tx(
 fn supports_retained_manual_placement_schema(schema: &str) -> bool {
     matches!(
         schema,
-        SCHEDULER_PUBLICATION_SCHEMA | MANUAL_PLACEMENT_PUBLICATION_SCHEMA
+        SCHEDULER_PUBLICATION_SCHEMA
+            | OCCURRENCE_PUBLICATION_SCHEMA
+            | MANUAL_PLACEMENT_PUBLICATION_SCHEMA
     )
 }
 
@@ -3228,7 +3280,7 @@ pub(super) fn validate_publishable_compose_result(
     timezone_name: &str,
     result: &ComposeScheduleResult,
 ) -> Result<([u8; 32], Value), SchedulePublicationError> {
-    validate_composed_result_for_schema(SCHEDULER_PUBLICATION_SCHEMA, timezone_name, result)?;
+    validate_composed_result_for_schema(result.publication_schema(), timezone_name, result)?;
     let publication_hash = publication_content_hash(timezone_name, result)?;
     let manual_placement_state = persisted_manual_placement_state(result)?;
     let snapshot = durable_snapshot(result, &publication_hash, &[], &manual_placement_state)?;
@@ -3248,6 +3300,7 @@ pub(super) fn validate_composed_result_for_schema(
         &result.calendar_projection_stamps,
         &result.planning_evidence.execution,
         result.habit_change_head,
+        &result.occurrence_lifecycle,
         &result.planning_request,
     )
     .map_err(|_| SchedulePublicationError::InvalidPayload)?;
@@ -3255,9 +3308,10 @@ pub(super) fn validate_composed_result_for_schema(
         return Err(SchedulePublicationError::InvalidPayload);
     }
     let expected_plan = Scheduler
-        .plan_with_execution(
+        .plan_with_lifecycle(
             &result.planning_request,
             &result.planning_evidence.execution,
+            &result.occurrence_lifecycle,
         )
         .map_err(|_| SchedulePublicationError::InvalidPayload)?;
     if expected_plan != *result.plan {
@@ -3547,7 +3601,7 @@ pub(crate) fn publication_content_hash(
     }
     let bytes = serde_json::to_vec(&Content {
         domain: "dayweave.schedule-publication-content.v3",
-        scheduler_publication_schema: SCHEDULER_PUBLICATION_SCHEMA,
+        scheduler_publication_schema: result.publication_schema(),
         timezone_name,
         result,
         planning_request: &result.planning_request,
@@ -3856,18 +3910,193 @@ fn revision_from_row(
     })
 }
 
+fn map_occurrence_publication_error(
+    error: crate::routine_occurrences::RoutineOccurrenceError,
+) -> SchedulePublicationError {
+    use crate::routine_occurrences::RoutineOccurrenceError;
+    match error {
+        RoutineOccurrenceError::Unavailable => SchedulePublicationError::Unavailable,
+        RoutineOccurrenceError::DefinitionChanged | RoutineOccurrenceError::SourceIneligible => {
+            SchedulePublicationError::StaleComposition
+        }
+        _ => SchedulePublicationError::InvalidPayload,
+    }
+}
+
+/// Initial admission follows preview in the publication transaction. A Defer
+/// policy may adopt that *unchanged initial capture*, never an outcome/policy
+/// mutation, without requiring a redundant user publication. Fresh publication
+/// still uses the strict context comparison below.
+async fn adopt_initial_occurrence_admission_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    revision_id: Uuid,
+    request: &PlanRequest,
+    expected: OccurrenceLifecycleContext,
+    snapshot: &Value,
+) -> Result<OccurrenceLifecycleContext, SchedulePublicationError> {
+    let identities = super::occurrence::planning_identities(request)
+        .map_err(map_occurrence_publication_error)?;
+    let evidence = routine_occurrence_planning_evidence_tx(transaction, scope, &identities)
+        .await
+        .map_err(map_occurrence_publication_error)?;
+    let actual = super::occurrence::lifecycle_from_evidence(evidence)
+        .map_err(map_occurrence_publication_error)?;
+    if actual == expected {
+        return Ok(expected);
+    }
+    let current_by_id = actual
+        .instances
+        .iter()
+        .map(|instance| (instance.occurrence_id, instance))
+        .collect::<BTreeMap<_, _>>();
+    let expected_ids = expected
+        .instances
+        .iter()
+        .map(|instance| instance.occurrence_id)
+        .collect::<BTreeSet<_>>();
+    if actual.snapshot_revision <= expected.snapshot_revision
+        || expected
+            .instances
+            .iter()
+            .any(|instance| current_by_id.get(&instance.occurrence_id) != Some(&instance))
+    {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    let only_this_initial_capture: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM routine_occurrence_changes change \
+         JOIN routine_occurrences instance ON instance.workspace_id=change.workspace_id \
+           AND instance.id=change.instance_id \
+         WHERE change.workspace_id=$1 AND change.sequence>$2 AND change.sequence<=$3 \
+           AND (change.revision<>1 OR change.operation_id IS NOT NULL \
+             OR instance.first_schedule_revision_id<>$4 \
+             OR NOT EXISTS(SELECT 1 FROM routine_occurrence_publications publication \
+               WHERE publication.workspace_id=change.workspace_id \
+                 AND publication.instance_id=change.instance_id AND publication.schedule_revision_id=$4)))",
+    ).bind(scope.workspace_id)
+        .bind(i64::try_from(expected.snapshot_revision).map_err(|_|SchedulePublicationError::StaleComposition)?)
+        .bind(i64::try_from(actual.snapshot_revision).map_err(|_|SchedulePublicationError::StaleComposition)?)
+        .bind(revision_id).fetch_one(&mut **transaction).await
+        .map_err(|_|SchedulePublicationError::Unavailable)?;
+    if !only_this_initial_capture {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    let new_instances = actual
+        .instances
+        .iter()
+        .filter(|instance| !expected_ids.contains(&instance.occurrence_id))
+        .collect::<Vec<_>>();
+    let roots = new_instances
+        .iter()
+        .map(|instance| instance.root_item_id.0)
+        .collect::<Vec<_>>();
+    let occurrences = new_instances
+        .iter()
+        .map(|instance| instance.occurrence_id.0)
+        .collect::<Vec<_>>();
+    let witnessed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routine_occurrences instance \
+         JOIN routine_occurrence_changes change ON change.workspace_id=instance.workspace_id \
+           AND change.instance_id=instance.id AND change.revision=1 AND change.operation_id IS NULL \
+         WHERE instance.workspace_id=$1 AND change.sequence>$2 AND change.sequence<=$3 \
+           AND instance.first_schedule_revision_id=$4 \
+           AND (instance.series_item_id,instance.occurrence_id) IN \
+             (SELECT * FROM unnest($5::uuid[],$6::uuid[]))",
+    ).bind(scope.workspace_id)
+        .bind(i64::try_from(expected.snapshot_revision).map_err(|_|SchedulePublicationError::StaleComposition)?)
+        .bind(i64::try_from(actual.snapshot_revision).map_err(|_|SchedulePublicationError::StaleComposition)?)
+        .bind(revision_id).bind(roots).bind(occurrences).fetch_one(&mut **transaction)
+        .await.map_err(|_|SchedulePublicationError::Unavailable)?;
+    if usize::try_from(witnessed).ok() != Some(new_instances.len()) {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    let execution: ExecutionPlanningContext = serde_json::from_value(
+        snapshot
+            .pointer("/execution_planning/execution")
+            .cloned()
+            .ok_or(SchedulePublicationError::StaleComposition)?,
+    )
+    .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    let before = Scheduler
+        .plan_with_lifecycle(request, &execution, &expected)
+        .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    let after = Scheduler
+        .plan_with_lifecycle(request, &execution, &actual)
+        .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    if before != after {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    Ok(actual)
+}
+
+/// Caller owns execution, canonical and occurrence locks in that order.
+pub(crate) async fn assert_occurrence_lifecycle_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    request: &PlanRequest,
+    expected: &OccurrenceLifecycleContext,
+) -> Result<(), SchedulePublicationError> {
+    let identities = super::occurrence::planning_identities(request)
+        .map_err(map_occurrence_publication_error)?;
+    let evidence = routine_occurrence_planning_evidence_tx(transaction, scope, &identities)
+        .await
+        .map_err(map_occurrence_publication_error)?;
+    let actual = super::occurrence::lifecycle_from_evidence(evidence)
+        .map_err(map_occurrence_publication_error)?;
+    if &actual != expected {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    Ok(())
+}
+
+fn supported_planning_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        SCHEDULER_PUBLICATION_SCHEMA | OCCURRENCE_PUBLICATION_SCHEMA
+    )
+}
+
+fn supported_policy_snapshot(schema: &str, snapshot: &Value) -> bool {
+    let version = match schema {
+        SCHEDULER_PUBLICATION_SCHEMA => 5,
+        OCCURRENCE_PUBLICATION_SCHEMA => 6,
+        _ => return false,
+    };
+    snapshot.get("schema_version").and_then(Value::as_u64) == Some(version)
+        && snapshot
+            .get("scheduler_publication_schema")
+            .and_then(Value::as_str)
+            == Some(schema)
+}
+
+fn snapshot_occurrence_lifecycle(
+    schema: &str,
+    snapshot: &Value,
+) -> Option<OccurrenceLifecycleContext> {
+    let raw = snapshot.pointer("/evidence/occurrence_lifecycle");
+    let context: OccurrenceLifecycleContext = match (schema, raw) {
+        (SCHEDULER_PUBLICATION_SCHEMA, None) => OccurrenceLifecycleContext::default(),
+        (_, Some(raw)) => serde_json::from_value(raw.clone()).ok()?,
+        _ => return None,
+    };
+    context.validate().ok()?;
+    match schema {
+        SCHEDULER_PUBLICATION_SCHEMA if context == OccurrenceLifecycleContext::default() => {
+            Some(context)
+        }
+        OCCURRENCE_PUBLICATION_SCHEMA if context.snapshot_revision > 0 => Some(context),
+        _ => None,
+    }
+}
+
 fn public_compose_snapshot(
     snapshot: &Value,
     revision: &PublishedScheduleRevision,
     solver_version: &str,
 ) -> Result<Value, SchedulingPortError> {
     let republish = || SchedulingPortError::RepublishRequired;
-    if solver_version != SCHEDULER_PUBLICATION_SCHEMA
-        || snapshot.get("schema_version").and_then(Value::as_u64) != Some(5)
-        || snapshot
-            .get("scheduler_publication_schema")
-            .and_then(Value::as_str)
-            != Some(SCHEDULER_PUBLICATION_SCHEMA)
+    if !supported_policy_snapshot(solver_version, snapshot)
+        || snapshot_occurrence_lifecycle(solver_version, snapshot).is_none()
     {
         return Err(republish());
     }
@@ -5481,6 +5710,55 @@ fn storage_port(_error: impl std::fmt::Debug) -> SchedulingPortError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_policy_capsules_require_exact_schema_pairs_and_preserve_legacy_reads() {
+        let legacy = json!({
+            "schema_version": 5,
+            "scheduler_publication_schema": SCHEDULER_PUBLICATION_SCHEMA,
+        });
+        assert!(supported_policy_snapshot(
+            SCHEDULER_PUBLICATION_SCHEMA,
+            &legacy
+        ));
+        assert_eq!(
+            snapshot_occurrence_lifecycle(SCHEDULER_PUBLICATION_SCHEMA, &legacy),
+            Some(OccurrenceLifecycleContext::default())
+        );
+        let mut modern = json!({
+            "schema_version": 6,
+            "scheduler_publication_schema": OCCURRENCE_PUBLICATION_SCHEMA,
+            "evidence": {"occurrence_lifecycle": {"snapshot_revision": 7, "instances": []}},
+        });
+        assert!(supported_policy_snapshot(
+            OCCURRENCE_PUBLICATION_SCHEMA,
+            &modern
+        ));
+        assert_eq!(
+            snapshot_occurrence_lifecycle(OCCURRENCE_PUBLICATION_SCHEMA, &modern),
+            Some(OccurrenceLifecycleContext {
+                snapshot_revision: 7,
+                instances: Vec::new()
+            })
+        );
+        assert!(!supported_policy_snapshot(
+            SCHEDULER_PUBLICATION_SCHEMA,
+            &modern
+        ));
+        assert!(snapshot_occurrence_lifecycle(SCHEDULER_PUBLICATION_SCHEMA, &modern).is_none());
+        modern["schema_version"] = json!(5);
+        assert!(!supported_policy_snapshot(
+            OCCURRENCE_PUBLICATION_SCHEMA,
+            &modern
+        ));
+        modern["evidence"]["occurrence_lifecycle"]["snapshot_revision"] = json!(0);
+        assert!(snapshot_occurrence_lifecycle(OCCURRENCE_PUBLICATION_SCHEMA, &modern).is_none());
+        modern["evidence"]["occurrence_lifecycle"]["snapshot_revision"] = json!(7);
+        modern["evidence"]["occurrence_lifecycle"]["unreviewed"] = json!(true);
+        assert!(snapshot_occurrence_lifecycle(OCCURRENCE_PUBLICATION_SCHEMA, &modern).is_none());
+        modern["evidence"] = json!({});
+        assert!(snapshot_occurrence_lifecycle(OCCURRENCE_PUBLICATION_SCHEMA, &modern).is_none());
+    }
     use crate::scheduling::{ManualPlacementAssignmentInput, PlanOperation};
 
     fn manual_block_evidence_fixture() -> (

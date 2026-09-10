@@ -11,9 +11,9 @@ use crate::{
     AvailabilityWindow, ConstraintStrength, DayOfWeek, Dependency, DependencyRelation,
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
     ExecutionWorkUnit, FixedBlockSource, ItemId, ItemKind, MaterializedIdentity, Minutes,
-    Occurrence, OccurrenceId, PlanRequest, PreviousAssignment, PreviousBlock,
-    SchedulingConstraints, SplitPolicy, WorkItem, materialize_recurrences,
-    roll_up_expected_durations,
+    Occurrence, OccurrenceId, OccurrenceLifecycleContext, OccurrenceLifecycleError, PlanRequest,
+    PreviousAssignment, PreviousBlock, SchedulingConstraints, SplitPolicy, WorkItem,
+    apply_occurrence_lifecycle, materialize_recurrences, roll_up_expected_durations,
 };
 
 const MAX_MANUAL_ASSESSMENT_VIOLATIONS: usize = 4_096;
@@ -297,6 +297,8 @@ pub enum ScheduleError {
     InvalidHierarchy(String),
     #[error("invalid recurrence: {0}")]
     InvalidRecurrence(String),
+    #[error("invalid occurrence lifecycle: {0}")]
+    InvalidOccurrenceLifecycle(OccurrenceLifecycleError),
     #[error("schedule conflict evidence exceeds the supported limit")]
     ConflictEvidenceLimit,
     #[error("invalid defer candidate {placement_id}: {message}")]
@@ -364,10 +366,28 @@ impl Scheduler {
         request: &PlanRequest,
         execution: &ExecutionPlanningContext,
     ) -> Result<SchedulePlan, ScheduleError> {
+        self.plan_with_lifecycle(request, execution, &OccurrenceLifecycleContext::default())
+    }
+
+    /// Plans using caller-authenticated, occurrence-specific member lifecycle.
+    /// The complete supplied trees are validated and projected onto existing
+    /// clones without changing templates or suppressing a parent's descendants.
+    ///
+    /// # Errors
+    /// Rejects invalid planning/execution input, malformed or stale lifecycle
+    /// evidence, unavailable occurrences and conflicting execution reservations.
+    pub fn plan_with_lifecycle(
+        &self,
+        request: &PlanRequest,
+        execution: &ExecutionPlanningContext,
+        lifecycle: &OccurrenceLifecycleContext,
+    ) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
         validate_execution_context(request, execution)?;
-        let materialized = materialize_recurrences(request)
+        let mut materialized = materialize_recurrences(request)
             .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
+        apply_occurrence_lifecycle(request, execution, lifecycle, &mut materialized)
+            .map_err(ScheduleError::InvalidOccurrenceLifecycle)?;
         let (materialized_request, materialized_execution) =
             apply_execution_context(&materialized.request, &materialized.identities, execution)?;
         let mut plan =
@@ -406,13 +426,37 @@ impl Scheduler {
         execution: &ExecutionPlanningContext,
         candidate: &DeferCandidateAssessmentInput,
     ) -> Result<DeferCandidateAssessmentResult, ScheduleError> {
+        self.assess_defer_candidate_with_lifecycle(
+            request,
+            execution,
+            &OccurrenceLifecycleContext::default(),
+            candidate,
+        )
+    }
+
+    /// Assesses an exact defer against the same occurrence lifecycle used by
+    /// ordinary planning. Empty context preserves the legacy assessment path.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale lifecycle or execution evidence and any candidate
+    /// rejected by [`Self::assess_defer_candidate`].
+    #[allow(clippy::too_many_lines)]
+    pub fn assess_defer_candidate_with_lifecycle(
+        &self,
+        request: &PlanRequest,
+        execution: &ExecutionPlanningContext,
+        lifecycle: &OccurrenceLifecycleContext,
+        candidate: &DeferCandidateAssessmentInput,
+    ) -> Result<DeferCandidateAssessmentResult, ScheduleError> {
         validate_request(request)?;
         let (candidate_execution, remaining_source_minutes) =
             prepare_defer_candidate(request, execution, candidate)?;
         validate_execution_context(request, &candidate_execution)?;
 
-        let materialized = materialize_recurrences(request)
+        let mut materialized = materialize_recurrences(request)
             .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
+        apply_occurrence_lifecycle(request, &candidate_execution, lifecycle, &mut materialized)
+            .map_err(ScheduleError::InvalidOccurrenceLifecycle)?;
         let (materialized_request, materialized_execution) = apply_execution_context(
             &materialized.request,
             &materialized.identities,

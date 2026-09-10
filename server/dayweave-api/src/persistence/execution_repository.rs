@@ -22,13 +22,13 @@ use crate::{
     scheduling::{
         AuthoritativePlanningEvidence, ManualPlacementViolationOutput, PublishedPlanningPolicy,
         SchedulePublicationError, assert_current_calendar_projection, assert_current_item_snapshot,
-        assert_current_planning_policy_tx, authoritative_planning_evidence_tx,
-        has_postgres_timestamp_precision, lock_owner, map_manual_placement_violations,
-        published_planning_policy_tx,
+        assert_current_planning_policy_tx, assert_occurrence_lifecycle_tx,
+        authoritative_planning_evidence_tx, has_postgres_timestamp_precision, lock_owner,
+        map_manual_placement_violations, published_planning_policy_tx,
     },
 };
 
-use super::{DatabaseScope, lock_canonical_item_space};
+use super::{DatabaseScope, lock_canonical_item_space, lock_routine_occurrence_space};
 
 const IDEMPOTENCY_NAMESPACE: &str = "execution.command";
 const DEFER_ASSESSMENT_SCHEMA: &str = "dayweave-execution-defer-assessment/1";
@@ -386,10 +386,21 @@ async fn assess_defer_transaction(
     lock_canonical_item_space(transaction, scope.workspace_id)
         .await
         .map_err(internal)?;
+    lock_routine_occurrence_space(transaction, scope.workspace_id)
+        .await
+        .map_err(|_| ExecutionRepositoryError::DeferAssessmentUnavailable)?;
     lock_owner(transaction, scope).await.map_err(internal)?;
     let policy = published_planning_policy_tx(transaction, scope)
         .await
         .map_err(map_schedule_assessment_error)?;
+    assert_occurrence_lifecycle_tx(
+        transaction,
+        scope,
+        &policy.planning_request,
+        &policy.occurrence_lifecycle,
+    )
+    .await
+    .map_err(map_schedule_assessment_error)?;
     assert_current_item_snapshot(transaction, scope, &policy.source_item_revisions)
         .await
         .map_err(map_schedule_assessment_error)?;
@@ -516,7 +527,12 @@ async fn assess_defer_transaction(
         move_end: chrono_to_offset(move_end)?,
     };
     let core = Scheduler
-        .assess_defer_candidate(&planning_request, &evidence.execution, &candidate)
+        .assess_defer_candidate_with_lifecycle(
+            &planning_request,
+            &evidence.execution,
+            &policy.occurrence_lifecycle,
+            &candidate,
+        )
         .map_err(|_| ExecutionRepositoryError::DeferDurationConflict)?;
     let violations = map_manual_placement_violations(&core.assessment.violations)
         .map_err(|_| ExecutionRepositoryError::Internal)?;
@@ -824,6 +840,8 @@ fn defer_assessment_digest(
         current_schedule_revision_id: Uuid,
         current_schedule_revision_number: u64,
         current_publication_hash: &'a [u8; 32],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        occurrence_lifecycle: Option<&'a dayweave_core::OccurrenceLifecycleContext>,
         item_id: Uuid,
         source_item_revision: u64,
         current_item_revision: u64,
@@ -863,6 +881,9 @@ fn defer_assessment_digest(
         current_schedule_revision_id: policy.revision_id,
         current_schedule_revision_number: policy.revision_number,
         current_publication_hash: &policy.publication_hash,
+        occurrence_lifecycle: (policy.occurrence_lifecycle.snapshot_revision != 0
+            || !policy.occurrence_lifecycle.instances.is_empty())
+        .then_some(&policy.occurrence_lifecycle),
         item_id: session.item_id,
         source_item_revision: session.item_revision,
         current_item_revision,
@@ -1039,10 +1060,21 @@ async fn authorize_defer_transaction(
     lock_canonical_item_space(transaction, scope.workspace_id)
         .await
         .map_err(internal)?;
+    lock_routine_occurrence_space(transaction, scope.workspace_id)
+        .await
+        .map_err(|_| ExecutionRepositoryError::DeferAssessmentUnavailable)?;
     lock_owner(transaction, scope).await.map_err(internal)?;
     let policy = published_planning_policy_tx(transaction, scope)
         .await
         .map_err(map_schedule_authorization_error)?;
+    assert_occurrence_lifecycle_tx(
+        transaction,
+        scope,
+        &policy.planning_request,
+        &policy.occurrence_lifecycle,
+    )
+    .await
+    .map_err(map_schedule_authorization_error)?;
     assert_current_item_snapshot(transaction, scope, &policy.source_item_revisions)
         .await
         .map_err(map_schedule_authorization_error)?;
@@ -1184,7 +1216,12 @@ async fn authorize_defer_transaction(
     planning_request.as_of = chrono_to_offset(stored.context.planning_as_of)?;
     planning_request.previous_assignments = core_previous_assignments(&evidence)?;
     let core = Scheduler
-        .assess_defer_candidate(&planning_request, &evidence.execution, &expected_candidate)
+        .assess_defer_candidate_with_lifecycle(
+            &planning_request,
+            &evidence.execution,
+            &policy.occurrence_lifecycle,
+            &expected_candidate,
+        )
         .map_err(|_| ExecutionRepositoryError::DeferAssessmentStale)?;
     let violations = map_manual_placement_violations(&core.assessment.violations)
         .map_err(|_| ExecutionRepositoryError::Internal)?;
@@ -1366,6 +1403,7 @@ async fn apply_command_transaction(
             input.item_revision,
         )
         .await?;
+        validate_start_occurrence(transaction, scope, input).await?;
         if session_exists(transaction, input.session_id).await? {
             return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
         }
@@ -1395,6 +1433,51 @@ async fn apply_command_transaction(
         insert_defer_replacement_claim(transaction, scope, &updated, &authorization).await?;
     }
     Ok(updated)
+}
+
+async fn validate_start_occurrence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    input: &crate::execution::StartExecution,
+) -> Result<(), ExecutionRepositoryError> {
+    let Some(occurrence_id) = input.occurrence_id else {
+        return Ok(());
+    };
+    lock_routine_occurrence_space(transaction, scope.workspace_id)
+        .await
+        .map_err(|_| ExecutionRepositoryError::Internal)?;
+    let roots: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT series_item_id FROM routine_occurrences WHERE workspace_id=$1 AND occurrence_id=$2 LIMIT 2",
+    ).bind(scope.workspace_id).bind(occurrence_id).fetch_all(&mut **transaction)
+        .await.map_err(internal)?;
+    let Some(root) = roots.first() else {
+        return Ok(());
+    };
+    if roots.len() != 1 {
+        return Err(ExecutionRepositoryError::ScheduleStale);
+    }
+    let evidence = super::routine_occurrence_planning_evidence_tx(
+        transaction,
+        scope,
+        &[(*root, occurrence_id)],
+    )
+    .await
+    .map_err(|_| ExecutionRepositoryError::ScheduleStale)?;
+    let member = evidence
+        .instances
+        .first()
+        .and_then(|instance| {
+            instance
+                .aggregate
+                .members
+                .iter()
+                .find(|member| member.item_id == input.item_id)
+        })
+        .ok_or(ExecutionRepositoryError::ItemNotExecutable)?;
+    if member.status.is_terminal() || member.status == crate::items::ItemStatus::Blocked {
+        return Err(ExecutionRepositoryError::ItemNotExecutable);
+    }
+    Ok(())
 }
 
 async fn validate_start_schedule(

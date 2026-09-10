@@ -2,12 +2,16 @@ mod compose;
 pub(crate) mod http;
 mod invalidation;
 mod memory;
+mod occurrence;
+#[cfg(test)]
+mod occurrence_tests;
 mod ports;
 mod postgres;
 mod projection;
 mod proposal_bridge;
 
 pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/5";
+pub(crate) const OCCURRENCE_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/6";
 pub(crate) const MANUAL_PLACEMENT_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/4";
 
 /// `PostgreSQL` `timestamptz` stores microseconds. Query boundaries must already
@@ -49,7 +53,8 @@ pub use ports::*;
 pub(crate) use postgres::{
     AuthoritativePlanningEvidence, PublishedPlanningPolicy, assert_current_calendar_projection,
     assert_current_item_snapshot, assert_current_planning_policy_tx,
-    authoritative_planning_evidence_tx, lock_owner, published_planning_policy_tx,
+    assert_occurrence_lifecycle_tx, authoritative_planning_evidence_tx, lock_owner,
+    published_planning_policy_tx,
 };
 pub use postgres::{
     CurrentPublishedSchedule, PostgresSchedulingRepository, PublishScheduleSpec,

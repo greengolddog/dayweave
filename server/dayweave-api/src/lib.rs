@@ -27,6 +27,7 @@ pub mod persistence;
 pub mod proposals;
 pub mod provider_admission;
 pub mod readiness;
+pub mod routine_occurrences;
 pub mod scheduling;
 
 use std::sync::Arc;
@@ -198,6 +199,7 @@ pub struct AppState {
     pub items: Arc<ItemService>,
     pub item_progress: Arc<item_progress::ItemProgressService>,
     pub item_completion: Arc<item_completion::ItemCompletionService>,
+    pub(crate) routine_occurrences: Option<Arc<persistence::PostgresRoutineOccurrenceRepository>>,
     pub habits: Arc<HabitService>,
     pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
@@ -257,6 +259,9 @@ impl AppState {
             items.clone(),
             clock.clone(),
         ));
+        let routine_occurrences = scheduling
+            .as_ref()
+            .map(|repository| Arc::new(repository.routine_occurrence_repository()));
         let habits = Arc::new(HabitService::new(
             habit_repository,
             items.clone(),
@@ -409,6 +414,7 @@ impl AppState {
             items,
             item_progress,
             item_completion,
+            routine_occurrences,
             habits,
             execution,
             authenticator,
@@ -468,6 +474,7 @@ impl AppState {
                 items.clone(),
                 clock.clone(),
             )),
+            routine_occurrences: None,
             items,
             habits,
             execution,
@@ -556,6 +563,7 @@ impl AppState {
             repository.clone(),
             allowed_origins,
         ));
+        self.routine_occurrences = Some(Arc::new(repository.routine_occurrence_repository()));
         self.scheduling = Some(repository);
         self
     }

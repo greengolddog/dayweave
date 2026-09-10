@@ -4447,6 +4447,15 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         include_str!("../migrations/0025_authoritative_dependency_graph.sql"),
         include_str!("../migrations/0026_habit_occurrence_ledger.sql"),
         include_str!("../migrations/0027_habit_missed_resolutions.sql"),
+        include_str!("../migrations/0028_account_recovery_codes.sql"),
+        include_str!("../migrations/0029_account_deletion_lifecycle.sql"),
+        include_str!("../migrations/0030_account_deletion_external_principal.sql"),
+        include_str!("../migrations/0031_account_deletion_provider_cleanup.sql"),
+        include_str!("../migrations/0032_provider_operation_admission.sql"),
+        include_str!("../migrations/0033_item_progress.sql"),
+        include_str!("../migrations/0034_item_bootstrap.sql"),
+        include_str!("../migrations/0035_item_completion.sql"),
+        include_str!("../migrations/0036_routine_occurrences.sql"),
     ] {
         test_database
             .pool

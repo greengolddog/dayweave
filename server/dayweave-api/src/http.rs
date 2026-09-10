@@ -74,6 +74,10 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::item_progress::http::put_progress,
         crate::item_completion::http::get_completion,
         crate::item_completion::http::put_completion,
+        crate::routine_occurrences::http::list_occurrences,
+        crate::routine_occurrences::http::occurrence_delta,
+        crate::routine_occurrences::http::get_occurrence,
+        crate::routine_occurrences::http::put_member,
         crate::habits::http::list_occurrences,
         crate::habits::http::put_outcome,
         crate::habits::http::habit_delta,
@@ -383,6 +387,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::items::http::routes())
         .merge(crate::item_progress::http::routes())
         .merge(crate::item_completion::http::routes())
+        .merge(crate::routine_occurrences::http::routes())
         .merge(crate::habits::http::routes())
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())

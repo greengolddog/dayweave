@@ -457,8 +457,12 @@ const fn map_schedule_error(error: &ScheduleError) -> ErrorCode {
         ScheduleError::MissingPreviousItem(_) => ErrorCode::MissingPreviousItem,
         ScheduleError::InvalidHierarchy(_) => ErrorCode::InvalidHierarchy,
         ScheduleError::InvalidRecurrence(_) => ErrorCode::InvalidRecurrence,
-        ScheduleError::ConflictEvidenceLimit => ErrorCode::ResourceLimitExceeded,
-        ScheduleError::InvalidDeferCandidate { .. }
+        ScheduleError::InvalidOccurrenceLifecycle(
+            dayweave_core::OccurrenceLifecycleError::TooLarge { .. },
+        )
+        | ScheduleError::ConflictEvidenceLimit => ErrorCode::ResourceLimitExceeded,
+        ScheduleError::InvalidOccurrenceLifecycle(_)
+        | ScheduleError::InvalidDeferCandidate { .. }
         | ScheduleError::MissingDeferSourceWorkUnit { .. }
         | ScheduleError::AmbiguousDeferSourceWorkUnit { .. }
         | ScheduleError::MissingDeferSourceReservation { .. }

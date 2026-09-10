@@ -14,6 +14,9 @@ mod outbox;
 mod proposal_application_repository;
 mod proposal_repository;
 mod provider_admission_repository;
+mod routine_occurrence_repository;
+#[cfg(test)]
+pub(crate) use routine_occurrence_repository::RoutineOccurrencePlanningInstance;
 
 pub use account_deletion_repository::PostgresAccountDeletionRepository;
 pub use credential_auth_repository::PostgresCredentialRepository;
@@ -44,4 +47,12 @@ pub use proposal_repository::PostgresProposalRepository;
 pub(crate) use proposal_repository::{insert_proposal_tx, proposal_from_row};
 pub(crate) use provider_admission_repository::{
     PostgresProviderAdmissionRepository, ensure_provider_admission_drained,
+};
+pub use routine_occurrence_repository::{
+    PostgresRoutineOccurrenceRepository, RoutineOccurrenceChange, RoutineOccurrenceMutation,
+    RoutineOccurrencePage,
+};
+pub(crate) use routine_occurrence_repository::{
+    RoutineOccurrencePlanningEvidence, lock_routine_occurrence_space,
+    record_published_routine_occurrences_tx, routine_occurrence_planning_evidence_tx,
 };

@@ -14,9 +14,10 @@ use dayweave_compose::{
     RejectedScheduleItem, prepare_canonical_schedule, validate_schedule_request,
 };
 use dayweave_core::{
-    ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId, PlanRequest,
-    RecurrenceExceptionAction, RecurrenceExceptionSelector, ScheduleBlockKind, ScheduleError,
-    SchedulePlan, Scheduler, expand_occurrences,
+    ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId,
+    OccurrenceLifecycleContext, PlanRequest, RecurrenceExceptionAction,
+    RecurrenceExceptionSelector, ScheduleBlockKind, ScheduleError, SchedulePlan, Scheduler,
+    expand_occurrences,
 };
 use dayweave_scheduler_helper::{PlanPreflightError, preflight_plan_request};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,10 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) habit_change_head: u64,
+    /// Complete server-owned member lifecycle evidence, never a caller claim.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) occurrence_lifecycle: OccurrenceLifecycleContext,
     /// Exact manual proposal inputs retained only for durable publication
     /// evidence and per-block audit binding.
     #[serde(skip)]
@@ -105,6 +110,20 @@ pub struct ComposeScheduleResult {
     pub manual_placement_assessments: Vec<ManualPlacementAssessmentOutput>,
     #[schema(value_type = Object)]
     pub plan: Rfc3339SchedulePlan,
+}
+
+impl ComposeScheduleResult {
+    pub(crate) fn publication_schema(&self) -> &'static str {
+        publication_schema_for_lifecycle(&self.occurrence_lifecycle)
+    }
+}
+
+fn publication_schema_for_lifecycle(context: &OccurrenceLifecycleContext) -> &'static str {
+    if context.snapshot_revision == 0 {
+        super::SCHEDULER_PUBLICATION_SCHEMA
+    } else {
+        super::OCCURRENCE_PUBLICATION_SCHEMA
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -380,6 +399,12 @@ pub enum ComposeScheduleError {
     ExecutionEvidenceChanged,
     #[error("execution planning evidence is temporarily unavailable")]
     ExecutionEvidenceUnavailable,
+    #[error("routine occurrence evidence changed during preview")]
+    OccurrenceEvidenceChanged,
+    #[error("routine occurrence definitions require explicit review before scheduling")]
+    OccurrenceReviewRequired,
+    #[error("routine occurrence authority is temporarily unavailable")]
+    OccurrenceEvidenceUnavailable,
     #[error("authoritative manual placement evidence changed: {0}")]
     AuthoritativeManualPlacementChanged(String),
 }
@@ -438,6 +463,17 @@ async fn compose_canonical_schedule_inner(
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     validate_schedule_request(&request).map_err(map_prepare_error)?;
     let moved_occurrence_ids = contained_moved_occurrence_ids(&request);
+    let occurrence_before = match projection {
+        Some(projection) => {
+            projection
+                .routine_occurrence_repository()
+                .planning_evidence(&[])
+                .await
+                .map_err(map_occurrence_evidence_error)?
+                .change_head
+        }
+        None => 0,
+    };
     let planning_before = match projection {
         Some(projection) => projection
             .authoritative_planning_evidence()
@@ -530,14 +566,71 @@ async fn compose_canonical_schedule_inner(
         }
         return Err(map_prepare_error(error));
     }
-    compose_items_with_projection_for_schema(
+    let occurrence_lifecycle = match projection {
+        Some(projection) => {
+            let mut probe = request.clone();
+            probe.recurrence_context.completed_occurrence_ids.clear();
+            probe.recurrence_context.partial_progress.clear();
+            let prepared = prepare_canonical_schedule(
+                items.iter().cloned().map(into_canonical_item).collect(),
+                probe,
+            )
+            .map_err(map_prepare_error)?;
+            preflight_plan_request(&prepared.plan_request)
+                .map_err(map_scheduler_preflight_error)?;
+            let identities = super::occurrence::planning_identities(&prepared.plan_request)
+                .map_err(map_occurrence_evidence_error)?;
+            let evidence = projection
+                .routine_occurrence_repository()
+                .planning_evidence(&identities)
+                .await
+                .map_err(map_occurrence_evidence_error)?;
+            if evidence.change_head != occurrence_before {
+                return Err(ComposeScheduleError::OccurrenceEvidenceChanged);
+            }
+            let context = super::occurrence::lifecycle_from_evidence(evidence)
+                .map_err(map_occurrence_evidence_error)?;
+            let source_revisions = items
+                .iter()
+                .map(|item| (ItemId(item.id), item.revision))
+                .collect::<BTreeMap<_, _>>();
+            if context
+                .instances
+                .iter()
+                .flat_map(|instance| &instance.members)
+                .any(|member| {
+                    source_revisions.get(&member.item_id) != Some(&member.source_revision)
+                })
+            {
+                return Err(ComposeScheduleError::OccurrenceEvidenceChanged);
+            }
+            let managed_ids = context
+                .instances
+                .iter()
+                .map(|instance| instance.occurrence_id)
+                .collect::<BTreeSet<_>>();
+            request
+                .recurrence_context
+                .completed_occurrence_ids
+                .retain(|id| !managed_ids.contains(id));
+            request
+                .recurrence_context
+                .partial_progress
+                .retain(|id, _| !managed_ids.contains(id));
+            context
+        }
+        None => OccurrenceLifecycleContext::default(),
+    };
+    let schema = publication_schema_for_lifecycle(&occurrence_lifecycle);
+    compose_items_with_lifecycle_for_schema(
         items,
         request,
-        super::SCHEDULER_PUBLICATION_SCHEMA,
+        schema,
         projection_before,
         planning_before,
         habit_after.change_head,
         untrusted_assignments,
+        occurrence_lifecycle,
     )
     .map_err(|error| {
         if (retained_placement_was_injected || manual_execution_evidence_was_applied)
@@ -1369,6 +1462,19 @@ const fn map_execution_evidence_error(
     ComposeScheduleError::ExecutionEvidenceUnavailable
 }
 
+fn map_occurrence_evidence_error(
+    error: crate::routine_occurrences::RoutineOccurrenceError,
+) -> ComposeScheduleError {
+    use crate::routine_occurrences::RoutineOccurrenceError;
+    match error {
+        RoutineOccurrenceError::TooLarge => ComposeScheduleError::SchedulerResourceLimit,
+        RoutineOccurrenceError::DefinitionChanged | RoutineOccurrenceError::SourceIneligible => {
+            ComposeScheduleError::OccurrenceReviewRequired
+        }
+        _ => ComposeScheduleError::OccurrenceEvidenceUnavailable,
+    }
+}
+
 #[cfg(test)]
 fn compose_items(
     source_items: Vec<Item>,
@@ -1401,6 +1507,7 @@ fn compose_items_for_schema(
     )
 }
 
+#[cfg(test)]
 fn compose_items_with_projection_for_schema(
     source_items: Vec<Item>,
     request: ComposeScheduleRequest,
@@ -1409,6 +1516,29 @@ fn compose_items_with_projection_for_schema(
     planning_evidence: AuthoritativePlanningEvidence,
     habit_change_head: u64,
     untrusted_assignments: Vec<IgnoredPreviousAssignment>,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    compose_items_with_lifecycle_for_schema(
+        source_items,
+        request,
+        scheduler_publication_schema,
+        calendar_projection_stamps,
+        planning_evidence,
+        habit_change_head,
+        untrusted_assignments,
+        OccurrenceLifecycleContext::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Private evidence remains outside the strict client request.
+pub(super) fn compose_items_with_lifecycle_for_schema(
+    source_items: Vec<Item>,
+    request: ComposeScheduleRequest,
+    scheduler_publication_schema: &str,
+    calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    planning_evidence: AuthoritativePlanningEvidence,
+    habit_change_head: u64,
+    untrusted_assignments: Vec<IgnoredPreviousAssignment>,
+    occurrence_lifecycle: OccurrenceLifecycleContext,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     if !calendar_projection_stamps.is_empty()
         && request
@@ -1424,13 +1554,14 @@ fn compose_items_with_projection_for_schema(
     validate_habit_recurrence_anchor_inputs(&request, &source_items)?;
     let source_items = source_items.into_iter().map(into_canonical_item).collect();
     let prepared = prepare_canonical_schedule(source_items, request).map_err(map_prepare_error)?;
-    compose_prepared_for_schema(
+    compose_prepared_with_lifecycle_for_schema(
         prepared,
         scheduler_publication_schema,
         calendar_projection_stamps,
         planning_evidence,
         habit_change_head,
         untrusted_assignments,
+        occurrence_lifecycle,
     )
 }
 
@@ -1459,13 +1590,14 @@ fn validate_habit_recurrence_anchor_inputs(
     Ok(())
 }
 
-fn compose_prepared_for_schema(
+fn compose_prepared_with_lifecycle_for_schema(
     prepared: PreparedSchedule,
     scheduler_publication_schema: &str,
     calendar_projection_stamps: Vec<CalendarProjectionStamp>,
     planning_evidence: AuthoritativePlanningEvidence,
     habit_change_head: u64,
     untrusted_assignments: Vec<IgnoredPreviousAssignment>,
+    occurrence_lifecycle: OccurrenceLifecycleContext,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     let PreparedSchedule {
         timezone_name,
@@ -1488,9 +1620,14 @@ fn compose_prepared_for_schema(
         &calendar_projection_stamps,
         &planning_evidence.execution,
         habit_change_head,
+        &occurrence_lifecycle,
         &plan_request,
     )?;
-    let plan = Scheduler.plan_with_execution(&plan_request, &planning_evidence.execution)?;
+    let plan = Scheduler.plan_with_lifecycle(
+        &plan_request,
+        &planning_evidence.execution,
+        &occurrence_lifecycle,
+    )?;
     let manual_placement_assessments = build_manual_placement_assessments(
         &input_digest,
         &manual_placements,
@@ -1505,6 +1642,7 @@ fn compose_prepared_for_schema(
         calendar_projection_stamps,
         planning_evidence,
         habit_change_head,
+        occurrence_lifecycle,
         manual_placements,
         manual_placement_releases,
         planning_request: plan_request.clone(),
@@ -1514,7 +1652,7 @@ fn compose_prepared_for_schema(
         manual_placement_assessments,
         plan: Rfc3339SchedulePlan(plan),
     };
-    let validation = if scheduler_publication_schema == super::SCHEDULER_PUBLICATION_SCHEMA {
+    let validation = if scheduler_publication_schema == result.publication_schema() {
         super::postgres::validate_publishable_compose_result(&timezone_name, &result).map(|_| ())
     } else {
         super::postgres::validate_composed_result_for_schema(
@@ -1868,6 +2006,7 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.format(&Rfc3339)
 }
 
+#[allow(clippy::too_many_arguments)] // Every independent authority is part of the same digest.
 pub(super) fn request_digest(
     scheduler_publication_schema: &str,
     timezone_name: &str,
@@ -1875,6 +2014,7 @@ pub(super) fn request_digest(
     calendar_projection_stamps: &[CalendarProjectionStamp],
     execution: &ExecutionPlanningContext,
     habit_change_head: u64,
+    occurrence_lifecycle: &OccurrenceLifecycleContext,
     request: &PlanRequest,
 ) -> Result<String, ComposeScheduleError> {
     #[derive(Serialize)]
@@ -1886,6 +2026,8 @@ pub(super) fn request_digest(
         execution: &'a ExecutionPlanningContext,
         #[serde(skip_serializing_if = "is_zero")]
         habit_change_head: u64,
+        #[serde(skip_serializing_if = "lifecycle_is_empty")]
+        occurrence_lifecycle: &'a OccurrenceLifecycleContext,
         request: &'a PlanRequest,
     }
 
@@ -1896,6 +2038,7 @@ pub(super) fn request_digest(
         calendar_projection_stamps,
         execution,
         habit_change_head,
+        occurrence_lifecycle,
         request,
     })
     .map_err(|_| ComposeScheduleError::Encoding)?;
@@ -1906,6 +2049,10 @@ pub(super) fn request_digest(
         write!(&mut encoded, "{byte:02x}").map_err(|_| ComposeScheduleError::Encoding)?;
     }
     Ok(encoded)
+}
+
+fn lifecycle_is_empty(context: &OccurrenceLifecycleContext) -> bool {
+    context.snapshot_revision == 0 && context.instances.is_empty()
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip callback receives a reference.

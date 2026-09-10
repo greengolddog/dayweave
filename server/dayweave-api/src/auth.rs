@@ -383,11 +383,17 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/items/{id}"
             | "/items/{item_id}/progress"
             | "/items/{item_id}/completion"
+            | "/routine-occurrences"
+            | "/routine-occurrences/delta"
+            | "/routine-occurrences/{occurrence_id}"
             | "/habits/occurrences/delta"
             | "/habits/stream"
             | "/habits/{habit_id}/occurrences"
             | "/habits/{habit_id}/analytics",
         ) => Some(Scope::ItemsRead),
+        (&Method::PUT, "/routine-occurrences/{occurrence_id}/members/{item_id}") => {
+            Some(Scope::ItemsWrite)
+        }
         (
             &Method::POST | &Method::PUT | &Method::DELETE,
             "/items"
