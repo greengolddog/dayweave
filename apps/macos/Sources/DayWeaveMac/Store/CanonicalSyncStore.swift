@@ -61,6 +61,9 @@ final class CanonicalSyncStore: ObservableObject {
     @Published private(set) var localCompositionWarnings: [String] = []
     @Published private(set) var isPreparingRoutinePlanningInput = false
     @Published private(set) var routinePlanningInputMessage = "No saved routine input has been prepared in this session."
+    @Published private(set) var isRecomputingRoutinePlanningDisplay = false
+    @Published private(set) var routinePlanningDisplayMessage = "Recompute the saved fixed input to inspect its execution-locked preview."
+    @Published private var routinePlanningDisplayAdmission: RoutinePlanningDisplayAdmission?
     @Published private var routinePlanningInputForegroundAvailable = false
 
     private let planner: PlannerStore
@@ -104,6 +107,16 @@ final class CanonicalSyncStore: ObservableObject {
     private var activeRoutinePlanningInputID: UUID?
     private var activeRoutineWitnessTask: Task<RoutinePlanningWitnessResponse, Error>?
     private var activeRoutineHelperTask: Task<RoutineOccurrenceLocalComposition, Error>?
+    private var routinePlanningDisplayObservedClock: Date?
+    private var routinePlanningDisplayWasRevoked = false
+    private struct RoutinePlanningDisplayAdmission {
+        let configurationGeneration: UInt64
+        let capsule: RoutinePlanningInputCapsule
+        let artifact: RoutinePlanningDisplayPlan
+        let fence: RoutinePlanningInputCaptureFence
+        let presentation: RoutinePlanningDisplayPresentation
+        let clock: Date
+    }
     private var foregroundItemPollTask: Task<Void, Never>?
     private var foregroundItemStreamTask: Task<Void, Never>?
     private var foregroundItemDrainTask: Task<Void, Never>?
@@ -1013,6 +1026,185 @@ final class CanonicalSyncStore: ObservableObject {
         } catch { return false }
     }
 
+    /// UI hint only: the operation repeats complete validation before running
+    /// the helper. This reads local binding metadata and never contacts a server.
+    var canRecomputeSavedRoutinePlanningDisplay: Bool {
+        guard routinePlanningInputForegroundAvailable,
+              let capsule = planner.routinePlanningInputCapsule,
+              !isPreparingRoutinePlanningInput, !isRecomputingRoutinePlanningDisplay,
+              let client = makeClient(reportFailure: false),
+              client.configurationIdentifier == capsule.configurationIdentifier,
+              planner.canonicalConfigurationIdentifier == capsule.configurationIdentifier,
+              let raw = configurationStore.loadBaseURL(),
+              (try? DayWeaveAPIBaseURL(raw).canonicalConfigurationIdentifier) == capsule.origin,
+              capsule.canonicalItems == planner.canonicalItems,
+              routinePlanningDisplayClockIsCurrent(capsule: capsule, notBefore: capsule.capturedAt) else { return false }
+        do {
+            let checkpoint = try requireLocalCompositionPreflight(allowManagedRoutine: true)
+            guard planner.routinePlanningInputPreparationIssue(habitCheckpoint: checkpoint) == nil,
+                  let current = try? RoutinePlanningInputEnvironment(planner: planner, habitCheckpoint: checkpoint) else { return false }
+            return capsule.environment.matchesForDisplay(current: current)
+        } catch { return false }
+    }
+
+    /// No admission is restored from encrypted bytes. Every launch/privacy
+    /// withdrawal requires another explicit, owned helper recomputation.
+    var routinePlanningDisplayPresentation: RoutinePlanningDisplayPresentation? {
+        guard let admission = routinePlanningDisplayAdmission,
+              routinePlanningDisplayIsCurrent(admission, at: now()) else { return nil }
+        return admission.presentation
+    }
+
+    private func routinePlanningDisplayIsCurrent(_ admission: RoutinePlanningDisplayAdmission, at observed: Date) -> Bool {
+        guard !routinePlanningDisplayWasRevoked else { return false }
+        guard routinePlanningInputForegroundAvailable,
+              admission.configurationGeneration == configurationGeneration,
+              planner.routinePlanningInputCapsule == admission.capsule,
+              planner.routinePlanningDisplayPlan == admission.artifact,
+              makeClient(reportFailure: false)?.configurationIdentifier == admission.capsule.configurationIdentifier,
+              let raw = configurationStore.loadBaseURL(),
+              (try? DayWeaveAPIBaseURL(raw).canonicalConfigurationIdentifier) == admission.capsule.origin,
+              observed >= (routinePlanningDisplayObservedClock ?? admission.clock),
+              routinePlanningDisplayClockIsCurrent(capsule: admission.capsule, notBefore: admission.clock, at: observed),
+              (try? planner.requireRoutinePlanningInputFence(admission.fence,
+                habitCheckpoint: habitCompositionProvider?.habitCompositionCheckpoint)) != nil else { return false }
+        return true
+    }
+
+    /// The protected sheet calls this once per second, so a quiet offline
+    /// window also hides at the original day/horizon boundary. Never persisted.
+    func refreshRoutinePlanningDisplayAdmission() {
+        guard let admission = routinePlanningDisplayAdmission else { return }
+        let observed = now()
+        guard routinePlanningDisplayIsCurrent(admission, at: observed) else {
+            // Only this explicit clock observer changes the sticky lease.
+            // SwiftUI's computed presentation getter remains entirely pure.
+            routinePlanningDisplayWasRevoked = true
+            routinePlanningDisplayAdmission = nil
+            routinePlanningDisplayMessage = "The fixed-input preview is locked or stale. Explicitly recompute before viewing again."
+            return
+        }
+        routinePlanningDisplayObservedClock = observed
+        routinePlanningDisplayAdmission = .init(configurationGeneration: admission.configurationGeneration,
+            capsule: admission.capsule, artifact: admission.artifact, fence: admission.fence,
+            presentation: admission.presentation, clock: observed)
+    }
+
+    /// Runs only the retained, qualified v2 request. It never expands a new
+    /// clock, asks for a witness, or changes the active canonical schedule.
+    @discardableResult
+    func recomputeSavedRoutinePlanningDisplay() async -> Bool {
+        guard routinePlanningInputForegroundAvailable,
+              !isPreparingRoutinePlanningInput, !isRecomputingRoutinePlanningDisplay else { return false }
+        let id = UUID(), generation = configurationGeneration
+        var lastClock = now(), ownsLock = false, didCommit = false
+        defer {
+            if ownsLock { planner.endCanonicalSync() }
+            if activeRoutinePlanningInputID == id {
+                activeRoutinePlanningInputID = nil; activeRoutineHelperTask = nil
+                isRecomputingRoutinePlanningDisplay = false
+            }
+        }
+        do {
+            let checkpoint = try requireLocalCompositionPreflight(allowManagedRoutine: true)
+            guard let capsule = planner.routinePlanningInputCapsule,
+                  makeClient(reportFailure: false)?.configurationIdentifier == capsule.configurationIdentifier,
+                  let raw = configurationStore.loadBaseURL(),
+                  (try? DayWeaveAPIBaseURL(raw).canonicalConfigurationIdentifier) == capsule.origin else {
+                throw RoutinePlanningInputCapsuleError.configurationChanged
+            }
+            if let issue = planner.routinePlanningDisplayCapsuleIssue(origin: capsule.origin,
+                configurationIdentifier: capsule.configurationIdentifier, habitCheckpoint: checkpoint, at: lastClock) { throw issue }
+            let fence = try planner.captureRoutinePlanningInputFence(habitCheckpoint: checkpoint)
+            guard planner.beginCanonicalSync() else { throw RoutinePlanningInputCapsuleError.superseded }
+            ownsLock = true; activeRoutinePlanningInputID = id
+            isRecomputingRoutinePlanningDisplay = true; routinePlanningDisplayAdmission = nil
+            routinePlanningDisplayMessage = "Recomputing the exact saved routine input on this Mac…"
+            lastClock = try requireRoutinePlanningDisplayCurrent(id: id, generation: generation,
+                capsule: capsule, fence: fence, notBefore: lastClock)
+            let composer = occurrenceComposer
+            let task = Task.detached(priority: .userInitiated) {
+                try await composer.composeOccurrences(canonicalItems: capsule.canonicalItems, witness: capsule.witness)
+            }
+            activeRoutineHelperTask = task
+            let composition = try await withTaskCancellationHandler { try await task.value }
+                onCancel: { task.cancel() }
+            lastClock = try requireRoutinePlanningDisplayCurrent(id: id, generation: generation,
+                capsule: capsule, fence: fence, notBefore: lastClock)
+            let artifact = try RoutinePlanningDisplayPlan(capsule: capsule, composition: composition, generatedAt: lastClock)
+            let presentation = try RoutinePlanningDisplayPresentation(artifact: artifact, capsule: capsule)
+            lastClock = try requireRoutinePlanningDisplayCurrent(id: id, generation: generation,
+                capsule: capsule, fence: fence, notBefore: lastClock)
+            let finalClock = lastClock
+            let postSaveFence = try planner.commitRoutinePlanningDisplayPlan(artifact, expected: fence,
+                habitCheckpoint: habitCompositionProvider?.habitCompositionCheckpoint, isCurrent: { [self] in
+                    !Task.isCancelled && routinePlanningInputForegroundAvailable
+                        && activeRoutinePlanningInputID == id && configurationGeneration == generation
+                        && makeClient(reportFailure: false)?.configurationIdentifier == capsule.configurationIdentifier
+                        && configurationStore.loadBaseURL().flatMap { try? DayWeaveAPIBaseURL($0).canonicalConfigurationIdentifier } == capsule.origin
+                        && routinePlanningDisplayClockIsCurrent(capsule: capsule, notBefore: finalClock)
+                })
+            didCommit = true
+            // Publishing UI admission is separate from writing historical data.
+            // No late callback may make a restored artifact visible on its own.
+            lastClock = try requireRoutinePlanningDisplayCurrent(id: id, generation: generation,
+                capsule: capsule, fence: postSaveFence, notBefore: lastClock)
+            routinePlanningDisplayAdmission = .init(configurationGeneration: generation, capsule: capsule,
+                artifact: artifact, fence: postSaveFence, presentation: presentation, clock: lastClock)
+            routinePlanningDisplayObservedClock = lastClock; routinePlanningDisplayWasRevoked = false
+            routinePlanningDisplayMessage = "Fixed-input preview saved encrypted. Read-only; execution and publication remain locked."
+            return true
+        } catch {
+            if activeRoutinePlanningInputID == id || !ownsLock && generation == configurationGeneration {
+                routinePlanningDisplayMessage = didCommit
+                    ? "The recomputed preview was retained privately, but its display permission changed. Explicitly recompute again before viewing. Pending work was kept."
+                    : "The saved fixed input could not be recomputed. Prior encrypted preview and pending work were kept. Prepare a new input while connected if its sources or planning day changed."
+            }
+            return false
+        }
+    }
+
+    private func requireRoutinePlanningDisplayCurrent(id: UUID, generation: UInt64,
+        capsule: RoutinePlanningInputCapsule, fence: RoutinePlanningInputCaptureFence, notBefore: Date) throws -> Date {
+        guard !Task.isCancelled, routinePlanningInputForegroundAvailable,
+              activeRoutinePlanningInputID == id, configurationGeneration == generation,
+              planner.isCanonicalSyncLocked, planner.routinePlanningInputCapsule == capsule,
+              makeClient(reportFailure: false)?.configurationIdentifier == capsule.configurationIdentifier,
+              let raw = configurationStore.loadBaseURL(),
+              (try? DayWeaveAPIBaseURL(raw).canonicalConfigurationIdentifier) == capsule.origin else {
+            throw RoutinePlanningInputCapsuleError.superseded
+        }
+        let checkpoint = habitCompositionProvider?.habitCompositionCheckpoint
+        try planner.requireRoutinePlanningInputFence(fence, habitCheckpoint: checkpoint)
+        let observed = now()
+        guard observed >= notBefore, routinePlanningDisplayClockIsCurrent(capsule: capsule, notBefore: notBefore) else {
+            throw RoutinePlanningInputCapsuleError.clockChanged
+        }
+        if let issue = planner.routinePlanningDisplayCapsuleIssue(origin: capsule.origin,
+            configurationIdentifier: capsule.configurationIdentifier, habitCheckpoint: checkpoint, at: observed) { throw issue }
+        try planner.requireRoutinePlanningInputFence(fence, habitCheckpoint: checkpoint)
+        let afterValidation = now()
+        guard afterValidation >= observed,
+              routinePlanningDisplayClockIsCurrent(capsule: capsule, notBefore: afterValidation) else {
+            throw RoutinePlanningInputCapsuleError.clockChanged
+        }
+        return afterValidation
+    }
+
+    private func routinePlanningDisplayClockIsCurrent(capsule: RoutinePlanningInputCapsule, notBefore: Date, at observed: Date? = nil) -> Bool {
+        let current = observed ?? now()
+        guard current.timeIntervalSinceReferenceDate.isFinite, current >= notBefore, current >= capsule.capturedAt,
+              let asOf = try? RoutinePlanningShape.instant(capsule.witness.schedule.fields["as_of"]),
+              let start = try? RoutinePlanningShape.instant(capsule.witness.schedule.fields["horizon_start"]),
+              let end = try? RoutinePlanningShape.instant(capsule.witness.schedule.fields["horizon_end"]),
+              let instant = CanonicalRFC3339Instant(date: current),
+              instant.microsecondsSinceUnixEpoch >= start, instant.microsecondsSinceUnixEpoch < end,
+              case let .string(zoneName)? = capsule.witness.schedule.fields["timezone_name"],
+              let zone = TimeZone(identifier: zoneName) else { return false }
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = zone
+        return calendar.isDate(Date(timeIntervalSince1970: Double(asOf) / 1_000_000), inSameDayAs: current)
+    }
+
     @discardableResult
     func prepareRoutineOccurrencePlanningInput() async -> Bool {
         guard routinePlanningInputForegroundAvailable, !isPreparingRoutinePlanningInput else { return false }
@@ -1146,6 +1338,10 @@ final class CanonicalSyncStore: ObservableObject {
         activeRoutinePlanningInputID = nil
         activeRoutineWitnessTask = nil; activeRoutineHelperTask = nil
         isPreparingRoutinePlanningInput = false
+        isRecomputingRoutinePlanningDisplay = false
+        routinePlanningDisplayAdmission = nil
+        routinePlanningDisplayObservedClock = nil
+        routinePlanningDisplayWasRevoked = true
         routinePlanningInputMessage = "Saved routine input is retained privately; prepare again after unlocking or reconnecting."
     }
 

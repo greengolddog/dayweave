@@ -2166,6 +2166,10 @@ data class DayWeaveUiState(
     val routineOccurrenceLedger: RoutineOccurrenceLedger = RoutineOccurrenceLedger(),
     /** Protected fixed-input custody only; restore never grants a live witness/helper admission. */
     val routinePlanningInputCapsule: RoutinePlanningInputCapsule? = null,
+    /** Never substituted for the canonical schedule; full helper-v2 fidelity stays encrypted. */
+    val routinePlanningDisplaySnapshot: RoutinePlanningDisplaySnapshot? = null,
+    @kotlinx.serialization.Transient
+    val routinePlanningDisplayAdmission: RoutinePlanningDisplayAdmission? = null,
     /** Runtime reads/privacy changes fence planning even when a remote review preserves status. */
     @kotlinx.serialization.Transient
     val routineOccurrenceAuthorityGeneration: Long = 0,

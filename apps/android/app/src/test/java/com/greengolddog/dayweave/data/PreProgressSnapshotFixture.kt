@@ -16,8 +16,13 @@ import kotlinx.serialization.json.jsonObject
  * Never use this in progress-injection tests, which exercise the unmodified stored bytes.
  */
 internal fun PlannerSnapshotEntity.asPreProgressFixtureWhenRelabelled(): PlannerSnapshotEntity {
-    if (payloadFormat == PlannerSnapshotFormats.JSON_V25) return this
+    if (payloadFormat == PlannerSnapshotFormats.JSON_V26) return this
     var root = Json.parseToJsonElement(payload).jsonObject
+    root["routinePlanningDisplaySnapshot"]?.let {
+        require(it == JsonNull) { "A historical fixture cannot discard a protected routine preview" }
+        root = JsonObject(root - "routinePlanningDisplaySnapshot")
+    }
+    if (payloadFormat == PlannerSnapshotFormats.JSON_V25) return copy(payload = root.toString())
     root["routinePlanningInputCapsule"]?.let {
         require(it == JsonNull) { "A historical fixture cannot discard protected planning input" }
         root = JsonObject(root - "routinePlanningInputCapsule")

@@ -376,6 +376,25 @@ struct DayWeaveServiceCoordinatorTests {
         ])
     }
 
+    @Test("private fixed-input ownership is granted before a failed execution refresh and withdrawn at stop")
+    func offlinePrivateInputActivationDoesNotWaitForNetworkAuthority() async {
+        let events = ServiceEventLog()
+        let canonical = CanonicalServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: ProposalRecoveryDouble(hasPendingRecovery: false, resolvesRecovery: false,
+                reportedResult: false, events: events),
+            executionSync: ExecutionServiceDouble(events: events, outcome: .transientNetworkFailure),
+            canonicalSync: canonical)
+        coordinator.activate()
+        #expect(canonical.privateInputAvailable)
+        #expect(events.values.isEmpty) // Synchronous grant precedes the queued refresh.
+        await coordinator.waitForActivation()
+        #expect(canonical.privateInputAvailable)
+        #expect(!events.values.contains("canonical.bootstrap"))
+        coordinator.deactivate()
+        #expect(!canonical.privateInputAvailable)
+    }
+
     @Test("habit sync establishes its checkpoint before canonical bootstrap and is scrubbed at privacy")
     func habitLifecycleIsOrderedAndPrivate() async {
         let events = ServiceEventLog()
@@ -549,14 +568,16 @@ private final class GoogleOutboundRecoveryDouble: GoogleOutboundRecovering {
 @MainActor
 private final class ExecutionServiceDouble: ExecutionServiceSynchronizing {
     private let events: ServiceEventLog
+    private let outcome: ExecutionSyncOutcome
 
-    init(events: ServiceEventLog) {
+    init(events: ServiceEventLog, outcome: ExecutionSyncOutcome = .success) {
         self.events = events
+        self.outcome = outcome
     }
 
     func refresh() async -> ExecutionSyncOutcome {
         events.values.append("execution.refresh")
-        return .success
+        return outcome
     }
 
     func startForegroundPolling(every _: Duration) {
@@ -571,6 +592,7 @@ private final class ExecutionServiceDouble: ExecutionServiceSynchronizing {
 @MainActor
 private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
     let isConfigured = true
+    private(set) var privateInputAvailable = false
     private let events: ServiceEventLog
     private let syncSucceeds: Bool
 
@@ -578,6 +600,8 @@ private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
         self.events = events
         self.syncSucceeds = syncSucceeds
     }
+
+    func activateRoutinePlanningInputCapture() { privateInputAvailable = true }
 
     func bootstrapForegroundActivation() async -> Bool {
         events.values.append("canonical.bootstrap")
@@ -594,6 +618,7 @@ private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
     }
 
     func stopForegroundItemInvalidations() {
+        privateInputAvailable = false
         events.values.append("canonical.stop")
     }
 }

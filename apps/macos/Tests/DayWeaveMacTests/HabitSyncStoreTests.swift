@@ -8,6 +8,97 @@ import Testing
 @Suite("Habit sync store", .serialized)
 @MainActor
 struct HabitSyncStoreTests {
+    @Test("rejected successful delta evidence stays withdrawn across an offline restart")
+    func rejectedDeltaSurvivesOfflineRestart() async throws {
+        for malformedWire in [false, true] {
+            let context = try Context(); defer { context.remove() }
+            let binding = "origin-a|auth=device-a"
+            let original = DayWeaveHabitClientSnapshot(savedAt: Self.now, configurationIdentifier: binding,
+                deltaCursor: "cursor-captured", deltaCaughtUp: true, occurrences: [Self.occurrence()],
+                pauses: [], analytics: [], pendingMutations: [])
+            _ = try context.persistence.save(original, expectedRevision: .missing)
+            let rejected = HabitTransportStub(configurationIdentifier: binding,
+                deltaPages: [.init(changes: [], nextCursor: "cursor-captured", hasMore: true)],
+                malformedDelta: malformedWire)
+            let store = makeStore(context: context, transport: rejected)
+            #expect(await store.activate() == .protocolFailure)
+            #expect(!store.habitCompositionCheckpoint.deltaCaughtUp)
+            let durable = try #require(context.persistence.loadRevisioned().snapshot)
+            #expect(!durable.deltaCaughtUp)
+            #expect(durable.deltaCursor == original.deltaCursor)
+            #expect(durable.occurrences == original.occurrences)
+            #expect(durable.pendingMutations.isEmpty)
+            #expect(await rejected.missedReconcileRequests().isEmpty)
+
+            let offline = HabitTransportStub(configurationIdentifier: binding,
+                missedReconcileMode: .offline, deltaFailureAtCall: 0)
+            let restarted = makeStore(context: context, transport: offline)
+            #expect(await restarted.activate() == .offline)
+            #expect(!restarted.habitCompositionCheckpoint.deltaCaughtUp)
+            #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == false)
+        }
+    }
+
+    @Test("cold offline activation preserves terminal input without manufacturing an automatic write")
+    func offlineTerminalCacheRemainsUsable() async throws {
+        let context = try Context(); defer { context.remove() }
+        let binding = "origin-a|auth=device-a"
+        _ = try context.persistence.save(.init(savedAt: Self.now, configurationIdentifier: binding,
+            deltaCursor: "cursor-captured", deltaCaughtUp: true, occurrences: [Self.occurrence()],
+            pauses: [], analytics: [], pendingMutations: []), expectedRevision: .missing)
+        let prior = try context.persistence.loadRevisioned()
+        let transport = HabitTransportStub(configurationIdentifier: binding, deltaFailureAtCall: 0)
+        let store = makeStore(context: context, transport: transport)
+
+        #expect(await store.activate() == .offline)
+        #expect(store.habitCompositionCheckpoint.deltaCaughtUp)
+        #expect(store.habitCompositionCheckpoint.deltaCursor == "cursor-captured")
+        #expect(store.pendingMutations.isEmpty)
+        #expect(await transport.missedReconcileRequests().isEmpty)
+        #expect(await transport.deltaCursors() == ["cursor-captured"])
+        let after = try context.persistence.loadRevisioned()
+        #expect(after.snapshot == prior.snapshot)
+        #expect(after.revision == prior.revision)
+    }
+
+    @Test("terminal cache is read before new automatic reconciliation and caught up again afterwards")
+    func terminalAutomaticScanHasReadBarrier() async throws {
+        let context = try Context(); defer { context.remove() }
+        let binding = "origin-a|auth=device-a", sawReadBeforeWrite = LockedFlag()
+        _ = try context.persistence.save(.init(savedAt: Self.now, configurationIdentifier: binding,
+            deltaCursor: "cursor-captured", deltaCaughtUp: true, occurrences: [Self.occurrence()],
+            pauses: [], analytics: [], pendingMutations: []), expectedRevision: .missing)
+        let transport = HabitTransportStub(configurationIdentifier: binding,
+            deltaPages: [.init(changes: [], nextCursor: "cursor-live", hasMore: false)],
+            beforeMissedReconcile: {
+                let retained = try? context.persistence.loadRevisioned().snapshot
+                sawReadBeforeWrite.set(retained?.deltaCursor == "cursor-live"
+                    && retained?.deltaCaughtUp == false && retained?.pendingMutations.count == 1)
+            })
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .success)
+        #expect(sawReadBeforeWrite.value)
+        #expect(await transport.deltaCursors() == ["cursor-captured", "cursor-live"])
+        #expect(await transport.missedReconcileRequests().count == 1)
+        #expect(store.habitCompositionCheckpoint.deltaCaughtUp)
+        #expect(store.pendingMutations.isEmpty)
+    }
+
+    @Test("offline read barrier never bypasses or discards an existing exact authored habit write")
+    func offlinePendingIntentStillOwnsRecovery() async throws {
+        let context = try Context(); defer { context.remove() }
+        let binding = "origin-a|auth=device-a", original = Self.snapshotWithPending(binding: "origin-a|auth=device-a")
+        _ = try context.persistence.save(original, expectedRevision: .missing)
+        let transport = HabitTransportStub(configurationIdentifier: binding, outcomeMode: .offline, deltaFailureAtCall: 0)
+        let store = makeStore(context: context, transport: transport)
+        #expect(await store.activate() == .offline)
+        #expect(try context.persistence.loadRevisioned().snapshot?.pendingMutations == original.pendingMutations)
+        #expect(!store.habitCompositionCheckpoint.deltaCaughtUp)
+        #expect(await transport.outcomeRequests().count == 1)
+        #expect(await transport.missedReconcileRequests().isEmpty)
+        #expect(await transport.deltaCursors().isEmpty)
+    }
+
     @Test("activation commits each delta page and cursor into the encrypted cache")
     func activationPersistsDelta() async throws {
         let context = try Context()
@@ -1166,6 +1257,9 @@ struct HabitSyncStoreTests {
                     nextCursor: "cursor-two",
                     hasMore: false
                 ),
+                // A terminal-cache sync reads before automatic writes and
+                // then catches up again after their acknowledgement.
+                .init(changes: [], nextCursor: "cursor-two", hasMore: false),
                 .init(
                     changes: [.pauseUpsert(changedIdentity)],
                     nextCursor: "cursor-three",
@@ -1298,7 +1392,10 @@ struct HabitSyncStoreTests {
         #expect(await store.sync() == .localStorageFailure)
         #expect(forcedCASConflict.value)
         #expect(!store.habitCompositionCheckpoint.deltaCaughtUp)
-        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == false)
+        // The read barrier has not authored an automatic journal. A competing
+        // encrypted revision must not be overwritten to revoke its verdict;
+        // this process instead remains fenced until a successful fresh read.
+        #expect(try context.persistence.loadRevisioned().snapshot?.deltaCaughtUp == true)
     }
 
     @Test("a mismatched outcome acknowledgement cannot clear its encrypted journal")
@@ -2548,6 +2645,7 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
     private let pauseOffline: Bool
     private let pauseResponseMode: PauseResponseMode
     private let deltaFailureAtCall: Int?
+    private let malformedDelta: Bool
     private let beforeDelta: @Sendable (String?) async -> Void
 
     init(
@@ -2560,6 +2658,7 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
         pauseOffline: Bool = false,
         pauseResponseMode: PauseResponseMode = .success,
         deltaFailureAtCall: Int? = nil,
+        malformedDelta: Bool = false,
         beforeDelta: @escaping @Sendable (String?) async -> Void = { _ in },
         beforeOutcome: @escaping @Sendable () -> Void = {},
         beforeMissedReconcile: @escaping @Sendable () -> Void = {},
@@ -2574,6 +2673,7 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
         self.pauseOffline = pauseOffline
         self.pauseResponseMode = pauseResponseMode
         self.deltaFailureAtCall = deltaFailureAtCall
+        self.malformedDelta = malformedDelta
         self.beforeDelta = beforeDelta
         self.beforeOutcome = beforeOutcome
         self.beforeMissedReconcile = beforeMissedReconcile
@@ -2778,6 +2878,7 @@ private final class HabitTransportStub: DayWeaveHabitTransport, @unchecked Senda
 
     func habitDelta(cursor: String?, limit: Int) async throws -> DayWeaveHabitDeltaPage {
         await beforeDelta(cursor)
+        if malformedDelta { throw DayWeaveAPIError.responseDecodingFailed }
         return try state.nextDelta(cursor: cursor, failureAtCall: deltaFailureAtCall)
     }
 

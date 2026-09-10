@@ -84,6 +84,8 @@ fun interface LocalScheduleComposer {
 data class RoutineOccurrenceLocalComposition(
     val composition: LocalScheduleComposition,
     val occurrenceSnapshotRevision: Long,
+    /** Exact, bounded UTF-8 helper-v2 envelope; never inferred from a display projection. */
+    val helperResponseJson: String? = null,
 ) {
     override fun toString() = "RoutineOccurrenceLocalComposition(<protected>)"
 }
@@ -207,7 +209,7 @@ class RustScheduleComposer(
             require(decoded.acceptedItemCount == decoded.sourceItemCount)
             require(decoded.rejectedItems.isEmpty()) // Qualified server capture rejects ineligible sources.
             requireV2Plan(decoded.plan, witness)
-            return RoutineOccurrenceLocalComposition(decoded, exact.occurrenceSnapshotRevision)
+            return RoutineOccurrenceLocalComposition(decoded, exact.occurrenceSnapshotRevision, text + "\n")
         } catch (error: LocalScheduleCompositionRejectedException) { throw error }
         catch (_: Exception) { throw LocalScheduleCompositionProtocolException() }
     }

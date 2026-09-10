@@ -6,12 +6,22 @@ import com.greengolddog.dayweave.model.HabitMissedExplicitActionSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeInputSnapshot
 import com.greengolddog.dayweave.model.HabitOutcomeStatusSnapshot
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
+import com.greengolddog.dayweave.model.planningTestReadyState
+import com.greengolddog.dayweave.model.planningDisplayCapsule
+import com.greengolddog.dayweave.model.planningDisplaySnapshot
+import com.greengolddog.dayweave.model.PLANNING_DISPLAY_NOW
+import com.greengolddog.dayweave.model.routinePlanningStableInputFingerprint
+import com.greengolddog.dayweave.model.HabitLedgerSnapshot
+import com.greengolddog.dayweave.model.AppDestination
+import com.greengolddog.dayweave.data.PlannerStateRepository
+import com.greengolddog.dayweave.data.RoomPlannerStateRepository
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.HabitApiException
 import com.greengolddog.dayweave.network.HabitTransport
 import com.greengolddog.dayweave.network.RemoteHabitAnalytics
 import com.greengolddog.dayweave.network.RemoteHabitAnalyticsBucket
 import com.greengolddog.dayweave.network.RemoteHabitDeltaPage
+import com.greengolddog.dayweave.network.RemoteHabitDeltaChange
 import com.greengolddog.dayweave.network.RemoteHabitMissedReconcilePage
 import com.greengolddog.dayweave.network.RemoteHabitMissedCancellationReason
 import com.greengolddog.dayweave.network.RemoteHabitMissedPolicy
@@ -27,23 +37,241 @@ import com.greengolddog.dayweave.network.RemoteHabitOutcomeStatus
 import com.greengolddog.dayweave.network.RemoteHabitPause
 import com.greengolddog.dayweave.network.RemoteHabitSupportiveFactCode
 import com.greengolddog.dayweave.state.PlannerStore
+import com.greengolddog.dayweave.state.PlannerLoadState
 import java.io.IOException
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class HabitSyncManagerTest {
+    @get:Rule val temporary = TemporaryFolder()
+
+    @Test
+    fun rejectedAuthoritativeReadsWithdrawEncryptedCheckpointAcrossRestartWithoutDiscardingFixedInputs(): Unit = runBlocking {
+        for (variant in listOf("decoder", "cursor", "immutable-evidence")) {
+            val base = fixedHabitInputState()
+            val capsule = requireNotNull(base.routinePlanningInputCapsule)
+            val display = planningDisplaySnapshot(capsule)
+            val initial = base.copy(routinePlanningDisplaySnapshot = display)
+            val directory = temporary.root.toPath().resolve(variant)
+            fun repository(prepare: Boolean) = RoomPlannerStateRepository(NativeConvergenceSnapshotDao(
+                NativeConvergenceDisk(directory, "synthetic-habit-withdrawal", prepare))) { displayNowMillis }
+            val persistence = repository(true)
+            persistence.save(initial)
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val store = PlannerStore(initial, persistence, scope, nowEpochMillis = { displayNowMillis })
+                withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+                val fence = requireNotNull(store.captureRoutinePlanningInputFence())
+                assertTrue(store.admitRoutinePlanningDisplay(fence, display) { true })
+                val before = store.state.value
+                val transport = FakeHabitTransport().apply {
+                    deltaHandler = { cursor ->
+                        when (variant) {
+                            "decoder" -> throw HabitApiException.InvalidResponse()
+                            "cursor" -> RemoteHabitDeltaPage(emptyList(), requireNotNull(cursor), hasMore = true)
+                            else -> RemoteHabitDeltaPage(listOf(RemoteHabitDeltaChange.OccurrenceUpsert(
+                                remoteOccurrence().let { it.copy(evidence = it.evidence.copy(sourceItemRevision = 8)) })),
+                                "cursor-rejected", hasMore = false)
+                        }
+                    }
+                }
+                assertEquals(HabitSyncOutcome.PROTOCOL_FAILURE, manager(store, transport, emptyList()).refresh())
+                val after = store.state.value
+                assertEquals(before.habitLedger.copy(deltaCaughtUp = false), after.habitLedger)
+                assertEquals(capsule, after.routinePlanningInputCapsule)
+                assertEquals(display, after.routinePlanningDisplaySnapshot)
+                assertNull(after.routinePlanningDisplayAdmission)
+                assertTrue(transport.missedReconcileBodies.isEmpty())
+                val restored = requireNotNull(repository(false).load())
+                assertEquals(after.habitLedger, restored.habitLedger)
+                assertEquals(capsule, restored.routinePlanningInputCapsule)
+                assertEquals(display, restored.routinePlanningDisplaySnapshot)
+                val restarted = PlannerStore(restored, nowEpochMillis = { displayNowMillis })
+                assertFalse(capsule.isReusableInput(restarted.state.value, displayNowMillis, true))
+                assertNull(restarted.state.value.routinePlanningDisplayAdmission)
+            } finally { scope.cancel() }
+        }
+    }
+
+    @Test
+    fun rejectedReadCannotWithdrawACompetingCheckpointOrAnEqualStateAfterABA(): Unit = runBlocking {
+        for (aba in listOf(false, true)) {
+            val store = PlannerStore(fixedHabitInputState(), nowEpochMillis = { displayNowMillis })
+            val before = store.state.value
+            var competitor: DayWeaveUiState? = null
+            val transport = FakeHabitTransport().apply {
+                deltaHandler = {
+                    if (aba) {
+                        store.navigate(AppDestination.CALENDAR)
+                        store.navigate(before.destination)
+                    } else {
+                        store.applyHabitDeltaPage(ORIGIN, CONFIGURATION_ID,
+                            listOf(HabitOccurrenceSnapshot.fromRemote(remoteOccurrence(outcome = completedOutcome()))),
+                            emptyList(), "cursor-competitor", hasMore = false)
+                    }
+                    competitor = store.state.value
+                    throw HabitApiException.InvalidResponse()
+                }
+            }
+            assertEquals(HabitSyncOutcome.CONFIGURATION_CHANGED, manager(store, transport, emptyList()).refresh())
+            assertSame(competitor, store.state.value)
+            assertSame(competitor, store.durableState.value)
+            assertTrue(store.state.value.habitLedger.deltaCaughtUp)
+            assertTrue(transport.missedReconcileBodies.isEmpty())
+        }
+    }
+
+    @Test
+    fun rejectedReadAfterPrivacyRevocationCannotPersistIntoTheNewRuntimeGeneration(): Unit = runBlocking {
+        val store = PlannerStore(fixedHabitInputState(), nowEpochMillis = { displayNowMillis })
+        var revoked: DayWeaveUiState? = null
+        val durable = store.durableState.value
+        val transport = FakeHabitTransport().apply {
+            deltaHandler = {
+                store.invalidateRoutineOccurrenceAuthority()
+                revoked = store.state.value
+                throw HabitApiException.InvalidResponse()
+            }
+        }
+        assertEquals(HabitSyncOutcome.CONFIGURATION_CHANGED, manager(store, transport, emptyList()).refresh())
+        assertSame(revoked, store.state.value)
+        assertSame(durable, store.durableState.value)
+        assertTrue(transport.missedReconcileBodies.isEmpty())
+    }
+
+    @Test
+    fun malformedLateReadAfterCredentialReplacementOrCancellationDoesNotWithdrawOldCustody(): Unit = runBlocking {
+        val store = PlannerStore(fixedHabitInputState(), nowEpochMillis = { displayNowMillis })
+        val before = store.state.value
+        val credentials = GenerationBoundCredentialStore().apply { configurationId = CONFIGURATION_ID }
+        val replaced = FakeHabitTransport().apply {
+            deltaHandler = {
+                credentials.configurationId = "synthetic-replaced-binding"
+                throw HabitApiException.InvalidResponse()
+            }
+        }
+        assertEquals(HabitSyncOutcome.CONFIGURATION_CHANGED,
+            HabitSyncManager(store, credentials, replaced).refresh())
+        assertSame(before, store.state.value)
+        assertSame(before, store.durableState.value)
+
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val cancelled = FakeHabitTransport().apply {
+            deltaHandler = {
+                withContext(NonCancellable) { entered.complete(Unit); release.await() }
+                throw HabitApiException.InvalidResponse()
+            }
+        }
+        val pending = async { manager(store, cancelled, emptyList()).refresh() }
+        withTimeout(3_000) { entered.await() }
+        pending.cancel()
+        release.complete(Unit)
+        withTimeout(3_000) { pending.join() }
+        assertTrue(pending.isCancelled)
+        assertSame(before, store.state.value)
+        assertSame(before, store.durableState.value)
+        assertTrue(replaced.missedReconcileBodies.isEmpty())
+        assertTrue(cancelled.missedReconcileBodies.isEmpty())
+    }
+
+    @Test
+    fun failedWithdrawalSaveRevokesRuntimeWithoutReloadRetryOrLosingRetainedBytes(): Unit = runBlocking {
+        val base = fixedHabitInputState()
+        val capsule = requireNotNull(base.routinePlanningInputCapsule)
+        val display = planningDisplaySnapshot(capsule)
+        val initial = base.copy(routinePlanningDisplaySnapshot = display)
+        var loads = 0
+        val attempts = mutableListOf<DayWeaveUiState>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState { loads++; return initial }
+            override suspend fun save(state: DayWeaveUiState) {
+                attempts += state
+                // Refresh first confirms the existing binding with an exact durable save.
+                // Fail the withdrawal itself, after the malformed response has been observed.
+                if (!state.habitLedger.deltaCaughtUp) throw IOException("Synthetic exact withdrawal storage failure")
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val store = PlannerStore(initial, repository, scope, nowEpochMillis = { displayNowMillis })
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            assertTrue(store.admitRoutinePlanningDisplay(requireNotNull(store.captureRoutinePlanningInputFence()), display) { true })
+            val transport = FakeHabitTransport().apply { deltaHandler = { throw HabitApiException.InvalidResponse() } }
+            assertEquals(HabitSyncOutcome.LOCAL_STORAGE_FAILURE, manager(store, transport, emptyList()).refresh())
+            assertEquals(1, loads); assertEquals(2, attempts.size)
+            assertEquals(initial.habitLedger, attempts.first().habitLedger)
+            assertFalse(attempts.last().habitLedger.deltaCaughtUp)
+            assertEquals(listOf("cursor-0"), transport.deltaCursors)
+            assertEquals(initial.habitLedger, store.durableState.value?.habitLedger)
+            assertEquals(capsule, store.state.value.routinePlanningInputCapsule)
+            assertEquals(display, store.state.value.routinePlanningDisplaySnapshot)
+            assertNull(store.state.value.routinePlanningDisplayAdmission)
+            assertNull(store.captureRoutinePlanningInputFence())
+            assertTrue(transport.missedReconcileBodies.isEmpty())
+        } finally { scope.cancel() }
+    }
+
+    @Test
+    fun withdrawalChecksCancellationAgainBeforeItsExactStateMutation() {
+        val store = boundStore()
+        val before = store.state.value
+        val read = store.captureHabitDeltaReadFence(ORIGIN, CONFIGURATION_ID)
+        var calls = 0
+        assertThrows(IllegalArgumentException::class.java) {
+            store.rejectHabitDeltaRead(read) { ++calls < 3 }
+        }
+        assertEquals(3, calls)
+        assertSame(before, store.state.value)
+        assertSame(before, store.durableState.value)
+    }
+
+    @Test
+    fun offlineForegroundReadKeepsTerminalHabitCacheAndSavedRoutineInputWithoutNewMissedJournal() = runBlocking {
+        for (ledger in listOf(HabitLedgerSnapshot(syncOrigin = ORIGIN, configurationId = CONFIGURATION_ID,
+                deltaCursor = "cursor-0", deltaCaughtUp = true), boundStore().state.value.habitLedger)) {
+            val base = planningTestReadyState().let { it.copy(canonicalSyncOrigin = ORIGIN, canonicalConfigurationId = CONFIGURATION_ID,
+                routineOccurrenceLedger = it.routineOccurrenceLedger.copy(syncOrigin = ORIGIN, configurationId = CONFIGURATION_ID), habitLedger = ledger) }
+            val capsule = planningDisplayCapsule(base)
+            val store = PlannerStore(base.copy(routinePlanningInputCapsule = capsule))
+            val before = store.state.value
+            val fingerprint = before.routinePlanningStableInputFingerprint()
+            val transport = FakeHabitTransport().apply { deltaHandler = { throw IOException("Synthetic offline read") } }
+            assertEquals(HabitSyncOutcome.TRANSIENT_NETWORK_FAILURE, manager(store, transport, emptyList()).refresh())
+            assertEquals(before, store.state.value)
+            assertEquals(ledger, store.state.value.habitLedger)
+            assertEquals(capsule, store.state.value.routinePlanningInputCapsule)
+            assertEquals(fingerprint, store.state.value.routinePlanningStableInputFingerprint())
+            assertTrue(transport.missedReconcileBodies.isEmpty())
+            assertNull(store.state.value.habitLedger.pendingMissedReconcile)
+            assertEquals(listOf("cursor-0"), transport.deltaCursors)
+        }
+    }
     @Test
     fun outcomeStageIsDurableBeforeSuccessAndDoesNotTouchTheNetwork() = runBlocking {
         val store = boundStore()
@@ -302,7 +530,8 @@ class HabitSyncManagerTest {
                     RemoteHabitMissedReconcilePage(emptyList(), false, replayed = false)
                 }
             }
-            deltaHandler = { cursor ->
+            deltaHandler = delta@ { cursor ->
+                if (reconcileAttempt == 0) return@delta RemoteHabitDeltaPage(emptyList(), cursor ?: "cursor-0", hasMore = false)
                 deltaAttempt += 1
                 if (deltaAttempt == 1) throw IOException("delta unavailable")
                 RemoteHabitDeltaPage(
@@ -630,7 +859,7 @@ class HabitSyncManagerTest {
                 LocalDate.parse("2026-09-02"),
             ),
         )
-        assertEquals(listOf("cursor-0"), transport.deltaCursors)
+        assertEquals(listOf("cursor-0", "cursor-workspace"), transport.deltaCursors)
         assertEquals(
             com.greengolddog.dayweave.model.HabitMissedResolutionActionSnapshot.Skip,
             store.state.value.habitLedger.occurrences.getValue(SECOND_OCCURRENCE_ID)
@@ -724,15 +953,15 @@ class HabitSyncManagerTest {
                     assertEquals("cursor-0", cursor)
                     throw HabitApiException.Validation(400)
                 }
-                assertNull(cursor)
+                if (attempts == 2) assertNull(cursor) else assertEquals("cursor-repaired", cursor)
                 RemoteHabitDeltaPage(emptyList(), "cursor-repaired", hasMore = false)
             }
         }
 
         assertEquals(HabitSyncOutcome.SUCCESS, manager(store, transport, emptyList()).refresh())
 
-        assertEquals(listOf("cursor-0", null), transport.deltaCursors)
-        assertEquals(listOf(25, 25), transport.deltaLimits)
+        assertEquals(listOf("cursor-0", null, "cursor-repaired"), transport.deltaCursors)
+        assertEquals(listOf(25, 25, 25), transport.deltaLimits)
         assertEquals("cursor-repaired", store.state.value.habitLedger.deltaCursor)
         assertTrue(store.state.value.habitLedger.deltaCaughtUp)
     }
@@ -754,9 +983,9 @@ class HabitSyncManagerTest {
         }
 
         assertEquals(HabitSyncOutcome.SUCCESS, manager(store, transport, emptyList()).refresh())
-        assertEquals(101, transport.deltaCursors.size)
+        assertEquals(102, transport.deltaCursors.size)
         assertTrue(transport.deltaLimits.all { it == 25 })
-        assertEquals("cursor-101", store.state.value.habitLedger.deltaCursor)
+        assertEquals("cursor-102", store.state.value.habitLedger.deltaCursor)
         assertTrue(store.state.value.habitLedger.deltaCaughtUp)
     }
 
@@ -1005,6 +1234,15 @@ class HabitSyncManagerTest {
             "cursor-0",
             hasMore = false,
         )
+    }
+
+    private val displayNowMillis = Instant.parse(PLANNING_DISPLAY_NOW).toEpochMilli() + 1
+
+    private fun fixedHabitInputState(): DayWeaveUiState {
+        val base = planningTestReadyState().let { it.copy(canonicalSyncOrigin = ORIGIN, canonicalConfigurationId = CONFIGURATION_ID,
+            routineOccurrenceLedger = it.routineOccurrenceLedger.copy(syncOrigin = ORIGIN, configurationId = CONFIGURATION_ID),
+            habitLedger = boundStore().state.value.habitLedger) }
+        return base.copy(routinePlanningInputCapsule = planningDisplayCapsule(base))
     }
 
     private fun manager(

@@ -1177,6 +1177,14 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
         using connection: DayWeaveHabitConnection,
         operation: UUID
     ) async throws {
+        // An already terminal cache remains useful offline. Before creating a
+        // NEW automatic write journal, try the ordinary read-only delta path.
+        // A failed read must not manufacture ambiguous mutation custody on
+        // every cold activation/poll. Existing pending writes are still replayed
+        // first and retain their exact recovery/invalidated-checkpoint rules.
+        if let current = snapshot, current.deltaCaughtUp, current.pendingMutations.isEmpty {
+            try await reconcileDelta(using: connection, operation: operation)
+        }
         var pages = 0
         while true {
             guard pages < Self.maximumMissedReconcilePagesPerSync,
@@ -1424,11 +1432,33 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
             guard pages < Self.maximumDeltaPagesPerSync,
                   let current = snapshot else { throw HabitSyncControllerError.protocolFailure }
             let observedInvalidationGeneration = foregroundStreamObservationGeneration
-            let page = try await connection.transport.habitDelta(
-                cursor: current.deltaCursor,
-                limit: 200
-            )
+            let revisionBeforePage = persistenceRevision
+            let page: DayWeaveHabitDeltaPage
+            do {
+                page = try await connection.transport.habitDelta(
+                    cursor: current.deltaCursor,
+                    limit: 200
+                )
+            } catch {
+                switch error {
+                case DayWeaveAPIError.responseDecodingFailed,
+                     DayWeaveAPIError.nonHTTPResponse,
+                     DayWeaveAPIError.responseTooLarge,
+                     HabitSyncControllerError.protocolFailure:
+                    withdrawRejectedDeltaAuthority(current, expectedRevision: revisionBeforePage,
+                        operation: operation, connection: connection)
+                default: break // A plain offline read has not contradicted the retained input.
+                }
+                throw error
+            }
             try assertCurrent(operation: operation, connection: connection)
+            var pageCommitted = false
+            defer {
+                if !pageCommitted {
+                    withdrawRejectedDeltaAuthority(current, expectedRevision: revisionBeforePage,
+                        operation: operation, connection: connection)
+                }
+            }
             // A successful authoritative response proves that the previously
             // terminal cache may be stale. Revoke process-local authority
             // before validating or persisting the page; only a committed
@@ -1508,21 +1538,11 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                         protectedOccurrences: retainedOccurrences
                     )
                 )
-            } catch {
-                // Once a new authoritative page has been observed, an older
-                // terminal snapshot cannot remain composition-authoritative if
-                // the page cannot be retained safely.
-                if current.deltaCaughtUp {
-                    let priorCheckpoint = habitCompositionCheckpoint
-                    foregroundStreamInvalidationPending = true
-                    try? persist(replacing(current, deltaCaughtUp: false))
-                    notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
-                }
-                throw error
             }
             // The complete page and its opaque cursor share one encrypted CAS
             // commit. A crash can replay the page, but can never skip it.
             try persist(candidate)
+            pageCommitted = true
             pages += 1
             if !page.hasMore {
                 reconcileForegroundInvalidations(
@@ -1536,6 +1556,24 @@ final class HabitSyncStore: ObservableObject, HabitCompositionCheckpointProvidin
                 continue
             }
         }
+    }
+
+    private func withdrawRejectedDeltaAuthority(
+        _ current: DayWeaveHabitClientSnapshot,
+        expectedRevision: HabitPersistenceRevision,
+        operation: UUID,
+        connection: DayWeaveHabitConnection
+    ) {
+        do { try assertCurrent(operation: operation, connection: connection) }
+        catch { return }
+        let priorCheckpoint = habitCompositionCheckpoint
+        foregroundStreamInvalidationPending = true
+        // Never reload/retry against a competing writer. Failed custody keeps
+        // this process fenced even when the original CAS cannot be committed.
+        if current.deltaCaughtUp, persistenceRevision == expectedRevision {
+            try? persist(replacing(current, deltaCaughtUp: false))
+        }
+        notifyCompositionCheckpointObservers(ifChangedFrom: priorCheckpoint)
     }
 
     private func persist(_ candidate: DayWeaveHabitClientSnapshot) throws {

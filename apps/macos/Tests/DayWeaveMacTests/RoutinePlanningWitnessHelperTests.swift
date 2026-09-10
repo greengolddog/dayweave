@@ -14,10 +14,21 @@ struct RoutinePlanningWitnessHelperTests {
         for fixture in cases {
             try fixture.witness.validate(canonicalItems: fixture.items)
             let result = try decode(fixture.response, witness: fixture.witness)
+            #expect(result.rawOutput == (try bytes(fixture.response)))
             #expect(result.occurrenceSnapshotRevision == fixture.witness.occurrenceLifecycle.snapshotRevision)
             #expect(result.composition.localInputFingerprint == fixture.witness.localInputFingerprint)
             #expect(result.composition.sourceItemRevisions == fixture.witness.sourceItemRevisions)
             #expect(result.composition.rejectedItems.isEmpty)
+        }
+    }
+
+    @Test("v2 retains exact stdout framing and timestamp strings, not a re-encoded display plan")
+    func rawOutputFidelity() throws {
+        for fixture in try fixtures() {
+            let raw = Data(" \n\t".utf8) + (try bytes(fixture.response)) + Data("\n ".utf8)
+            let decoded = try SchedulerHelperClient.decodeOccurrenceOutput(output(raw), witness: fixture.witness)
+            #expect(decoded.rawOutput == raw)
+            #expect(decoded.composition.localInputFingerprint == fixture.witness.localInputFingerprint)
         }
     }
 

@@ -380,6 +380,9 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var routinePlanningInputCapsule: RoutinePlanningInputCapsule? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var routinePlanningDisplayPlan: RoutinePlanningDisplayPlan? {
+        didSet { scheduleAutosave() }
+    }
     private let routinePlanningInputCaptureOwner = UUID()
     @Published private(set) var itemCompletionEvidenceGeneration: UInt64 = 0
     @Published private(set) var routineOccurrencePlanningGeneration: UInt64 = 0
@@ -578,6 +581,7 @@ final class PlannerStore: ObservableObject {
         itemCompletionState: ItemCompletionState = .empty,
         routineOccurrenceState: RoutineOccurrenceState = .empty,
         routinePlanningInputCapsule: RoutinePlanningInputCapsule? = nil,
+        routinePlanningDisplayPlan: RoutinePlanningDisplayPlan? = nil,
         scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
@@ -797,6 +801,13 @@ final class PlannerStore: ObservableObject {
             restorationError = .snapshotDecodingFailed
         }
         self.routinePlanningInputCapsule = initialRoutinePlanningInputCapsule
+        let initialRoutinePlanningDisplayPlan = restoredSnapshot == nil
+            ? routinePlanningDisplayPlan : restoredSnapshot?.routinePlanningDisplayPlan
+        if let display = initialRoutinePlanningDisplayPlan,
+           (try? display.validate()) == nil || display.capsuleBinding.configurationIdentifier != initialCanonicalConfigurationIdentifier {
+            restorationError = .snapshotDecodingFailed
+        }
+        self.routinePlanningDisplayPlan = initialRoutinePlanningDisplayPlan
         if !initialRoutineOccurrenceState.isValid
             || (initialRoutineOccurrenceState.configurationIdentifier != nil
                 && initialRoutineOccurrenceState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
@@ -1094,12 +1105,60 @@ final class PlannerStore: ObservableObject {
         if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { throw issue }
         flushPersistence()
         if let persistenceError { throw persistenceError }
+        return try currentRoutinePlanningInputFence(habitCheckpoint: habitCheckpoint)
+    }
+
+    /// A read-only runtime fence, including the display artifact's exact
+    /// durable preimage. It neither writes nor grants restored presentation.
+    func currentRoutinePlanningInputFence(
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) throws -> RoutinePlanningInputCaptureFence {
+        if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { throw issue }
         return .init(environment: try .init(planner: self, habitCheckpoint: habitCheckpoint),
             canonicalItems: canonicalItems, priorCapsule: routinePlanningInputCapsule,
             snapshot: makeSnapshot(savedAt: Date(timeIntervalSince1970: 0)),
             ownerID: routinePlanningInputCaptureOwner,
             occurrenceGeneration: routineOccurrencePlanningGeneration,
             canonicalGeneration: itemCompletionEvidenceGeneration, habitCheckpoint: habitCheckpoint)
+    }
+
+    /// Installs only encrypted display custody. The synchronous callback must
+    /// be read-only and checks the caller's current foreground/private/config
+    /// ownership and clock continuity; it must not perform network IO or
+    /// refresh credentials. Local read-only credential binding checks are allowed.
+    func commitRoutinePlanningDisplayPlan(
+        _ display: RoutinePlanningDisplayPlan,
+        expected fence: RoutinePlanningInputCaptureFence,
+        habitCheckpoint: HabitCompositionCheckpoint?,
+        isCurrent: () -> Bool
+    ) throws -> RoutinePlanningInputCaptureFence {
+        try requireRoutinePlanningInputFence(fence, habitCheckpoint: habitCheckpoint)
+        guard isCurrent(), let capsule = routinePlanningInputCapsule,
+              fence.priorCapsule == capsule else { throw RoutinePlanningInputCapsuleError.superseded }
+        _ = try display.validatedComposition(capsule: capsule)
+        let referenceDate = now()
+        guard display.generatedAt <= referenceDate else { throw RoutinePlanningInputCapsuleError.clockChanged }
+        if let issue = routinePlanningDisplayCapsuleIssue(origin: capsule.origin,
+            configurationIdentifier: capsule.configurationIdentifier, habitCheckpoint: habitCheckpoint, at: referenceDate) { throw issue }
+        try requireRoutinePlanningInputFence(fence, habitCheckpoint: habitCheckpoint)
+        guard isCurrent(), !Task.isCancelled else { throw RoutinePlanningInputCapsuleError.superseded }
+        let prior = routinePlanningDisplayPlan
+        routinePlanningDisplayPlan = display
+        do {
+            let stagedFence = try currentRoutinePlanningInputFence(habitCheckpoint: habitCheckpoint)
+            try persistence?.preflightSave(makeSnapshot())
+            try requireRoutinePlanningInputFence(stagedFence, habitCheckpoint: habitCheckpoint)
+            guard isCurrent(), !Task.isCancelled else { throw RoutinePlanningInputCapsuleError.superseded }
+        } catch {
+            routinePlanningDisplayPlan = prior
+            throw error
+        }
+        flushPersistence()
+        if let persistenceError {
+            routinePlanningDisplayPlan = prior
+            throw persistenceError
+        }
+        return try currentRoutinePlanningInputFence(habitCheckpoint: habitCheckpoint)
     }
 
     func requireRoutinePlanningInputFence(
@@ -1164,6 +1223,26 @@ final class PlannerStore: ObservableObject {
         origin: String, configurationIdentifier: String,
         habitCheckpoint: HabitCompositionCheckpoint?, at date: Date
     ) -> RoutinePlanningInputCapsuleError? {
+        routinePlanningCapsuleIssue(origin: origin, configurationIdentifier: configurationIdentifier,
+            habitCheckpoint: habitCheckpoint, at: date, allowingExecutionFreshnessWithdrawal: false)
+    }
+
+    /// Only the actionless display workflow may tolerate withdrawal of the two
+    /// execution freshness flags. The original fixed input and all source data
+    /// stay untouched; full process capture fences still compare exact state.
+    func routinePlanningDisplayCapsuleIssue(
+        origin: String, configurationIdentifier: String,
+        habitCheckpoint: HabitCompositionCheckpoint?, at date: Date
+    ) -> RoutinePlanningInputCapsuleError? {
+        routinePlanningCapsuleIssue(origin: origin, configurationIdentifier: configurationIdentifier,
+            habitCheckpoint: habitCheckpoint, at: date, allowingExecutionFreshnessWithdrawal: true)
+    }
+
+    private func routinePlanningCapsuleIssue(
+        origin: String, configurationIdentifier: String,
+        habitCheckpoint: HabitCompositionCheckpoint?, at date: Date,
+        allowingExecutionFreshnessWithdrawal: Bool
+    ) -> RoutinePlanningInputCapsuleError? {
         if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { return issue }
         guard let capsule = routinePlanningInputCapsule else { return .incompleteSources }
         guard (try? capsule.validate()) != nil else { return .invalidData }
@@ -1171,7 +1250,10 @@ final class PlannerStore: ObservableObject {
               canonicalConfigurationIdentifier == configurationIdentifier else { return .configurationChanged }
         guard capsule.canonicalItems == canonicalItems else { return .sourceChanged }
         guard capsule.request.terminalCursor == routineOccurrenceState.terminalDeltaCursor else { return .checkpointChanged }
-        guard (try? RoutinePlanningInputEnvironment(planner: self, habitCheckpoint: habitCheckpoint)) == capsule.environment else {
+        guard let currentEnvironment = try? RoutinePlanningInputEnvironment(planner: self, habitCheckpoint: habitCheckpoint),
+              (allowingExecutionFreshnessWithdrawal
+                ? capsule.environment.matchesForDisplay(current: currentEnvironment)
+                : currentEnvironment == capsule.environment) else {
             return .inputChanged
         }
         guard date.timeIntervalSinceReferenceDate.isFinite, date >= capsule.capturedAt,
@@ -1564,6 +1646,7 @@ final class PlannerStore: ObservableObject {
         itemCompletionState = .empty
         routineOccurrenceState = .empty
         routinePlanningInputCapsule = nil
+        routinePlanningDisplayPlan = nil
         invalidateItemCompletionReadEvidence()
         pendingCanonicalAuthoringMutations = preservedCreates
         if let anchor = onboardingFirstItemAnchor,
@@ -1829,6 +1912,7 @@ final class PlannerStore: ObservableObject {
         itemProgressState.configurationIdentifier != nil || itemCompletionState.configurationIdentifier != nil
             || routineOccurrenceState.configurationIdentifier != nil
             || routinePlanningInputCapsule != nil
+            || routinePlanningDisplayPlan != nil
             || !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
@@ -5603,6 +5687,7 @@ final class PlannerStore: ObservableObject {
         itemCompletionState = .empty
         routineOccurrenceState = .empty
         routinePlanningInputCapsule = nil
+        routinePlanningDisplayPlan = nil
         invalidateItemCompletionReadEvidence()
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
@@ -6819,7 +6904,8 @@ final class PlannerStore: ObservableObject {
             itemProgressState: itemProgressState,
             itemCompletionState: itemCompletionState,
             routineOccurrenceState: routineOccurrenceState,
-            routinePlanningInputCapsule: routinePlanningInputCapsule
+            routinePlanningInputCapsule: routinePlanningInputCapsule,
+            routinePlanningDisplayPlan: routinePlanningDisplayPlan
         )
     }
 

@@ -34,7 +34,7 @@ struct RoutinePlanningInputEnvironment: Codable, Equatable, Sendable {
     let publishedScheduleLatestHintRevision: UInt64
     let scheduleProfile: ScheduleProfile
     let freezeHours: Int
-    let executionState: DayWeaveExecutionDurableState
+    private(set) var executionState: DayWeaveExecutionDurableState
     let routineOccurrenceState: RoutineOccurrenceState
     let itemCompletionState: ItemCompletionState
     let itemProgressState: ItemProgressState
@@ -45,6 +45,19 @@ struct RoutinePlanningInputEnvironment: Codable, Equatable, Sendable {
         case recurrenceSessionOutcomes, recurrenceOccurrenceMoves, deferredExecutionPublicationSessionIDs
         case blocks, publishedScheduleProof, publishedScheduleLatestHintRevision, scheduleProfile, freezeHours
         case executionState, routineOccurrenceState, itemCompletionState, itemProgressState, habitCheckpointFingerprint
+    }
+
+    /// An offline startup can withdraw execution freshness before a failed
+    /// GET. Display-only reuse tolerates that withdrawal, never a new grant or
+    /// any changed execution data. This local comparison copy is not persisted
+    /// and cannot restore either flag on the planner or grant execution rights.
+    func matchesForDisplay(current: Self) -> Bool {
+        guard !current.executionState.historyVerified || executionState.historyVerified,
+              !current.executionState.historyContinuityEstablished || executionState.historyContinuityEstablished else { return false }
+        var comparison = current
+        comparison.executionState.historyVerified = executionState.historyVerified
+        comparison.executionState.historyContinuityEstablished = executionState.historyContinuityEstablished
+        return comparison == self
     }
 
     @MainActor

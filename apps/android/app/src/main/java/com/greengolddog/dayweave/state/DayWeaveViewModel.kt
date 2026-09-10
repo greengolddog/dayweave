@@ -1177,6 +1177,13 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.launchRoutinePlanningInputPreparation()
     }
 
+    fun composeSavedRoutinePlanningInput() {
+        if (isCanonicalBusy()) return
+        dayWeaveApplication.launchSavedRoutinePlanningComposition()
+    }
+
+    fun dismissSavedRoutinePlanningPreview() = dayWeaveApplication.dismissSavedRoutinePlanningPreview()
+
     fun cancelLocalScheduleComposition() {
         dayWeaveApplication.cancelLocalScheduleComposition()
     }

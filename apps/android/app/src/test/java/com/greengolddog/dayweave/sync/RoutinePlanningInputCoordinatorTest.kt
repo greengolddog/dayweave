@@ -4,6 +4,8 @@ import com.greengolddog.dayweave.model.*
 import com.greengolddog.dayweave.network.*
 import com.greengolddog.dayweave.scheduler.*
 import com.greengolddog.dayweave.state.PlannerStore
+import com.greengolddog.dayweave.state.PlannerLoadState
+import com.greengolddog.dayweave.data.PlannerStateRepository
 import java.time.Instant
 import java.time.ZoneId
 import kotlinx.coroutines.runBlocking
@@ -11,6 +13,13 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Test
@@ -18,6 +27,108 @@ import org.junit.Test
 /** Synthetic operation ownership and native store wiring, not production Device/TLS or JNI acceptance. */
 class RoutinePlanningInputCoordinatorTest {
     private val instant = Instant.parse(ROUTINE_NOW)
+
+    @Test fun offlineFixedInputRecomputeHasNoTransportOrV1AndNeverReplacesCanonicalSchedule(): Unit = runBlocking {
+        val base = readyState(); val capsule = planningDisplayCapsule(base)
+        // A new process need not acquire fresh network/execution admission for an actionless view.
+        val initial = base.copy(routinePlanningInputCapsule = capsule, canonicalExecutionHistoryVerified = false)
+        val displayClock = Instant.parse(PLANNING_DISPLAY_NOW)
+        val store = PlannerStore(initial, nowEpochMillis = { displayClock.toEpochMilli() + 1 })
+        val before = store.state.value
+        var helperCalls = 0
+        val manager = manager(store, clock = { displayClock }, capture = { error("Offline composition cannot POST") },
+            composer = RoutineLifecycleScheduleComposer { items, witness ->
+                helperCalls++
+                assertEquals(capsule.canonicalItems, items); assertEquals(capsule.witness, witness)
+                planningDisplayComposition(capsule)
+            })
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.composeSavedRoutinePlanningInput())
+        assertEquals(1, helperCalls)
+        val saved = requireNotNull(store.durableState.value?.routinePlanningDisplaySnapshot)
+        assertEquals(ROUTINE_NOW, saved.capturedAt); assertEquals(PLANNING_DISPLAY_NOW, saved.computedAt)
+        assertNotNull(store.state.value.routinePlanningDisplayAdmission)
+        assertNull(store.durableState.value?.routinePlanningDisplayAdmission)
+        assertEquals(before, store.state.value.copy(routinePlanningDisplaySnapshot = null, routinePlanningDisplayAdmission = null))
+        assertTrue(store.state.value.requiresRemoteRoutineOccurrenceComposition())
+        assertFalse(store.state.value.canonicalExecutionHistoryVerified)
+        store.invalidateRoutineOccurrenceAuthority()
+        assertNull(store.state.value.routinePlanningDisplayAdmission)
+        assertEquals(saved, store.state.value.routinePlanningDisplaySnapshot)
+    }
+
+    @Test fun offlinePendingCatchupChangedSourceClockAndBindingCannotUseTheSavedInput(): Unit = runBlocking {
+        val base = readyState(); val capsule = planningDisplayCapsule(base); val initial = base.copy(routinePlanningInputCapsule = capsule)
+        val displayClock = Instant.parse(PLANNING_DISPLAY_NOW)
+        val variants = listOf(initial.copy(routineOccurrenceLedger = initial.routineOccurrenceLedger.copy(needsRemoteScheduleCatchUp = true)),
+            initial.copy(canonicalItems = initial.canonicalItems.map { it.copy(revision = 8) }),
+            initial.copy(scheduleCompositionProfile = initial.scheduleCompositionProfile.copy(dayStartMinute = 1)))
+        for (changed in variants) {
+            val store = PlannerStore(changed, nowEpochMillis = { displayClock.toEpochMilli() + 1 })
+            val manager = manager(store, clock = { displayClock }, capture = { error("No POST") },
+                composer = RoutineLifecycleScheduleComposer { _, _ -> error("Stale capsule cannot run helper") })
+            assertNotEquals(CanonicalRefreshOutcome.SUCCESS, manager.composeSavedRoutinePlanningInput())
+            assertEquals(changed, store.state.value)
+        }
+        for (clock in listOf(instant.minusSeconds(1), instant.plusSeconds(86400))) {
+            val store = PlannerStore(initial, nowEpochMillis = { clock.toEpochMilli() + 1 })
+            assertNotEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, clock = { clock }, composer = RoutineLifecycleScheduleComposer { _, _ -> error("Wrong clock") }).composeSavedRoutinePlanningInput())
+            assertNull(store.state.value.routinePlanningDisplaySnapshot)
+        }
+        val credentials = Credentials().apply { binding = "replacement" }
+        val store = PlannerStore(initial, nowEpochMillis = { displayClock.toEpochMilli() + 1 })
+        assertNotEquals(CanonicalRefreshOutcome.SUCCESS, manager(store, credentials = credentials, clock = { displayClock }).composeSavedRoutinePlanningInput())
+    }
+
+    @Test fun offlineLateHelperCancellationPrivacyReadAbaAndCredentialChangesCannotInstallOrShow(): Unit = runBlocking {
+        for (change in listOf("cancel", "privacy", "read_aba", "credentials", "clock")) {
+            val base = readyState(); val capsule = planningDisplayCapsule(base); val initial = base.copy(routinePlanningInputCapsule = capsule)
+            var clock = Instant.parse(PLANNING_DISPLAY_NOW)
+            val store = PlannerStore(initial, nowEpochMillis = { clock.toEpochMilli() + 1 })
+            val composed = planningDisplayComposition(capsule); val fence = Fence(); val credentials = Credentials()
+            val manager = manager(store, credentials = credentials, clock = { clock }, fence = fence, capture = { error("No POST") },
+                composer = RoutineLifecycleScheduleComposer { _, _ ->
+                    when (change) {
+                        "cancel" -> currentCoroutineContext().cancel()
+                        "privacy" -> fence.current = false
+                        "read_aba" -> { store.invalidateRoutineOccurrenceAuthority(); store.invalidateRoutineOccurrenceAuthority() }
+                        "credentials" -> credentials.binding = "replacement"
+                        else -> clock = clock.minusNanos(1)
+                    }
+                    composed
+                })
+            val job = launch(start = CoroutineStart.UNDISPATCHED) { assertNotEquals(CanonicalRefreshOutcome.SUCCESS, manager.composeSavedRoutinePlanningInput()) }
+            job.join()
+            assertNull(store.state.value.routinePlanningDisplaySnapshot)
+            assertNull(store.state.value.routinePlanningDisplayAdmission)
+            assertEquals(initial.routinePlanningInputCapsule, store.state.value.routinePlanningInputCapsule)
+            assertEquals(initial.routineOccurrenceLedger, store.state.value.routineOccurrenceLedger)
+        }
+    }
+
+    @Test fun credentialReplacementDuringEncryptedSaveCannotAdmitADurablePreview(): Unit = runBlocking {
+        val base = readyState(); val capsule = planningDisplayCapsule(base); val initial = base.copy(routinePlanningInputCapsule = capsule)
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load() = initial
+            override suspend fun save(state: DayWeaveUiState) { entered.complete(Unit); release.await() }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val clock = Instant.parse(PLANNING_DISPLAY_NOW)
+        try {
+            val store = PlannerStore(initial, repository, scope, nowEpochMillis = { clock.toEpochMilli() + 1 })
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val credentials = Credentials()
+            val manager = manager(store, credentials = credentials, clock = { clock }, capture = { error("No POST") },
+                composer = RoutineLifecycleScheduleComposer { _, _ -> planningDisplayComposition(capsule) })
+            val attempt = async { manager.composeSavedRoutinePlanningInput() }
+            withTimeout(3_000) { entered.await() }
+            credentials.binding = "replacement"; release.complete(Unit)
+            assertNotEquals(CanonicalRefreshOutcome.SUCCESS, withTimeout(3_000) { attempt.await() })
+            assertNotNull(store.durableState.value?.routinePlanningDisplaySnapshot)
+            assertNull(store.state.value.routinePlanningDisplayAdmission)
+            assertEquals(initial.routineOccurrenceLedger, store.state.value.routineOccurrenceLedger)
+        } finally { release.complete(Unit); scope.cancel() }
+    }
 
     @Test fun connectedPreparationStoresExactRequestWithoutInstallingPublishingOrAcknowledgingHistory() = runBlocking {
         val store = store()

@@ -22,6 +22,9 @@ protocol RoutineOccurrenceScheduleComposing: Sendable {
 struct RoutineOccurrenceLocalComposition: Equatable, Sendable {
     let composition: LocalScheduleComposition
     let occurrenceSnapshotRevision: UInt64
+    /// Exact validated helper-v2 stdout. Display timestamps must never be
+    /// re-encoded from the lossy Foundation Date projection for custody.
+    let rawOutput: Data
 }
 
 enum SchedulerHelperClientError: Error, Equatable, LocalizedError, Sendable {
@@ -530,7 +533,7 @@ struct SchedulerHelperClient: LocalScheduleComposing, RoutineOccurrenceScheduleC
             }
             switch output.termination {
             case .exited(0):
-                return .init(composition: decoded, occurrenceSnapshotRevision: head)
+                return .init(composition: decoded, occurrenceSnapshotRevision: head, rawOutput: output.standardOutput)
             case .signaled: throw SchedulerHelperClientError.unexpectedTermination
             default: throw SchedulerHelperClientError.invalidResponse
             }

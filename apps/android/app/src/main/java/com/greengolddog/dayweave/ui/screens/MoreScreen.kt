@@ -44,6 +44,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import com.greengolddog.dayweave.ui.authoring.RoutinePlanningPreviewSheet
+import com.greengolddog.dayweave.ui.authoring.previewPresentation
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -179,8 +181,30 @@ fun MoreScreen(
     onOpenGoals: () -> Unit = {},
     onOpenProjects: () -> Unit = {},
     onPrepareRoutinePlanningInput: () -> Unit = {},
+    onComposeSavedRoutinePlanningInput: () -> Unit = {},
+    onDismissSavedRoutinePlanningPreview: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val previewAdmission = state.routinePlanningDisplayAdmission
+    val previewMatches = remember(state, previewAdmission) { previewAdmission?.matchesState(state) == true }
+    var previewClock by remember(previewAdmission) { mutableStateOf(java.time.Instant.now()) }
+    var previewClockValid by remember(previewAdmission) { mutableStateOf(true) }
+    LaunchedEffect(previewAdmission) {
+        if (previewAdmission != null) while (true) {
+            kotlinx.coroutines.delay(1_000)
+            val clock = java.time.Instant.now()
+            if (clock < previewClock) previewClockValid = false
+            previewClock = clock
+        }
+    }
+    val previewZone = runCatching { state.scheduleCompositionProfile.timezoneName?.let(java.time.ZoneId::of) ?: java.time.ZoneId.systemDefault() }.getOrNull()
+    val showPreview = canonicalPrivacyActionsEnabled && previewMatches && previewClockValid && previewZone != null &&
+        previewAdmission?.permitsClock(previewClock, previewZone) == true
+    val preview = remember(previewAdmission, showPreview) { if (showPreview) previewAdmission?.previewPresentation() else null }
+    LaunchedEffect(previewAdmission, showPreview) {
+        if (previewAdmission != null && !showPreview) onDismissSavedRoutinePlanningPreview()
+    }
+    RoutinePlanningPreviewSheet(preview, onDismissSavedRoutinePlanningPreview)
     var pendingSensitivityRemoval by remember {
         mutableStateOf<CanonicalItemSnapshot?>(null)
     }
@@ -431,9 +455,12 @@ fun MoreScreen(
                     },
                 )
                 if (canonicalPrivacyActionsEnabled && state.routinePlanningInputCapsule != null) {
-                    Text("An encrypted fixed input is retained. Local recurring planning remains gated.",
+                    Text("An encrypted fixed input is retained. Recompute it offline for a private read-only preview; new clocks, edits and execution still require remote planning.",
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                         style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = onComposeSavedRoutinePlanningInput,
+                        enabled = !canonicalSyncState.isBusy && state.hasRoutinePlanningInputReadiness(),
+                        modifier = Modifier.padding(horizontal = 8.dp).testTag("compose_saved_routine_input")) { Text("Compose saved input") }
                 }
             }
         }

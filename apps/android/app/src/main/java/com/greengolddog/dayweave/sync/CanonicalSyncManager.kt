@@ -7,6 +7,7 @@ import com.greengolddog.dayweave.model.ItemCompletionReadProof
 import com.greengolddog.dayweave.model.completionLocalEvidence
 import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
 import com.greengolddog.dayweave.model.RoutinePlanningInputCapsule
+import com.greengolddog.dayweave.model.RoutinePlanningDisplaySnapshot
 import com.greengolddog.dayweave.model.RoutinePlanningSchedule
 import com.greengolddog.dayweave.model.RoutinePlanningWitnessRequest
 import com.greengolddog.dayweave.model.RoutinePlanningWitnessResult
@@ -922,6 +923,74 @@ class CanonicalSyncManager(
                     CanonicalRefreshOutcome.SUCCESS
                 }
             } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
+    /** Offline fixed-input recomputation. No remote transport, v1 fallback or canonical installer. */
+    suspend fun composeSavedRoutinePlanningInput(admittedLifecycleGeneration: Long? = null): CanonicalRefreshOutcome {
+        if (plannerStore.loadState.first { it != PlannerLoadState.LOADING } != PlannerLoadState.READY) {
+            updateError("Encrypted storage is unavailable; the saved preview was kept.")
+            return CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        return operationMutex.withLock {
+            plannerStore.revokeRoutinePlanningDisplay()
+            val composer = routineLifecycleScheduleComposer ?: run {
+                updateError("The occurrence-aware bundled scheduler is unavailable in this build.")
+                return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+            }
+            // This reads the existing encrypted Device binding, not fresh server authentication.
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            try {
+                configuration.withBindingOperation {
+                    val operation = currentCoroutineContext()
+                    val generation = admittedLifecycleGeneration ?: localCompositionLifecycleFence.captureGeneration()
+                    val fence = plannerStore.captureRoutinePlanningInputFence() ?: throw RoutinePlanningWitnessProtocolException()
+                    val expected = fence.state
+                    val capsule = expected.routinePlanningInputCapsule ?: throw RoutinePlanningWitnessProtocolException()
+                    val binding = configuration.configurationId ?: throw RoutinePlanningWitnessProtocolException()
+                    require(capsule.syncOrigin == configuration.baseUrl.toString() && capsule.configurationId == binding)
+                    val zone = compositionPlanningZone(expected.scheduleCompositionProfile)
+                    require(zone.id == capsule.witness.schedule.timezoneName)
+                    var lastClock = now()
+                    fun clockIsCurrent(clock: Instant): Boolean = operation.isActive && localCompositionLifecycleFence.isCurrent(generation) &&
+                            clock >= lastClock && compositionPlanningZone(expected.scheduleCompositionProfile) == zone &&
+                            clock.atZone(zone).toLocalDate() == Instant.parse(capsule.capturedAt).atZone(zone).toLocalDate() &&
+                            clock >= Instant.parse(capsule.witness.schedule.horizonStart) && clock < Instant.parse(capsule.witness.schedule.horizonEnd)
+                    fun ownsOperation(): Boolean = clockIsCurrent(now())
+                    fun checkInput() {
+                        operation.ensureActive()
+                        ensureConfigurationCurrent(configuration)
+                        val clock = now()
+                        require(clockIsCurrent(clock) && plannerStore.isRoutinePlanningInputFenceCurrent(fence) && plannerStore.isRoutinePlanningStateDurable(expected))
+                        require(capsule.isReusableInput(expected, clock.toEpochMilli(), true))
+                        lastClock = clock
+                    }
+                    checkInput()
+                    mutableState.value = CanonicalSyncState(phase = CanonicalSyncPhase.SYNCING,
+                        message = "Recomputing the exact saved routine input privately…",
+                        sourceItemCount = capsule.canonicalItems.size, scheduledBlockCount = expected.schedule.size)
+                    val composed = composer.compose(capsule.canonicalItems, capsule.witness)
+                    checkInput()
+                    val computedAt = lastClock.truncatedTo(ChronoUnit.MICROS).toString()
+                    val display = RoutinePlanningDisplaySnapshot.create(capsule, composed, computedAt)
+                    checkInput()
+                    val transition = plannerStore.installRoutinePlanningDisplay(fence, display, ::ownsOperation)
+                        ?: throw LocalPlannerStorageException()
+                    if (!transition.persistence.awaitDurable()) throw LocalPlannerStorageException()
+                    operation.ensureActive(); ensureConfigurationCurrent(configuration)
+                    require(ownsOperation() && plannerStore.isRoutinePlanningInputFenceCurrent(transition.postSaveFence))
+                    require(plannerStore.admitRoutinePlanningDisplay(transition.postSaveFence, display, ::ownsOperation))
+                    mutableState.value = CanonicalSyncState(phase = CanonicalSyncPhase.READY,
+                        message = "Private fixed-input preview saved. Display only; no canonical schedule or action authority changed.",
+                        sourceItemCount = capsule.canonicalItems.size, scheduledBlockCount = expected.schedule.size)
+                    CanonicalRefreshOutcome.SUCCESS
+                }
+            } catch (error: Throwable) {
+                plannerStore.revokeRoutinePlanningDisplay()
                 handleFailure(error)
             }
         }

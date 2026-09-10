@@ -56,21 +56,21 @@ class RoutinePlanningInputPersistenceTest {
             pending = base.routineOccurrenceLedger.pending.map { it.copy(syncOrigin = requireNotNull(base.canonicalSyncOrigin), configurationId = requireNotNull(base.canonicalConfigurationId)) }))
         repository.save(original)
         val modern = requireNotNull(dao.snapshot)
-        val oldRoot = Json.parseToJsonElement(modern.payload).jsonObject - "routinePlanningInputCapsule"
+        val oldRoot = Json.parseToJsonElement(modern.payload).jsonObject - "routinePlanningInputCapsule" - "routinePlanningDisplaySnapshot"
         dao.snapshot = modern.copy(payloadFormat = PlannerSnapshotFormats.JSON_V24, payload = JsonObject(oldRoot).toString())
         val restored = requireNotNull(repository.load())
         assertNull(restored.routinePlanningInputCapsule)
         assertEquals(original.itemProgressLedger, restored.itemProgressLedger)
         assertEquals(original.itemCompletionLedger, restored.itemCompletionLedger)
         assertEquals(original.routineOccurrenceLedger, restored.routineOccurrenceLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
-        assertEquals(oldRoot, Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject - "routinePlanningInputCapsule")
+        assertEquals(PlannerSnapshotFormats.JSON_V26, dao.snapshot?.payloadFormat)
+        assertEquals(oldRoot, Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject - "routinePlanningInputCapsule" - "routinePlanningDisplaySnapshot")
     }
 
     @Test fun allPredecessorLabelsRejectInjectedCapsuleEvenNullWithoutRewriting(): Unit = runBlocking {
         val dao = RawDao(); val repository = RoomPlannerStateRepository(dao) { now }
         repository.save(planningTestReadyState()); val original = requireNotNull(dao.snapshot)
-        val root = Json.parseToJsonElement(original.payload).jsonObject
+        val root = Json.parseToJsonElement(original.payload).jsonObject - "routinePlanningDisplaySnapshot"
         for (version in 1..24) for (value in listOf(JsonNull, ROUTINE_CAPSULE_JSON.encodeToJsonElement(capsule(planningTestReadyState())))) {
             val format = PlannerSnapshotFormats::class.java.getDeclaredField("JSON_V$version").get(null) as String
             val injected = original.copy(payloadFormat = format, payload = JsonObject(root + ("routinePlanningInputCapsule" to value)).toString())

@@ -49,7 +49,7 @@ class RoutineOccurrencePersistenceTest {
             val original = routineStateTestUi(routineStateTestLedger().copy(pending = listOf(
                 routineStateTestIntent(true).copy(disposition = disposition))))
             repository.save(original)
-            assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V26, dao.snapshot?.payloadFormat)
             val restored = requireNotNull(repository.load())
             assertEquals(original.routineOccurrenceLedger, restored.routineOccurrenceLedger)
             assertEquals(original.routineOccurrenceLedger.pending.single().requestJson,
@@ -66,22 +66,22 @@ class RoutineOccurrencePersistenceTest {
             itemCompletionLedger = completionTestLedger().copy(pending = listOf(completionTestMutation(true))))
         repository.save(original)
         val saved = requireNotNull(dao.snapshot)
-        val oldRoot = Json.parseToJsonElement(saved.payload).jsonObject - "routineOccurrenceLedger" - "routinePlanningInputCapsule"
+        val oldRoot = Json.parseToJsonElement(saved.payload).jsonObject - "routineOccurrenceLedger" - "routinePlanningInputCapsule" - "routinePlanningDisplaySnapshot"
         val old = saved.copy(payloadFormat = PlannerSnapshotFormats.JSON_V23, payload = JsonObject(oldRoot).toString())
         dao.snapshot = old
         val restored = requireNotNull(repository.load())
         assertEquals(RoutineOccurrenceLedger(), restored.routineOccurrenceLedger)
         assertEquals(original.itemProgressLedger.pending, restored.itemProgressLedger.pending)
         assertEquals(original.itemCompletionLedger.pending, restored.itemCompletionLedger.pending)
-        assertEquals(oldRoot, Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject - "routineOccurrenceLedger" - "routinePlanningInputCapsule")
-        assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
+        assertEquals(oldRoot, Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject - "routineOccurrenceLedger" - "routinePlanningInputCapsule" - "routinePlanningDisplaySnapshot")
+        assertEquals(PlannerSnapshotFormats.JSON_V26, dao.snapshot?.payloadFormat)
     }
 
     @Test fun everyOlderFormatRejectsInjectedLedgerAndRuntimeProofEvenNullBeforeMigration() = runBlocking {
         val dao = RawDao(); val repository = RoomPlannerStateRepository(dao) { 1_000 }
         repository.save(DayWeaveUiState())
         val original = requireNotNull(dao.snapshot)
-        val currentRoot = Json.parseToJsonElement(original.payload).jsonObject - "routinePlanningInputCapsule"
+        val currentRoot = Json.parseToJsonElement(original.payload).jsonObject - "routinePlanningInputCapsule" - "routinePlanningDisplaySnapshot"
         for (version in 1..24) {
             val format = PlannerSnapshotFormats::class.java.getDeclaredField("JSON_V$version").get(null) as String
             val root = currentRoot - if (version < 24) setOf("routineOccurrenceLedger") else emptySet()

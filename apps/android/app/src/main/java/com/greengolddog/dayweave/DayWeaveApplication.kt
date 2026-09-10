@@ -1284,15 +1284,32 @@ class DayWeaveApplication : Application() {
             }
 
     /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
-    fun cancelLocalScheduleComposition() = localScheduleCompositionLauncher.cancel()
+    fun cancelLocalScheduleComposition() {
+        localScheduleCompositionLauncher.cancel()
+        plannerStore.revokeRoutinePlanningDisplay()
+    }
 
-    fun setLocalScheduleCompositionForegroundActive(active: Boolean) =
+    fun setLocalScheduleCompositionForegroundActive(active: Boolean) {
         localScheduleCompositionLauncher.setForegroundActive(
             active && onboardingRuntimeGate.foregroundProviderWorkAllowed(),
         )
+        if (!active || !onboardingRuntimeGate.foregroundProviderWorkAllowed()) plannerStore.revokeRoutinePlanningDisplay()
+    }
 
-    internal suspend fun cancelAndDrainLocalScheduleComposition() =
+    /** Local private ownership does not require a successful network request after restart. */
+    fun launchSavedRoutinePlanningComposition(): Boolean =
+        onboardingRuntimeGate.privatePresentationAllowed() && !hasGoogleAuthorizationRecoveryBlocker() &&
+            !hasAccountRecoveryWorkBlocker() && localScheduleCompositionLauncher.launch { generation ->
+                canonicalSyncManager.composeSavedRoutinePlanningInput(generation)
+            }
+
+    fun dismissSavedRoutinePlanningPreview() = plannerStore.revokeRoutinePlanningDisplay()
+
+    internal suspend fun cancelAndDrainLocalScheduleComposition() {
+        localScheduleCompositionLauncher.cancel()
+        plannerStore.revokeRoutinePlanningDisplay()
         localScheduleCompositionLauncher.cancelAndDrain()
+    }
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
@@ -1303,6 +1320,9 @@ class DayWeaveApplication : Application() {
     private fun closePrivatePresentationBoundary() {
         energySignalGenerationFence.close()
         privatePresentationAllowed.set(false)
+        // Revoke the atomic operation generation before any store lock can wait for a large
+        // validation/serialization. Late pure work must observe privacy withdrawal at final CAS.
+        localScheduleCompositionLauncher.setForegroundActive(false)
         if (itemProgressRefreshCoordinatorDelegate.isInitialized()) itemProgressRefreshCoordinator.cancelActiveSessions()
         if (itemCompletionRefreshCoordinatorDelegate.isInitialized()) itemCompletionRefreshCoordinator.cancelActiveSessions()
         if (itemCompletionSyncManagerDelegate.isInitialized()) {

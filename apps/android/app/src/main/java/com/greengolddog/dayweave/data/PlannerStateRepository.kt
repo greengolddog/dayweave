@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.ItemProgressLedger
 import com.greengolddog.dayweave.model.ItemCompletionLedger
 import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
 import com.greengolddog.dayweave.model.RoutinePlanningInputCapsule
+import com.greengolddog.dayweave.model.RoutinePlanningDisplaySnapshot
 import com.greengolddog.dayweave.model.decodeExactRoutinePlanningWitness
 import com.greengolddog.dayweave.model.decodeExactRoutineOccurrence
 import com.greengolddog.dayweave.model.decodeExactItemCompletion
@@ -72,12 +73,13 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { persistedSnapshot ->
         // Inspect the original bytes before any older migration can erase an injected authority.
+        validateRoutinePlanningDisplaySnapshotShape(persistedSnapshot)
         validateRoutinePlanningCapsuleSnapshotShape(persistedSnapshot)
         validateItemProgressSnapshotShape(persistedSnapshot)
         validateItemCompletionSnapshotShape(persistedSnapshot)
         validateRoutineOccurrenceSnapshotShape(persistedSnapshot)
         val snapshot = if (persistedSnapshot.payloadFormat in setOf(
-                PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V21,
+                PlannerSnapshotFormats.JSON_V26, PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V21,
             )) {
             persistedSnapshot
         } else {
@@ -86,6 +88,7 @@ class RoomPlannerStateRepository(
             )
         }
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V26,
             PlannerSnapshotFormats.JSON_V25,
             PlannerSnapshotFormats.JSON_V24,
             PlannerSnapshotFormats.JSON_V23,
@@ -262,6 +265,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V26 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V25 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V24 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V23 ||
@@ -284,6 +288,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V26 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V25 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V24 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V23 ||
@@ -316,7 +321,7 @@ class RoomPlannerStateRepository(
         validateRoutineOccurrenceState(hardened)
         validateRoutinePlanningCapsuleState(hardened)
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V25 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V26 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -353,13 +358,13 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V25,
+                payloadFormat = PlannerSnapshotFormats.JSON_V26,
             ),
         )
     }
 
     private fun validateItemProgressSnapshotShape(snapshot: PlannerSnapshotEntity) {
-        val hasProgress = snapshot.payloadFormat in setOf(PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25)
+        val hasProgress = snapshot.payloadFormat in setOf(PlannerSnapshotFormats.JSON_V22, PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V26)
         if (hasProgress) {
             try {
                 // Do not let tree decoding erase equivalent duplicate authority keys. Other
@@ -404,7 +409,7 @@ class RoomPlannerStateRepository(
         val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
         if (root.containsKey("itemCompletionGetProofs") || root.containsKey("itemCompletionEvidenceGeneration"))
             throw SerializationException("Completion GET admission is runtime-only")
-        if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25)) {
+        if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V23, PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V26)) {
             if (root.containsKey("itemCompletionLedger")) throw SerializationException("Legacy snapshot contains completion authority")
             return
         }
@@ -429,7 +434,7 @@ class RoomPlannerStateRepository(
                 "routineOccurrenceEvidenceGeneration", "routineOccurrenceReviewLease") }) {
             throw SerializationException("Occurrence GET admission is runtime-only")
         }
-        if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25)) {
+        if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V24, PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V26)) {
             if (root.containsKey("routineOccurrenceLedger")) {
                 throw SerializationException("Legacy snapshot contains occurrence authority")
             }
@@ -454,7 +459,7 @@ class RoomPlannerStateRepository(
         try {
             val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
             require(root.keys.none { it in setOf("routinePlanningInputCaptureFence", "routinePlanningInputAdmission", "routinePlanningInputGeneration") })
-            if (snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V25) {
+            if (snapshot.payloadFormat !in setOf(PlannerSnapshotFormats.JSON_V25, PlannerSnapshotFormats.JSON_V26)) {
                 require("routinePlanningInputCapsule" !in root)
                 return
             }
@@ -470,7 +475,22 @@ class RoomPlannerStateRepository(
                 capsule.requireValid()
                 require(capsule.syncOrigin == state.canonicalSyncOrigin && capsule.configurationId == state.canonicalConfigurationId)
             }
+            state.routinePlanningDisplaySnapshot?.validateAndDecode(requireNotNull(state.routinePlanningInputCapsule))
         } catch (_: Exception) { throw SerializationException("Saved planning input binding is invalid") }
+    }
+
+    private fun validateRoutinePlanningDisplaySnapshotShape(snapshot: PlannerSnapshotEntity) {
+        try {
+            val root = SNAPSHOT_JSON.parseToJsonElement(snapshot.payload).jsonObject
+            require(root.keys.none { it in setOf("routinePlanningDisplayAdmission", "routinePlanningDisplayFence", "routinePlanningDisplayGeneration") })
+            if (snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V26) {
+                require("routinePlanningDisplaySnapshot" !in root)
+                return
+            }
+            val raw = root.getValue("routinePlanningDisplaySnapshot")
+            if (raw != JsonNull) decodeExactRoutinePlanningWitness<RoutinePlanningDisplaySnapshot>(raw.toString())
+                .validateAndDecode(decodeExactRoutinePlanningWitness(root.getValue("routinePlanningInputCapsule").toString()))
+        } catch (_: Exception) { throw SerializationException("Saved routine preview shape is invalid") }
     }
 
     /**

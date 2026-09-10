@@ -64,6 +64,9 @@ import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
 import com.greengolddog.dayweave.model.RoutinePlanningInputCapsule
+import com.greengolddog.dayweave.model.RoutinePlanningDisplaySnapshot
+import com.greengolddog.dayweave.model.RoutinePlanningDisplayAdmission
+import com.greengolddog.dayweave.model.withoutRoutinePlanningRuntime
 import com.greengolddog.dayweave.model.RoutinePlanningWitnessProtocolException
 import com.greengolddog.dayweave.model.hasRoutinePlanningInputReadiness
 import com.greengolddog.dayweave.model.routinePlanningStableInputFingerprint
@@ -384,6 +387,14 @@ class PlannerPersistenceReceipt internal constructor(
     suspend fun awaitDurable(): Boolean = completion.await()
 }
 
+/** One process-local read owner; a rejected page may withdraw only this exact checkpoint. */
+class HabitDeltaReadFence internal constructor(
+    internal val state: DayWeaveUiState,
+    internal val generation: Long,
+) {
+    override fun toString() = "HabitDeltaReadFence(<protected, runtime-only>)"
+}
+
 /** Process-local ownership only. Never serialized into the capsule or reconstructed on load. */
 class RoutinePlanningInputCaptureFence internal constructor(
     val state: DayWeaveUiState,
@@ -395,6 +406,12 @@ class RoutinePlanningInputCaptureFence internal constructor(
 
 class RoutinePlanningInputTransition internal constructor(
     val capsule: RoutinePlanningInputCapsule,
+    val persistence: PlannerPersistenceReceipt,
+    val postSaveFence: RoutinePlanningInputCaptureFence,
+)
+
+class RoutinePlanningDisplayTransition internal constructor(
+    val display: RoutinePlanningDisplaySnapshot,
     val persistence: PlannerPersistenceReceipt,
     val postSaveFence: RoutinePlanningInputCaptureFence,
 )
@@ -458,7 +475,7 @@ class PlannerStore(
     private val canonicalTrashCleanupScheduler = cleanupScheduler
         ?: scope?.let(::CoroutineCanonicalTrashCleanupScheduler)
     private val mutableState = MutableStateFlow(
-        initialState.copy(routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0)
+        initialState.copy(routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0, routinePlanningDisplayAdmission = null)
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
@@ -3682,12 +3699,14 @@ class PlannerStore(
     /** Lock/account/visibility shutdown revokes read permission without abandoning any custody. */
     internal fun invalidateItemCompletionReadProofs() = synchronized(persistenceLock) {
         mutableState.value = mutableState.value.copy(itemCompletionGetProofs = emptyMap(),
+            routinePlanningDisplayAdmission = null,
             itemCompletionEvidenceGeneration = Math.addExact(mutableState.value.itemCompletionEvidenceGeneration, 1))
     }
 
     /** Exact encrypted save of the occurrence sidecar; canonical templates/lifecycle stay separate. */
     internal fun invalidateRoutineOccurrenceAuthority() = synchronized(persistenceLock) {
         mutableState.value = mutableState.value.copy(
+            routinePlanningDisplayAdmission = null,
             routineOccurrenceAuthorityGeneration = Math.addExact(mutableState.value.routineOccurrenceAuthorityGeneration, 1),
             routineOccurrenceDeferAdmission = null,
             localScheduleCompositionProvenance = null,
@@ -3706,14 +3725,15 @@ class PlannerStore(
 
     /** Cached protected history can be forgotten only after every intent and receipt is resolved. */
     internal fun quarantineRoutineOccurrenceLedger(): PlannerPersistenceReceipt? =
-        mutateDurably { current -> current.copy(routineOccurrenceLedger = current.routineOccurrenceLedger.quarantineRoutineOccurrences(), routinePlanningInputCapsule = null) }
+        mutateDurably { current -> current.copy(routineOccurrenceLedger = current.routineOccurrenceLedger.quarantineRoutineOccurrences(),
+            routinePlanningInputCapsule = null, routinePlanningDisplaySnapshot = null) }
 
     /** Capturing a fence does not authenticate an HTTP response or permit helper installation. */
     internal fun captureRoutinePlanningInputFence(): RoutinePlanningInputCaptureFence? = synchronized(persistenceLock) {
         val current = mutableState.value
         if (persistenceStatus !in setOf(PersistenceStatus.READY, PersistenceStatus.DISABLED) || !current.hasRoutinePlanningInputReadiness()) return@synchronized null
         try {
-            requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), current.copy(routinePlanningInputCapsule = null), MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
+            requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), current.copy(routinePlanningInputCapsule = null, routinePlanningDisplaySnapshot = null), MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
             RoutinePlanningInputCaptureFence(current, currentGeneration, current.routinePlanningStableInputFingerprint())
         } catch (_: Exception) { null }
     }
@@ -3747,7 +3767,8 @@ class PlannerStore(
                     require(pinned.syncOrigin == capsule.syncOrigin && pinned.configurationId == capsule.configurationId)
                     require(pinned.workspaceId == capsule.workspaceId && pinned.userId == capsule.userId)
                 }
-                val proposed = current.copy(routinePlanningInputCapsule = capsule)
+                val proposed = current.copy(routinePlanningInputCapsule = capsule,
+                    routinePlanningDisplaySnapshot = current.routinePlanningDisplaySnapshot.takeIf { current.routinePlanningInputCapsule == capsule })
                 require(capsule.isReusableInput(proposed, nowEpochMillis(), allowPrivateContent = true))
                 // Admission is all-or-nothing. No cache/journal trimming buys room for a new artifact.
                 requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), proposed, MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
@@ -3765,7 +3786,55 @@ class PlannerStore(
     /** Explicit local discard changes no occurrence history, request, receipt target or schedule latch. */
     internal fun discardRoutinePlanningInputCapsule(expected: RoutinePlanningInputCapsule): PlannerPersistenceReceipt? = mutateDurably { current ->
         require(current.routinePlanningInputCapsule == expected)
-        current.copy(routinePlanningInputCapsule = null)
+        current.copy(routinePlanningInputCapsule = null, routinePlanningDisplaySnapshot = null)
+    }
+
+    /** Offline ownership compares every durable field, excluding only process-local permissions. */
+    internal fun isRoutinePlanningStateDurable(expected: DayWeaveUiState): Boolean = synchronized(persistenceLock) {
+        mutableDurableState.value?.withoutRoutinePlanningRuntime() == expected.withoutRoutinePlanningRuntime()
+    }
+
+    internal fun revokeRoutinePlanningDisplay() = synchronized(persistenceLock) {
+        if (mutableState.value.routinePlanningDisplayAdmission != null)
+            mutableState.value = mutableState.value.copy(routinePlanningDisplayAdmission = null)
+    }
+
+    internal fun installRoutinePlanningDisplay(expected: RoutinePlanningInputCaptureFence,
+        display: RoutinePlanningDisplaySnapshot, isCurrent: () -> Boolean): RoutinePlanningDisplayTransition? {
+        try {
+            val mutation = mutateDurablyWithSnapshot { current ->
+                require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected) && isRoutinePlanningStateDurable(current))
+                val capsule = requireNotNull(current.routinePlanningInputCapsule)
+                require(capsule.isReusableInput(current, nowEpochMillis(), true))
+                // Store clock is millisecond precision; the operation callback retains and checks
+                // its full-resolution monotonic clock. Never round retained helper/input times.
+                require(Instant.parse(display.computedAt).toEpochMilli() <= nowEpochMillis())
+                display.validateAndDecode(capsule)
+                val proposed = current.copy(routinePlanningDisplaySnapshot = display, routinePlanningDisplayAdmission = null)
+                requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), proposed, MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
+                require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected) && isRoutinePlanningStateDurable(current))
+                proposed
+            } ?: return null
+            val receipt = requireNotNull(mutation.receipt)
+            return RoutinePlanningDisplayTransition(display, receipt,
+                RoutinePlanningInputCaptureFence(mutation.snapshot, receipt.generation, expected.stableInputFingerprint))
+        } catch (_: Exception) { throw RoutinePlanningWitnessProtocolException() }
+    }
+
+    /** Durable bytes alone never activate presentation, including after process restart. */
+    internal fun admitRoutinePlanningDisplay(expected: RoutinePlanningInputCaptureFence,
+        display: RoutinePlanningDisplaySnapshot, isCurrent: () -> Boolean): Boolean = synchronized(persistenceLock) {
+        try {
+            require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected) && isRoutinePlanningStateDurable(expected.state))
+            val current = mutableState.value
+            val capsule = requireNotNull(current.routinePlanningInputCapsule)
+            require(current.routinePlanningDisplaySnapshot === display && capsule.isReusableInput(current, nowEpochMillis(), true))
+            val composed = display.validateAndDecode(capsule)
+            require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected) && isRoutinePlanningStateDurable(current))
+            mutableState.value = current.copy(routinePlanningDisplayAdmission = RoutinePlanningDisplayAdmission(capsule, display, composed,
+                current.routineOccurrenceAuthorityGeneration, current.itemCompletionEvidenceGeneration))
+            true
+        } catch (_: Exception) { false }
     }
 
     /** Establishes an empty habit cache under the exact credential/workspace binding. */
@@ -3844,6 +3913,35 @@ class PlannerStore(
                 .also(HabitLedgerSnapshot::requireValid),
             scheduleMessage = "Checking missed habits against server time",
         )
+    }
+
+    internal fun captureHabitDeltaReadFence(syncOrigin: String, configurationId: String): HabitDeltaReadFence =
+        synchronized(persistenceLock) {
+            val current = mutableState.value
+            require(current.habitLedger.syncOrigin == syncOrigin && current.habitLedger.configurationId == configurationId)
+            HabitDeltaReadFence(current, currentGeneration)
+        }
+
+    internal fun isHabitDeltaReadFenceCurrent(expected: HabitDeltaReadFence): Boolean = synchronized(persistenceLock) {
+        currentGeneration == expected.generation && mutableState.value === expected.state &&
+            persistenceStatus in setOf(PersistenceStatus.READY, PersistenceStatus.DISABLED)
+    }
+
+    /** No cursor advance, replay, reload, or retry against a newer checkpoint is permitted here. */
+    internal fun rejectHabitDeltaRead(
+        expected: HabitDeltaReadFence,
+        isCurrent: () -> Boolean,
+    ): PlannerPersistenceReceipt? = synchronized(persistenceLock) {
+        if (!isCurrent() || !isHabitDeltaReadFenceCurrent(expected)) return@synchronized null
+        mutateDurably { current ->
+            require(isCurrent() && isHabitDeltaReadFenceCurrent(expected))
+            val candidate = current.copy(
+                habitLedger = current.habitLedger.copy(deltaCaughtUp = false).also(HabitLedgerSnapshot::requireValid),
+                scheduleMessage = "Habit history needs a trusted refresh",
+            )
+            require(isCurrent() && isHabitDeltaReadFenceCurrent(expected))
+            candidate
+        }
     }
 
     /** Persists the exact bounded scan request before it can reach the server. */
@@ -4191,7 +4289,10 @@ class PlannerStore(
         pauses: List<HabitPauseSnapshot>,
         nextCursor: String,
         hasMore: Boolean = true,
+        expectedRead: HabitDeltaReadFence? = null,
+        isCurrent: () -> Boolean = { true },
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(isCurrent() && (expectedRead == null || isHabitDeltaReadFenceCurrent(expectedRead)))
         val ledger = current.habitLedger.also(HabitLedgerSnapshot::requireValid)
         require(ledger.syncOrigin == syncOrigin && ledger.configurationId == configurationId)
         // Delta is an ordered append-only log, so one page may legitimately contain multiple
@@ -4252,7 +4353,7 @@ class PlannerStore(
                 },
             ),
         )
-        if (occurrenceMap == ledger.occurrences && pauseMap == ledger.pauses) {
+        val candidate = if (occurrenceMap == ledger.occurrences && pauseMap == ledger.pauses) {
             current.copy(
                 habitLedger = updated,
                 scheduleMessage = "Habit history is synchronized",
@@ -4260,6 +4361,8 @@ class PlannerStore(
         } else {
             current.withHabitLedgerProjection(updated, "Habit history is synchronized")
         }
+        require(isCurrent() && (expectedRead == null || isHabitDeltaReadFenceCurrent(expectedRead)))
+        candidate
     }
 
     /** Merges an authoritative date-window page without pruning unrelated offline history. */
@@ -6247,6 +6350,7 @@ class PlannerStore(
             itemCompletionLedger = com.greengolddog.dayweave.model.ItemCompletionLedger(),
             routineOccurrenceLedger = RoutineOccurrenceLedger(),
             routinePlanningInputCapsule = null,
+            routinePlanningDisplaySnapshot = null,
             itemCompletionGetProofs = emptyMap(),
             pendingCanonicalMutation = null,
             canonicalExecutionSyncOrigin = null,
@@ -7840,7 +7944,7 @@ class PlannerStore(
             return@synchronized null
         }
         val previous = mutableState.value
-        val transformed = transform(previous)
+        val transformed = transform(previous).copy(routinePlanningDisplayAdmission = null)
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
@@ -7916,7 +8020,7 @@ class PlannerStore(
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
             val snapshot = (persistedState ?: initialState).copy(itemCompletionGetProofs = emptyMap(), itemCompletionEvidenceGeneration = 0,
-                routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0)
+                routineOccurrenceDeferAdmission = null, routineOccurrenceAuthorityGeneration = 0, routinePlanningDisplayAdmission = null)
                 .withCanonicalTrashRetention(nowEpochMillis())
                 .withPendingSensitivityHardened()
                 .withInvalidRecurrenceMoveSourcesAbandoned()
@@ -8079,7 +8183,9 @@ class PlannerStore(
                 itemCompletionLedger = retainedCompletion, itemCompletionGetProofs = emptyMap(),
                 // Receipt settlement and journal removal roll back together on failed disk IO.
                 routineOccurrenceLedger = mutableDurableState.value?.routineOccurrenceLedger ?: RoutineOccurrenceLedger(),
-                routinePlanningInputCapsule = mutableDurableState.value?.routinePlanningInputCapsule)
+                routinePlanningInputCapsule = mutableDurableState.value?.routinePlanningInputCapsule,
+                routinePlanningDisplaySnapshot = mutableDurableState.value?.routinePlanningDisplaySnapshot,
+                routinePlanningDisplayAdmission = null)
                 .withPendingSensitivityHardened()
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {

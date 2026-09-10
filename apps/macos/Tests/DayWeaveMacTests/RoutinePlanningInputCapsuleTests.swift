@@ -192,7 +192,7 @@ struct RoutinePlanningInputCapsuleTests {
         var source = try f.object(); source["schemaVersion"] = 28; source.removeValue(forKey: "routinePlanningInputCapsule")
         _ = try f.write(W.data(source))
         let migrated = try #require(try f.persistence.load())
-        #expect(migrated.schemaVersion == 29 && migrated.routinePlanningInputCapsule == nil)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion && migrated.routinePlanningInputCapsule == nil)
         #expect(migrated.routineOccurrenceState?.journals == ledger.journals)
         #expect(migrated.routineOccurrenceState?.journals.first?.hasBeenSubmitted == true)
         #expect(migrated.routineOccurrenceState?.journals.first?.requestBody == journal.requestBody)
@@ -221,7 +221,7 @@ struct RoutinePlanningInputCapsuleTests {
     }
 
     @MainActor
-    private struct Fixture {
+    struct Fixture {
         let directory: URL, file: URL
         let persistence: EncryptedPlannerPersistence
         let planner: PlannerStore

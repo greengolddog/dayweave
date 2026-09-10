@@ -70,7 +70,7 @@ class CanonicalStructuralAuthoringPersistenceTest {
                     assertEquals(CanonicalDeadlineKind.DATE_TIME, restored.draft?.deadlineKind)
                     assertEquals(CanonicalDeadlineStrength.HARD, restored.draft?.deadlineStrength)
                     assertTrue(requireNotNull(restored.draft).hasOwnEffort)
-                    assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
+                    assertEquals(PlannerSnapshotFormats.JSON_V26, dao.snapshot?.payloadFormat)
                     val roundTrip = requireNotNull(repository.load()).pendingCanonicalAuthoringMutations.single()
                     assertEquals("Migration cannot repeatedly upgrade request authority", restored, roundTrip)
                 }
@@ -123,7 +123,7 @@ class CanonicalStructuralAuthoringPersistenceTest {
         val repository = repository(dao)
         repository.save(state(original))
         val stored = requireNotNull(dao.snapshot)
-        assertEquals(PlannerSnapshotFormats.JSON_V25, stored.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V26, stored.payloadFormat)
         val entry = entry(stored)
         assertEquals(JsonPrimitive(2), entry["structuralRequestShapeVersion"])
         val draft = entry.getValue("draft").jsonObject

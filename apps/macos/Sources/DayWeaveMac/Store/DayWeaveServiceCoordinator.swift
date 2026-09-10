@@ -59,12 +59,20 @@ extension GoogleSchedulePublicationStore: GoogleSchedulePublicationRecovering {}
 protocol CanonicalServiceSynchronizing: AnyObject {
     var isConfigured: Bool { get }
 
+    /// Private process ownership, independent of successful network refresh.
+    /// This never grants execution, publication, or fresh server authority.
+    func activateRoutinePlanningInputCapture()
+
     @discardableResult
     func bootstrapForegroundActivation() async -> Bool
     @discardableResult
     func syncThroughFreshComposition() async -> Bool
     func startForegroundItemInvalidations(every interval: Duration)
     func stopForegroundItemInvalidations()
+}
+
+extension CanonicalServiceSynchronizing {
+    func activateRoutinePlanningInputCapture() {}
 }
 
 extension CanonicalSyncStore: CanonicalServiceSynchronizing {}
@@ -136,6 +144,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
 
     func activate() {
         desiredForeground = true
+        canonicalSync.activateRoutinePlanningInputCapture()
         guard !servicesAreActive, activationTask == nil else { return }
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration

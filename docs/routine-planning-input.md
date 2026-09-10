@@ -58,6 +58,10 @@ instants rather than relying on a potentially lossy display timestamp.
 
 ## Persistence and recovery boundaries
 
+The preparation checkpoint introduced these formats. The separate
+[display checkpoint](routine-planning-display.md) extends them without dropping
+the saved inputs or existing recovery journals.
+
 - macOS planner schema **29** preserves schema-28 occurrence state and all
   existing journals. The artifact shares the existing ordinary **16 MiB**
   complete-snapshot allowance, with no new publication-only reserve.
@@ -81,43 +85,51 @@ the request with `now()`. Stale artifacts can remain encrypted while recovery
 continues. Account/credential quarantine clears the associated private cache
 only through the existing lifecycle boundaries.
 
-## Verification boundary and next work
+## Preparation-checkpoint verification
 
 The [shared Rust producer corpus](../fixtures/routine-planning-witness/README.md)
 is consumed by both native wire/helper suites. Native tests cover transport
 framing and cancellation, complete current-source joins, encrypted migration,
 save failures, bounded admission, scope pins and connected prepared-only
-control flow. Root-run verification passes **44 focused macOS tests** and the
-full macOS suite with **1,166 executed tests**, four opt-in skips and no
-failures. All macOS application and test sources compile with warnings denied.
-The full Android JVM suite passes **1,759 executed tests**, three opt-in skips
-and no failures or errors. Android lint reports zero errors and 34 existing
-warnings, none in the new routine-planning files; debug app and test APKs build,
+control flow. At the preparation checkpoint, root-run verification passed
+**44 focused macOS tests** and the full macOS suite with **1,166 executed
+tests**, four opt-in skips and no
+failures. All macOS application and test sources compiled with warnings denied.
+The full Android JVM suite passed **1,759 executed tests**, three opt-in skips
+and no failures or errors. Android lint reported zero errors and 34 existing
+warnings, none in the new routine-planning files; debug app and test APKs built,
 including SQLCipher migration instrumentation source. That instrumentation has
 not run on a device. The connected tests use synthetic owned transports and
 helper doubles alongside separate exact corpus/adapter tests; this checkpoint
 does not claim real Google/owner-account, bundled-JNI/device or full native/service
 preparation acceptance. Earlier server/corpus and service-convergence evidence
-is recorded in the linked contract.
+is recorded in the linked contract. These counts describe preparation, not the
+later display checkpoint's verification.
 
-The next separate checkpoint must connect saved-input recomputation to an
-encrypted **display-only, execution-locked** plan, including restart/offline
-ownership and final installation fences. This needs a separate protected
-preview artifact/surface: the existing ordinary local installer replaces
-schedule/publication fields that are part of the capsule's original input
-comparison. Using it here would invalidate those fixed inputs and could imply
-execution authority. The preview must leave the canonical schedule, publication
-proofs and all recovery journals unchanged. Arbitrary new offline clocks,
-horizons, source edits, execution credit and manual-placement policy need
-additional representation and authority handling. Routine cadence, template
-rebase, nested recurrence, step deferral, controlled live convergence and
-physical-device acceptance remain open. No existing local-install, execution,
-publication or Defer guard is removed by preparation.
+## Implemented display extension and remaining work
 
-On macOS, cold offline recomputation also needs its own private foreground
-admission: the current service startup grants capture activation only after
-successful execution synchronization. That network-dependent activation is
-suitable for connected preparation, not sufficient for offline restart. A new
-lifecycle hook must distinguish local private ownership from fresh remote
-execution or authentication evidence; unlock/background withdrawal must revoke
-it immediately.
+The separate [private fixed-input preview](routine-planning-display.md) now
+connects the saved capsule to explicit helper-v2 recomputation and an encrypted
+**display-only, execution-locked** artifact on both native clients. It retains
+the exact validated helper output and exposes only a protected, read-only
+presentation. It does not rebuild the original request, advance its clock or
+horizon, fall back to v1, or make a new witness request. Source, generation,
+privacy, pending-work, clock and durable-state fences surround computation and
+storage; restart restores custody but never presentation permission.
+
+The preview does not use the ordinary local installer, which replaces
+schedule/publication fields that are part of the saved input comparison.
+Canonical schedule, publication proofs and recovery journals remain unchanged;
+no existing local-install, execution, publication or Defer guard is removed.
+On macOS, local private foreground ownership is granted after the existing
+unlock/onboarding gate without depending on a successful execution refresh.
+Lock/background withdrawal revokes it, and displaying restored inputs requires
+a new explicit recomputation. This ownership is not fresh remote execution or
+authentication evidence. The linked display checkpoint records its own
+verification and capacity boundaries.
+
+Arbitrary new offline clocks and horizons, source editing, execution credit and
+manual-placement policy still need additional representation and authority
+handling. Routine cadence, template rebase, nested recurrence, step deferral,
+broader process/cross-client recovery, controlled real-service preparation and
+convergence, and physical-device acceptance remain open.

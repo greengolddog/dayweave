@@ -6765,6 +6765,7 @@ struct SettingsView: View {
     @State private var scheduleProfileDraft: ScheduleProfileDraft?
     @State private var scheduleProfileError: String?
     @State private var scheduleProfileStatus: String?
+    @State private var isRoutinePlanningDisplayPresented = false
 
     private enum ApprovedCurrentSessionRevocation {
         case inventory(DurableDeviceSessionInventorySnapshot)
@@ -6835,7 +6836,7 @@ struct SettingsView: View {
             }
             Section("Saved routine planning input") {
                 if appLock.isContentAvailable, store.canPersistPlan {
-                    Text("Prepare a fixed, encrypted input while connected. This does not install a local routine schedule or publish anything; local recurring planning remains gated.")
+                    Text("Prepare a fixed, encrypted input while connected, then recompute it for a protected read-only preview. This does not install an active routine schedule or publish anything; execution and publication remain locked.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button(canonicalSync.isPreparingRoutinePlanningInput ? "Preparing saved input…" : "Prepare saved routine input") {
@@ -6844,6 +6845,18 @@ struct SettingsView: View {
                     .disabled(!canonicalSync.canPrepareRoutinePlanningInput || canonicalSync.isPreparingRoutinePlanningInput)
                     .accessibilityIdentifier("settings.routine-planning.prepare")
                     Text(canonicalSync.routinePlanningInputMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button(canonicalSync.isRecomputingRoutinePlanningDisplay ? "Recomputing fixed input…" : "Recompute saved input & view") {
+                        Task {
+                            if await canonicalSync.recomputeSavedRoutinePlanningDisplay(), appLock.isContentAvailable {
+                                isRoutinePlanningDisplayPresented = true
+                            }
+                        }
+                    }
+                    .disabled(!canonicalSync.canRecomputeSavedRoutinePlanningDisplay)
+                    .accessibilityIdentifier("settings.routine-planning.recompute-display")
+                    Text(canonicalSync.routinePlanningDisplayMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if let capsule = store.routinePlanningInputCapsule {
@@ -6863,6 +6876,12 @@ struct SettingsView: View {
                 }
             }
             .privacySensitive()
+            .sheet(isPresented: $isRoutinePlanningDisplayPresented) {
+                RoutinePlanningDisplaySheet()
+                    .environmentObject(store)
+                    .environmentObject(canonicalSync)
+                    .environmentObject(appLock)
+            }
             Section("Appearance") {
                 Picker("Theme", selection: appearanceModeBinding) {
                     ForEach(DayWeaveAppearanceMode.allCases) { mode in

@@ -38,6 +38,9 @@ import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -610,60 +613,79 @@ class HabitSyncManager(
         val seenCursors = mutableSetOf<String>()
         while (true) {
             if (++pages > MAX_DELTA_PAGE_CHAIN) throw InvalidHabitProtocolException()
-            val cursor = plannerStore.state.value.habitLedger.deltaCursor
+            val read = plannerStore.captureHabitDeltaReadFence(configuration.baseUrl.toString(), requireConfigurationId(configuration))
+            val cursor = read.state.habitLedger.deltaCursor
+            val context = currentCoroutineContext()
+            fun requireReadCurrent() {
+                context.ensureActive()
+                ensureConfigurationCurrent(configuration)
+                if (!plannerStore.isHabitDeltaReadFenceCurrent(read)) throw HabitConfigurationChangedException()
+            }
             if (cursor != null && !seenCursors.add(cursor)) {
                 throw InvalidHabitProtocolException()
             }
-            val page = try {
-                transport.delta(configuration, cursor, MAX_HABIT_RESPONSE_PAGE_LIMIT)
-            } catch (error: HabitApiException.Validation) {
-                if (
-                    error.statusCode != INVALID_DELTA_CURSOR_STATUS ||
-                    cursor == null ||
-                    repairedRejectedCursor
-                ) {
-                    throw error
+            try {
+                val page = try {
+                    transport.delta(configuration, cursor, MAX_HABIT_RESPONSE_PAGE_LIMIT)
+                } catch (error: HabitApiException.Validation) {
+                    if (
+                        error.statusCode != INVALID_DELTA_CURSOR_STATUS ||
+                        cursor == null ||
+                        repairedRejectedCursor
+                    ) {
+                        throw error
+                    }
+                    requireReadCurrent()
+                    awaitDurable(
+                        plannerStore.resetHabitDeltaCursor(
+                            configuration.baseUrl.toString(),
+                            requireConfigurationId(configuration),
+                        ),
+                    )
+                    repairedRejectedCursor = true
+                    pages = 0
+                    seenCursors.clear()
+                    continue
                 }
-                ensureConfigurationCurrent(configuration)
+                if (
+                    page.nextCursor in seenCursors &&
+                    (page.hasMore || page.nextCursor != cursor)
+                ) {
+                    throw InvalidHabitProtocolException()
+                }
+                requireReadCurrent()
+                val occurrences = mutableListOf<HabitOccurrenceSnapshot>()
+                val pauses = mutableListOf<HabitPauseSnapshot>()
+                page.changes.forEach { change ->
+                    when (change) {
+                        is RemoteHabitDeltaChange.OccurrenceUpsert ->
+                            occurrences += HabitOccurrenceSnapshot.fromRemote(change.occurrence)
+                        is RemoteHabitDeltaChange.PauseUpsert ->
+                            pauses += HabitPauseSnapshot.fromRemote(change.pause)
+                    }
+                }
                 awaitDurable(
-                    plannerStore.resetHabitDeltaCursor(
+                    plannerStore.applyHabitDeltaPage(
                         configuration.baseUrl.toString(),
                         requireConfigurationId(configuration),
+                        occurrences,
+                        pauses,
+                        nextCursor = page.nextCursor,
+                        hasMore = page.hasMore,
+                        expectedRead = read,
+                        isCurrent = { context.isActive },
                     ),
                 )
-                repairedRejectedCursor = true
-                pages = 0
-                seenCursors.clear()
-                continue
-            }
-            if (
-                page.nextCursor in seenCursors &&
-                (page.hasMore || page.nextCursor != cursor)
-            ) {
+                if (!page.hasMore) return
+            } catch (error: Exception) {
+                if (error !is HabitApiException.InvalidResponse && error !is InvalidHabitProtocolException && error !is IllegalArgumentException) throw error
+                // An unavailable network says nothing about the old checkpoint. An invalid
+                // response does: retain every byte of history/custody, but do not let restart
+                // turn that withdrawn checkpoint back into fixed-input planning eligibility.
+                requireReadCurrent()
+                awaitDurable(plannerStore.rejectHabitDeltaRead(read) { context.isActive })
                 throw InvalidHabitProtocolException()
             }
-            ensureConfigurationCurrent(configuration)
-            val occurrences = mutableListOf<HabitOccurrenceSnapshot>()
-            val pauses = mutableListOf<HabitPauseSnapshot>()
-            page.changes.forEach { change ->
-                when (change) {
-                    is RemoteHabitDeltaChange.OccurrenceUpsert ->
-                        occurrences += HabitOccurrenceSnapshot.fromRemote(change.occurrence)
-                    is RemoteHabitDeltaChange.PauseUpsert ->
-                        pauses += HabitPauseSnapshot.fromRemote(change.pause)
-                }
-            }
-            awaitDurable(
-                plannerStore.applyHabitDeltaPage(
-                    configuration.baseUrl.toString(),
-                    requireConfigurationId(configuration),
-                    occurrences,
-                    pauses,
-                    nextCursor = page.nextCursor,
-                    hasMore = page.hasMore,
-                ),
-            )
-            if (!page.hasMore) return
         }
     }
 
@@ -672,6 +694,13 @@ class HabitSyncManager(
      * an operation ID and nothing that could let this client invent a carry window or target.
      */
     private suspend fun reconcileMissed(configuration: AuthenticatedApiConfiguration) {
+        val prior = plannerStore.state.value.habitLedger
+        if (prior.deltaCaughtUp && prior.pendingMissedReconcile == null && prior.pendingMutations.isEmpty()) {
+            // Do not manufacture a new write journal merely because an offline foreground refresh
+            // ran. Existing pending custody still takes its original exact-replay path below.
+            // A failed first read leaves the previously terminal cache and fixed inputs untouched.
+            pullDelta(configuration)
+        }
         // The response projection is intentionally not trusted as cache authority. Revoke the
         // prior terminal checkpoint durably before the first server write so response loss or
         // coroutine cancellation cannot leave stale composition data marked complete.

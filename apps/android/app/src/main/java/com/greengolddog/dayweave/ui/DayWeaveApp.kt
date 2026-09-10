@@ -1158,6 +1158,8 @@ private fun DayWeaveRoot(
             AppDestination.MORE -> MoreScreen(
                 state = state,
                 onPrepareRoutinePlanningInput = viewModel::prepareRoutinePlanningInput,
+                onComposeSavedRoutinePlanningInput = viewModel::composeSavedRoutinePlanningInput,
+                onDismissSavedRoutinePlanningPreview = viewModel::dismissSavedRoutinePlanningPreview,
                 onOpenGoals = { viewModel.navigate(AppDestination.GOALS) },
                 onOpenProjects = { viewModel.navigate(AppDestination.PROJECTS) },
                 onToggleCompleted = viewModel::toggleCompleted,

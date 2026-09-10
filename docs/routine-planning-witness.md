@@ -104,19 +104,22 @@ consumers must still bind credential configuration and privacy, retain exact
 pending-operation custody, and revalidate captured generations around helper
 execution and durable installation. The separate [native preparation
 checkpoint](routine-planning-input.md) uses helper-v2 only to verify and retain
-fixed original inputs. It does not enable local schedule installation or grant
-publication/execution authority.
+fixed original inputs. The subsequent [private display
+checkpoint](routine-planning-display.md) explicitly recomputes those exact
+inputs through v2 and retains the validated raw result in a separate encrypted,
+read-only artifact. Neither path enables ordinary local schedule installation
+or grants publication/execution authority.
 
-## Verification and remaining work
+## Server-checkpoint verification
 
-Focused verification passes 13 wire/backend unit tests, 10 HTTP boundary tests
-and 17 real PostgreSQL scenarios. These cover complete sources and terminal
+At the server checkpoint, focused verification passed 13 wire/backend unit
+tests, 10 HTTP boundary tests and 17 real PostgreSQL scenarios. These cover
+complete sources and terminal
 cursors, unchanged authority/history/receipts, current versus first-source
 revisions, instance-specific outcomes, positive empty-horizon heads, first
 publication, owner lifecycle, both first-Start/capture orderings and progress
 lock ordering. Additional cases exercise successful real-router responses with
-synthetic Device
-authentication, real Habit outcomes and stripped caller completion/progress
+synthetic Device authentication, real Habit outcomes and stripped caller completion/progress
 claims, plus configured Calendar capacity, incomplete/stale/future coverage and
 generation-bound fingerprints. Calendar fixtures exercise authoritative storage
 and production invalidation triggers, not Google ingestion or OAuth.
@@ -129,20 +132,33 @@ All six remote-required reasons, 17 semantic mismatches and four raw malformed
 messages are discovered dynamically. These synthetic cases establish wire
 compatibility, not live authentication or native custody.
 
-The strict helper decoder and unchanged v1/v2 protocol regressions pass 76 tests.
+The strict helper decoder and unchanged v1/v2 protocol regressions passed 76 tests.
 The [nine-phase native/service convergence gate](native-routine-occurrence-convergence.md)
-also passes after the shared remote-normalization refactor, including immutable
+also passed after the shared remote-normalization refactor, including immutable
 SQL/current-reader checks and verified cleanup. No native client is enabled by
-this server checkpoint. The full API gate including the producer corpus passes 729 tests against a fresh
-disposable PostgreSQL service, with database-only cases enabled and the
-two maintenance-only fixture emitters excluded; no tests fail or remain ignored.
+this server checkpoint alone. The full API gate including the producer corpus
+passed 729 tests against a fresh disposable PostgreSQL service, with
+database-only cases enabled and the two maintenance-only fixture emitters
+excluded; no tests failed or remained ignored.
 All-target, all-feature workspace Clippy with warnings denied and formatting
-checks pass. Owned test services and the retained native runtime were cleaned up.
+checks passed. Owned test services and the retained native runtime were cleaned up.
+
+## Native extensions and remaining work
 
 Native adapters, protected connected preparation and encrypted fixed-input
 custody have a separate [checkpoint and verification boundary](routine-planning-input.md).
-Remaining full-product work includes saved-input display installation with
-source/generation/privacy/pending-intent fences, process and cross-client
-recovery, wider local execution/manual-policy representation and physical-device
-acceptance. Routine cadence/rebase/nested recurrence and step-specific deferral
-retain their separate unfinished requirements.
+The implemented [display-only extension](routine-planning-display.md) adds
+explicit saved-input recomputation, exact helper-output custody and protected
+actionless presentation, with source/generation/privacy/pending-work and durable
+fences. It leaves the main schedule, publication proofs and recovery journals
+unchanged. Runtime presentation permission is not restored; a new private
+foreground recomputation is required after restart. Its local ownership does
+not depend on a successful remote execution refresh and is not authentication
+or execution authority. Native verification is recorded in those checkpoints,
+not established by the server counts above.
+
+Remaining full-product work includes arbitrary offline clocks/horizons and
+source editing, wider local execution/manual-policy representation, broader
+process and cross-client recovery, controlled real-service preparation and
+physical-device acceptance. Routine cadence/rebase/nested recurrence and
+step-specific deferral retain their separate unfinished requirements.
