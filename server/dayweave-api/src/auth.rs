@@ -416,7 +416,9 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             "/schedule/current" | "/schedule/stream" | "/schedule/manual-placements",
         )
         | (&Method::POST, "/assistant/turns") => Some(Scope::ScheduleRead),
-        (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
+        (&Method::POST, "/schedule/preview" | "/routine-occurrences/planning-witness") => {
+            Some(Scope::ScheduleSimulate)
+        }
         (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history" | "/execution/stream") => {
             Some(Scope::ExecutionRead)

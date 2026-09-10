@@ -31,6 +31,32 @@ pub const SUCCESS_EXIT_CODE: u8 = 0;
 pub const REJECTED_EXIT_CODE: u8 = 2;
 pub const INTERNAL_EXIT_CODE: u8 = 70;
 
+/// Fail-closed classification for the shared bounded JSON decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedJsonError {
+    /// Encoding, syntax, duplicate keys, or nesting depth is invalid.
+    Invalid,
+    /// Input bytes or the parser's value, collection, or string budget is exceeded.
+    TooLarge,
+}
+
+/// Decodes one bounded JSON value using the helper's strict parser.
+///
+/// This validates JSON only: it admits no protocol envelope, scheduling input,
+/// source authority, or lifecycle evidence. Callers must validate their own
+/// typed contract and authority after decoding.
+///
+/// # Errors
+///
+/// Returns [`BoundedJsonError::TooLarge`] for excessive input bytes or parser
+/// resource use, and [`BoundedJsonError::Invalid`] for every other decode failure.
+pub fn decode_bounded_json(input: &[u8]) -> Result<serde_json::Value, BoundedJsonError> {
+    decode_input(input).map_err(|error| match error {
+        ErrorCode::RequestTooLarge | ErrorCode::ResourceLimitExceeded => BoundedJsonError::TooLarge,
+        _ => BoundedJsonError::Invalid,
+    })
+}
+
 /// Typed result of the bounded scheduler work preflight shared by the helper and server.
 #[derive(Debug)]
 pub enum PlanPreflightError {
@@ -507,6 +533,126 @@ mod tests {
         include_bytes!("../tests/fixtures/compose-request-v1.json");
     const COMPOSE_GOLDEN_SUCCESS: &[u8] =
         include_bytes!("../tests/fixtures/compose-success-v1.json");
+
+    #[test]
+    fn bounded_json_decodes_regular_values_without_admitting_an_envelope() {
+        let input = br#" {"synthetic":{"members":[null,"example",true,17]}} "#;
+        assert_eq!(
+            decode_bounded_json(input).unwrap(),
+            serde_json::json!({"synthetic":{"members":[null,"example",true,17]}})
+        );
+        assert_eq!(
+            decode_bounded_json(b"null").unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(process_bytes(input).exit_code, REJECTED_EXIT_CODE);
+    }
+
+    #[test]
+    fn bounded_json_rejects_duplicate_and_escaped_duplicate_keys_at_any_depth() {
+        let cases: &[&[u8]] = &[
+            br#"{"value":1,"value":2}"#,
+            br#"{"outer":{"value":1,"value":2}}"#,
+            br#"{"outer":[{"value":1,"\u0076alue":2}]}"#,
+            br#"{"outer":{"\u0076alue":1,"value":2}}"#,
+        ];
+        for input in cases {
+            assert_eq!(decode_bounded_json(input), Err(BoundedJsonError::Invalid));
+        }
+    }
+
+    #[test]
+    fn bounded_json_rejects_malformed_trailing_and_invalid_utf8_input() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"{",
+            b"[1,]",
+            b"{}{}",
+            b"null true",
+            b"NaN",
+            b"1e400",
+            b"\xef\xbb\xbf{}",
+            &[0xff],
+            &[b'"', 0xc3, 0x28, b'"'],
+        ];
+        for input in cases {
+            assert_eq!(decode_bounded_json(input), Err(BoundedJsonError::Invalid));
+        }
+    }
+
+    #[test]
+    fn bounded_json_preserves_integer_float_and_boolean_kinds() {
+        let value = decode_bounded_json(
+            br#"{"integer":1,"float":1.0,"exponent":1e0,"boolean":true,"negative":-9223372036854775808,"unsigned":18446744073709551615}"#,
+        )
+        .unwrap();
+        assert!(value["integer"].is_u64());
+        assert!(!value["integer"].is_f64());
+        assert!(value["float"].is_f64());
+        assert!(!value["float"].is_u64());
+        assert!(value["exponent"].is_f64());
+        assert_eq!(value["boolean"].as_bool(), Some(true));
+        assert!(!value["boolean"].is_number());
+        assert_eq!(value["negative"].as_i64(), Some(i64::MIN));
+        assert_eq!(value["unsigned"].as_u64(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn bounded_json_maps_nesting_failure_to_invalid_not_too_large() {
+        let accepted = format!("{}null{}", "[".repeat(64), "]".repeat(64));
+        assert!(decode_bounded_json(accepted.as_bytes()).is_ok());
+        let rejected = format!("{}null{}", "[".repeat(65), "]".repeat(65));
+        assert_eq!(
+            decode_bounded_json(rejected.as_bytes()),
+            Err(BoundedJsonError::Invalid)
+        );
+    }
+
+    #[test]
+    fn bounded_json_maps_aggregate_collection_budget_to_too_large() {
+        // Neither inner array reaches the parser's 500,000-value ceiling;
+        // the complete document must share that ceiling across containers.
+        let half = "0,".repeat(250_000);
+        let input = format!("[[{half}null],[{half}null]]");
+        assert!(input.len() < MAX_INPUT_BYTES);
+        assert_eq!(
+            decode_input(input.as_bytes()),
+            Err(ErrorCode::ResourceLimitExceeded)
+        );
+        assert_eq!(
+            decode_bounded_json(input.as_bytes()),
+            Err(BoundedJsonError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn bounded_json_enforces_exact_wire_and_shared_parser_string_bounds() {
+        let mut input = vec![b'"'];
+        input.resize(MAX_INPUT_BYTES - 1, b'x');
+        input.push(b'"');
+        assert_eq!(input.len(), MAX_INPUT_BYTES);
+        assert_eq!(
+            decode_bounded_json(&input).unwrap().as_str().map(str::len),
+            Some(MAX_INPUT_BYTES - 2)
+        );
+        input.push(b' ');
+        assert_eq!(decode_bounded_json(&input), Err(BoundedJsonError::TooLarge));
+
+        // The decoded-string ceiling equals the wire ceiling, so an input
+        // exhausting it is rejected by the public byte fence first. Confirm
+        // the reused parser also retains its own independent string budget.
+        let mut oversized_string = vec![b'"'];
+        oversized_string.resize(MAX_INPUT_BYTES + 2, b'x');
+        oversized_string.push(b'"');
+        assert_eq!(
+            strict_json::parse(&oversized_string),
+            Err(StrictJsonError::ResourceLimit)
+        );
+        assert_eq!(
+            decode_bounded_json(&oversized_string),
+            Err(BoundedJsonError::TooLarge)
+        );
+    }
 
     fn error_code(output: &ProcessOutput) -> String {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

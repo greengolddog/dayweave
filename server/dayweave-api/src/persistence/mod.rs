@@ -34,9 +34,10 @@ pub use idempotency::{IdempotencyDecision, IdempotencyError, PostgresIdempotency
 pub use item_repository::PostgresItemRepository;
 pub(crate) use item_repository::{
     TransactionalGraphMode, TransactionalItemCommand, TransactionalItemEffect,
-    apply_item_command_tx, clear_dependency_edges_tx, fetch_item_batch_tx, list_item_batch_tx,
-    lock_execution_item_batch_tx, lock_item_batch_tx, stage_item_create_tx, staged_item_shell,
-    start_item_change_group_tx, validate_dependency_graph_batch_tx, validate_item_change_group_tx,
+    apply_item_command_tx, clear_dependency_edges_tx, fetch_item_batch_tx,
+    list_active_completion_items_tx, list_item_batch_tx, lock_execution_item_batch_tx,
+    lock_item_batch_tx, stage_item_create_tx, staged_item_shell, start_item_change_group_tx,
+    validate_dependency_graph_batch_tx, validate_item_change_group_tx,
     validate_preview_item_change_group_tx,
 };
 pub use outbox::{NewOutboxMessage, OutboxError, OutboxMessage, PostgresOutboxRepository};
@@ -54,5 +55,7 @@ pub use routine_occurrence_repository::{
 };
 pub(crate) use routine_occurrence_repository::{
     RoutineOccurrencePlanningEvidence, lock_routine_occurrence_space,
+    lock_routine_planning_witness_owner_tx, lock_routine_planning_witness_sources_tx,
     record_published_routine_occurrences_tx, routine_occurrence_planning_evidence_tx,
+    routine_occurrence_terminal_head_tx,
 };

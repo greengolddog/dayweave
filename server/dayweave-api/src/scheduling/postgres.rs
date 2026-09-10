@@ -351,6 +351,21 @@ impl std::fmt::Debug for PostgresSchedulingRepository {
 }
 
 impl PostgresSchedulingRepository {
+    /// Captures current, authenticated helper-v2 inputs without admitting
+    /// occurrences, publishing a schedule, or persisting a publication proof.
+    ///
+    /// # Errors
+    /// Returns bounded input, source/checkpoint conflict, or storage errors.
+    pub async fn routine_planning_witness(
+        &self,
+        request: &crate::routine_occurrences::RoutinePlanningWitnessRequest,
+    ) -> Result<
+        crate::routine_occurrences::RoutinePlanningWitnessResponse,
+        crate::routine_occurrences::RoutinePlanningWitnessError,
+    > {
+        super::planning_witness::capture(&self.pool, self.scope, request).await
+    }
+
     /// Uses the same fixed workspace and pool as publication admission.
     #[must_use]
     pub(crate) fn routine_occurrence_repository(
@@ -4669,7 +4684,6 @@ pub(crate) async fn assert_current_item_snapshot(
 /// item-space lock. Locking even currently unselected rows prevents a
 /// concurrent configuration update from introducing a new blocking source as
 /// a publication is sealed.
-#[allow(clippy::too_many_lines)] // Lock, eligibility, freshness, and exact stamp checks are one fence.
 pub(crate) async fn assert_current_calendar_projection(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -4677,6 +4691,24 @@ pub(crate) async fn assert_current_calendar_projection(
     horizon_end: DateTime<Utc>,
     expected: &[CalendarProjectionStamp],
 ) -> Result<(), SchedulePublicationError> {
+    let actual =
+        capture_current_calendar_projection_tx(transaction, scope, horizon_start, horizon_end)
+            .await?;
+    if actual != expected {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    Ok(())
+}
+
+/// Shared capture/publication eligibility policy. The witness rechecks this
+/// under the same transaction, including freshness against database time.
+#[allow(clippy::too_many_lines)] // Lock, eligibility, freshness, and exact stamp checks are one fence.
+pub(crate) async fn capture_current_calendar_projection_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    horizon_start: DateTime<Utc>,
+    horizon_end: DateTime<Utc>,
+) -> Result<Vec<CalendarProjectionStamp>, SchedulePublicationError> {
     let rows = sqlx::query(
         "SELECT collection.id, collection.selected, collection.provider_deleted, \
          collection.sync_role, collection.confirmed_busy_policy, collection.tentative_policy, \
@@ -4810,10 +4842,7 @@ pub(crate) async fn assert_current_calendar_projection(
             refreshed_at,
         });
     }
-    if actual != expected {
-        return Err(SchedulePublicationError::StaleComposition);
-    }
-    Ok(())
+    Ok(actual)
 }
 
 pub(crate) async fn lock_owner(

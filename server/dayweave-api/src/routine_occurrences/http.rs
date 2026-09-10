@@ -3,21 +3,23 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
+    body::to_bytes,
     extract::{
-        Path, Query, State,
+        Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use utoipa::IntoParams;
 use uuid::Uuid;
 
 use super::{
-    RoutineOccurrenceCommand, RoutineOccurrenceError, RoutineOccurrenceSnapshot,
-    validate_occurrence_lookup,
+    ROUTINE_PLANNING_WITNESS_BYTES, RoutineOccurrenceCommand, RoutineOccurrenceError,
+    RoutineOccurrenceSnapshot, RoutinePlanningWitnessError, RoutinePlanningWitnessRequest,
+    RoutinePlanningWitnessResponse, validate_occurrence_lookup,
 };
 use crate::{
     AppState,
@@ -33,11 +35,133 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/routine-occurrences", get(list_occurrences))
         .route("/routine-occurrences/delta", get(occurrence_delta))
         .route("/routine-occurrences/lookup", get(lookup_occurrence))
+        .route(
+            "/routine-occurrences/planning-witness",
+            post(planning_witness),
+        )
         .route("/routine-occurrences/{occurrence_id}", get(get_occurrence))
         .route(
             "/routine-occurrences/{occurrence_id}/members/{item_id}",
             put(put_member),
         )
+}
+
+#[utoipa::path(post, path = "/v1/routine-occurrences/planning-witness", tag = "schedule",
+    description = "Read-only owner-Device qualification of exact current-source inputs for helper v2; requires items_read and schedule_simulate. A qualified response is neither publication nor execution authority and does not advance the client's terminal checkpoint.",
+    security(("bearer_token" = [])), request_body = RoutinePlanningWitnessRequest,
+    responses((status = 200, body = RoutinePlanningWitnessResponse),
+        (status = 400, body = crate::error::ErrorEnvelope),
+        (status = 401, body = crate::error::ErrorEnvelope),
+        (status = 403, body = crate::error::ErrorEnvelope),
+        (status = 404, body = crate::error::ErrorEnvelope),
+        (status = 409, body = crate::error::ErrorEnvelope),
+        (status = 413, body = crate::error::ErrorEnvelope),
+        (status = 415, body = crate::error::ErrorEnvelope),
+        (status = 422, body = crate::error::ErrorEnvelope),
+        (status = 503, body = crate::error::ErrorEnvelope)))]
+pub(crate) async fn planning_witness(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    require_device(&principal, Scope::ItemsRead)?;
+    require_device(&principal, Scope::ScheduleSimulate)?;
+    if principal.credential_id.is_none_or(|id| id.is_nil()) {
+        return Err(ApiError::forbidden());
+    }
+    if request.uri().query().is_some() {
+        return Err(ApiError::routine_occurrence(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Planning witness selectors belong in the request body",
+        ));
+    }
+    let content_types = request.headers().get_all(header::CONTENT_TYPE);
+    if content_types.iter().count() != 1
+        || content_types
+            .iter()
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| {
+                !value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            })
+    {
+        return Err(ApiError::routine_occurrence(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "Planning witnesses require application/json",
+        ));
+    }
+    // Explicitly bounded raw extraction preserves duplicate/numeric evidence;
+    // the ordinary route-wide body limit is not widened for member mutations.
+    let body = to_bytes(request.into_body(), ROUTINE_PLANNING_WITNESS_BYTES)
+        .await
+        .map_err(|_| map_planning_error(RoutinePlanningWitnessError::TooLarge))?;
+    let value =
+        dayweave_scheduler_helper::decode_bounded_json(&body).map_err(|error| match error {
+            dayweave_scheduler_helper::BoundedJsonError::TooLarge => {
+                map_planning_error(RoutinePlanningWitnessError::TooLarge)
+            }
+            dayweave_scheduler_helper::BoundedJsonError::Invalid => invalid_planning_json(),
+        })?;
+    let request: RoutinePlanningWitnessRequest =
+        serde_json::from_value(value).map_err(|_| invalid_planning_json())?;
+    request.validate().map_err(map_planning_error)?;
+    // The occurrence repository checks the exact owner binding without reading
+    // storage; AppState constructs it from this same scheduling repository.
+    repository(&state, &principal)?;
+    let scheduling = state
+        .scheduling
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Routine planning authority requires PostgreSQL"))?;
+    let response = scheduling
+        .routine_planning_witness(&request)
+        .await
+        .map_err(map_planning_error)?;
+    response.validate_size().map_err(map_planning_error)?;
+    Ok(no_store(Json(response).into_response()))
+}
+
+fn invalid_planning_json() -> ApiError {
+    ApiError::routine_occurrence(
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+        "Invalid routine planning JSON",
+    )
+}
+
+fn map_planning_error(error: RoutinePlanningWitnessError) -> ApiError {
+    let (status, code, message) = match error {
+        RoutinePlanningWitnessError::Invalid => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "routine_planning_invalid",
+            "The routine planning request is invalid",
+        ),
+        RoutinePlanningWitnessError::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "routine_planning_too_large",
+            "Routine planning evidence exceeds resource bounds",
+        ),
+        RoutinePlanningWitnessError::SourceChanged => (
+            StatusCode::CONFLICT,
+            "routine_planning_source_changed",
+            "The complete canonical planning snapshot changed",
+        ),
+        RoutinePlanningWitnessError::CursorChanged => (
+            StatusCode::CONFLICT,
+            "routine_planning_cursor_changed",
+            "A current terminal occurrence checkpoint is required",
+        ),
+        RoutinePlanningWitnessError::Unavailable => {
+            return ApiError::unavailable("Routine planning authority is unavailable");
+        }
+    };
+    ApiError::routine_occurrence(status, code, message)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

@@ -5,6 +5,7 @@ mod memory;
 mod occurrence;
 #[cfg(test)]
 mod occurrence_tests;
+mod planning_witness;
 mod ports;
 mod postgres;
 mod projection;

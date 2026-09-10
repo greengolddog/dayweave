@@ -118,7 +118,9 @@ impl ComposeScheduleResult {
     }
 }
 
-fn publication_schema_for_lifecycle(context: &OccurrenceLifecycleContext) -> &'static str {
+pub(super) fn publication_schema_for_lifecycle(
+    context: &OccurrenceLifecycleContext,
+) -> &'static str {
     if context.snapshot_revision == 0 {
         super::SCHEDULER_PUBLICATION_SCHEMA
     } else {
@@ -543,29 +545,16 @@ async fn compose_canonical_schedule_inner(
     if habit_before != habit_after {
         return Err(ComposeScheduleError::ExecutionEvidenceChanged);
     }
-    if projection.is_some() {
-        merge_authoritative_habit_recurrence(&mut request, &items, &habit_after)?;
-    }
-    normalize_manual_placements_for_execution(&mut request, &planning_before.execution)?;
-    validate_manual_placement_item_revisions(&request, &items)?;
-    validate_manual_placement_sources(&request, &planning_before)?;
-    let pruned_assignment_identities =
-        merge_retained_manual_placements(&mut request, &planning_before, &items)?;
-    let (retained_placement_was_injected, manual_execution_evidence_was_applied) =
-        manual_placement_staleness_flags(&request, &planning_before);
-    let untrusted_assignments =
-        replace_with_authoritative_assignments(&mut request, &planning_before)?;
-    request.previous_assignments.retain(|assignment| {
-        !pruned_assignment_identities.contains(&(assignment.item_id, assignment.occurrence_id))
-    });
-    if let Err(error) = validate_schedule_request(&request) {
-        if retained_placement_was_injected {
-            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
-                "retained placement evidence no longer satisfies the compose request".to_owned(),
-            ));
-        }
-        return Err(map_prepare_error(error));
-    }
+    let AuthoritativeNormalization {
+        untrusted_assignments,
+        retained_placement_was_injected,
+        manual_execution_evidence_was_applied,
+    } = normalize_authoritative_schedule_request(
+        &mut request,
+        &items,
+        projection.map(|_| &habit_after),
+        &planning_before,
+    )?;
     let occurrence_lifecycle = match projection {
         Some(projection) => {
             let mut probe = request.clone();
@@ -604,19 +593,7 @@ async fn compose_canonical_schedule_inner(
             {
                 return Err(ComposeScheduleError::OccurrenceEvidenceChanged);
             }
-            let managed_ids = context
-                .instances
-                .iter()
-                .map(|instance| instance.occurrence_id)
-                .collect::<BTreeSet<_>>();
-            request
-                .recurrence_context
-                .completed_occurrence_ids
-                .retain(|id| !managed_ids.contains(id));
-            request
-                .recurrence_context
-                .partial_progress
-                .retain(|id, _| !managed_ids.contains(id));
+            discard_managed_occurrence_claims(&mut request, &context);
             context
         }
         None => OccurrenceLifecycleContext::default(),
@@ -649,11 +626,74 @@ async fn compose_canonical_schedule_inner(
     })
 }
 
+pub(super) struct AuthoritativeNormalization {
+    pub(super) untrusted_assignments: Vec<IgnoredPreviousAssignment>,
+    retained_placement_was_injected: bool,
+    manual_execution_evidence_was_applied: bool,
+}
+
+/// Managed Task/Routine member authority supersedes caller whole-instance
+/// completion/progress claims in both remote composition and helper inputs.
+pub(super) fn discard_managed_occurrence_claims(
+    request: &mut ComposeScheduleRequest,
+    lifecycle: &OccurrenceLifecycleContext,
+) {
+    let managed = lifecycle
+        .instances
+        .iter()
+        .map(|instance| instance.occurrence_id)
+        .collect::<BTreeSet<_>>();
+    request
+        .recurrence_context
+        .completed_occurrence_ids
+        .retain(|id| !managed.contains(id));
+    request
+        .recurrence_context
+        .partial_progress
+        .retain(|id, _| !managed.contains(id));
+}
+
+/// The remote composer and read-only planning witness must apply exactly the
+/// same authoritative Habit, execution, retained-pin and assignment policies.
+pub(super) fn normalize_authoritative_schedule_request(
+    request: &mut ComposeScheduleRequest,
+    items: &[Item],
+    habit: Option<&AuthoritativeHabitRecurrence>,
+    planning: &AuthoritativePlanningEvidence,
+) -> Result<AuthoritativeNormalization, ComposeScheduleError> {
+    if let Some(habit) = habit {
+        merge_authoritative_habit_recurrence(request, items, habit)?;
+    }
+    normalize_manual_placements_for_execution(request, &planning.execution)?;
+    validate_manual_placement_item_revisions(request, items)?;
+    validate_manual_placement_sources(request, planning)?;
+    let pruned_assignment_identities = merge_retained_manual_placements(request, planning, items)?;
+    let (retained_placement_was_injected, manual_execution_evidence_was_applied) =
+        manual_placement_staleness_flags(request, planning);
+    let untrusted_assignments = replace_with_authoritative_assignments(request, planning)?;
+    request.previous_assignments.retain(|assignment| {
+        !pruned_assignment_identities.contains(&(assignment.item_id, assignment.occurrence_id))
+    });
+    if let Err(error) = validate_schedule_request(request) {
+        if retained_placement_was_injected {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                "retained placement evidence no longer satisfies the compose request".to_owned(),
+            ));
+        }
+        return Err(map_prepare_error(error));
+    }
+    Ok(AuthoritativeNormalization {
+        untrusted_assignments,
+        retained_placement_was_injected,
+        manual_execution_evidence_was_applied,
+    })
+}
+
 /// Explicit occurrence moves can restore a nominal occurrence from outside
 /// the rolling horizon. Hydration admits only destinations wholly contained
 /// by this request, matching core's one-horizon ownership rule and keeping the
 /// authoritative lookup bounded by the validated exception collection.
-fn contained_moved_occurrence_ids(request: &ComposeScheduleRequest) -> Vec<Uuid> {
+pub(super) fn contained_moved_occurrence_ids(request: &ComposeScheduleRequest) -> Vec<Uuid> {
     let horizon_start = i128::from(request.horizon_start.timestamp_micros()) * 1_000;
     let horizon_end = i128::from(request.horizon_end.timestamp_micros()) * 1_000;
     request
@@ -1679,7 +1719,7 @@ fn map_scheduler_preflight_error(error: PlanPreflightError) -> ComposeScheduleEr
     }
 }
 
-fn into_canonical_item(item: Item) -> CanonicalItem {
+pub(super) fn into_canonical_item(item: Item) -> CanonicalItem {
     CanonicalItem {
         id: item.id,
         is_sensitive: item.is_sensitive,

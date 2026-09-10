@@ -180,8 +180,14 @@ composition adapters are not enabled for v2 yet. Neither helper version can
 authenticate a ledger or prove that a cache is current. In particular, the
 [occurrence review API](routine-occurrence-completion.md) exposes immutable
 first-source revisions, not the current-source planning witness required here.
-Native use must wait for qualified terminal ledger/current-source evidence,
-encrypted persistence, pending-operation and lifecycle fencing, and freshness
+The separate authenticated [planning-witness endpoint](routine-planning-witness.md)
+qualifies an exact terminal checkpoint and complete current-source snapshot,
+normalizes authoritative Habit/Calendar/assignment inputs, and verifies exact
+helper-v2 input, plan and source-accounting parity without writing authority.
+Nonempty execution work units and requested/retained manual-placement policy
+still require remote composition because v2 cannot represent that authority.
+Native use must wait for versioned adapters, encrypted witness persistence,
+pending-operation and lifecycle fencing, and freshness
 rechecks around helper execution and durable installation. Guessing a witness
 from current canonical rows is not a supported bridge. Existing execution-lease
 and local-result execution restrictions must also remain in place.

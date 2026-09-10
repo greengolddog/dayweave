@@ -77,6 +77,7 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::routine_occurrences::http::list_occurrences,
         crate::routine_occurrences::http::occurrence_delta,
         crate::routine_occurrences::http::lookup_occurrence,
+        crate::routine_occurrences::http::planning_witness,
         crate::routine_occurrences::http::get_occurrence,
         crate::routine_occurrences::http::put_member,
         crate::habits::http::list_occurrences,

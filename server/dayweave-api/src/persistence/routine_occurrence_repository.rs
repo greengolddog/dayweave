@@ -420,6 +420,76 @@ pub(crate) async fn lock_routine_occurrence_space(
     Ok(())
 }
 
+/// Witness capture must not create the otherwise lazily initialized execution
+/// row. Existing authority is locked before canonical, just like publication.
+/// If the row is absent, first Start still needs exclusive canonical item row
+/// locks before it can create a session. Take shared rows before occurrence
+/// locks, matching Start's item-row -> occurrence order. A concurrent empty-row
+/// initialization adds no authority. Never lock execution after canonical.
+pub(crate) async fn lock_routine_planning_witness_sources_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<(), RoutineOccurrenceError> {
+    admit(tx, scope).await?;
+    sqlx::query("SELECT workspace_id FROM execution_state WHERE workspace_id=$1 FOR UPDATE")
+        .bind(scope.workspace_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?;
+    super::lock_canonical_item_space(tx, scope.workspace_id)
+        .await
+        .map_err(storage)?;
+    let rows = sqlx::query("SELECT id FROM items WHERE workspace_id=$1 AND trashed_at IS NULL ORDER BY id LIMIT 10001 FOR SHARE")
+        .bind(scope.workspace_id).fetch_all(&mut **tx).await.map_err(storage)?;
+    if rows.len() > crate::item_completion::MAX_COMPLETION_ITEMS {
+        return Err(RoutineOccurrenceError::TooLarge);
+    }
+    Ok(())
+}
+
+/// Only a terminal checkpoint already held by the caller can qualify. In
+/// particular an intermediate list cursor must not become a delta checkpoint.
+pub(crate) async fn routine_occurrence_terminal_head_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    cursor: &str,
+) -> Result<u64, RoutineOccurrenceError> {
+    let cursor = decode_cursor(cursor, scope)?;
+    let head = change_head(tx, scope).await?;
+    if cursor.list_head.is_some() || cursor.after != head {
+        return Err(RoutineOccurrenceError::InvalidCursor);
+    }
+    Ok(head)
+}
+
+/// Publication is already serialized by canonical/occurrence locks. A shared
+/// owner fence prevents revocation without deadlocking progress commands that
+/// acquire this same shared admission fence before the canonical mutex.
+pub(crate) async fn lock_routine_planning_witness_owner_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<(), RoutineOccurrenceError> {
+    admit(tx, scope).await?;
+    let owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT member.workspace_id FROM workspace_members member \
+         JOIN workspaces workspace ON workspace.id=member.workspace_id \
+         JOIN users owner ON owner.id=workspace.owner_user_id \
+         WHERE member.workspace_id=$1 AND member.user_id=$2 AND workspace.owner_user_id=$2 \
+         AND workspace.trashed_at IS NULL AND workspace.tombstoned_at IS NULL \
+         AND owner.trashed_at IS NULL AND owner.tombstoned_at IS NULL \
+         AND member.role='owner' AND member.removed_at IS NULL FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if owner.is_none() {
+        return Err(RoutineOccurrenceError::Unavailable);
+    }
+    Ok(())
+}
+
 async fn lock_read(
     tx: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,

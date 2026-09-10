@@ -193,7 +193,9 @@ Android uses the real encrypted snapshot codec through a test-only file-backed
 DAO, not physical Room/SQLCipher or Android Keystore. Neither native UI is
 launched. This six-node scenario is not a deep native cascade, privacy/foreground
 timing test, active execution test, provider synchronization test, production
-TLS/auth lifecycle trial or owner acceptance. Authenticated current-source
-planning witnesses and enabled helper-v2 native local composition remain open.
+TLS/auth lifecycle trial or owner acceptance. The separate authenticated
+[planning-witness endpoint](routine-planning-witness.md) now qualifies exact
+current-source inputs. Native witness custody/use and enabled helper-v2 local
+composition remain open.
 Completion-relative cadence, template rebase, nested recurrence, step-specific
 deferral and other full-product work are not completed by this gate.

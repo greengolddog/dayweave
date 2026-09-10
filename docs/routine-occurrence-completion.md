@@ -234,8 +234,10 @@ fresh-composition witness also permits a genuinely new publication request that
 deduplicates to the same current revision; a changed revision ID is not used as a
 substitute for fresh composition.
 
-Helper v1 remains unavailable for recurring Task/Routine authority until the
-authenticated current-source witness and native v2 adapters are implemented.
+Helper v1 cannot represent recurring Task/Routine authority. The separate
+[authenticated planning-witness endpoint](routine-planning-witness.md) qualifies
+current-source inputs, but native helper-v2 adapters remain disabled pending
+encrypted witness custody and installation/recovery fencing.
 Native preview/install/publication and fresh execution-Defer checks are fenced
 against occurrence reads and mutations; already frozen publication and execution
 requests retain exact replay custody. An empty never-managed occurrence checkpoint
@@ -367,7 +369,8 @@ skips and 1,717 Android JVM tests plus three opt-in skips. The nine native live
 phases run separately from those opt-in skips. All owned services and the exact
 retained test runtime were cleaned up. This is not physical Room/Keystore, native
 UI, production TLS/auth lifecycle or owner-device acceptance; helper-v2 native
-composition remains disabled pending qualified current-source evidence.
+composition remains disabled pending native integration of qualified
+current-source evidence.
 
 ## Remaining integration
 
@@ -375,12 +378,16 @@ composition remains disabled pending qualified current-source evidence.
   physical UI/lifecycle/owner-device acceptance. The controlled first-admission,
   competing choices, lost replies, restarts and immutable SQL gate is now covered
   separately above; it does not establish these broader acceptance conditions.
-- Authenticated current-source witness and native helper-v2 adapter integration.
+- Native helper-v2 adapter integration and encrypted current-source witness custody.
   Existing native local-composition and publication fences conservatively require
   remote composition; helper v1 cannot consume occurrence authority.
-  The private API retains first-source revisions and opaque current eligibility,
-  not a current-source planning witness. A native client must not guess that
-  witness from its canonical cache or mutate template statuses to feed helper v1.
+  The private occurrence review API retains first-source revisions and opaque
+  current eligibility. The separate [planning-witness endpoint](routine-planning-witness.md)
+  qualifies an exact current-source/terminal snapshot with authoritative
+  normalization and helper parity; it neither publishes nor advances the ledger.
+  A native client must not guess that witness from its canonical cache or mutate
+  template statuses to feed helper v1. Nonempty execution evidence and manual
+  placement policy still need wider helper representation.
   The connected controls use remote recomposition until the versioned local
   bridge has fully qualified evidence and native installation fences.
 - Explicit review/rebase for semantic template changes. Harmless title/notes/
