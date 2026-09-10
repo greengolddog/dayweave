@@ -1,7 +1,7 @@
 # Recurring task and routine member completion
 
-Status: server/shared-engine implementation in progress for `HIE-004` and
-`ROU`. This does not replace the [full requirements](product-requirements.md)
+Status: server/shared-engine and native wire implementation in progress for
+`HIE-004` and `ROU`. This does not replace the [full requirements](product-requirements.md)
 or imply that the native routine experience is complete. The detailed choices
 below are implementation defaults, not additional answers attributed to the
 owner.
@@ -100,6 +100,44 @@ local fingerprint. Its nine focused regressions and the opaque Android bridge
 bring the shared Rust gate to 333 passing tests. This supplies the bounded engine
 entry point, not authenticated native planning evidence or enabled client adapters.
 
+## Native wire checkpoint
+
+macOS and Android now have separate closed occurrence models and authenticated
+review, list/delta and exact-member mutation transports. Both validate complete
+iterative trees, member/state correspondence, required/optional counts, parent
+completion fixed points, retained reopening provenance and immutable manifests
+across repeated delta instances. Ledger path IDs remain distinct from planner
+occurrence IDs. UTC timestamps retain microsecond precision, recurrence anchors
+retain their original offsets, and unsupported timezone aliases fail admission.
+
+Mutation receipts bind the exact operation, ledger/member targets, checked
+instance/member revision increments and requested action. An immutable historical
+receipt can settle the matching intent; it is not a current review or cache
+installation witness. HTTP admission checks JSON media type, non-cacheable
+responses and the exact replay header/body agreement. Only an explicitly named
+error-code/status pair in the closed error envelope proves a definitive rejection;
+malformed or ambiguous replies do not prove that a write had no effect. Private
+response content is not copied into parser errors.
+
+Responses are capped while reading at 8 MiB. Programmatically constructed pages
+also stop at the byte budget without allocating an oversized whole-page buffer.
+Android performs body reading and validation off the caller thread and retains
+cancellation ownership after headers arrive, including error bodies and an
+authentication retry. macOS reuses the existing authenticated request,
+credential-refresh, redirect and cancellation boundaries.
+
+The [shared synthetic wire corpus](../fixtures/routine-occurrences/README.md)
+contains 48 accepted and 115 rejected cases produced and checked by Rust, then
+consumed by both native suites. Fixture values preserve their exact JSON bytes:
+floating-point spellings, exponent notation and 64-bit boundaries are not
+normalized by a platform JSON round-trip before validation. Additional native
+tests exercise raw duplicate keys, bounded deep trees, transport metadata,
+historical receipt binding and cancellation. The corpus contains no owner data.
+
+This checkpoint does not yet connect the transports to native protected review
+controls, encrypted caches/outboxes, terminal convergence or local composition.
+No template status is changed to represent an occurrence outcome.
+
 ## Verification
 
 The 2026-09-10 server/shared checkpoint passes:
@@ -123,10 +161,27 @@ The disposable database was stopped after verification; owner services were not
 modified. These are server/shared gates, not new native UI, device, or deployment
 acceptance results.
 
+The subsequent native-wire/shared-corpus checkpoint passes:
+
+- 1,083 executed macOS tests with warnings denied, including 24 focused
+  occurrence tests; three opt-in integration tests are skipped (1,086 total).
+- 1,674 Android JVM tests, including 20 focused occurrence tests; two opt-in
+  integration tests are skipped (1,676 total). Android lint reports zero errors
+  and 29 warnings in existing dependency/platform/UI files, none in the new
+  occurrence files.
+- Four new Rust wire-contract regressions; the maintenance-only fixture emitter
+  is ignored in ordinary test runs and passed when explicitly invoked separately.
+  Workspace all-target/all-feature Clippy with warnings denied also passes.
+
+These runs use synthetic fixtures and mock HTTP services. They do not claim
+native/service convergence, physical-device interaction, a new installable APK
+or a production deployment for occurrence completion.
+
 ## Remaining integration
 
-- Native macOS/Android protected review, strict transports, encrypted per-instance
-  cache/outbox, frozen exact replay and terminal-only convergence.
+- Native macOS/Android protected review, encrypted per-instance cache/outbox,
+  frozen exact replay and terminal-only convergence; the strict models and
+  transports above are implemented separately from those integrations.
 - Native local-composition and pending-publication fencing against the occurrence
   head; helper v1 cannot consume this authority, while helper v2 still requires
   an admitted current-source witness and native adapter integration.

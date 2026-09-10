@@ -3158,6 +3158,14 @@ struct DayWeaveAPIClient: Sendable {
         return result
     }
 
+    func sendRoutineOccurrence<Response: Decodable>(
+        method: String, pathComponents: [String], queryItems: [URLQueryItem] = [], body: Data? = nil
+    ) async throws -> Response {
+        guard pathComponents.prefix(2) == ["v1", "routine-occurrences"] else { throw RoutineOccurrenceError.invalidData }
+        return try await send(method: method, pathComponents: pathComponents, queryItems: queryItems,
+            body: body, requiredStatusCode: 200, maximumResponseBytes: RoutineOccurrenceValidation.maximumBytes)
+    }
+
     private func send<Response: Decodable>(
         method: String,
         pathComponents: [String],
@@ -3166,7 +3174,8 @@ struct DayWeaveAPIClient: Sendable {
         body: Data? = nil,
         requiredStatusCode: Int? = nil,
         requiresDurableAuthorization: Bool = false,
-        additionalSecretsToRedact: [String] = []
+        additionalSecretsToRedact: [String] = [],
+        maximumResponseBytes: Int = Self.maximumResponseBytes
     ) async throws -> Response {
         if let body, body.count > Self.maximumRequestBytes {
             throw DayWeaveAPIError.requestEncodingFailed
@@ -3224,7 +3233,8 @@ struct DayWeaveAPIClient: Sendable {
         var replayedAuthorization: DurableAuthorization?
         var result = try await perform(
             pristineRequest,
-            bearer: initialAuthorization.bearerToken
+            bearer: initialAuthorization.bearerToken,
+            maximumResponseBytes: maximumResponseBytes
         )
         if result.response.statusCode == 401, let authCoordinator,
            DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
@@ -3254,7 +3264,7 @@ struct DayWeaveAPIClient: Sendable {
             replayedAuthorization = recovered
             // `pristineRequest` is retained untouched. The replay changes only
             // Authorization; method, URL, headers, and body bytes are identical.
-            result = try await perform(pristineRequest, bearer: recovered.bearerToken)
+            result = try await perform(pristineRequest, bearer: recovered.bearerToken, maximumResponseBytes: maximumResponseBytes)
         }
         if result.response.statusCode == 401,
            let replayedAuthorization,
@@ -3282,6 +3292,9 @@ struct DayWeaveAPIClient: Sendable {
 
         let data = result.data
         let httpResponse = result.response
+        if pathComponents.prefix(2) == ["v1", "routine-occurrences"] {
+            return try RoutineOccurrenceHTTP.decode(Response.self, method: method, response: httpResponse, data: data)
+        }
         let isItemCompletion = pathComponents.count == 4 && pathComponents[0] == "v1"
             && pathComponents[1] == "items" && pathComponents[3] == "completion"
         if isItemCompletion {
@@ -4421,7 +4434,8 @@ struct DayWeaveAPIClient: Sendable {
 
     private func perform(
         _ pristineRequest: URLRequest,
-        bearer: String
+        bearer: String,
+        maximumResponseBytes: Int = Self.maximumResponseBytes
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         var request = pristineRequest
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
@@ -4433,18 +4447,18 @@ struct DayWeaveAPIClient: Sendable {
             guard let httpResponse = receivedResponse as? HTTPURLResponse else {
                 throw DayWeaveAPIError.nonHTTPResponse
             }
-            if receivedResponse.expectedContentLength > Int64(Self.maximumResponseBytes) {
+            if receivedResponse.expectedContentLength > Int64(maximumResponseBytes) {
                 bytes.task.cancel()
-                throw DayWeaveAPIError.responseTooLarge(limitBytes: Self.maximumResponseBytes)
+                throw DayWeaveAPIError.responseTooLarge(limitBytes: maximumResponseBytes)
             }
             var boundedData = Data()
             if receivedResponse.expectedContentLength > 0 {
                 boundedData.reserveCapacity(Int(receivedResponse.expectedContentLength))
             }
             for try await byte in bytes {
-                guard boundedData.count < Self.maximumResponseBytes else {
+                guard boundedData.count < maximumResponseBytes else {
                     bytes.task.cancel()
-                    throw DayWeaveAPIError.responseTooLarge(limitBytes: Self.maximumResponseBytes)
+                    throw DayWeaveAPIError.responseTooLarge(limitBytes: maximumResponseBytes)
                 }
                 boundedData.append(byte)
             }
