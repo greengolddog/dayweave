@@ -221,7 +221,6 @@ struct NativeOccurrence {
     window_start: String,
     window_end: String,
     local_date: Option<String>,
-    #[allow(dead_code)]
     ordinal: u32,
     state: dayweave_core::OccurrenceState,
 }
@@ -4095,11 +4094,11 @@ fn public_compose_snapshot(
     solver_version: &str,
 ) -> Result<Value, SchedulingPortError> {
     let republish = || SchedulingPortError::RepublishRequired;
-    if !supported_policy_snapshot(solver_version, snapshot)
-        || snapshot_occurrence_lifecycle(solver_version, snapshot).is_none()
-    {
+    if !supported_policy_snapshot(solver_version, snapshot) {
         return Err(republish());
     }
+    let lifecycle =
+        snapshot_occurrence_lifecycle(solver_version, snapshot).ok_or_else(republish)?;
     let compose = snapshot.get("compose").cloned().ok_or_else(republish)?;
     let parsed: NativeComposeSnapshot =
         serde_json::from_value(compose.clone()).map_err(|_| republish())?;
@@ -4149,6 +4148,15 @@ fn public_compose_snapshot(
     ) else {
         return Err(republish());
     };
+    let occurrence_items = native_occurrence_members(
+        snapshot,
+        &parsed,
+        revision,
+        solver_version,
+        &lifecycle,
+        &occurrence_items,
+    )
+    .ok_or_else(republish)?;
     if !valid_native_plan_envelope(plan, revision, &parse_instant)
         || !valid_native_blocks(
             &plan.blocks,
@@ -4206,7 +4214,7 @@ fn valid_native_plan_envelope(
 fn valid_native_blocks(
     blocks: &[NativeScheduleBlock],
     revisions: &BTreeMap<Uuid, u64>,
-    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    occurrence_items: &BTreeMap<Uuid, BTreeSet<Uuid>>,
     parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
 ) -> bool {
     let mut ids = BTreeSet::new();
@@ -4278,7 +4286,7 @@ fn valid_native_blocks(
 fn valid_native_unscheduled(
     values: &[NativeUnscheduledWork],
     revisions: &BTreeMap<Uuid, u64>,
-    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    occurrence_items: &BTreeMap<Uuid, BTreeSet<Uuid>>,
 ) -> bool {
     values.iter().all(|value| {
         valid_native_item_reference(
@@ -4304,7 +4312,7 @@ fn valid_native_unscheduled(
 fn valid_native_decisions(
     values: &[NativePlanDecision],
     revisions: &BTreeMap<Uuid, u64>,
-    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    occurrence_items: &BTreeMap<Uuid, BTreeSet<Uuid>>,
 ) -> bool {
     values.iter().all(|value| {
         valid_native_item_reference(
@@ -4329,7 +4337,7 @@ fn valid_native_decisions(
 fn valid_native_violations(
     values: &[NativePlanViolation],
     revisions: &BTreeMap<Uuid, u64>,
-    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    occurrence_items: &BTreeMap<Uuid, BTreeSet<Uuid>>,
     parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
 ) -> bool {
     values.iter().all(|value| {
@@ -4339,7 +4347,7 @@ fn valid_native_violations(
             && value.occurrence_ids.iter().all(|id| {
                 occurrence_items
                     .get(id)
-                    .is_some_and(|series_item_id| value.item_ids.contains(series_item_id))
+                    .is_some_and(|members| value.item_ids.iter().any(|item| members.contains(item)))
             })
             && value.start.is_some() == start.is_some()
             && value.end.is_some() == end.is_some()
@@ -4408,11 +4416,223 @@ fn valid_native_item_reference(
     item_id: Uuid,
     occurrence_id: Option<Uuid>,
     revisions: &BTreeMap<Uuid, u64>,
-    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    occurrence_items: &BTreeMap<Uuid, BTreeSet<Uuid>>,
 ) -> bool {
     revisions.contains_key(&item_id)
-        && occurrence_id
-            .is_none_or(|occurrence_id| occurrence_items.get(&occurrence_id) == Some(&item_id))
+        && occurrence_id.is_none_or(|occurrence_id| {
+            occurrence_items
+                .get(&occurrence_id)
+                .is_some_and(|members| members.contains(&item_id))
+        })
+}
+
+/// Descendants share their outermost recurring ancestor's occurrence ID. Only
+/// the immutable, digest-bound publication witness may establish that relation;
+/// the current canonical tree could have changed since this schedule was made.
+fn native_occurrence_members(
+    snapshot: &Value,
+    parsed: &NativeComposeSnapshot,
+    revision: &PublishedScheduleRevision,
+    schema: &str,
+    lifecycle: &OccurrenceLifecycleContext,
+    roots: &BTreeMap<Uuid, Uuid>,
+) -> Option<BTreeMap<Uuid, BTreeSet<Uuid>>> {
+    let mut members = roots
+        .iter()
+        .map(|(occurrence, root)| (*occurrence, BTreeSet::from([*root])))
+        .collect::<BTreeMap<_, _>>();
+    if snapshot.get("planning_request").is_none() {
+        // Preserve old v5 root-only snapshots, never infer descendant authority
+        // from a source revision map or the public output itself.
+        return (schema == SCHEDULER_PUBLICATION_SCHEMA).then_some(members);
+    }
+    let request = native_retained_request(snapshot, parsed, revision, schema, lifecycle)?;
+    dayweave_scheduler_helper::preflight_plan_request(&request).ok()?;
+    let expanded = dayweave_core::expand_occurrences(&request).ok()?;
+    if expanded.len() != parsed.plan.occurrences.len() {
+        return None;
+    }
+    let by_occurrence = expanded
+        .iter()
+        .map(|occurrence| (occurrence.id.0, occurrence))
+        .collect::<BTreeMap<_, _>>();
+    for occurrence in &parsed.plan.occurrences {
+        if !native_occurrence_matches(occurrence, by_occurrence.get(&occurrence.id)?) {
+            return None;
+        }
+    }
+    // Expansion already validates the bounded forest and implements the exact
+    // outermost-root semantics (a nested recurrence is not an independent root).
+    let recurrence_roots = roots.values().copied().collect::<BTreeSet<_>>();
+    let mut children = BTreeMap::<Uuid, Vec<Uuid>>::new();
+    let mut pending = Vec::new();
+    for item in &request.items {
+        if let Some(parent) = item.parent_id {
+            children.entry(parent.0).or_default().push(item.id.0);
+        } else {
+            pending.push((item.id.0, None));
+        }
+    }
+    let mut owners = BTreeMap::new();
+    let mut root_members = BTreeMap::<Uuid, BTreeSet<Uuid>>::new();
+    while let Some((item, owner)) = pending.pop() {
+        let owner = owner.or_else(|| recurrence_roots.contains(&item).then_some(item));
+        if let Some(root) = owner {
+            owners.insert(item, root);
+            root_members.entry(root).or_default().insert(item);
+        }
+        if let Some(nested) = children.get(&item) {
+            pending.extend(nested.iter().map(|child| (*child, owner)));
+        }
+    }
+    if !valid_native_lifecycle_members(lifecycle, &request, parsed, &owners, &root_members) {
+        return None;
+    }
+    for occurrence in expanded {
+        if occurrence.state == dayweave_core::OccurrenceState::Generated {
+            members.insert(
+                occurrence.id.0,
+                root_members.get(&occurrence.series_item_id.0)?.clone(),
+            );
+        }
+    }
+    Some(members)
+}
+
+fn native_retained_request(
+    snapshot: &Value,
+    parsed: &NativeComposeSnapshot,
+    revision: &PublishedScheduleRevision,
+    schema: &str,
+    lifecycle: &OccurrenceLifecycleContext,
+) -> Option<PlanRequest> {
+    let request: PlanRequest =
+        serde_json::from_value(snapshot.get("planning_request")?.clone()).ok()?;
+    let execution: ExecutionPlanningContext =
+        serde_json::from_value(snapshot.pointer("/execution_planning/execution")?.clone()).ok()?;
+    let stamps: Vec<CalendarProjectionStamp> = serde_json::from_value(
+        snapshot
+            .pointer("/evidence/calendar_projection_stamps")?
+            .clone(),
+    )
+    .ok()?;
+    let habit_head = snapshot.pointer("/evidence/habit_change_head")?.as_u64()?;
+    let rejected = parsed
+        .rejected_items
+        .iter()
+        .map(|item| item.item_id)
+        .collect::<BTreeSet<_>>();
+    if request.items.len() > parsed.accepted_item_count
+        || request.items.iter().any(|item| {
+            parsed.source_item_revisions.get(&item.id.0) != Some(&item.revision)
+                || rejected.contains(&item.id.0)
+        })
+        || offset_to_chrono(request.horizon_start).ok()? != revision.horizon_start
+        || offset_to_chrono(request.horizon_end).ok()? != revision.horizon_end
+        || offset_to_chrono(request.as_of).ok()?
+            != DateTime::parse_from_rfc3339(&parsed.plan.as_of)
+                .ok()?
+                .with_timezone(&Utc)
+        || super::compose::request_digest(
+            schema,
+            &revision.timezone_name,
+            &parsed.source_item_revisions,
+            &stamps,
+            &execution,
+            habit_head,
+            lifecycle,
+            &request,
+        )
+        .ok()?
+            != revision.input_digest
+    {
+        return None;
+    }
+    Some(request)
+}
+
+fn native_occurrence_matches(
+    value: &NativeOccurrence,
+    expected: &dayweave_core::Occurrence,
+) -> bool {
+    let instant = |raw: &str| {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))
+    };
+    value.id == expected.id.0
+        && value.series_item_id == expected.series_item_id.0
+        && value.identity == expected.identity
+        && value.state == expected.state
+        && value.ordinal == expected.ordinal
+        && value.local_date == expected.local_date.map(|date| date.to_string())
+        && instant(&value.nominal_start) == offset_to_chrono(expected.nominal_start).ok()
+        && instant(&value.nominal_end) == offset_to_chrono(expected.nominal_end).ok()
+        && instant(&value.window_start) == offset_to_chrono(expected.window_start).ok()
+        && instant(&value.window_end) == offset_to_chrono(expected.window_end).ok()
+}
+
+fn valid_native_lifecycle_members(
+    lifecycle: &OccurrenceLifecycleContext,
+    request: &PlanRequest,
+    parsed: &NativeComposeSnapshot,
+    owners: &BTreeMap<Uuid, Uuid>,
+    root_members: &BTreeMap<Uuid, BTreeSet<Uuid>>,
+) -> bool {
+    let source = request
+        .items
+        .iter()
+        .map(|item| (item.id.0, item))
+        .collect::<BTreeMap<_, _>>();
+    let occurrences = parsed
+        .plan
+        .occurrences
+        .iter()
+        .map(|value| (value.id, value))
+        .collect::<BTreeMap<_, _>>();
+    lifecycle.instances.iter().all(|instance| {
+        let root = instance.root_item_id.0;
+        let Some(occurrence) = occurrences.get(&instance.occurrence_id.0) else {
+            return false;
+        };
+        if occurrence.series_item_id != root
+            || occurrence.identity != instance.identity
+            || occurrence.state != dayweave_core::OccurrenceState::Generated
+        {
+            return false;
+        }
+        let omitted_parents = instance
+            .members
+            .iter()
+            .filter(|member| !source.contains_key(&member.item_id.0))
+            .filter_map(|member| member.parent_id.map(|parent| parent.0))
+            .collect::<BTreeSet<_>>();
+        let mut present = BTreeSet::new();
+        for member in &instance.members {
+            if parsed.source_item_revisions.get(&member.item_id.0) != Some(&member.source_revision)
+            {
+                return false;
+            }
+            // Inbox/context-only members remain in the full lifecycle witness
+            // but cannot grant a reference absent from the planning request.
+            let Some(item) = source.get(&member.item_id.0) else {
+                continue;
+            };
+            let parent = if item.id.0 == root {
+                None
+            } else {
+                item.parent_id
+            };
+            if owners.get(&item.id.0) != Some(&root)
+                || member.parent_id != parent
+                || item.has_children_outside_plan != omitted_parents.contains(&item.id.0)
+            {
+                return false;
+            }
+            present.insert(item.id.0);
+        }
+        root_members.get(&root) == Some(&present)
+    })
 }
 
 pub(crate) async fn assert_current_item_snapshot(
@@ -5995,6 +6215,677 @@ mod tests {
             manual_placement_block_evidence_index(&[placement], &[state], &[block]),
             Err(SchedulePublicationError::InvalidPayload)
         );
+    }
+
+    fn native_witness_item(id: u128, parent: Option<u128>) -> dayweave_core::WorkItem {
+        let at = time::OffsetDateTime::parse(
+            "2026-09-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        dayweave_core::WorkItem {
+            id: ItemId(Uuid::from_u128(id)),
+            is_sensitive: false,
+            revision: 1,
+            title: format!("Synthetic retained member {id}"),
+            kind: dayweave_core::ItemKind::Task,
+            status: dayweave_core::WorkStatus::NotStarted,
+            parent_id: parent.map(|parent| ItemId(Uuid::from_u128(parent))),
+            sibling_order: None,
+            has_own_effort: false,
+            has_children_outside_plan: false,
+            goal_ids: BTreeSet::new(),
+            priority: dayweave_core::Priority {
+                importance: 5,
+                urgency: 5,
+            },
+            duration: Some(dayweave_core::DurationEstimate::exact(5)),
+            constraints: dayweave_core::SchedulingConstraints::default(),
+            split_policy: dayweave_core::SplitPolicy::Indivisible,
+            energy: None,
+            tags: BTreeSet::new(),
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    fn native_witness_request(items: Vec<dayweave_core::WorkItem>) -> PlanRequest {
+        let at = items[0].created_at;
+        PlanRequest {
+            as_of: at,
+            horizon_start: at,
+            horizon_end: at + time::Duration::days(1),
+            items,
+            availability: vec![dayweave_core::AvailabilityWindow {
+                start: at,
+                end: at + time::Duration::days(1),
+                contexts: BTreeSet::new(),
+                location: None,
+                energy: dayweave_core::EnergyLevel::Deep,
+            }],
+            fixed_blocks: Vec::new(),
+            previous_assignments: Vec::new(),
+            config: dayweave_core::SchedulerConfig::default(),
+            recurrence_context: dayweave_core::RecurrenceContext::default(),
+        }
+    }
+
+    fn native_witness_recurring_kind() -> dayweave_core::ItemKind {
+        dayweave_core::ItemKind::Routine(dayweave_core::RoutineSpec {
+            ordered: false,
+            recurrence: Some(dayweave_core::Recurrence::Daily { times_per_day: 1 }),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the complete private/public fixture capsule together.
+    fn native_witness_snapshot(
+        request: &PlanRequest,
+        lifecycle: &OccurrenceLifecycleContext,
+        sources: &BTreeMap<Uuid, u64>,
+        schema: &str,
+    ) -> (Value, PublishedScheduleRevision) {
+        dayweave_scheduler_helper::preflight_plan_request(request)
+            .expect("retained reader fixture must satisfy publication's shared work budget");
+        let execution = ExecutionPlanningContext::default();
+        let plan = Scheduler
+            .plan_with_lifecycle(request, &execution, lifecycle)
+            .unwrap();
+        let digest = super::super::compose::request_digest(
+            schema,
+            "UTC",
+            sources,
+            &[],
+            &execution,
+            0,
+            lifecycle,
+            request,
+        )
+        .unwrap();
+        // Match the API's RFC3339 public wrapper without exposing private
+        // planning or lifecycle evidence in the returned compose object.
+        let instant = |value: time::OffsetDateTime| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let mut wire = serde_json::to_value(&plan).unwrap();
+        wire["as_of"] = json!(instant(plan.as_of));
+        wire["horizon_start"] = json!(instant(plan.horizon_start));
+        wire["horizon_end"] = json!(instant(plan.horizon_end));
+        wire.as_object_mut()
+            .unwrap()
+            .remove("manual_placement_assessments");
+        for (value, block) in wire["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&plan.blocks)
+        {
+            value["start"] = json!(instant(block.start));
+            value["end"] = json!(instant(block.end));
+        }
+        for (value, occurrence) in wire["occurrences"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&plan.occurrences)
+        {
+            value["local_date"] = json!(occurrence.local_date.map(|date| date.to_string()));
+        }
+        for (value, violation) in wire["violations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&plan.violations)
+        {
+            value["start"] = json!(violation.start.map(instant));
+            value["end"] = json!(violation.end.map(instant));
+        }
+        let snapshot = json!({
+            "schema_version": if schema == OCCURRENCE_PUBLICATION_SCHEMA { 6 } else { 5 },
+            "scheduler_publication_schema": schema,
+            "compose": {
+                "input_digest": digest,
+                "source_item_count": sources.len(),
+                "source_item_revisions": sources,
+                "accepted_item_count": sources.len(),
+                "rejected_items": [],
+                "ignored_previous_assignments": [],
+                "plan": wire,
+            },
+            "planning_request": request,
+            "execution_planning": {"execution": execution},
+            "evidence": {
+                "calendar_projection_stamps": [],
+                "habit_change_head": 0,
+                "occurrence_lifecycle": lifecycle,
+            },
+        });
+        let id = Uuid::from_u128(90);
+        let revision = PublishedScheduleRevision {
+            id,
+            revision: format!("1:{id}"),
+            revision_number: 1,
+            input_digest: digest,
+            horizon_start: offset_to_chrono(request.horizon_start).unwrap(),
+            horizon_end: offset_to_chrono(request.horizon_end).unwrap(),
+            timezone_name: "UTC".to_owned(),
+            published_at: offset_to_chrono(request.as_of).unwrap(),
+        };
+        (snapshot, revision)
+    }
+
+    #[allow(clippy::too_many_lines)] // One shared real-scheduler fixture covers both publication schemas.
+    fn native_descendant_fixture(schema: &str) -> (Value, PublishedScheduleRevision) {
+        let mut items = [
+            (10, None),
+            (1, Some(10)),
+            (2, Some(1)),
+            (3, Some(2)),
+            (4, Some(1)),
+            (5, Some(1)),
+            (7, None),
+            (8, Some(10)),
+            (9, Some(8)),
+        ]
+        .into_iter()
+        .map(|(id, parent)| native_witness_item(id, parent))
+        .collect::<Vec<_>>();
+        for item in &mut items {
+            match item.id.0.as_u128() {
+                10 => item.kind = dayweave_core::ItemKind::Project,
+                1 | 8 => item.kind = native_witness_recurring_kind(),
+                2 => {
+                    item.kind = dayweave_core::ItemKind::Routine(dayweave_core::RoutineSpec {
+                        ordered: false,
+                        recurrence: None,
+                    });
+                }
+                3 if schema == SCHEDULER_PUBLICATION_SCHEMA => {
+                    item.status = dayweave_core::WorkStatus::Completed;
+                }
+                5 => item.status = dayweave_core::WorkStatus::Blocked,
+                _ => {}
+            }
+            item.has_children_outside_plan = item.id.0 == Uuid::from_u128(1);
+        }
+        let request = native_witness_request(items);
+        let mut sources = request
+            .items
+            .iter()
+            .map(|item| (item.id.0, item.revision))
+            .collect::<BTreeMap<_, _>>();
+        sources.insert(Uuid::from_u128(6), 1); // Accepted Inbox member, deliberately absent from planning.
+        let lifecycle = if schema == OCCURRENCE_PUBLICATION_SCHEMA {
+            let instances = dayweave_core::expand_occurrences(&request)
+                .unwrap()
+                .into_iter()
+                .map(|occurrence| {
+                    let ids: &[u128] = if occurrence.series_item_id.0 == Uuid::from_u128(1) {
+                        &[1, 2, 3, 4, 5, 6]
+                    } else {
+                        &[8, 9]
+                    };
+                    let members = ids
+                        .iter()
+                        .map(|id| {
+                            let item_id = ItemId(Uuid::from_u128(*id));
+                            let parent_id = if item_id == occurrence.series_item_id {
+                                None
+                            } else if *id == 6 {
+                                Some(ItemId(Uuid::from_u128(1)))
+                            } else {
+                                request
+                                    .items
+                                    .iter()
+                                    .find(|item| item.id == item_id)
+                                    .unwrap()
+                                    .parent_id
+                            };
+                            dayweave_core::OccurrenceLifecycleMember {
+                                item_id,
+                                parent_id,
+                                source_revision: 1,
+                                status: match id {
+                                    1..=3 => dayweave_core::WorkStatus::Completed,
+                                    5 => dayweave_core::WorkStatus::Blocked,
+                                    _ => dayweave_core::WorkStatus::NotStarted,
+                                },
+                            }
+                        })
+                        .collect();
+                    dayweave_core::OccurrenceLifecycleInstance {
+                        root_item_id: occurrence.series_item_id,
+                        occurrence_id: occurrence.id,
+                        identity: occurrence.identity,
+                        members,
+                    }
+                })
+                .collect();
+            OccurrenceLifecycleContext {
+                snapshot_revision: 6,
+                instances,
+            }
+        } else {
+            OccurrenceLifecycleContext::default()
+        };
+        let (mut snapshot, revision) =
+            native_witness_snapshot(&request, &lifecycle, &sources, schema);
+        let occurrence = native_fixture_occurrence(&snapshot, 1);
+        snapshot["compose"]["plan"]["violations"] = json!([{
+            "kind": "capacity", "severity": "warning",
+            "item_ids": [Uuid::from_u128(4)], "occurrence_ids": [occurrence],
+            "start": null, "end": null, "penalty": 1,
+            "message": "Synthetic descendant capacity constraint.",
+        }]);
+        (snapshot, revision)
+    }
+
+    fn native_fixture_occurrence(snapshot: &Value, root: u128) -> Value {
+        snapshot["compose"]["plan"]["occurrences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["series_item_id"] == json!(Uuid::from_u128(root)))
+            .unwrap()["id"]
+            .clone()
+    }
+
+    fn native_resign_witness(
+        snapshot: &mut Value,
+        revision: &mut PublishedScheduleRevision,
+        schema: &str,
+    ) {
+        let request = serde_json::from_value(snapshot["planning_request"].clone()).unwrap();
+        let sources =
+            serde_json::from_value(snapshot["compose"]["source_item_revisions"].clone()).unwrap();
+        let execution =
+            serde_json::from_value(snapshot["execution_planning"]["execution"].clone()).unwrap();
+        let stamps: Vec<CalendarProjectionStamp> =
+            serde_json::from_value(snapshot["evidence"]["calendar_projection_stamps"].clone())
+                .unwrap();
+        let lifecycle = snapshot_occurrence_lifecycle(schema, snapshot).unwrap();
+        let digest = super::super::compose::request_digest(
+            schema,
+            &revision.timezone_name,
+            &sources,
+            &stamps,
+            &execution,
+            snapshot["evidence"]["habit_change_head"].as_u64().unwrap(),
+            &lifecycle,
+            &request,
+        )
+        .unwrap();
+        snapshot["compose"]["input_digest"] = json!(digest);
+        revision.input_digest = digest;
+    }
+
+    #[test]
+    fn native_snapshot_accepts_digest_bound_descendants_without_exposing_private_witness() {
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let (snapshot, revision) = native_descendant_fixture(schema);
+            let occurrence = native_fixture_occurrence(&snapshot, 1);
+            let plan = &snapshot["compose"]["plan"];
+            assert!(
+                plan["blocks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value["item_id"] == json!(Uuid::from_u128(4))
+                        && value["occurrence_id"] == occurrence)
+            );
+            assert!(
+                plan["unscheduled"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value["item_id"] == json!(Uuid::from_u128(5))
+                        && value["occurrence_id"] == occurrence)
+            );
+            assert!(
+                plan["decisions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value["item_id"] == json!(Uuid::from_u128(3))
+                        && value["kind"] == "terminal_item_ignored"
+                        && value["occurrence_id"] == occurrence)
+            );
+            assert_eq!(snapshot["compose"]["source_item_count"], 10);
+            assert_eq!(snapshot["compose"]["accepted_item_count"], 10);
+            assert_eq!(
+                snapshot["planning_request"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                9
+            );
+            let public = public_compose_snapshot(&snapshot, &revision, schema).unwrap();
+            assert_eq!(public, snapshot["compose"]);
+            assert!(public.get("planning_request").is_none() && public.get("evidence").is_none());
+        }
+    }
+
+    #[test]
+    fn native_snapshot_rejects_unrelated_and_omitted_members_in_every_output_category() {
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let (snapshot, revision) = native_descendant_fixture(schema);
+            let occurrence = native_fixture_occurrence(&snapshot, 1);
+            for collection in ["blocks", "unscheduled", "decisions", "violations"] {
+                for unrelated in [6, 7, 8, 9, 10] {
+                    let mut invalid = snapshot.clone();
+                    let values = invalid["compose"]["plan"][collection]
+                        .as_array_mut()
+                        .unwrap();
+                    let value = values
+                        .iter_mut()
+                        .find(|value| {
+                            if collection == "violations" {
+                                value["occurrence_ids"] == json!([occurrence])
+                            } else {
+                                value["occurrence_id"] == occurrence
+                            }
+                        })
+                        .unwrap();
+                    value[if collection == "violations" {
+                        "item_ids"
+                    } else {
+                        "item_id"
+                    }] = if collection == "violations" {
+                        json!([Uuid::from_u128(unrelated)])
+                    } else {
+                        json!(Uuid::from_u128(unrelated))
+                    };
+                    assert_eq!(
+                        public_compose_snapshot(&invalid, &revision, schema),
+                        Err(SchedulingPortError::RepublishRequired),
+                        "{schema}: {collection}, unrelated {unrelated}"
+                    );
+                }
+            }
+            let mut wrong_instance = snapshot.clone();
+            let other = native_fixture_occurrence(&snapshot, 8);
+            let value = wrong_instance["compose"]["plan"]["blocks"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|value| value["occurrence_id"] == occurrence)
+                .unwrap();
+            value["occurrence_id"] = other;
+            assert_eq!(
+                public_compose_snapshot(&wrong_instance, &revision, schema),
+                Err(SchedulingPortError::RepublishRequired)
+            );
+        }
+    }
+
+    #[test]
+    fn native_snapshot_rejects_missing_or_corrupt_descendant_witness() {
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let (snapshot, revision) = native_descendant_fixture(schema);
+            for key in ["planning_request", "execution_planning", "evidence"] {
+                let mut missing = snapshot.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert_eq!(
+                    public_compose_snapshot(&missing, &revision, schema),
+                    Err(SchedulingPortError::RepublishRequired),
+                    "{schema}: missing {key}"
+                );
+            }
+            let mut malformed = snapshot.clone();
+            malformed["planning_request"] = json!(null);
+            assert_eq!(
+                public_compose_snapshot(&malformed, &revision, schema),
+                Err(SchedulingPortError::RepublishRequired)
+            );
+            // A valid forest is still corrupt if it is not the retained digest's
+            // forest. Do not let a source ID become a descendant by reparenting.
+            let mut tampered = snapshot.clone();
+            tampered["planning_request"]["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|value| value["id"] == json!(Uuid::from_u128(7)))
+                .unwrap()["parent_id"] = json!(Uuid::from_u128(1));
+            assert_eq!(
+                public_compose_snapshot(&tampered, &revision, schema),
+                Err(SchedulingPortError::RepublishRequired)
+            );
+        }
+    }
+
+    #[test]
+    fn native_snapshot_rejects_digest_bound_malformed_topology_and_revision_joins() {
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let (snapshot, revision) = native_descendant_fixture(schema);
+            for defect in [
+                "duplicate",
+                "missing_parent",
+                "cycle",
+                "source_revision",
+                "missing_planned_member",
+            ] {
+                let mut invalid = snapshot.clone();
+                let mut signed = revision.clone();
+                let items = invalid["planning_request"]["items"].as_array_mut().unwrap();
+                match defect {
+                    "duplicate" => items.push(items[0].clone()),
+                    "missing_planned_member" => {
+                        items.retain(|value| value["id"] != json!(Uuid::from_u128(4)));
+                    }
+                    _ => {
+                        let item = items
+                            .iter_mut()
+                            .find(|value| value["id"] == json!(Uuid::from_u128(2)))
+                            .unwrap();
+                        match defect {
+                            "missing_parent" => item["parent_id"] = json!(Uuid::from_u128(99)),
+                            "cycle" => item["parent_id"] = json!(Uuid::from_u128(3)),
+                            "source_revision" => item["revision"] = json!(2),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                native_resign_witness(&mut invalid, &mut signed, schema);
+                assert_eq!(
+                    public_compose_snapshot(&invalid, &signed, schema),
+                    Err(SchedulingPortError::RepublishRequired),
+                    "{schema}: {defect}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_snapshot_rejects_mismatched_retained_lifecycle_members() {
+        let schema = OCCURRENCE_PUBLICATION_SCHEMA;
+        let (snapshot, revision) = native_descendant_fixture(schema);
+        for defect in [
+            "parent",
+            "revision",
+            "missing",
+            "omission_flag",
+            "unrelated",
+            "identity",
+        ] {
+            let mut invalid = snapshot.clone();
+            let mut signed = revision.clone();
+            let instance = invalid["evidence"]["occurrence_lifecycle"]["instances"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|value| value["root_item_id"] == json!(Uuid::from_u128(1)))
+                .unwrap();
+            if defect == "identity" {
+                instance["identity"]["bucket_ordinal"] = json!(1);
+            } else {
+                let members = instance["members"].as_array_mut().unwrap();
+                match defect {
+                    "missing" => {
+                        members.retain(|value| value["item_id"] != json!(Uuid::from_u128(4)));
+                    }
+                    "omission_flag" => {
+                        members.retain(|value| value["item_id"] != json!(Uuid::from_u128(6)));
+                    }
+                    "unrelated" => members.push(json!(dayweave_core::OccurrenceLifecycleMember {
+                        item_id: ItemId(Uuid::from_u128(7)),
+                        parent_id: Some(ItemId(Uuid::from_u128(1))),
+                        source_revision: 1,
+                        status: dayweave_core::WorkStatus::NotStarted,
+                    })),
+                    _ => {
+                        let member = members
+                            .iter_mut()
+                            .find(|value| value["item_id"] == json!(Uuid::from_u128(3)))
+                            .unwrap();
+                        if defect == "parent" {
+                            member["parent_id"] = json!(Uuid::from_u128(1));
+                        } else {
+                            member["source_revision"] = json!(2);
+                        }
+                    }
+                }
+            }
+            native_resign_witness(&mut invalid, &mut signed, schema);
+            assert_eq!(
+                public_compose_snapshot(&invalid, &signed, schema),
+                Err(SchedulingPortError::RepublishRequired),
+                "lifecycle {defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_snapshot_uses_outermost_recurrence_not_a_forged_nested_instance() {
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let (mut snapshot, mut revision) = native_descendant_fixture(schema);
+            snapshot["planning_request"]["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|value| value["id"] == json!(Uuid::from_u128(2)))
+                .unwrap()["kind"] = json!(native_witness_recurring_kind());
+            native_resign_witness(&mut snapshot, &mut revision, schema);
+            assert!(public_compose_snapshot(&snapshot, &revision, schema).is_ok());
+            let mut forged = snapshot.clone();
+            forged["compose"]["plan"]["occurrences"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|value| value["series_item_id"] == json!(Uuid::from_u128(1)))
+                .unwrap()["series_item_id"] = json!(Uuid::from_u128(2));
+            assert_eq!(
+                public_compose_snapshot(&forged, &revision, schema),
+                Err(SchedulingPortError::RepublishRequired)
+            );
+        }
+    }
+
+    #[test]
+    fn native_snapshot_keeps_legacy_root_only_compatibility_without_widening_references() {
+        let (mut snapshot, revision) = native_descendant_fixture(SCHEDULER_PUBLICATION_SCHEMA);
+        snapshot.as_object_mut().unwrap().remove("planning_request");
+        let occurrence = native_fixture_occurrence(&snapshot, 1);
+        for collection in ["blocks", "unscheduled", "violations"] {
+            snapshot["compose"]["plan"][collection] = json!([]);
+        }
+        snapshot["compose"]["plan"]["decisions"] = json!([{
+            "item_id": Uuid::from_u128(1), "occurrence_id": occurrence,
+            "kind": "container_rolled_up", "message": "Synthetic root-only legacy decision.",
+        }]);
+        assert!(
+            public_compose_snapshot(&snapshot, &revision, SCHEDULER_PUBLICATION_SCHEMA).is_ok()
+        );
+        snapshot["compose"]["plan"]["decisions"][0]["item_id"] = json!(Uuid::from_u128(2));
+        assert_eq!(
+            public_compose_snapshot(&snapshot, &revision, SCHEDULER_PUBLICATION_SCHEMA),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+    }
+
+    #[test]
+    fn native_snapshot_retained_membership_handles_five_thousand_levels_iteratively() {
+        let mut items = (1..=5_000)
+            .map(|id| {
+                let mut item = native_witness_item(id, (id > 1).then_some(id - 1));
+                // Structural ancestors have no independent estimated work,
+                // matching the existing canonical deep-routine fixtures. Giving
+                // all 5,000 nodes durations charges 5,000 candidate sessions in
+                // shared preflight even though the core emits only one leaf.
+                if id < 5_000 {
+                    item.duration = None;
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        items[0].kind = native_witness_recurring_kind();
+        let mut request = native_witness_request(items);
+        // Canonical preparation resolves local day boundaries before shared
+        // preflight. Without this witness, a 24-hour horizon conservatively
+        // counts three possible calendar days (floor(days) + 2), so 5,000
+        // members imply 15,000 clones and correctly exceed the 10,000 ceiling.
+        request.recurrence_context.calendar = dayweave_core::RecurrenceCalendar {
+            time_zone_id: Some("UTC".to_owned()),
+            days: vec![dayweave_core::ZonedDayBoundary {
+                local_date: request.horizon_start.date(),
+                start: request.horizon_start,
+                end: request.horizon_end,
+            }],
+            ..dayweave_core::RecurrenceCalendar::default()
+        };
+        assert_eq!(request.items.len(), 5_000);
+        dayweave_scheduler_helper::preflight_plan_request(&request)
+            .expect("one resolved day and one executable leaf retain a bounded 5,000-level tree");
+        assert_eq!(
+            dayweave_core::expand_occurrences(&request).unwrap().len(),
+            1
+        );
+        let sources = request.items.iter().map(|item| (item.id.0, 1)).collect();
+        for schema in [SCHEDULER_PUBLICATION_SCHEMA, OCCURRENCE_PUBLICATION_SCHEMA] {
+            let lifecycle = if schema == OCCURRENCE_PUBLICATION_SCHEMA {
+                OccurrenceLifecycleContext {
+                    snapshot_revision: 1,
+                    instances: dayweave_core::expand_occurrences(&request)
+                        .unwrap()
+                        .into_iter()
+                        .map(|occurrence| dayweave_core::OccurrenceLifecycleInstance {
+                            root_item_id: occurrence.series_item_id,
+                            occurrence_id: occurrence.id,
+                            identity: occurrence.identity,
+                            members: request
+                                .items
+                                .iter()
+                                .map(|item| dayweave_core::OccurrenceLifecycleMember {
+                                    item_id: item.id,
+                                    parent_id: item.parent_id,
+                                    source_revision: 1,
+                                    status: dayweave_core::WorkStatus::NotStarted,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                }
+            } else {
+                OccurrenceLifecycleContext::default()
+            };
+            let (snapshot, revision) =
+                native_witness_snapshot(&request, &lifecycle, &sources, schema);
+            assert_eq!(
+                snapshot["compose"]["plan"]["blocks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                snapshot["compose"]["plan"]["blocks"][0]["item_id"],
+                json!(Uuid::from_u128(5_000))
+            );
+            assert_eq!(
+                public_compose_snapshot(&snapshot, &revision, schema).unwrap(),
+                snapshot["compose"]
+            );
+        }
     }
 
     #[test]

@@ -47,6 +47,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Test disposable native convergence harness safety
         run: |
+          python3 -B scripts/test-native-routine-occurrence-scenario.py
+          python3 -B scripts/test-native-routine-occurrence-harness.py
           python3 -B scripts/test-native-completion-scenario.py
           python3 -B scripts/test-native-completion-harness.py
           python3 -B scripts/test-native-progress-harness.py

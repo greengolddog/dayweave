@@ -105,7 +105,9 @@ that witness, existing instances must remain exact, and recomputing the complete
 plan with the original execution evidence must give the same result. The current
 context then binds assessment and authorization. Any later reviewed policy or
 outcome change—even one preserving status—invalidates the old assessment. Fresh
-publication retains strict head comparison. Native ledger catch-up remains open.
+publication retains strict head comparison. The connected native coordinators
+perform terminal ledger catch-up followed by fresh remote composition; qualified
+helper-v2 local planning remains separate unfinished work.
 
 The subsequent [helper v2 bridge](scheduler-helper.md#occurrence-aware-composition-protocol-v2)
 can compose an explicitly supplied lifecycle context, checking complete current
@@ -335,13 +337,44 @@ installed toolchain and owner services were unchanged.
 These are deterministic native transport/store/presentation and build gates, not
 a two-native-client live-service convergence run, visual acceptance, production
 device authentication/TLS trial, final signed release or owner-device acceptance.
+The subsequent controlled service gate below supplies a separate bounded live
+convergence result, without changing these device and release limits.
+
+## Controlled native service convergence
+
+The [nine-phase macOS/Android gate](native-routine-occurrence-convergence.md)
+passes against one fresh disposable service and PostgreSQL cluster. It covers
+real first publication of a six-member subtree, competing member outcomes,
+lost successful replies, API/client restarts, exact historical receipts without
+rollback, parent Keep open/Automatic changes, exact manual blocker reopening,
+terminal catch-up and lost-publication recovery followed by fresh composition.
+Independent SQL joins every immutable command and publication receipt and
+confirms unchanged canonical templates, complete manifests and an unchanged
+second-instance sentinel. The public current-schedule read matches the final
+native/SQL proof and terminal occurrence head while retaining optional work.
+
+This gate found and fixed a public-reader root-only reference check. Descendant
+references now require the retained, digest-bound planning topology and exact
+recurrence/lifecycle membership rather than today's canonical tree. Omitted Inbox
+members remain in full lifecycle evidence without gaining planned references;
+legacy root-only v5 compatibility remains. The private witness is not exposed by
+the reader. Eight new regressions include both schemas and a 5,000-level tree.
+
+The full API gate now passes 687 tests with database-only cases enabled and the
+maintenance fixture emitter excluded; workspace warnings-denied Clippy passes.
+Full native regression results are 1,122 executed macOS tests plus four opt-in
+skips and 1,717 Android JVM tests plus three opt-in skips. The nine native live
+phases run separately from those opt-in skips. All owned services and the exact
+retained test runtime were cleaned up. This is not physical Room/Keystore, native
+UI, production TLS/auth lifecycle or owner-device acceptance; helper-v2 native
+composition remains disabled pending qualified current-source evidence.
 
 ## Remaining integration
 
-- Controlled macOS/Android first-admission and two-client/service convergence,
-  including competing member choices, actual lost successful replies, process
-  restarts and independent immutable SQL verification; physical UI/lifecycle
-  and owner-device acceptance remain open.
+- Expand the bounded six-member service gate to deep native cascades and
+  physical UI/lifecycle/owner-device acceptance. The controlled first-admission,
+  competing choices, lost replies, restarts and immutable SQL gate is now covered
+  separately above; it does not establish these broader acceptance conditions.
 - Authenticated current-source witness and native helper-v2 adapter integration.
   Existing native local-composition and publication fences conservatively require
   remote composition; helper v1 cannot consume occurrence authority.
