@@ -119,13 +119,21 @@ claims, plus configured Calendar capacity, incomplete/stale/future coverage and
 generation-bound fingerprints. Calendar fixtures exercise authoritative storage
 and production invalidation triggers, not Google ingestion or OAuth.
 
+The [shared producer corpus](../fixtures/routine-planning-witness/README.md)
+adds two deterministic golden/admission tests. It records exact request,
+normalized response and helper-v2 bytes for complete current-source routine,
+Habit and Calendar inputs, plus a positive history with no current instances.
+All six remote-required reasons, 17 semantic mismatches and four raw malformed
+messages are discovered dynamically. These synthetic cases establish wire
+compatibility, not live authentication or native custody.
+
 The strict helper decoder and unchanged v1/v2 protocol regressions pass 76 tests.
 The [nine-phase native/service convergence gate](native-routine-occurrence-convergence.md)
 also passes after the shared remote-normalization refactor, including immutable
 SQL/current-reader checks and verified cleanup. No native client is enabled by
-this server checkpoint. The final full API gate passes 727 tests against a fresh
+this server checkpoint. The full API gate including the producer corpus passes 729 tests against a fresh
 disposable PostgreSQL service, with database-only cases enabled and the
-maintenance-only fixture emitter excluded; no tests fail or remain ignored.
+two maintenance-only fixture emitters excluded; no tests fail or remain ignored.
 All-target, all-feature workspace Clippy with warnings denied and formatting
 checks pass. Owned test services and the retained native runtime were cleaned up.
 

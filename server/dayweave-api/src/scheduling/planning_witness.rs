@@ -45,6 +45,10 @@ use super::{
     },
 };
 
+#[cfg(test)]
+#[path = "planning_witness_fixtures.rs"]
+mod shared_fixtures;
+
 #[derive(Debug)]
 enum CaptureFailure {
     Error(WitnessError),
