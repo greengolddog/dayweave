@@ -13,8 +13,16 @@ use crate::{
     custom_recurrence::{CustomRecurrenceRuleError, parse_custom_rrule},
 };
 
+/// Maximum number of work items after recurrence materialization, including
+/// retained nonrecurring items and every generated occurrence's complete tree.
+/// This matches the bundled scheduler helper's established 10,000-item ceiling;
+/// direct core callers must not bypass it by multiplying a smaller source tree.
+pub const MAX_RECURRENCE_MATERIALIZED_ITEMS: usize = 10_000;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RecurrenceError {
+    #[error("invalid recurrence hierarchy: {0}")]
+    InvalidHierarchy(crate::HierarchyError),
     #[error("recurrence for item {item_id} has an invalid value: {message}")]
     InvalidRule { item_id: ItemId, message: String },
     #[error("timezone day {date} has invalid or mismatched boundaries")]
@@ -44,35 +52,37 @@ pub enum RecurrenceError {
         successor_id: ItemId,
         predecessor_id: ItemId,
     },
+    #[error("recurrence materialization exceeds the {limit}-item limit")]
+    MaterializedItemLimitExceeded { limit: usize },
     #[error("calendar date arithmetic exceeded supported range")]
     DateOutOfRange,
 }
 
-/// Expands recurrence definitions into stable, bounded occurrences without
+/// Expands recurrence definitions into stable occurrences without
 /// invoking the scheduler.
+///
+/// This validates topology and recurrence invariants, not an overall allocation
+/// or work budget. Untrusted callers must run the shared scheduler preflight
+/// first; the materialized-item ceiling does not apply to raw expansion.
 ///
 /// # Errors
 ///
-/// Returns [`RecurrenceError`] for malformed frequency rules, timezone day
-/// boundaries, pauses, exceptions, or out-of-range calendar arithmetic.
+/// Returns [`RecurrenceError`] for invalid hierarchy, malformed frequency rules,
+/// timezone day boundaries, pauses, exceptions, or out-of-range calendar arithmetic.
 pub fn expand_occurrences(request: &PlanRequest) -> Result<Vec<Occurrence>, RecurrenceError> {
+    crate::roll_up_expected_durations(&request.items).map_err(RecurrenceError::InvalidHierarchy)?;
+    expand_occurrences_validated(request)
+}
+
+/// The scheduler has already validated the complete hierarchy before entering
+/// materialization. Public expansion uses the checked wrapper above instead.
+fn expand_occurrences_validated(request: &PlanRequest) -> Result<Vec<Occurrence>, RecurrenceError> {
     validate_recurrence_context(request)?;
     let days = resolved_days(request)?;
     let by_id: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
-    let recurring_ids: BTreeSet<_> = request
-        .items
-        .iter()
-        .filter_map(|item| recurrence_of(item).map(|_| item.id))
-        .collect();
-
-    let roots: Vec<_> = request
-        .items
-        .iter()
-        .filter(|item| {
-            recurrence_of(item).is_some() && !has_recurring_ancestor(item, &by_id, &recurring_ids)
-        })
-        .collect();
-    let root_ids: BTreeSet<_> = roots.iter().map(|item| item.id).collect();
+    let children = children_by_parent(&request.items);
+    let roots = recurrence_roots(&request.items, &by_id, &children);
+    let root_ids: BTreeSet<_> = roots.iter().copied().collect();
     if let Some(exception) = request
         .recurrence_context
         .exceptions
@@ -86,7 +96,8 @@ pub fn expand_occurrences(request: &PlanRequest) -> Result<Vec<Occurrence>, Recu
     }
 
     let mut result = Vec::new();
-    for item in roots {
+    for root in roots {
+        let item = by_id[&root];
         let Some(recurrence) = recurrence_of(item) else {
             continue;
         };
@@ -156,22 +167,10 @@ pub(crate) struct MaterializedPlan {
 pub(crate) fn materialize_recurrences(
     request: &PlanRequest,
 ) -> Result<MaterializedPlan, RecurrenceError> {
-    let occurrences = expand_occurrences(request)?;
+    let occurrences = expand_occurrences_validated(request)?;
     let by_id: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
     let children = children_by_parent(&request.items);
-    let recurring_ids: BTreeSet<_> = request
-        .items
-        .iter()
-        .filter_map(|item| recurrence_of(item).map(|_| item.id))
-        .collect();
-    let roots: Vec<_> = request
-        .items
-        .iter()
-        .filter(|item| {
-            recurrence_of(item).is_some() && !has_recurring_ancestor(item, &by_id, &recurring_ids)
-        })
-        .map(|item| item.id)
-        .collect();
+    let roots = recurrence_roots(&request.items, &by_id, &children);
 
     let mut removed = BTreeSet::new();
     let mut subtrees = BTreeMap::new();
@@ -182,24 +181,39 @@ pub(crate) fn materialize_recurrences(
     }
     validate_recurring_subtree_dependencies(request, &subtrees)?;
 
-    let mut items: Vec<WorkItem> = request
+    let mut generated_by_root = BTreeMap::<ItemId, Vec<&Occurrence>>::new();
+    for occurrence in &occurrences {
+        if occurrence.state == OccurrenceState::Generated {
+            generated_by_root
+                .entry(occurrence.series_item_id)
+                .or_default()
+                .push(occurrence);
+        }
+    }
+    let retained = request
         .items
         .iter()
-        .filter(|item| !removed.contains(&item.id))
-        .cloned()
-        .collect();
+        .filter(|item| !removed.contains(&item.id));
+    // Check the complete product before allocating clone IDs or cloning any
+    // WorkItem. Completed, paused, and skipped occurrences create no clones.
+    let materialized_count = checked_materialized_item_count(
+        retained.clone().count(),
+        subtrees.iter().map(|(root, subtree)| {
+            (
+                subtree.len(),
+                generated_by_root.get(root).map_or(0, Vec::len),
+            )
+        }),
+    )?;
+    let mut items = Vec::with_capacity(materialized_count);
+    items.extend(retained.cloned());
     let mut identities = BTreeMap::new();
     let mut previous_first_leaf = BTreeMap::<ItemId, ItemId>::new();
 
     for root in roots {
         let subtree = &subtrees[&root];
-        let root_occurrences: Vec<_> = occurrences
-            .iter()
-            .filter(|occurrence| {
-                occurrence.series_item_id == root && occurrence.state == OccurrenceState::Generated
-            })
-            .collect();
-        for occurrence in root_occurrences {
+        let spacing = minimum_spacing(request, by_id[&root]);
+        for occurrence in generated_by_root.get(&root).map_or(&[][..], Vec::as_slice) {
             let clone_ids: BTreeMap<_, _> = subtree
                 .iter()
                 .map(|original_id| {
@@ -214,7 +228,6 @@ pub(crate) fn materialize_recurrences(
 
             let leaves = subtree_leaves(subtree, &children, &by_id);
             let first_leaf = leaves.first().map(|id| clone_ids[id]);
-            let spacing = minimum_spacing(request, root);
 
             for original_id in subtree {
                 let original = by_id[original_id];
@@ -301,6 +314,26 @@ pub(crate) fn materialize_recurrences(
     })
 }
 
+fn checked_materialized_item_count(
+    retained: usize,
+    subtrees: impl IntoIterator<Item = (usize, usize)>,
+) -> Result<usize, RecurrenceError> {
+    let too_large = || RecurrenceError::MaterializedItemLimitExceeded {
+        limit: MAX_RECURRENCE_MATERIALIZED_ITEMS,
+    };
+    if retained > MAX_RECURRENCE_MATERIALIZED_ITEMS {
+        return Err(too_large());
+    }
+    subtrees
+        .into_iter()
+        .try_fold(retained, |total, (size, count)| {
+            size.checked_mul(count)
+                .and_then(|clones| total.checked_add(clones))
+                .filter(|total| *total <= MAX_RECURRENCE_MATERIALIZED_ITEMS)
+                .ok_or_else(too_large)
+        })
+}
+
 fn partial_remaining_minutes(
     occurrence_id: OccurrenceId,
     progress: crate::RecurrencePartialProgress,
@@ -375,19 +408,36 @@ fn recurrence_of(item: &WorkItem) -> Option<&Recurrence> {
     }
 }
 
-fn has_recurring_ancestor(
-    item: &WorkItem,
+fn recurrence_roots(
+    items: &[WorkItem],
     by_id: &BTreeMap<ItemId, &WorkItem>,
-    recurring_ids: &BTreeSet<ItemId>,
-) -> bool {
-    let mut parent = item.parent_id;
-    while let Some(id) = parent {
-        if recurring_ids.contains(&id) {
-            return true;
+    children: &BTreeMap<ItemId, Vec<ItemId>>,
+) -> Vec<ItemId> {
+    let mut roots = BTreeSet::new();
+    let mut pending: Vec<_> = items
+        .iter()
+        .filter(|item| item.parent_id.is_none())
+        .map(|item| (item.id, false))
+        .collect();
+    while let Some((id, has_recurring_ancestor)) = pending.pop() {
+        let recurs = recurrence_of(by_id[&id]).is_some();
+        if recurs && !has_recurring_ancestor {
+            roots.insert(id);
         }
-        parent = by_id.get(&id).and_then(|value| value.parent_id);
+        if let Some(children) = children.get(&id) {
+            pending.extend(
+                children
+                    .iter()
+                    .map(|child| (*child, has_recurring_ancestor || recurs)),
+            );
+        }
     }
-    false
+    // Each node is visited once; returning source order preserves
+    // the prior expansion/materialization ordering across independent roots.
+    items
+        .iter()
+        .filter_map(|item| roots.contains(&item.id).then_some(item.id))
+        .collect()
 }
 
 fn validate_recurrence_context(request: &PlanRequest) -> Result<(), RecurrenceError> {
@@ -596,7 +646,7 @@ fn expand_series(
     days: &[ZonedDayBoundary],
 ) -> Result<Vec<Occurrence>, RecurrenceError> {
     let week_start = request.recurrence_context.calendar.week_starts_on;
-    let spacing = minimum_spacing(request, item.id);
+    let spacing = minimum_spacing(request, item);
     match recurrence {
         Recurrence::Daily { times_per_day } => Ok(expand_calendar_buckets(
             item.id,
@@ -1544,7 +1594,7 @@ fn validated_identity_name(
             && local_day_is_plausible(date)
             && calendar_source_matches(
                 request,
-                item.id,
+                item,
                 source,
                 date,
                 *times_per_day,
@@ -1574,7 +1624,7 @@ fn validated_identity_name(
             (local_day_is_plausible(date)
                 && calendar_source_matches(
                     request,
-                    item.id,
+                    item,
                     source,
                     date,
                     *times_per_week,
@@ -1611,7 +1661,7 @@ fn validated_identity_name(
             (local_day_is_plausible(date)
                 && calendar_source_matches(
                     request,
-                    item.id,
+                    item,
                     source,
                     date,
                     *times_per_month,
@@ -1633,7 +1683,7 @@ fn validated_identity_name(
             effective_rolling_anchor(request, item, None),
             anchor,
             interval.get(),
-            minimum_spacing(request, item.id),
+            minimum_spacing(request, item),
             index,
             "interval",
         ),
@@ -1647,7 +1697,7 @@ fn validated_identity_name(
                 .get(&item.id)
                 .copied()
                 .unwrap_or(item.created_at);
-            let spacing = minimum_spacing(request, item.id);
+            let spacing = minimum_spacing(request, item);
             let effective_interval = (*interval).max(spacing);
             let due = effective_anchor
                 .checked_add(Duration::minutes(i64::from(effective_interval.get())))?;
@@ -1686,15 +1736,7 @@ fn validated_identity_name(
             && (weekdays.is_empty()
                 || weekdays.contains(&DayOfWeek::from_time(date.weekday())))
             && local_day_is_plausible(date)
-            && calendar_source_matches(
-                request,
-                item.id,
-                source,
-                date,
-                *target,
-                1,
-                bucket_ordinal,
-            ) =>
+            && calendar_source_matches(request, item, source, date, *target, 1, bucket_ordinal) =>
         {
             Some((
                 format!("frequency-calendar-day:{date}:{bucket_ordinal}"),
@@ -1724,7 +1766,7 @@ fn validated_identity_name(
             (local_day_is_plausible(date)
                 && calendar_source_matches(
                     request,
-                    item.id,
+                    item,
                     source,
                     date,
                     *target,
@@ -1767,7 +1809,7 @@ fn validated_identity_name(
             (local_day_is_plausible(date)
                 && calendar_source_matches(
                     request,
-                    item.id,
+                    item,
                     source,
                     date,
                     *target,
@@ -1800,7 +1842,7 @@ fn validated_identity_name(
                 identity_anchor,
                 *target,
                 *period,
-                minimum_spacing(request, item.id),
+                minimum_spacing(request, item),
                 index,
             )
         }
@@ -1828,7 +1870,7 @@ fn validated_identity_name(
                     cycle,
                     index,
                     *target,
-                    minimum_spacing(request, item.id),
+                    minimum_spacing(request, item),
                 )
                 && source.local_date.is_none();
             nominal_dates_match.then(|| {
@@ -2014,7 +2056,7 @@ fn allocated_date(dates: &[Date], target: u16, bucket_ordinal: u16) -> Option<Da
 
 fn calendar_source_matches(
     request: &PlanRequest,
-    item_id: ItemId,
+    item: &WorkItem,
     source: crate::RecurrenceMoveSource,
     date: Date,
     target: u16,
@@ -2029,7 +2071,7 @@ fn calendar_source_matches(
         target,
         eligible_day_count,
         bucket_ordinal,
-        minimum_spacing(request, item_id),
+        minimum_spacing(request, item),
     ) else {
         return false;
     };
@@ -2189,36 +2231,26 @@ fn calendar_occurrence_bounds(
     Some((start, end.max(spacing_end)))
 }
 
-fn minimum_spacing(request: &PlanRequest, item_id: ItemId) -> Minutes {
+fn minimum_spacing(request: &PlanRequest, item: &WorkItem) -> Minutes {
     request
         .recurrence_context
         .minimum_spacing
-        .get(&item_id)
+        .get(&item.id)
         .copied()
         .or_else(|| {
-            request
-                .items
-                .iter()
-                .find(|item| item.id == item_id)
-                .and_then(|item| match &item.kind {
-                    ItemKind::Habit(spec) => {
-                        let recurrence_spacing = recurrence_of(item)
-                            .and_then(|recurrence| match recurrence {
-                                Recurrence::Frequency {
-                                    minimum_spacing, ..
-                                } => Some(*minimum_spacing),
-                                _ => None,
-                            })
-                            .unwrap_or(Minutes::ZERO);
-                        Some(spec.minimum_spacing.max(recurrence_spacing))
-                    }
-                    _ => recurrence_of(item).and_then(|recurrence| match recurrence {
-                        Recurrence::Frequency {
-                            minimum_spacing, ..
-                        } => Some(*minimum_spacing),
-                        _ => None,
-                    }),
-                })
+            let recurrence_spacing = recurrence_of(item).and_then(|recurrence| match recurrence {
+                Recurrence::Frequency {
+                    minimum_spacing, ..
+                } => Some(*minimum_spacing),
+                _ => None,
+            });
+            match &item.kind {
+                ItemKind::Habit(spec) => Some(
+                    spec.minimum_spacing
+                        .max(recurrence_spacing.unwrap_or(Minutes::ZERO)),
+                ),
+                _ => recurrence_spacing,
+            }
         })
         .unwrap_or(Minutes::ZERO)
 }
@@ -2237,14 +2269,17 @@ fn children_by_parent(items: &[WorkItem]) -> BTreeMap<ItemId, Vec<ItemId>> {
 }
 
 fn collect_subtree(root: ItemId, children: &BTreeMap<ItemId, Vec<ItemId>>) -> Vec<ItemId> {
-    fn visit(id: ItemId, children: &BTreeMap<ItemId, Vec<ItemId>>, result: &mut Vec<ItemId>) {
+    // Scheduler admission validates the complete forest before materialization.
+    // Reverse the sorted children on the stack to preserve the previous
+    // ascending-ID depth-first preorder without consuming the call stack.
+    let mut result = Vec::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
         result.push(id);
-        for child in children.get(&id).map_or(&[][..], Vec::as_slice) {
-            visit(*child, children, result);
+        if let Some(children) = children.get(&id) {
+            pending.extend(children.iter().rev().copied());
         }
     }
-    let mut result = Vec::new();
-    visit(root, children, &mut result);
     result
 }
 
@@ -2371,6 +2406,10 @@ fn boundary_instant(
     }
     midnight(date, fallback_offset)
 }
+
+#[cfg(test)]
+#[path = "recurrence_materialization_limits.rs"]
+mod materialization_limits_tests;
 
 #[cfg(test)]
 mod tests {

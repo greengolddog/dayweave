@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_runs_the_existing_hierarchy_budget_after_preparation() {
+    fn compose_accepts_hierarchy_beyond_256_levels_after_preparation() {
         let mut value: serde_json::Value = serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
         let template = value["request"]["canonical_items"][0].clone();
         let mut items = Vec::new();
@@ -691,13 +691,42 @@ mod tests {
             } else {
                 serde_json::json!(format!("00000000-0000-0000-0000-{:012x}", index - 1))
             };
+            if index < 257 {
+                item["kind"] = serde_json::json!("project");
+                item["is_executable"] = serde_json::json!(false);
+                item["duration_seconds"] = serde_json::Value::Null;
+                item["flexible_constraints"] = serde_json::json!({"has_own_effort": false});
+            }
             items.push(item);
         }
+        let mut leaf_only = value.clone();
+        let mut leaf = items.last().unwrap().clone();
+        leaf["parent_id"] = serde_json::Value::Null;
+        leaf_only["request"]["canonical_items"] = serde_json::json!([leaf]);
+        items.reverse();
         value["request"]["canonical_items"] = serde_json::Value::Array(items);
         let output = process_bytes(&serde_json::to_vec(&value).unwrap());
-        assert_eq!(error_code(&output), "resource_limit_exceeded");
+        assert_eq!(output.exit_code, SUCCESS_EXIT_CODE);
         let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(response["result"].get("composition").is_none());
+        let baseline = process_bytes(&serde_json::to_vec(&leaf_only).unwrap());
+        assert_eq!(baseline.exit_code, SUCCESS_EXIT_CODE);
+        let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+        let composition = &response["result"]["composition"];
+        assert_eq!(composition["accepted_item_count"], 257);
+        assert_eq!(composition["rejected_items"], serde_json::json!([]));
+        for field in [
+            "blocks",
+            "unscheduled",
+            "violations",
+            "score",
+            "occurrences",
+        ] {
+            assert_eq!(
+                composition["plan"][field], baseline["result"]["composition"]["plan"][field],
+                "{field}"
+            );
+        }
+        assert_eq!(composition["plan"]["blocks"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1191,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_hierarchy_depth_before_core_recursion() {
+    fn accepts_hierarchy_beyond_256_levels_with_an_equivalent_leaf_plan() {
         let mut value: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
         let template = value["request"]["items"][0].clone();
         let mut items = Vec::new();
@@ -1203,11 +1232,42 @@ mod tests {
             } else {
                 serde_json::json!(format!("00000000-0000-0000-0000-{:012x}", index - 1))
             };
+            if index < 257 {
+                item["kind"] = serde_json::json!({"type": "project"});
+            }
             items.push(item);
         }
+        let mut leaf_only = value.clone();
+        let mut leaf = items.last().unwrap().clone();
+        leaf["parent_id"] = serde_json::Value::Null;
+        leaf_only["request"]["items"] = serde_json::json!([leaf]);
+        items.reverse();
         value["request"]["items"] = serde_json::Value::Array(items);
         let output = process_bytes(&serde_json::to_vec(&value).unwrap());
-        assert_eq!(error_code(&output), "resource_limit_exceeded");
+        assert_eq!(output.exit_code, SUCCESS_EXIT_CODE);
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let baseline = process_bytes(&serde_json::to_vec(&leaf_only).unwrap());
+        assert_eq!(baseline.exit_code, SUCCESS_EXIT_CODE);
+        let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+        for field in [
+            "blocks",
+            "unscheduled",
+            "violations",
+            "score",
+            "occurrences",
+        ] {
+            assert_eq!(
+                response["result"]["plan"][field], baseline["result"]["plan"][field],
+                "{field}"
+            );
+        }
+        assert_eq!(
+            response["result"]["plan"]["blocks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

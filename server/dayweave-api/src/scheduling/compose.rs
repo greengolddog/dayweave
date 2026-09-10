@@ -673,9 +673,17 @@ fn merge_authoritative_habit_recurrence(
             .recurrence_context
             .exceptions
             .push(exception.clone());
-        let is_current = prepare_canonical_schedule(canonical_items.clone(), candidate)
-            .ok()
-            .is_some_and(|prepared| expand_occurrences(&prepared.plan_request).is_ok());
+        let is_current = match prepare_canonical_schedule(canonical_items.clone(), candidate) {
+            Ok(prepared) => {
+                // Exhausting a work budget is not evidence that a durable
+                // carry became stale. Reject this composition before raw
+                // expansion instead of silently replacing the carry with Skip.
+                preflight_plan_request(&prepared.plan_request)
+                    .map_err(map_scheduler_preflight_error)?;
+                expand_occurrences(&prepared.plan_request).is_ok()
+            }
+            Err(_) => false,
+        };
         if !is_current {
             exception.action = RecurrenceExceptionAction::Skip;
         }
@@ -703,6 +711,7 @@ fn merge_authoritative_habit_recurrence(
         .retain(|exception| !habit_ids.contains(&exception.item_id));
     let prepared = prepare_canonical_schedule(canonical_items.clone(), ownership_request.clone())
         .map_err(map_prepare_error)?;
+    preflight_plan_request(&prepared.plan_request).map_err(map_scheduler_preflight_error)?;
     let current_habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
         .map_err(|error| ComposeScheduleError::InvalidRequest(error.to_string()))?
         .into_iter()
@@ -719,6 +728,7 @@ fn merge_authoritative_habit_recurrence(
         .extend(authoritative_exceptions.clone());
     let prepared = prepare_canonical_schedule(canonical_items, ownership_request)
         .map_err(map_prepare_error)?;
+    preflight_plan_request(&prepared.plan_request).map_err(map_scheduler_preflight_error)?;
     let effective_habit_occurrence_ids = expand_occurrences(&prepared.plan_request)
         .map_err(|error| ComposeScheduleError::InvalidRequest(error.to_string()))?
         .into_iter()
@@ -2267,6 +2277,167 @@ mod tests {
         );
         assert!(matches!(
             result.expect("preflight result"),
+            Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
+    }
+
+    fn deep_routine_items(count: usize) -> Vec<Item> {
+        let ids = std::iter::once(Uuid::from_u128(1))
+            .chain((3..=count).map(|id| Uuid::from_u128(id as u128)))
+            .chain(std::iter::once(Uuid::from_u128(2)))
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), count);
+        ids.iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut item = canonical_item(*id);
+                item.timezone_name = "UTC".into();
+                item.parent_id = index.checked_sub(1).map(|parent| ids[parent]);
+                item.flexible_constraints = json!({});
+                clear_deadline(&mut item);
+                if index + 1 != count {
+                    item.kind = ItemKind::Routine;
+                    item.is_executable = false;
+                    set_unknown_duration(&mut item);
+                }
+                if index == 0 {
+                    item.recurrence = Some(json!({"type":"daily","times_per_day":1}));
+                }
+                item
+            })
+            .rev()
+            .collect()
+    }
+
+    fn oversized_mixed_recurrences() -> Vec<Item> {
+        (1..=101_u128)
+            .map(|id| {
+                let mut item = canonical_item(Uuid::from_u128(id));
+                item.timezone_name = "UTC".into();
+                item.flexible_constraints = json!({});
+                clear_deadline(&mut item);
+                if id == 1 {
+                    item.kind = ItemKind::Habit;
+                }
+                item.recurrence = Some(json!({
+                    "type":"daily", "times_per_day": if id == 1 { 1 } else { 100 }
+                }));
+                item
+            })
+            .collect()
+    }
+
+    #[test]
+    fn habit_ownership_rejects_over_budget_expansion_before_raw_recurrence_generation() {
+        let mut request = preview_request();
+        request.timezone_name = "UTC".into();
+        request.availability.clear();
+        let items = oversized_mixed_recurrences();
+        let result = merge_authoritative_habit_recurrence(
+            &mut request,
+            &items,
+            &AuthoritativeHabitRecurrence::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn habit_carry_probe_resource_exhaustion_is_not_stale_carry_evidence() {
+        let mut request = preview_request();
+        request.timezone_name = "UTC".into();
+        request.availability.clear();
+        let items = oversized_mixed_recurrences();
+        let carry = recurrence_move_for(&items[0], &request, 60);
+        let mut authoritative = AuthoritativeHabitRecurrence::default();
+        authoritative.context.exceptions.push(carry.clone());
+        let result = merge_authoritative_habit_recurrence(&mut request, &items, &authoritative);
+        assert!(matches!(
+            result,
+            Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
+        assert_eq!(authoritative.context.exceptions, vec![carry]);
+        assert!(
+            request.recurrence_context.exceptions.is_empty(),
+            "an unproved resource failure must not install a replacement Skip"
+        );
+    }
+
+    #[test]
+    fn deep_routine_preview_and_publication_recomputation_preserve_the_single_leaf() {
+        let mut request = preview_request();
+        request.timezone_name = "UTC".into();
+        let shallow = compose_items(deep_routine_items(8), request.clone()).unwrap();
+        let items = deep_routine_items(5_000);
+        let deep = compose_items(items.clone(), request.clone()).unwrap();
+        assert_eq!(deep.source_item_count, 5_000);
+        assert_eq!(deep.accepted_item_count, 5_000);
+        assert_eq!(deep.source_item_revisions.len(), 5_000);
+        assert!(deep.rejected_items.is_empty());
+        assert_eq!(deep.plan.blocks.len(), 1);
+        assert_eq!(
+            deep.plan.blocks[0].item_id,
+            Some(ItemId(Uuid::from_u128(2)))
+        );
+        assert_eq!(deep.plan.blocks, shallow.plan.blocks);
+        assert_eq!(deep.plan.occurrences, shallow.plan.occurrences);
+        assert_eq!(deep.plan.score, shallow.plan.score);
+        assert_eq!(deep.plan.decisions.len(), 5_000);
+
+        // Use the real private snapshot and deterministic publication verifier,
+        // not only a direct engine plan. This is not a PostgreSQL commit test.
+        let (_, snapshot) = super::super::postgres::validate_publishable_compose_result(
+            &request.timezone_name,
+            &deep,
+        )
+        .unwrap();
+        assert_eq!(snapshot["schema_version"], 5);
+        assert_eq!(
+            snapshot["scheduler_publication_schema"],
+            super::super::SCHEDULER_PUBLICATION_SCHEMA
+        );
+        assert_eq!(snapshot["compose"]["input_digest"], deep.input_digest);
+
+        let mut reordered = items;
+        reordered.reverse();
+        let repeated = compose_items(reordered, request).unwrap();
+        assert_eq!(repeated.input_digest, deep.input_digest);
+        assert_eq!(*repeated.plan, *deep.plan);
+    }
+
+    #[test]
+    fn deep_routine_preview_still_rejects_expansion_over_the_shared_item_budget() {
+        let mut items = deep_routine_items(5_000);
+        items
+            .iter_mut()
+            .find(|item| item.id == Uuid::from_u128(1))
+            .unwrap()
+            .recurrence = Some(json!({"type":"daily","times_per_day":3}));
+        let mut request = preview_request();
+        request.timezone_name = "UTC".into();
+        assert!(matches!(
+            compose_items(items, request),
+            Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn structural_depth_support_does_not_waive_wide_executable_ordering_budget() {
+        let items = (1..=5_000)
+            .map(|id| {
+                let mut item = canonical_item(Uuid::from_u128(id));
+                item.flexible_constraints = json!({});
+                clear_deadline(&mut item);
+                set_unknown_duration(&mut item);
+                item
+            })
+            .collect();
+        let mut request = preview_request();
+        request.availability.clear();
+        assert!(matches!(
+            compose_items(items, request),
             Err(ComposeScheduleError::SchedulerResourceLimit)
         ));
     }

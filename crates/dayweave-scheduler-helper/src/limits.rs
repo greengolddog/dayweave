@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use dayweave_compose::MAX_SCHEDULING_OFFSET_MINUTES;
 use dayweave_core::{
-    ConstraintStrength, ItemId, ItemKind, PlanRequest, Recurrence, RecurrenceExceptionAction,
-    RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity, RecurrencePeriod,
-    RecurrenceSemantics, ScheduleError, SplitPolicy, WorkItem, custom_rrule_search_day_bound,
+    ConstraintStrength, ItemId, ItemKind, MAX_RECURRENCE_MATERIALIZED_ITEMS, PlanRequest,
+    Recurrence, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    RecurrenceOccurrenceIdentity, RecurrencePeriod, RecurrenceSemantics, ScheduleError,
+    SplitPolicy, WorkItem, custom_rrule_search_day_bound,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -21,8 +22,6 @@ const MAX_HORIZON_DAYS: i64 = 90;
 const MAX_WEIGHT: u32 = 1_000_000;
 const MAX_TITLE_CHARACTERS: usize = 500;
 const MAX_OCCURRENCES: usize = 10_000;
-const MAX_MATERIALIZED_ITEMS: usize = 10_000;
-const MAX_HIERARCHY_DEPTH: usize = 256;
 const MAX_CANDIDATE_EVALUATIONS: usize = 10_000_000;
 const MAX_IMMUTABLE_OVERLAP_VIOLATIONS: usize = 10_000;
 const MAX_MATERIALIZED_COLLECTION_ENTRIES: usize = 100_000;
@@ -173,21 +172,17 @@ fn validate_hierarchy(request: &PlanRequest, ids: &BTreeSet<ItemId>) -> Result<(
             }
             children.entry(parent).or_default().push(item.id);
         } else {
-            queue.push_back((item.id, 1_usize));
+            queue.push_back(item.id);
         }
     }
 
     let mut visited = 0_usize;
-    while let Some((id, depth)) = queue.pop_front() {
-        if depth > MAX_HIERARCHY_DEPTH {
-            return Err(PreflightError::ResourceLimit);
-        }
+    while let Some(id) = queue.pop_front() {
         visited = visited
             .checked_add(1)
             .ok_or(PreflightError::ResourceLimit)?;
         if let Some(nested) = children.get(&id) {
-            let child_depth = depth.checked_add(1).ok_or(PreflightError::ResourceLimit)?;
-            queue.extend(nested.iter().copied().map(|child| (child, child_depth)));
+            queue.extend(nested.iter().copied());
         }
     }
     if visited != request.items.len() {
@@ -424,21 +419,19 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
 
     let mut order = Vec::with_capacity(request.items.len());
     let mut recurrence_roots = Vec::new();
-    let mut queue: VecDeque<_> = roots.into_iter().map(|id| (id, false)).collect();
-    while let Some((id, has_recurring_ancestor)) = queue.pop_front() {
+    let mut recurrence_root_by_item = BTreeMap::new();
+    let mut queue: VecDeque<_> = roots.into_iter().map(|id| (id, None)).collect();
+    while let Some((id, recurring_ancestor)) = queue.pop_front() {
         order.push(id);
-        let is_recurrence_root = !has_recurring_ancestor && recurrence_of(by_id[&id]).is_some();
+        let is_recurrence_root =
+            recurring_ancestor.is_none() && recurrence_of(by_id[&id]).is_some();
         if is_recurrence_root {
             recurrence_roots.push(id);
         }
-        let descendant_has_recurring_ancestor = has_recurring_ancestor || is_recurrence_root;
+        let recurring_root = recurring_ancestor.or(is_recurrence_root.then_some(id));
+        recurrence_root_by_item.insert(id, recurring_root);
         if let Some(nested) = children.get(&id) {
-            queue.extend(
-                nested
-                    .iter()
-                    .copied()
-                    .map(|child| (child, descendant_has_recurring_ancestor)),
-            );
+            queue.extend(nested.iter().copied().map(|child| (child, recurring_root)));
         }
     }
 
@@ -460,7 +453,7 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
                 .map(|attempts| (item.id, attempts))
         })
         .collect::<Result<_, _>>()?;
-    for id in order.into_iter().rev() {
+    for id in order.iter().copied().rev() {
         let size = subtree_sizes[&id];
         let sessions = subtree_sessions[&id];
         let attempts = subtree_attempts[&id];
@@ -582,7 +575,7 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
                     .ok_or(PreflightError::ResourceLimit)?,
             )
             .ok_or(PreflightError::ResourceLimit)?;
-        if occurrence_count > MAX_OCCURRENCES || cloned_items > MAX_MATERIALIZED_ITEMS {
+        if occurrence_count > MAX_OCCURRENCES || cloned_items > MAX_RECURRENCE_MATERIALIZED_ITEMS {
             return Err(PreflightError::ResourceLimit);
         }
     }
@@ -592,7 +585,7 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
         .checked_sub(removed_items)
         .and_then(|value| value.checked_add(cloned_items))
         .ok_or(PreflightError::ResourceLimit)?;
-    if materialized_items > MAX_MATERIALIZED_ITEMS {
+    if materialized_items > MAX_RECURRENCE_MATERIALIZED_ITEMS {
         return Err(PreflightError::ResourceLimit);
     }
     let materialized_sessions = source_sessions
@@ -603,15 +596,47 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
         .checked_sub(removed_attempts)
         .and_then(|value| value.checked_add(cloned_attempts))
         .ok_or(PreflightError::ResourceLimit)?;
-    validate_materialized_payload_budget(request, &by_id, &root_occurrences)?;
-    validate_immutable_overlap_budget(request, &by_id, &root_occurrences)?;
+    // Inherit the outer occurrence count in one forest pass. Rewalking every
+    // ancestor for each payload/candidate budget makes a deep, single-leaf
+    // routine quadratic even though it has almost no executable work.
+    let materialized_copies = order
+        .iter()
+        .map(|id| {
+            let copies = recurrence_root_by_item[id].map_or(1, |root| root_occurrences[&root]);
+            (*id, copies)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let ordering_items = request
+        .items
+        .iter()
+        .try_fold(0_usize, |total, item| {
+            // An admitted occurrence clones its whole subtree. Outside one, a
+            // direct recurring child can disappear when all of its occurrences
+            // are suppressed. Include any parent that could then become a leaf;
+            // only a guaranteed retained child rules out its own ordering work.
+            let has_guaranteed_children = children.get(&item.id).is_some_and(|children| {
+                recurrence_root_by_item[&item.id].is_some()
+                    || children
+                        .iter()
+                        .any(|child| recurrence_root_by_item[child].is_none())
+            });
+            if item.occupies_time(has_guaranteed_children) {
+                total.checked_add(materialized_copies[&item.id])
+            } else {
+                Some(total)
+            }
+        })
+        .ok_or(PreflightError::ResourceLimit)?;
+    validate_materialized_payload_budget(request, &by_id, &materialized_copies)?;
+    validate_immutable_overlap_budget(request, &by_id, &materialized_copies)?;
     let candidate_slots = candidate_slot_bound(request)?;
-    validate_candidate_string_work(request, &by_id, &root_occurrences, candidate_slots)?;
+    validate_candidate_string_work(request, &materialized_copies, candidate_slots)?;
 
     validate_candidate_work(
         request,
         candidate_slots,
         materialized_items,
+        ordering_items,
         materialized_sessions,
         materialized_attempts,
         occurrence_count,
@@ -642,8 +667,7 @@ fn candidate_slot_bound(request: &PlanRequest) -> Result<usize, PreflightError> 
 
 fn validate_candidate_string_work(
     request: &PlanRequest,
-    by_id: &BTreeMap<ItemId, &WorkItem>,
-    root_occurrences: &BTreeMap<ItemId, usize>,
+    materialized_copies: &BTreeMap<ItemId, usize>,
     candidate_slots: usize,
 ) -> Result<(), PreflightError> {
     let candidate_string_work =
@@ -651,7 +675,7 @@ fn validate_candidate_string_work(
             .items
             .iter()
             .try_fold(0_usize, |total, item| -> Result<usize, PreflightError> {
-                let multiplier = recurrence_multiplier(item.id, by_id, root_occurrences)?;
+                let multiplier = recurrence_multiplier(item.id, materialized_copies)?;
                 let item_work = candidate_string_allocation_bytes(item)?
                     .checked_mul(attempt_bound(item, request.config.slot_granularity.get())?)
                     .and_then(|value| value.checked_mul(multiplier))
@@ -667,10 +691,12 @@ fn validate_candidate_string_work(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Independent checked bounds, not untrusted planner state.
 fn validate_candidate_work(
     request: &PlanRequest,
     candidate_slots: usize,
     materialized_items: usize,
+    ordering_items: usize,
     materialized_sessions: usize,
     materialized_attempts: usize,
     occurrence_count: usize,
@@ -722,8 +748,14 @@ fn validate_candidate_work(
         .checked_mul(busy_bound)
         .and_then(|value| value.checked_mul(maximum_block_scan_factor))
         .ok_or(PreflightError::ResourceLimit)?;
-    let ordering_evaluations = materialized_items
-        .checked_mul(materialized_items)
+    // The scheduler visits every structural node but orders only executable
+    // work. Count a traversal plus pairwise ordering among that conservative
+    // population (including terminal/blocked/fixed work). This retains the
+    // previous n² charge for a fully executable graph without charging a
+    // 5,000-level single-leaf hierarchy as 5,000 competing tasks.
+    let ordering_evaluations = ordering_items
+        .checked_mul(ordering_items.saturating_sub(1))
+        .and_then(|value| value.checked_add(materialized_items))
         .ok_or(PreflightError::ResourceLimit)?;
     let previous_mapping_evaluations = request
         .previous_assignments
@@ -755,7 +787,7 @@ fn validate_candidate_work(
 fn validate_immutable_overlap_budget(
     request: &PlanRequest,
     by_id: &BTreeMap<ItemId, &WorkItem>,
-    root_occurrences: &BTreeMap<ItemId, usize>,
+    materialized_copies: &BTreeMap<ItemId, usize>,
 ) -> Result<(), PreflightError> {
     let mut intervals = Vec::new();
     for block in &request.fixed_blocks {
@@ -770,7 +802,7 @@ fn validate_immutable_overlap_budget(
         if !interval_intersects_horizon(request, event.start, event.end) {
             continue;
         }
-        let copies = recurrence_multiplier(item.id, by_id, root_occurrences)?;
+        let copies = recurrence_multiplier(item.id, materialized_copies)?;
         intervals
             .try_reserve(copies)
             .map_err(|_| PreflightError::ResourceLimit)?;
@@ -817,12 +849,12 @@ fn validate_immutable_overlap_budget(
 fn validate_materialized_payload_budget(
     request: &PlanRequest,
     by_id: &BTreeMap<ItemId, &WorkItem>,
-    root_occurrences: &BTreeMap<ItemId, usize>,
+    materialized_copies: &BTreeMap<ItemId, usize>,
 ) -> Result<(), PreflightError> {
     let mut collection_entries = 0_usize;
     let mut string_bytes = 0_usize;
     for item in &request.items {
-        let multiplier = recurrence_multiplier(item.id, by_id, root_occurrences)?;
+        let multiplier = recurrence_multiplier(item.id, materialized_copies)?;
         collection_entries = collection_entries
             .checked_add(
                 item_collection_entries(item)?
@@ -1063,23 +1095,12 @@ fn interval_intersects_horizon(
 
 fn recurrence_multiplier(
     item_id: ItemId,
-    by_id: &BTreeMap<ItemId, &WorkItem>,
-    root_occurrences: &BTreeMap<ItemId, usize>,
+    materialized_copies: &BTreeMap<ItemId, usize>,
 ) -> Result<usize, PreflightError> {
-    let mut current = Some(item_id);
-    for _ in 0..=MAX_HIERARCHY_DEPTH {
-        let Some(id) = current else {
-            return Ok(1);
-        };
-        if let Some(copies) = root_occurrences.get(&id) {
-            return Ok(*copies);
-        }
-        current = by_id
-            .get(&id)
-            .ok_or(PreflightError::InvalidRequest)?
-            .parent_id;
-    }
-    Err(PreflightError::ResourceLimit)
+    materialized_copies
+        .get(&item_id)
+        .copied()
+        .ok_or(PreflightError::InvalidRequest)
 }
 
 fn recurrence_day_bound(request: &PlanRequest) -> Result<usize, PreflightError> {
@@ -1505,6 +1526,72 @@ mod tests {
             missed_policy: HabitMissedPolicy::Ask,
             minimum_spacing: Minutes::ZERO,
         });
+    }
+
+    #[test]
+    fn potential_leaves_below_suppressed_recurrences_retain_the_ordering_budget() {
+        let mut request = fixture_request();
+        let template = request.items[0].clone();
+        request.items.clear();
+        request.availability.clear();
+        for index in 1..=3_200_u128 {
+            let mut parent = template.clone();
+            parent.id = ItemId(Uuid::from_u128(index));
+            parent.duration = None;
+            let mut child = parent.clone();
+            child.id = ItemId(Uuid::from_u128(index + 10_000));
+            child.parent_id = Some(parent.id);
+            child.kind = ItemKind::Routine(dayweave_core::RoutineSpec {
+                ordered: false,
+                recurrence: Some(Recurrence::AfterCompletion {
+                    interval: Minutes(60),
+                }),
+            });
+            child.has_own_effort = false;
+            request.items.extend([parent, child]);
+        }
+        // 6,400 source/materialized-bound items fit the item ceiling, there
+        // are no candidate slots or estimated sessions, and the recurring
+        // child containers have no own effort. The 3,200 potential parent
+        // leaves alone must still exceed the quadratic ordering budget.
+        assert!(matches!(
+            validate(&request),
+            Err(PreflightError::ResourceLimit)
+        ));
+
+        for parent in request
+            .items
+            .iter_mut()
+            .filter(|item| item.parent_id.is_none())
+        {
+            parent.has_children_outside_plan = true;
+        }
+        assert!(
+            validate(&request).is_ok(),
+            "omitted children still veto parent work"
+        );
+
+        let mut retained_children = Vec::new();
+        for parent in request
+            .items
+            .iter_mut()
+            .filter(|item| item.parent_id.is_none())
+        {
+            parent.has_children_outside_plan = false;
+            let mut child = parent.clone();
+            child.id = ItemId(Uuid::from_u128(parent.id.0.as_u128() + 20_000));
+            child.parent_id = Some(parent.id);
+            child.kind = ItemKind::Routine(dayweave_core::RoutineSpec {
+                ordered: false,
+                recurrence: None,
+            });
+            retained_children.push(child);
+        }
+        request.items.extend(retained_children);
+        assert!(
+            validate(&request).is_ok(),
+            "a retained direct child keeps its parent structural"
+        );
     }
 
     #[test]

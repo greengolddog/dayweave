@@ -799,6 +799,32 @@ projections do not emit this legacy shape.
 
 ## Recurrence
 
+Hierarchy traversal and recurring-subtree materialization are iterative, with
+no separate fixed logical-depth limit. Server composition still applies the
+[shared preflight](scheduler-helper.md#acceptance-limits): 10,000 source items,
+estimated occurrences and estimated materialized items, together with byte,
+collection, session, candidate-work and output bounds. Ordering work counts
+the conservative executable or potentially executable leaf population plus
+structural traversal, rather than charging every parent as competing work.
+One-off parents whose recurring children could all disappear remain counted as
+potential leaves. Recurring-root classification, occurrence multipliers and
+spacing use forest passes/indexed inputs instead of repeated ancestor or
+source-item scans.
+
+The core additionally checks the exact retained-plus-generated item count
+against 10,000 before cloning work items or allocating clone IDs. That guard
+does not independently bound raw `expand_occurrences`: its public topology
+validation is not a substitute for shared preflight. This prerequisite changes
+neither the public request/response shape nor helper v1, local fingerprint v1,
+publication schema `/5`, existing digests or exact historical receipt replay.
+Controlled 5,000-level core/helper composition and server preview/private
+publication recomputation pass, including source-order invariance and retained
+resource limits. Habit ownership hydration and carry-source probes also apply
+shared preflight before raw expansion; a work-budget failure rejects the
+composition and is never evidence for converting a durable carry to Skip.
+It does not provide an authoritative occurrence-member completion ledger or
+native qualified recurring-instance completion.
+
 Tasks with recurrence become recurring tasks. Habits require recurrence;
 routines may have it. Authorable forms are `daily`, `weekly`, `monthly`,
 `every_interval`, `after_completion`, `frequency`, and bounded `custom` RFC

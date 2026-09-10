@@ -1,9 +1,10 @@
 # Scheduler helper process contract
 
 `dayweave-scheduler-helper` is a one-shot, deterministic process bridge to
-`dayweave-core`. It is deliberately dormant: the macOS app does not bundle or
-invoke it yet. Shipping the helper requires a separate Swift integration,
-bundle-signing, cancellation, and fallback slice.
+`dayweave-core`. The macOS app uses it through the verified bundled
+[`SchedulerHelperClient`](../apps/macos/Sources/DayWeaveMac/Store/SchedulerHelperClient.swift);
+Android uses the same bounded protocol through its Rust/JNI bridge. Release
+build scripts package the appropriate implementation for each platform.
 
 ## Protocol v1
 
@@ -194,13 +195,30 @@ would be exceeded:
 - 500 non-control characters in item and fixed-block titles;
 - scheduler and soft-constraint weights no greater than 1,000,000;
 - 10,000 estimated occurrences and 10,000 estimated materialized items;
-- hierarchy depth no greater than 256, 100,000 occurrence-weighted collection
-  entries, 16 MiB of occurrence/session-weighted cloned and retained string
+- 100,000 occurrence-weighted collection entries, 16 MiB of
+  occurrence/session-weighted cloned and retained string
   data (including scheduled, fixed, and pinned titles plus context/location
   messages), and 10,000 immutable-overlap violations;
 - 128 MiB of estimated candidate-time context/location string formatting; and
 - 10,000,000 conservative recurrence, ordering, split-attempt, busy/block scan,
   constraint, and candidate-slot evaluations.
+
+Logical hierarchy depth has no separate fixed ceiling. Topology validation and
+recurring-subtree traversal are iterative; the item, occurrence, byte,
+collection and work budgets above still apply. JSON container nesting is a
+separate encoding bound, not a parent-chain depth limit. Ordering work charges
+the conservative executable or potentially executable leaf population, rather
+than treating every structural parent as competing work, plus structural
+traversal. A one-off parent whose only children are recurring roots is counted
+as a potential leaf because those children can disappear when all occurrences
+are suppressed. A retained child or `has_children_outside_plan` still prevents
+flexible parent demand; fixed events retain their interval exception.
+
+Recurring-root classification and inherited occurrence multipliers use forest
+passes and indexed lookup instead of repeated ancestry walks. Spacing is read
+from the indexed item and reused per materialized root. These changes remove
+depth-dependent recursion and redundant structural work, not the budgets for
+wide executable graphs or large recurrence expansion.
 
 For `compose`, canonical preparation first enforces its snapshot and accounting
 bounds. The helper then applies all of the core limits above to the normalized
@@ -218,7 +236,31 @@ recurrence expansion and scheduler search begin.
 Rolling-minute anchors are also bounded before the core alignment loop so a
 far-old anchor cannot create an unbounded index catch-up.
 
+The core also checks the exact total of retained items and generated subtree
+members against `MAX_RECURRENCE_MATERIALIZED_ITEMS = 10_000` before allocating
+clone IDs or cloning work items. Completed, paused and skipped occurrences do
+not create clones. This is defense in depth beneath the shared preflight, not
+a replacement for it: raw public `expand_occurrences` validates topology but
+does not pass through the materialized-item cap or independently enforce the
+helper's complete allocation/work limits. External core callers must still use
+`preflight_plan_request` at their trust boundary.
+
+The shared Rust regression gate passes 302 tests across core, canonical
+composition, helper and Android FFI. This includes a 5,000-node recurring tree
+through the native helper protocol on a 512-KiB stack, unchanged shallow
+goldens/fingerprints, potential-leaf admission and retained resource limits.
+Server preview and private publication recomputation also pass a controlled
+5,000-node case. The full API gate passes 638 tests against fresh PostgreSQL,
+including database-only tests; workspace warnings-denied Clippy and formatting
+pass. These are engine/bridge/service checks, not physical native-device
+interaction or recurring-instance completion acceptance.
+
 ## Schema behavior
+
+This prerequisite leaves helper protocol v1, the local-composition fingerprint
+domain v1 and server publication schema `dayweave-scheduler-publication/5`
+unchanged. It widens depth admission within bounded work without changing the
+wire or the outputs of previously accepted requests.
 
 The envelope must contain exactly `protocol`, `version`, `operation`, and
 `request`. Each operation has a distinct strict request shape: a `plan` request

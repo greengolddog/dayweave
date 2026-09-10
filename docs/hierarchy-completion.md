@@ -77,6 +77,34 @@ Authoritative occurrence outcomes, not a bounded execution-history window,
 must supply the evidence. This engine does not award time, settle execution
 commands, stop reservations, or infer completion from estimated duration.
 
+### Depth-safe recurrence prerequisite
+
+The current development slice removes the scheduler helper's former fixed
+256-level admission limit and makes recurring-subtree traversal iterative.
+Logical depth remains unrestricted by a separate depth policy, within the
+existing 10,000-item/occurrence/materialization and byte, collection and
+candidate-work budgets. Ordering cost counts executable or potentially
+executable leaves plus structural traversal, not every container as competing
+work. Recurring-root classification, inherited occurrence multipliers and
+spacing use forest passes/indexed inputs to avoid repeated ancestry and
+source-item scans. The core rejects an exact retained-plus-generated count
+above 10,000 before cloning work items or allocating clone IDs.
+
+Public raw occurrence expansion now validates topology, but that materialized
+item guard does not alone bound its allocation. External callers still require
+the [shared preflight](scheduler-helper.md#acceptance-limits). Helper v1, local
+fingerprint v1, publication schema `/5` and existing wire/receipt contracts are
+unchanged. Controlled 5,000-level traversal, native helper-protocol composition
+and server preview/publication recomputation pass; the shared Rust gate passes
+302 tests with retained resource-bound and shallow-output coverage.
+
+This is not qualified recurring completion. The durable exact-publication
+occurrence/member manifest, occurrence-scoped policy/lifecycle evidence and
+replay/delta integration, scheduling-ledger fence and native occurrence review
+remain unfinished. A materialized plan or template status cannot substitute
+for that authority, and this prerequisite does not narrow `HIE-004` or count as
+deep native completion-cascade acceptance.
+
 ## Decision engine boundary
 
 The shared engine takes a complete normalized active forest, explicit policy,
