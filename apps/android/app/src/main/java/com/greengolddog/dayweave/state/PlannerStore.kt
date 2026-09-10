@@ -63,6 +63,12 @@ import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
+import com.greengolddog.dayweave.model.RoutinePlanningInputCapsule
+import com.greengolddog.dayweave.model.RoutinePlanningWitnessProtocolException
+import com.greengolddog.dayweave.model.hasRoutinePlanningInputReadiness
+import com.greengolddog.dayweave.model.routinePlanningStableInputFingerprint
+import com.greengolddog.dayweave.model.requireRoutinePlanningEncodedBudget
+import com.greengolddog.dayweave.model.MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES
 import com.greengolddog.dayweave.model.fenceRoutineOccurrenceAuthority
 import com.greengolddog.dayweave.model.RoutineOccurrenceDeferAdmission
 import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
@@ -377,6 +383,21 @@ class PlannerPersistenceReceipt internal constructor(
 ) {
     suspend fun awaitDurable(): Boolean = completion.await()
 }
+
+/** Process-local ownership only. Never serialized into the capsule or reconstructed on load. */
+class RoutinePlanningInputCaptureFence internal constructor(
+    val state: DayWeaveUiState,
+    internal val generation: Long,
+    val stableInputFingerprint: String,
+) {
+    override fun toString() = "RoutinePlanningInputCaptureFence(<protected, runtime-only>)"
+}
+
+class RoutinePlanningInputTransition internal constructor(
+    val capsule: RoutinePlanningInputCapsule,
+    val persistence: PlannerPersistenceReceipt,
+    val postSaveFence: RoutinePlanningInputCaptureFence,
+)
 
 class LocalScheduleCompositionTransition internal constructor(
     val provenance: LocalScheduleCompositionProvenanceSnapshot,
@@ -1399,6 +1420,7 @@ class PlannerStore(
             if (!sameBinding) {
                 require(
                         current.canonicalItems.isEmpty() &&
+                        current.routinePlanningInputCapsule == null &&
                         current.routineOccurrenceLedger.syncOrigin == null &&
                         current.canonicalDeltaCursor == null &&
                         current.pendingSchedulePublication == null &&
@@ -3684,7 +3706,67 @@ class PlannerStore(
 
     /** Cached protected history can be forgotten only after every intent and receipt is resolved. */
     internal fun quarantineRoutineOccurrenceLedger(): PlannerPersistenceReceipt? =
-        mutateRoutineOccurrences { it.routineOccurrenceLedger.quarantineRoutineOccurrences() }
+        mutateDurably { current -> current.copy(routineOccurrenceLedger = current.routineOccurrenceLedger.quarantineRoutineOccurrences(), routinePlanningInputCapsule = null) }
+
+    /** Capturing a fence does not authenticate an HTTP response or permit helper installation. */
+    internal fun captureRoutinePlanningInputFence(): RoutinePlanningInputCaptureFence? = synchronized(persistenceLock) {
+        val current = mutableState.value
+        if (persistenceStatus !in setOf(PersistenceStatus.READY, PersistenceStatus.DISABLED) || !current.hasRoutinePlanningInputReadiness()) return@synchronized null
+        try {
+            requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), current.copy(routinePlanningInputCapsule = null), MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
+            RoutinePlanningInputCaptureFence(current, currentGeneration, current.routinePlanningStableInputFingerprint())
+        } catch (_: Exception) { null }
+    }
+
+    internal fun isRoutinePlanningInputFenceCurrent(fence: RoutinePlanningInputCaptureFence): Boolean = synchronized(persistenceLock) {
+        persistenceStatus in setOf(PersistenceStatus.READY, PersistenceStatus.DISABLED) &&
+            currentGeneration == fence.generation && mutableState.value === fence.state
+    }
+
+    /**
+     * The caller owns authenticated transport, privacy and cancellation. isCurrent is synchronous,
+     * side-effect-free, and must not perform auth lookup or any IO while this lock is held.
+     */
+    internal fun commitRoutinePlanningInputCapsule(
+        capsule: RoutinePlanningInputCapsule,
+        expected: RoutinePlanningInputCaptureFence,
+        isCurrent: () -> Boolean,
+    ): RoutinePlanningInputTransition? {
+        try {
+            val mutation = mutateDurablyWithSnapshot { current ->
+                require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected))
+                require(current.hasRoutinePlanningInputReadiness())
+                capsule.requireValid()
+                require(capsule.syncOrigin == current.canonicalSyncOrigin && capsule.configurationId == current.canonicalConfigurationId)
+                require(capsule.stableInputFingerprint == expected.stableInputFingerprint)
+                require(capsule.stableInputFingerprint == current.routinePlanningStableInputFingerprint())
+                require(capsule.witness.terminalCursor == current.routineOccurrenceLedger.deltaCursor)
+                require(capsule.witness.executionSnapshotRevision == current.canonicalExecutionRevision)
+                require(capsule.canonicalItems == current.canonicalItems.sortedBy { it.id })
+                current.routinePlanningInputCapsule?.let { pinned ->
+                    require(pinned.syncOrigin == capsule.syncOrigin && pinned.configurationId == capsule.configurationId)
+                    require(pinned.workspaceId == capsule.workspaceId && pinned.userId == capsule.userId)
+                }
+                val proposed = current.copy(routinePlanningInputCapsule = capsule)
+                require(capsule.isReusableInput(proposed, nowEpochMillis(), allowPrivateContent = true))
+                // Admission is all-or-nothing. No cache/journal trimming buys room for a new artifact.
+                requireRoutinePlanningEncodedBudget(DayWeaveUiState.serializer(), proposed, MAX_ROUTINE_PLANNING_CAPSULE_SNAPSHOT_ADMISSION_BYTES)
+                // Validation/encoding may be substantial; withdrawal during that work must not
+                // acquire durable custody merely because the operation was current at entry.
+                require(isCurrent() && isRoutinePlanningInputFenceCurrent(expected))
+                proposed
+            } ?: return null
+            val receipt = requireNotNull(mutation.receipt)
+            return RoutinePlanningInputTransition(capsule, receipt,
+                RoutinePlanningInputCaptureFence(mutation.snapshot, receipt.generation, capsule.stableInputFingerprint))
+        } catch (_: Exception) { throw RoutinePlanningWitnessProtocolException() }
+    }
+
+    /** Explicit local discard changes no occurrence history, request, receipt target or schedule latch. */
+    internal fun discardRoutinePlanningInputCapsule(expected: RoutinePlanningInputCapsule): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.routinePlanningInputCapsule == expected)
+        current.copy(routinePlanningInputCapsule = null)
+    }
 
     /** Establishes an empty habit cache under the exact credential/workspace binding. */
     fun bindHabitLedger(
@@ -6164,6 +6246,7 @@ class PlannerStore(
             itemProgressLedger = com.greengolddog.dayweave.model.ItemProgressLedger(),
             itemCompletionLedger = com.greengolddog.dayweave.model.ItemCompletionLedger(),
             routineOccurrenceLedger = RoutineOccurrenceLedger(),
+            routinePlanningInputCapsule = null,
             itemCompletionGetProofs = emptyMap(),
             pendingCanonicalMutation = null,
             canonicalExecutionSyncOrigin = null,
@@ -7995,7 +8078,8 @@ class PlannerStore(
             mutableState.value = current.copy(itemProgressLedger = retainedProgress,
                 itemCompletionLedger = retainedCompletion, itemCompletionGetProofs = emptyMap(),
                 // Receipt settlement and journal removal roll back together on failed disk IO.
-                routineOccurrenceLedger = mutableDurableState.value?.routineOccurrenceLedger ?: RoutineOccurrenceLedger())
+                routineOccurrenceLedger = mutableDurableState.value?.routineOccurrenceLedger ?: RoutineOccurrenceLedger(),
+                routinePlanningInputCapsule = mutableDurableState.value?.routinePlanningInputCapsule)
                 .withPendingSensitivityHardened()
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {

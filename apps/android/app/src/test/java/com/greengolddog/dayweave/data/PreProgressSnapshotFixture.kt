@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.RoutineOccurrenceLedger
 import com.greengolddog.dayweave.model.ITEM_PROGRESS_JSON
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
 
@@ -15,8 +16,13 @@ import kotlinx.serialization.json.jsonObject
  * Never use this in progress-injection tests, which exercise the unmodified stored bytes.
  */
 internal fun PlannerSnapshotEntity.asPreProgressFixtureWhenRelabelled(): PlannerSnapshotEntity {
-    if (payloadFormat == PlannerSnapshotFormats.JSON_V24) return this
+    if (payloadFormat == PlannerSnapshotFormats.JSON_V25) return this
     var root = Json.parseToJsonElement(payload).jsonObject
+    root["routinePlanningInputCapsule"]?.let {
+        require(it == JsonNull) { "A historical fixture cannot discard protected planning input" }
+        root = JsonObject(root - "routinePlanningInputCapsule")
+    }
+    if (payloadFormat == PlannerSnapshotFormats.JSON_V24) return copy(payload = root.toString())
     root["routineOccurrenceLedger"]?.let {
         require(it == ITEM_PROGRESS_JSON.encodeToJsonElement(RoutineOccurrenceLedger())) {
             "A historical fixture cannot discard occurrence authority"

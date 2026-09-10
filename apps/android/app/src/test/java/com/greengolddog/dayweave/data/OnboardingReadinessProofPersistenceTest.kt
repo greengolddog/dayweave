@@ -35,7 +35,7 @@ class OnboardingReadinessProofPersistenceTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(state.onboardingFirstItemAnchor, restored.onboardingFirstItemAnchor)
-        assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
         val root = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
         val anchor = requireNotNull(root["onboardingFirstItemAnchor"]).jsonObject
         assertEquals(setOf("itemId", "canonicalRevision"), anchor.keys)
@@ -99,7 +99,7 @@ class OnboardingReadinessProofPersistenceTest {
             val restored = requireNotNull(repository.load())
 
             assertNull(restored.onboardingFirstItemAnchor)
-            assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
             val rewritten = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
             assertTrue(rewritten.getValue("onboardingFirstItemAnchor") is JsonNull)
         }

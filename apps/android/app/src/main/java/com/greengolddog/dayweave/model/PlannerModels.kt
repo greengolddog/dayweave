@@ -2164,6 +2164,8 @@ data class DayWeaveUiState(
     val itemCompletionLedger: ItemCompletionLedger = ItemCompletionLedger(),
     /** Separate ledger-instance authority; never projects occurrence outcomes into templates. */
     val routineOccurrenceLedger: RoutineOccurrenceLedger = RoutineOccurrenceLedger(),
+    /** Protected fixed-input custody only; restore never grants a live witness/helper admission. */
+    val routinePlanningInputCapsule: RoutinePlanningInputCapsule? = null,
     /** Runtime reads/privacy changes fence planning even when a remote review preserves status. */
     @kotlinx.serialization.Transient
     val routineOccurrenceAuthorityGeneration: Long = 0,

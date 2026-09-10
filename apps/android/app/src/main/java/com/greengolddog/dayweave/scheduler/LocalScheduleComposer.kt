@@ -6,6 +6,15 @@ import com.greengolddog.dayweave.model.CanonicalDeadlineKind
 import com.greengolddog.dayweave.model.CanonicalDeadlineStrength
 import com.greengolddog.dayweave.model.CanonicalDurationKind
 import com.greengolddog.dayweave.model.CanonicalDurationSource
+import com.greengolddog.dayweave.model.RoutinePlanningWitness
+import com.greengolddog.dayweave.model.RoutinePlanningSchedule
+import com.greengolddog.dayweave.model.RoutinePlanningLifecycle
+import com.greengolddog.dayweave.model.decodePlanningUtf8
+import com.greengolddog.dayweave.model.requirePlanningJson
+import com.greengolddog.dayweave.model.requirePlanningInstant
+import com.greengolddog.dayweave.model.requirePlanningUuid
+import com.greengolddog.dayweave.model.requirePlanningOccurrenceId
+import com.greengolddog.dayweave.model.requirePlanningIdentity
 import com.greengolddog.dayweave.model.requireValidStructuralMetadata
 import com.greengolddog.dayweave.network.RemoteIgnoredPreviousAssignment
 import com.greengolddog.dayweave.network.RemotePlanDecision
@@ -36,6 +45,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -70,6 +80,18 @@ fun interface LocalScheduleComposer {
     ): LocalScheduleComposition
 }
 
+/** Deliberately distinct from v1: a positive occurrence head cannot disappear in a generic result. */
+data class RoutineOccurrenceLocalComposition(
+    val composition: LocalScheduleComposition,
+    val occurrenceSnapshotRevision: Long,
+) {
+    override fun toString() = "RoutineOccurrenceLocalComposition(<protected>)"
+}
+
+fun interface RoutineLifecycleScheduleComposer {
+    suspend fun compose(items: List<CanonicalItemSnapshot>, witness: RoutinePlanningWitness): RoutineOccurrenceLocalComposition
+}
+
 class LocalScheduleCompositionProtocolException :
     IllegalStateException("Bundled scheduler returned an invalid response")
 
@@ -101,7 +123,7 @@ class RustScheduleComposer(
     private val bridge: RustSchedulerByteArrayBridge =
         RustSchedulerByteArrayBridge(RustSchedulerNative::process),
     private val beforeBridge: suspend () -> Unit = {},
-) : LocalScheduleComposer {
+) : LocalScheduleComposer, RoutineLifecycleScheduleComposer {
     override suspend fun compose(
         items: List<CanonicalItemSnapshot>,
         request: SchedulePreviewRequest,
@@ -116,6 +138,134 @@ class RustScheduleComposer(
         decodeResponse(response).copy(
             scheduleRequestFingerprint = requestBytes.sha256Fingerprint(),
         )
+    }
+
+    /** This explicit entry point never retries with helper v1 or installs its result. */
+    override suspend fun compose(items: List<CanonicalItemSnapshot>, witness: RoutinePlanningWitness): RoutineOccurrenceLocalComposition = withContext(Dispatchers.Default) {
+        ensureActive()
+        val requestBytes = encodeWitnessRequest(items, witness)
+        beforeBridge(); ensureActive()
+        val response = bridge.process(requestBytes) ?: throw LocalScheduleCompositionProtocolException()
+        ensureActive()
+        val decoded = decodeV2Response(response, witness)
+        ensureActive()
+        decoded.copy(composition = decoded.composition.copy(scheduleRequestFingerprint = requestBytes.sha256Fingerprint()))
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    internal fun encodeWitnessRequest(items: List<CanonicalItemSnapshot>, witness: RoutinePlanningWitness, byteLimit: Int = MAX_MESSAGE_BYTES): ByteArray {
+        require(byteLimit in 1..MAX_MESSAGE_BYTES)
+        val output = BoundedRequestOutput(byteLimit)
+        try {
+            witness.requireValid(); witness.requireCurrentSources(items)
+            output.writeAscii("{\"protocol\":\"dayweave.scheduler.helper\",\"version\":2,\"operation\":\"compose\",\"request\":{\"canonical_items\":[")
+            items.forEachIndexed { index, item ->
+                if (index > 0) output.write(','.code)
+                JSON.encodeToStream(HelperCanonicalItem.serializer(), item.toHelperItem(), output)
+            }
+            output.writeAscii(REQUEST_SCHEDULE_SEPARATOR)
+            JSON.encodeToStream(RoutinePlanningSchedule.serializer(), witness.schedule, output)
+            output.writeAscii(",\"occurrence_lifecycle\":")
+            JSON.encodeToStream(RoutinePlanningLifecycle.serializer(), witness.occurrenceLifecycle, output)
+            output.writeAscii(REQUEST_SUFFIX)
+            return output.finish()
+        } catch (_: LocalScheduleCompositionRequestTooLargeException) { throw LocalScheduleCompositionRequestTooLargeException() }
+        catch (error: Exception) {
+            if (error.hasRequestTooLargeCause()) throw LocalScheduleCompositionRequestTooLargeException()
+            throw LocalScheduleCompositionRequestException()
+        }
+    }
+
+    internal fun decodeV2Response(bytes: ByteArray, witness: RoutinePlanningWitness): RoutineOccurrenceLocalComposition {
+        try {
+            witness.requireValid()
+            require(bytes.size in 1..MAX_MESSAGE_BYTES && bytes.last() == '\n'.code.toByte())
+            val text = decodePlanningUtf8(bytes.copyOf(bytes.size - 1)); requirePlanningJson(text)
+            val root = JSON.parseToJsonElement(text).jsonObject
+            root.requireExactKeys("protocol", "version", "result")
+            require(root.getValue("protocol").jsonPrimitive.isString && root.string("protocol") == PROTOCOL)
+            require(!root.getValue("version").jsonPrimitive.isString && root.getValue("version").jsonPrimitive.content == "2")
+            val result = root.getValue("result").jsonObject
+            require(result.getValue("type").jsonPrimitive.isString)
+            if (result.string("type") == "error") {
+                result.requireExactKeys("type", "error")
+                val error = result.getValue("error").jsonObject; error.requireExactKeys("code", "message")
+                require(error.getValue("code").jsonPrimitive.isString && error.getValue("message").jsonPrimitive.isString)
+                val code = error.string("code")
+                require(code in V2_ERROR_CODES && error.string("message").isNotBlank())
+                throw LocalScheduleCompositionRejectedException(code)
+            }
+            require(result.string("type") == "composition"); result.requireExactKeys("type", "composition")
+            val raw = result.getValue("composition").jsonObject
+            val exact = JSON.decodeFromJsonElement<HelperV2Composition>(raw)
+            require(JSON.encodeToJsonElement(exact) == raw)
+            require(exact.occurrenceSnapshotRevision == witness.occurrenceLifecycle.snapshotRevision)
+            val legacyShape = JsonObject(raw.filterKeys { it != "occurrence_snapshot_revision" })
+            val decoded = decodeComposition(JsonObject(mapOf("type" to result.getValue("type"), "composition" to legacyShape)))
+            require(decoded.localInputFingerprint == witness.localInputFingerprint)
+            require(decoded.sourceItemRevisions == witness.sourceItemRevisions && decoded.sourceItemCount == witness.sourceItemRevisions.size)
+            require(decoded.acceptedItemCount == decoded.sourceItemCount)
+            require(decoded.rejectedItems.isEmpty()) // Qualified server capture rejects ineligible sources.
+            requireV2Plan(decoded.plan, witness)
+            return RoutineOccurrenceLocalComposition(decoded, exact.occurrenceSnapshotRevision)
+        } catch (error: LocalScheduleCompositionRejectedException) { throw error }
+        catch (_: Exception) { throw LocalScheduleCompositionProtocolException() }
+    }
+
+    private fun requireV2Plan(plan: RemoteSchedulePlan, witness: RoutinePlanningWitness) {
+        val schedule = witness.schedule
+        require(requirePlanningInstant(plan.asOf) == requirePlanningInstant(schedule.asOf))
+        val start = requirePlanningInstant(plan.horizonStart); val end = requirePlanningInstant(plan.horizonEnd)
+        require(start == requirePlanningInstant(schedule.horizonStart) && end == requirePlanningInstant(schedule.horizonEnd))
+        require(plan.score.scheduledMinutes in 0..4_294_967_295L && plan.score.unscheduledMinutes in 0..4_294_967_295L && plan.score.movedMinutes in 0..4_294_967_295L)
+        val occurrences = plan.occurrences.associateBy { it.id }
+        require(occurrences.size == plan.occurrences.size && occurrences.size <= 10_000)
+        occurrences.values.forEach {
+            requirePlanningOccurrenceId(it.id); requirePlanningUuid(it.seriesItemId)
+            require(it.seriesItemId in witness.sourceItemRevisions && it.ordinal in 0..4_294_967_295L)
+            requirePlanningIdentity(it.identity)
+            require(requirePlanningInstant(it.nominalStart) < requirePlanningInstant(it.nominalEnd))
+            require(requirePlanningInstant(it.windowStart) < requirePlanningInstant(it.windowEnd))
+            require(it.state in setOf("generated", "completed", "paused", "skipped"))
+            it.localDate?.let { date -> require(java.time.LocalDate.parse(date).toString() == date) }
+        }
+        val managed = witness.occurrenceLifecycle.instances.associateBy { it.occurrenceId }
+        managed.forEach { (id, instance) ->
+            val occurrence = requireNotNull(occurrences[id])
+            require(occurrence.seriesItemId == instance.rootItemId && occurrence.identity == instance.identity && occurrence.state == "generated")
+        }
+        val ids = HashSet<String>()
+        plan.blocks.forEach { block ->
+            requirePlanningUuid(block.id); require(ids.add(block.id))
+            require(block.kind in setOf("planned", "pinned", "calendar_event", "external_fixed"))
+            require(block.title.isNotBlank() && block.title.length <= 4096)
+            block.explanations.forEach { require(it.code in V2_EXPLANATION_CODES && it.message.isNotBlank() && it.message.length <= 4096) }
+            val blockStart = requirePlanningInstant(block.start); val blockEnd = requirePlanningInstant(block.end)
+            require(blockStart < blockEnd && blockStart >= start && blockEnd <= end && block.sessionIndex in 0..65_535)
+            block.itemId?.let { requirePlanningUuid(it); require(it in witness.sourceItemRevisions) }
+            block.externalBlockId?.let(::requirePlanningUuid)
+            block.occurrenceId?.let { id ->
+                requirePlanningOccurrenceId(id); require(id in occurrences && block.itemId != null)
+                managed[id]?.let { require(it.members.any { member -> member.itemId == block.itemId }) }
+            }
+        }
+        plan.unscheduled.forEach {
+            requirePlanningUuid(it.itemId); require(it.itemId in witness.sourceItemRevisions && it.remaining in 0..4_294_967_295L)
+            require(it.reason in setOf("missing_duration", "no_capacity", "hard_constraint", "blocked", "dependency_unavailable", "dependency_cycle", "session_limit"))
+            require(it.message.isNotBlank() && it.message.length <= 4096); it.occurrenceId?.let { id -> require(id in occurrences) }
+        }
+        plan.decisions.forEach {
+            requirePlanningUuid(it.itemId); require(it.itemId in witness.sourceItemRevisions)
+            require(it.kind in setOf("container_rolled_up", "terminal_item_ignored", "fixed_event_retained", "scheduled", "partially_scheduled", "kept_pinned"))
+            require(it.message.isNotBlank() && it.message.length <= 4096); it.occurrenceId?.let { id -> require(id in occurrences) }
+        }
+        plan.violations.forEach { violation ->
+            require(violation.kind in setOf("soft_constraint", "fixed_overlap", "pinned_conflict", "deadline_risk", "dependency", "buffer_compressed", "capacity"))
+            require(violation.severity in setOf("warning", "error") && violation.message.isNotBlank() && violation.message.length <= 4096)
+            violation.itemIds.forEach { requirePlanningUuid(it); require(it in witness.sourceItemRevisions) }
+            violation.occurrenceIds.forEach { requirePlanningOccurrenceId(it); require(it in occurrences) }
+            violation.start?.let(::requirePlanningInstant); violation.end?.let(::requirePlanningInstant)
+        }
     }
 
     @OptIn(ExperimentalSerializationApi::class)
@@ -389,6 +539,8 @@ class RustScheduleComposer(
         const val REQUEST_SUFFIX = "}}"
         const val LOCAL_FINGERPRINT_PREFIX = "local-sha256:"
         val ERROR_CODE_PATTERN = Regex("[a-z][a-z0-9_]{0,63}")
+        val V2_ERROR_CODES = setOf("request_too_large", "invalid_utf8", "invalid_json", "duplicate_json_key", "json_depth_exceeded", "unsupported_protocol", "unsupported_version", "unsupported_operation", "invalid_request", "resource_limit_exceeded", "response_too_large", "invalid_horizon", "invalid_granularity", "duplicate_item", "invalid_item", "invalid_window", "missing_previous_item", "invalid_hierarchy", "invalid_recurrence", "internal_failure")
+        val V2_EXPLANATION_CODES = setOf("fixed_event", "pinned", "hard_deadline", "goal_progress", "habit_or_routine", "priority", "preferred_window", "context_match", "energy_match", "dependency", "stable_time", "earliest_available", "split_session")
         val HELPER_SUPPORTED_ITEM_KINDS = setOf(
             "event", "task", "habit", "routine", "goal", "project", "break",
         )
@@ -403,6 +555,18 @@ class RustScheduleComposer(
         }
     }
 }
+
+@Serializable
+private data class HelperV2Composition(
+    @SerialName("local_input_fingerprint") val localInputFingerprint: String,
+    @SerialName("source_item_count") val sourceItemCount: Int,
+    @SerialName("source_item_revisions") val sourceItemRevisions: Map<String, Long>,
+    @SerialName("accepted_item_count") val acceptedItemCount: Int,
+    @SerialName("rejected_items") val rejectedItems: List<RemoteRejectedScheduleItem>,
+    @SerialName("ignored_previous_assignments") val ignoredPreviousAssignments: List<RemoteIgnoredPreviousAssignment>,
+    val plan: RemoteSchedulePlan,
+    @SerialName("occurrence_snapshot_revision") val occurrenceSnapshotRevision: Long,
+)
 
 @Serializable
 private data class HelperCanonicalItem(

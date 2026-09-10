@@ -36,7 +36,7 @@ class ItemProgressPersistenceTest {
             val repository = RoomPlannerStateRepository(dao) { 1_000 }
             val original = state(disposition)
             repository.save(original)
-            assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
             val first = requireNotNull(repository.load())
             assertEquals(original.itemProgressLedger, first.itemProgressLedger)
             assertEquals(original.itemProgressLedger.pending.single().requestJson,
@@ -58,12 +58,12 @@ class ItemProgressPersistenceTest {
                 createdAt = INSTANT),
         )))
         val old = requireNotNull(dao.snapshot)
-        val oldRoot = Json.parseToJsonElement(old.payload).jsonObject - "itemProgressLedger" - "itemCompletionLedger" - "routineOccurrenceLedger"
+        val oldRoot = Json.parseToJsonElement(old.payload).jsonObject - "itemProgressLedger" - "itemCompletionLedger" - "routineOccurrenceLedger" - "routinePlanningInputCapsule"
         dao.snapshot = old.copy(payload = JsonObject(oldRoot).toString(), payloadFormat = PlannerSnapshotFormats.JSON_V21)
         assertEquals(ItemProgressLedger(), repository.load()?.itemProgressLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
         val newRoot = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload).jsonObject
-        assertEquals(oldRoot, newRoot - "itemProgressLedger" - "itemCompletionLedger" - "routineOccurrenceLedger")
+        assertEquals(oldRoot, newRoot - "itemProgressLedger" - "itemCompletionLedger" - "routineOccurrenceLedger" - "routinePlanningInputCapsule")
     }
 
     @Test
@@ -78,7 +78,7 @@ class ItemProgressPersistenceTest {
                 val repository = RoomPlannerStateRepository(dao) { 1_000 }
                 repository.save(DayWeaveUiState())
                 val current = requireNotNull(dao.snapshot)
-                val root = Json.parseToJsonElement(current.payload).jsonObject
+                val root = Json.parseToJsonElement(current.payload).jsonObject - "routinePlanningInputCapsule" - "routineOccurrenceLedger" - "itemCompletionLedger"
                 val injected = current.copy(payload = JsonObject(root + ("itemProgressLedger" to ledger)).toString(),
                     payloadFormat = format)
                 dao.snapshot = injected

@@ -1274,6 +1274,15 @@ class DayWeaveApplication : Application() {
             !hasAccountRecoveryWorkBlocker() &&
             localScheduleCompositionLauncher.launch()
 
+    /** Explicit private connected read, sharing the existing foreground/cancellation gate. */
+    fun launchRoutinePlanningInputPreparation(): Boolean =
+        onboardingRuntimeGate.privatePresentationAllowed() &&
+            !hasGoogleAuthorizationRecoveryBlocker() &&
+            !hasAccountRecoveryWorkBlocker() &&
+            localScheduleCompositionLauncher.launch { generation ->
+                canonicalSyncManager.prepareRoutinePlanningInput(generation)
+            }
+
     /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
     fun cancelLocalScheduleComposition() = localScheduleCompositionLauncher.cancel()
 

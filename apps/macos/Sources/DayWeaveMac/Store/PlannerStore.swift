@@ -376,6 +376,11 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var routineOccurrenceState: RoutineOccurrenceState {
         didSet { scheduleAutosave() }
     }
+    /// Optional fixed-input custody only; this never enables routine v2 installation.
+    @Published private(set) var routinePlanningInputCapsule: RoutinePlanningInputCapsule? {
+        didSet { scheduleAutosave() }
+    }
+    private let routinePlanningInputCaptureOwner = UUID()
     @Published private(set) var itemCompletionEvidenceGeneration: UInt64 = 0
     @Published private(set) var routineOccurrencePlanningGeneration: UInt64 = 0
     @Published private(set) var itemCompletionReadAdmissions: [UUID: ItemCompletionReadAdmission] = [:]
@@ -572,6 +577,7 @@ final class PlannerStore: ObservableObject {
         itemProgressState: ItemProgressState = .empty,
         itemCompletionState: ItemCompletionState = .empty,
         routineOccurrenceState: RoutineOccurrenceState = .empty,
+        routinePlanningInputCapsule: RoutinePlanningInputCapsule? = nil,
         scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
@@ -784,6 +790,13 @@ final class PlannerStore: ObservableObject {
         self.itemProgressState = initialItemProgressState
         self.itemCompletionState = initialItemCompletionState
         self.routineOccurrenceState = initialRoutineOccurrenceState
+        let initialRoutinePlanningInputCapsule = restoredSnapshot == nil
+            ? routinePlanningInputCapsule : restoredSnapshot?.routinePlanningInputCapsule
+        if let capsule = initialRoutinePlanningInputCapsule,
+           (try? capsule.validate()) == nil || capsule.configurationIdentifier != initialCanonicalConfigurationIdentifier {
+            restorationError = .snapshotDecodingFailed
+        }
+        self.routinePlanningInputCapsule = initialRoutinePlanningInputCapsule
         if !initialRoutineOccurrenceState.isValid
             || (initialRoutineOccurrenceState.configurationIdentifier != nil
                 && initialRoutineOccurrenceState.configurationIdentifier != initialCanonicalConfigurationIdentifier) {
@@ -1063,6 +1076,143 @@ final class PlannerStore: ObservableObject {
     func invalidateRoutineOccurrencePlanningEvidence(authorityChanged: Bool = false) {
         routineOccurrencePlanningGeneration &+= 1
         if authorityChanged || localScheduleCompositionProvenance != nil { invalidateCanonicalPreview() }
+    }
+
+    /// May run before or during the caller's owned canonical-sync lock. The
+    /// lock itself is not a planning input; the complete durable preimage and
+    /// process read generations are. Privacy and authenticated-operation
+    /// ownership remain the coordinator's responsibility.
+    func routinePlanningInputPreparationIssue(
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) -> RoutinePlanningInputCapsuleError? {
+        routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint)
+    }
+
+    func captureRoutinePlanningInputFence(
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) throws -> RoutinePlanningInputCaptureFence {
+        if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { throw issue }
+        flushPersistence()
+        if let persistenceError { throw persistenceError }
+        return .init(environment: try .init(planner: self, habitCheckpoint: habitCheckpoint),
+            canonicalItems: canonicalItems, priorCapsule: routinePlanningInputCapsule,
+            snapshot: makeSnapshot(savedAt: Date(timeIntervalSince1970: 0)),
+            ownerID: routinePlanningInputCaptureOwner,
+            occurrenceGeneration: routineOccurrencePlanningGeneration,
+            canonicalGeneration: itemCompletionEvidenceGeneration, habitCheckpoint: habitCheckpoint)
+    }
+
+    func requireRoutinePlanningInputFence(
+        _ fence: RoutinePlanningInputCaptureFence,
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) throws {
+        if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { throw issue }
+        guard !Task.isCancelled,
+              fence.ownerID == routinePlanningInputCaptureOwner,
+              fence.occurrenceGeneration == routineOccurrencePlanningGeneration,
+              fence.canonicalGeneration == itemCompletionEvidenceGeneration,
+              fence.habitCheckpoint == habitCheckpoint,
+              fence.snapshot == makeSnapshot(savedAt: Date(timeIntervalSince1970: 0)) else {
+            throw RoutinePlanningInputCapsuleError.superseded
+        }
+    }
+
+    /// Exact in-memory preimage and existing encrypted-file CAS. Neither
+    /// successful capture nor failure touches any outbox, cursor, catch-up
+    /// target, publication latch or current schedule proof.
+    func commitRoutinePlanningInputCapsule(
+        _ capsule: RoutinePlanningInputCapsule,
+        expected fence: RoutinePlanningInputCaptureFence,
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) throws {
+        try requireRoutinePlanningInputFence(fence, habitCheckpoint: habitCheckpoint)
+        try capsule.validate()
+        guard capsule.configurationIdentifier == canonicalConfigurationIdentifier,
+              capsule.canonicalItems == fence.canonicalItems,
+              capsule.environment == fence.environment,
+              capsule.capturedAt <= now() else { throw RoutinePlanningInputCapsuleError.inputChanged }
+        if let pin = fence.priorCapsule {
+            guard pin.configurationIdentifier == capsule.configurationIdentifier,
+                  pin.origin == capsule.origin, pin.workspaceID == capsule.workspaceID,
+                  pin.userID == capsule.userID else { throw RoutinePlanningInputCapsuleError.scopeChanged }
+        }
+        // Cancellation may arrive while the bounded synchronous validation
+        // runs, even though MainActor input mutations cannot interleave.
+        try requireRoutinePlanningInputFence(fence, habitCheckpoint: habitCheckpoint)
+        let prior = routinePlanningInputCapsule
+        routinePlanningInputCapsule = capsule
+        do {
+            // The capsule gets no new plaintext allowance; all preexisting
+            // journals must still fit in the exact same complete snapshot.
+            try persistence?.preflightSave(makeSnapshot())
+            guard !Task.isCancelled else { throw RoutinePlanningInputCapsuleError.superseded }
+        } catch {
+            routinePlanningInputCapsule = prior
+            throw error
+        }
+        flushPersistence()
+        if let persistenceError {
+            routinePlanningInputCapsule = prior
+            throw persistenceError
+        }
+    }
+
+    /// Returns a stale reason without discarding the encrypted artifact. A nil
+    /// result is fixed-input eligibility only, not fresh remote authority or a
+    /// privacy/review/execution lease. The original request clock never advances.
+    func routinePlanningInputCapsuleIssue(
+        origin: String, configurationIdentifier: String,
+        habitCheckpoint: HabitCompositionCheckpoint?, at date: Date
+    ) -> RoutinePlanningInputCapsuleError? {
+        if let issue = routinePlanningInputCustodyIssue(habitCheckpoint: habitCheckpoint) { return issue }
+        guard let capsule = routinePlanningInputCapsule else { return .incompleteSources }
+        guard (try? capsule.validate()) != nil else { return .invalidData }
+        guard capsule.origin == origin, capsule.configurationIdentifier == configurationIdentifier,
+              canonicalConfigurationIdentifier == configurationIdentifier else { return .configurationChanged }
+        guard capsule.canonicalItems == canonicalItems else { return .sourceChanged }
+        guard capsule.request.terminalCursor == routineOccurrenceState.terminalDeltaCursor else { return .checkpointChanged }
+        guard (try? RoutinePlanningInputEnvironment(planner: self, habitCheckpoint: habitCheckpoint)) == capsule.environment else {
+            return .inputChanged
+        }
+        guard date.timeIntervalSinceReferenceDate.isFinite, date >= capsule.capturedAt,
+              case let .string(asOf)? = capsule.witness.schedule.fields["as_of"],
+              case let .string(end)? = capsule.witness.schedule.fields["horizon_end"],
+              let originalClock = SchedulerHelperRFC3339.date(from: asOf),
+              let horizonEnd = SchedulerHelperRFC3339.date(from: end), date < horizonEnd,
+              let zone = TimeZone(identifier: capsule.environment.scheduleProfile.timezoneName) else { return .clockChanged }
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = zone
+        return calendar.isDate(originalClock, inSameDayAs: date) ? nil : .clockChanged
+    }
+
+    private func routinePlanningInputCustodyIssue(
+        habitCheckpoint: HabitCompositionCheckpoint?
+    ) -> RoutinePlanningInputCapsuleError? {
+        guard hasEncryptedPersistence, canPersistPlan, persistenceError == nil else { return .persistenceRequired }
+        guard let binding = canonicalConfigurationIdentifier,
+              canonicalDeltaCursor?.isEmpty == false, canonicalItems.count <= 10_000,
+              Set(canonicalItems.map(\.id)).count == canonicalItems.count,
+              canonicalItems.allSatisfy({ $0.deletedAt == nil }),
+              routineOccurrenceState.configurationIdentifier == binding,
+              routineOccurrenceState.terminalDeltaCursor != nil else { return .incompleteSources }
+        guard pendingCanonicalMutations.isEmpty, pendingCanonicalSensitivityMutations.isEmpty,
+              pendingCanonicalAuthoringMutations.isEmpty, pendingSchedulePublication == nil,
+              pendingProposalApplicationMutation == nil, googleOutboundRecoveryJournal == nil,
+              googleSchedulePublicationRecoveryJournal == nil,
+              itemProgressState.journals.isEmpty, itemCompletionState.journals.isEmpty,
+              !itemCompletionState.needsCanonicalCatchUp, !routineOccurrenceState.hasUnresolvedCustody,
+              executionState.activeSession == nil, executionState.pendingCommand == nil,
+              !executionState.hasCredentialReplacementBlocker, pendingExecutionDeferIntent == nil,
+              deferredExecutionPublicationSessionIDs.isEmpty, pendingPublicationDeferredSessionIDs.isEmpty,
+              !blocks.contains(where: { $0.syncOrigin == .remoteExecutionLease }),
+              habitCheckpoint?.pendingMutationIDs.isEmpty != false,
+              habitCheckpoint?.hasActiveOperation != true else { return .pendingRecovery }
+        let activeHabits = Dictionary(uniqueKeysWithValues: canonicalItems.compactMap {
+            $0.kind == .habit && $0.deletedAt == nil ? ($0.id, $0.revision) : nil
+        })
+        guard activeHabits.isEmpty || habitCheckpoint?.isAuthoritative(for: binding, activeHabitRevisions: activeHabits) == true else {
+            return .incompleteSources
+        }
+        return nil
     }
 
     func invalidateItemCompletionReadEvidence() {
@@ -1413,6 +1563,7 @@ final class PlannerStore: ObservableObject {
         itemProgressState = .empty
         itemCompletionState = .empty
         routineOccurrenceState = .empty
+        routinePlanningInputCapsule = nil
         invalidateItemCompletionReadEvidence()
         pendingCanonicalAuthoringMutations = preservedCreates
         if let anchor = onboardingFirstItemAnchor,
@@ -1677,6 +1828,7 @@ final class PlannerStore: ObservableObject {
     private var hasCanonicalRemoteState: Bool {
         itemProgressState.configurationIdentifier != nil || itemCompletionState.configurationIdentifier != nil
             || routineOccurrenceState.configurationIdentifier != nil
+            || routinePlanningInputCapsule != nil
             || !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
@@ -5450,6 +5602,7 @@ final class PlannerStore: ObservableObject {
         itemProgressState = .empty
         itemCompletionState = .empty
         routineOccurrenceState = .empty
+        routinePlanningInputCapsule = nil
         invalidateItemCompletionReadEvidence()
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
         let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
@@ -6614,11 +6767,13 @@ final class PlannerStore: ObservableObject {
     }
 
     private func makeSnapshot(
+        savedAt: Date = Date(),
         canonicalTrashOverride: [DayWeaveCanonicalTrashEntry]? = nil,
         canonicalAuthoringMutationsOverride:
             [DayWeavePendingCanonicalAuthoringMutation]? = nil
     ) -> PlannerSnapshot {
         PlannerSnapshot(
+            savedAt: savedAt,
             destination: destination,
             selectedBlockID: selectedBlockID,
             selectedCanonicalItemID: selectedCanonicalItemID,
@@ -6663,7 +6818,8 @@ final class PlannerStore: ObservableObject {
             executionState: executionState,
             itemProgressState: itemProgressState,
             itemCompletionState: itemCompletionState,
-            routineOccurrenceState: routineOccurrenceState
+            routineOccurrenceState: routineOccurrenceState,
+            routinePlanningInputCapsule: routinePlanningInputCapsule
         )
     }
 

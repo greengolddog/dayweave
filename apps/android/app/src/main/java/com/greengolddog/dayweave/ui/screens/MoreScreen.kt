@@ -73,6 +73,7 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.hasRoutinePlanningInputReadiness
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.network.AccountRecoveryDisclosure
 import com.greengolddog.dayweave.network.AccountRecoveryIssuanceConfirmation
@@ -177,6 +178,7 @@ fun MoreScreen(
     habitStatisticsContent: (@Composable () -> Unit)? = null,
     onOpenGoals: () -> Unit = {},
     onOpenProjects: () -> Unit = {},
+    onPrepareRoutinePlanningInput: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var pendingSensitivityRemoval by remember {
@@ -410,6 +412,30 @@ fun MoreScreen(
                     showPlanningProfileEditor = true
                 },
             )
+        }
+        item {
+            Card {
+                ListItem(
+                    headlineContent = { Text("Saved routine input") },
+                    supportingContent = {
+                        Text("Prepare encrypted inputs for one fixed planning clock and horizon. " +
+                            "Requires a connection; does not install, publish, or start a schedule.")
+                    },
+                    trailingContent = {
+                        TextButton(
+                            onClick = onPrepareRoutinePlanningInput,
+                            enabled = canonicalPrivacyActionsEnabled && !canonicalSyncState.isBusy &&
+                                state.hasRoutinePlanningInputReadiness(),
+                            modifier = Modifier.testTag("prepare_routine_planning_input"),
+                        ) { Text("Prepare") }
+                    },
+                )
+                if (canonicalPrivacyActionsEnabled && state.routinePlanningInputCapsule != null) {
+                    Text("An encrypted fixed input is retained. Local recurring planning remains gated.",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
         }
         item {
             Card {

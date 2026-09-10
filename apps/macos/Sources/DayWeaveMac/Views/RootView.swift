@@ -6833,6 +6833,36 @@ struct SettingsView: View {
             Section("Routine occurrence recovery") {
                 RoutineOccurrenceOutboxView()
             }
+            Section("Saved routine planning input") {
+                if appLock.isContentAvailable, store.canPersistPlan {
+                    Text("Prepare a fixed, encrypted input while connected. This does not install a local routine schedule or publish anything; local recurring planning remains gated.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button(canonicalSync.isPreparingRoutinePlanningInput ? "Preparing saved input…" : "Prepare saved routine input") {
+                        Task { await canonicalSync.prepareRoutineOccurrencePlanningInput() }
+                    }
+                    .disabled(!canonicalSync.canPrepareRoutinePlanningInput || canonicalSync.isPreparingRoutinePlanningInput)
+                    .accessibilityIdentifier("settings.routine-planning.prepare")
+                    Text(canonicalSync.routinePlanningInputMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let capsule = store.routinePlanningInputCapsule {
+                        if case let .string(clock)? = capsule.request.schedule.fields["as_of"],
+                           case let .string(start)? = capsule.request.schedule.fields["horizon_start"],
+                           case let .string(end)? = capsule.request.schedule.fields["horizon_end"] {
+                            Text("Saved original clock: \(clock)\nFixed horizon: \(start) – \(end). Preparing a new input is required to advance this clock.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                } else {
+                    Text("Unlock DayWeave to prepare or inspect saved routine input.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .privacySensitive()
             Section("Appearance") {
                 Picker("Theme", selection: appearanceModeBinding) {
                     ForEach(DayWeaveAppearanceMode.allCases) { mode in

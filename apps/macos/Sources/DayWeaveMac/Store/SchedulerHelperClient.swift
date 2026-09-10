@@ -1,4 +1,5 @@
 import Darwin
+import CoreFoundation
 import Foundation
 import Security
 
@@ -7,6 +8,20 @@ protocol LocalScheduleComposing: Sendable {
         canonicalItems: [DayWeaveCanonicalItem],
         schedule: DayWeaveSchedulePreviewRequest
     ) async throws -> LocalScheduleComposition
+}
+
+/// An explicit v2 boundary. A witness is exact input, not permission to publish
+/// or execute the result; callers must separately fence its durable installation.
+protocol RoutineOccurrenceScheduleComposing: Sendable {
+    func composeOccurrences(
+        canonicalItems: [DayWeaveCanonicalItem],
+        witness: RoutinePlanningWitness
+    ) async throws -> RoutineOccurrenceLocalComposition
+}
+
+struct RoutineOccurrenceLocalComposition: Equatable, Sendable {
+    let composition: LocalScheduleComposition
+    let occurrenceSnapshotRevision: UInt64
 }
 
 enum SchedulerHelperClientError: Error, Equatable, LocalizedError, Sendable {
@@ -294,7 +309,7 @@ protocol SchedulerHelperProcessRunning: Sendable {
     ) async throws -> SchedulerHelperProcessResult
 }
 
-struct SchedulerHelperClient: LocalScheduleComposing, Sendable {
+struct SchedulerHelperClient: LocalScheduleComposing, RoutineOccurrenceScheduleComposing, Sendable {
     static let maximumStandardInputBytes = 16 * 1_024 * 1_024
     static let maximumStandardOutputBytes = 16 * 1_024 * 1_024
     static let maximumStandardErrorBytes = 16 * 1_024 * 1_024
@@ -397,7 +412,137 @@ struct SchedulerHelperClient: LocalScheduleComposing, Sendable {
         }
     }
 
-    private static var encoder: JSONEncoder {
+    func composeOccurrences(
+        canonicalItems: [DayWeaveCanonicalItem],
+        witness: RoutinePlanningWitness
+    ) async throws -> RoutineOccurrenceLocalComposition {
+        try Task.checkCancellation()
+        guard canonicalItems.count <= 10_000 else {
+            throw SchedulerHelperClientError.inputTooLarge
+        }
+        do {
+            try witness.validate(canonicalItems: canonicalItems)
+        } catch {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        let location: SchedulerHelperLocation
+        do {
+            location = try locator.locate()
+        } catch {
+            throw SchedulerHelperClientError.helperUnavailable
+        }
+        let executable = try SchedulerHelperExecutableValidator.validate(location)
+        let projectedItems = try canonicalItems.map(SchedulerHelperCanonicalItemWire.init)
+        let input: Data
+        do {
+            input = try Self.encoder.encode(SchedulerHelperOccurrenceRequestEnvelope(
+                request: .init(canonicalItems: projectedItems, schedule: witness.schedule,
+                    occurrenceLifecycle: witness.occurrenceLifecycle)
+            ))
+        } catch {
+            throw SchedulerHelperClientError.unsupportedCanonicalItem
+        }
+        guard input.count <= Self.maximumStandardInputBytes else {
+            throw SchedulerHelperClientError.inputTooLarge
+        }
+        try Task.checkCancellation()
+        // Preserve the same host signature and immediate runner inode/ctime
+        // checks as v1; neither witness decoding nor encoding widens that gap.
+        try signatureValidator.validate(
+            executableURL: executable.url,
+            hostBundleURL: location.bundleURL
+        )
+        let output = try await processRunner.run(
+            executable: executable, standardInput: input, timeout: timeout
+        )
+        try Task.checkCancellation()
+        return try Self.decodeOccurrenceOutput(output, witness: witness)
+    }
+
+    /// Kept separate from the v1 decoder, including its exact key set.
+    static func decodeOccurrenceOutput(
+        _ output: SchedulerHelperProcessResult,
+        witness: RoutinePlanningWitness
+    ) throws -> RoutineOccurrenceLocalComposition {
+        guard output.standardOutput.count <= maximumStandardOutputBytes,
+              output.standardError.count <= maximumStandardErrorBytes else {
+            throw SchedulerHelperClientError.outputTooLarge
+        }
+        guard output.standardError.isEmpty else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+        do {
+            guard StrictJSONObjectKeyScanner.hasUniqueKeysAndCanonicalIntegers(in: output.standardOutput) else {
+                throw SchedulerHelperClientError.invalidResponse
+            }
+            let root = try SchedulerHelperOccurrenceShape.object(
+                JSONSerialization.jsonObject(with: output.standardOutput),
+                keys: ["protocol", "version", "result"]
+            )
+            guard root["protocol"] as? String == "dayweave.scheduler.helper",
+                  try SchedulerHelperOccurrenceShape.integer(root["version"]) == 2 else {
+                throw SchedulerHelperClientError.invalidResponse
+            }
+            let result = try SchedulerHelperOccurrenceShape.object(root["result"])
+            if result["type"] as? String == "error" {
+                _ = try SchedulerHelperOccurrenceShape.object(result, keys: ["type", "error"])
+                let error = try SchedulerHelperOccurrenceShape.object(result["error"], keys: ["code", "message"])
+                guard error["code"] is String, error["message"] is String else {
+                    throw SchedulerHelperClientError.invalidResponse
+                }
+                switch output.termination {
+                case .exited(2), .exited(70): throw SchedulerHelperClientError.requestRejected
+                case .signaled: throw SchedulerHelperClientError.unexpectedTermination
+                default: throw SchedulerHelperClientError.invalidResponse
+                }
+            }
+            _ = try SchedulerHelperOccurrenceShape.object(result, keys: ["type", "composition"])
+            guard result["type"] as? String == "composition" else {
+                throw SchedulerHelperClientError.invalidResponse
+            }
+            var composition = try SchedulerHelperOccurrenceShape.object(result["composition"], keys: [
+                "local_input_fingerprint", "source_item_count", "source_item_revisions",
+                "accepted_item_count", "rejected_items", "ignored_previous_assignments",
+                "plan", "occurrence_snapshot_revision",
+            ])
+            let head = try SchedulerHelperOccurrenceShape.integer(composition.removeValue(forKey: "occurrence_snapshot_revision"))
+            try SchedulerHelperOccurrenceShape.validate(composition)
+            // Bind the original clock before the display model rounds it to
+            // Foundation Date. Distant instants can collapse distinct wire
+            // microseconds to the same floating-point value.
+            let plan = try SchedulerHelperOccurrenceShape.object(composition["plan"])
+            for key in ["as_of", "horizon_start", "horizon_end"] {
+                guard let raw = plan[key] as? String,
+                      try RoutinePlanningShape.instant(.string(raw))
+                        == RoutinePlanningShape.instant(witness.schedule.fields[key]) else {
+                    throw SchedulerHelperClientError.invalidResponse
+                }
+            }
+            let decoded = try decoder.decode(LocalScheduleComposition.self,
+                from: JSONSerialization.data(withJSONObject: composition, options: [.sortedKeys]))
+            guard head == witness.occurrenceLifecycle.snapshotRevision,
+                  decoded.localInputFingerprint == witness.localInputFingerprint,
+                  decoded.sourceItemRevisions == witness.sourceItemRevisions,
+                  decoded.sourceItemCount == witness.sourceItemRevisions.count,
+                  decoded.acceptedItemCount == decoded.sourceItemCount,
+                  decoded.rejectedItems.isEmpty else {
+                throw SchedulerHelperClientError.invalidResponse
+            }
+            switch output.termination {
+            case .exited(0):
+                return .init(composition: decoded, occurrenceSnapshotRevision: head)
+            case .signaled: throw SchedulerHelperClientError.unexpectedTermination
+            default: throw SchedulerHelperClientError.invalidResponse
+            }
+        } catch let error as SchedulerHelperClientError {
+            throw error
+        } catch {
+            // No private helper response snippets or cause chains escape.
+            throw SchedulerHelperClientError.invalidResponse
+        }
+    }
+
+    static var encoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .custom { date, encoder in
@@ -407,7 +552,7 @@ struct SchedulerHelperClient: LocalScheduleComposing, Sendable {
         return encoder
     }
 
-    private static var decoder: JSONDecoder {
+    static var decoder: JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
@@ -424,7 +569,7 @@ struct SchedulerHelperClient: LocalScheduleComposing, Sendable {
     }
 }
 
-private enum SchedulerHelperRFC3339 {
+enum SchedulerHelperRFC3339 {
     static func string(from date: Date) throws -> String {
         let timestamp = date.timeIntervalSince1970
         guard timestamp.isFinite else {
@@ -581,6 +726,162 @@ private struct SchedulerHelperComposeRequest: Encodable {
     private enum CodingKeys: String, CodingKey {
         case schedule
         case canonicalItems = "canonical_items"
+    }
+}
+
+private struct SchedulerHelperOccurrenceRequestEnvelope: Encodable {
+    let protocolName = "dayweave.scheduler.helper"
+    let version = 2
+    let operation = "compose"
+    let request: Request
+
+    struct Request: Encodable {
+        let canonicalItems: [SchedulerHelperCanonicalItemWire]
+        let schedule: RoutinePlanningScheduleInput
+        let occurrenceLifecycle: RoutinePlanningLifecycleContext
+        private enum CodingKeys: String, CodingKey {
+            case schedule
+            case canonicalItems = "canonical_items"
+            case occurrenceLifecycle = "occurrence_lifecycle"
+        }
+    }
+    private enum CodingKeys: String, CodingKey {
+        case version, operation, request
+        case protocolName = "protocol"
+    }
+}
+
+/// The existing display plan has intentionally forward-compatible JSON fields.
+/// V2 cannot inherit that permissiveness at a qualified helper boundary: check
+/// every nested object's closed wire shape before using the shared typed model.
+private enum SchedulerHelperOccurrenceShape {
+    static func object(_ value: Any?, keys: Set<String>? = nil) throws -> [String: Any] {
+        guard let object = value as? [String: Any],
+              keys == nil || Set(object.keys) == keys else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+        return object
+    }
+
+    static func array(_ value: Any?) throws -> [Any] {
+        guard let array = value as? [Any], array.count <= 100_000 else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+        return array
+    }
+
+    static func integer(_ value: Any?) throws -> UInt64 {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let integer = UInt64(number.stringValue) else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+        return integer
+    }
+
+    static func date(_ value: Any?) throws -> Date {
+        guard let string = value as? String,
+              let date = SchedulerHelperRFC3339.date(from: string) else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+        return date
+    }
+
+    private static func uuid(_ value: Any?, optional: Bool = false) throws {
+        if optional, value is NSNull { return }
+        guard let string = value as? String, let uuid = UUID(uuidString: string),
+              uuid.uuidString.lowercased() == string,
+              uuid != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+    }
+
+    private static func text(_ value: Any?, among allowed: Set<String>? = nil) throws {
+        guard let string = value as? String,
+              allowed == nil || allowed?.contains(string) == true else {
+            throw SchedulerHelperClientError.invalidResponse
+        }
+    }
+
+    static func validate(_ composition: [String: Any]) throws {
+        // Match the strict parser's aggregate collection budget without a
+        // recursive traversal or allocating a second unbounded flattened tree.
+        var pending: [Any] = [composition]
+        var remaining = 500_000
+        while let value = pending.popLast() {
+            let children: [Any]
+            if let object = value as? [String: Any] { children = Array(object.values) }
+            else if let array = value as? [Any] { children = array }
+            else { continue }
+            guard children.count <= remaining else { throw SchedulerHelperClientError.invalidResponse }
+            remaining -= children.count
+            pending.append(contentsOf: children)
+        }
+        for value in try array(composition["rejected_items"]) {
+            let rejected = try object(value, keys: ["item_id", "is_sensitive", "title", "reason"])
+            try uuid(rejected["item_id"])
+        }
+        for value in try array(composition["ignored_previous_assignments"]) {
+            let ignored = try object(value, keys: ["item_id", "requested_revision", "current_revision", "reason"])
+            try uuid(ignored["item_id"])
+        }
+        let plan = try object(composition["plan"], keys: [
+            "as_of", "horizon_start", "horizon_end", "blocks", "unscheduled",
+            "decisions", "violations", "score", "occurrences",
+        ])
+        _ = try object(plan["score"], keys: ["scheduled_minutes", "unscheduled_minutes", "soft_penalty", "moved_minutes"])
+        for value in try array(plan["blocks"]) {
+            let block = try object(value, keys: ["id", "is_sensitive", "item_id", "occurrence_id", "external_block_id",
+                "title", "start", "end", "session_index", "kind", "explanations"])
+            try uuid(block["id"])
+            for key in ["item_id", "occurrence_id", "external_block_id"] { try uuid(block[key], optional: true) }
+            try text(block["kind"], among: ["planned", "pinned", "calendar_event", "external_fixed"])
+            for value in try array(block["explanations"]) {
+                let explanation = try object(value, keys: ["code", "message"])
+                try text(explanation["code"], among: ["fixed_event", "pinned", "hard_deadline", "goal_progress",
+                    "habit_or_routine", "priority", "preferred_window", "context_match", "energy_match", "dependency",
+                    "stable_time", "earliest_available", "split_session"])
+            }
+        }
+        for value in try array(plan["unscheduled"]) {
+            let item = try object(value, keys: ["item_id", "occurrence_id", "remaining", "reason", "message"])
+            try uuid(item["item_id"])
+            try uuid(item["occurrence_id"], optional: true)
+            try text(item["reason"], among: ["missing_duration", "no_capacity", "hard_constraint", "blocked",
+                "dependency_unavailable", "dependency_cycle", "session_limit"])
+        }
+        for value in try array(plan["decisions"]) {
+            let decision = try object(value, keys: ["item_id", "occurrence_id", "kind", "message"])
+            try uuid(decision["item_id"])
+            try uuid(decision["occurrence_id"], optional: true)
+            try text(decision["kind"], among: ["container_rolled_up", "terminal_item_ignored", "fixed_event_retained",
+                "scheduled", "partially_scheduled", "kept_pinned"])
+            try text(decision["message"])
+        }
+        for value in try array(plan["violations"]) {
+            let violation = try object(value, keys: ["kind", "severity", "item_ids", "occurrence_ids",
+                "start", "end", "penalty", "message"])
+            try text(violation["kind"], among: ["soft_constraint", "fixed_overlap", "pinned_conflict", "deadline_risk",
+                "dependency", "buffer_compressed", "capacity"])
+            try text(violation["severity"], among: ["warning", "error"])
+            for id in try array(violation["item_ids"]) { try uuid(id) }
+            for id in try array(violation["occurrence_ids"]) { try uuid(id) }
+            for key in ["start", "end"] {
+                if !(violation[key] is NSNull) { _ = try date(violation[key]) }
+            }
+            _ = try integer(violation["penalty"])
+            try text(violation["message"])
+        }
+        for value in try array(plan["occurrences"]) {
+            let occurrence = try object(value, keys: ["id", "series_item_id", "identity", "nominal_start", "nominal_end",
+                "window_start", "window_end", "local_date", "ordinal", "state"])
+            try uuid(occurrence["id"])
+            try uuid(occurrence["series_item_id"])
+            // RecurrenceOccurrenceIdentity's decoder already enforces every
+            // tagged case's exact key set and value bounds.
+            try text(occurrence["state"], among: ["generated", "completed", "paused", "skipped"])
+            for key in ["nominal_start", "nominal_end", "window_start", "window_end"] { _ = try date(occurrence[key]) }
+        }
     }
 }
 

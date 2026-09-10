@@ -3166,6 +3166,12 @@ struct DayWeaveAPIClient: Sendable {
             body: body, requiredStatusCode: 200, maximumResponseBytes: RoutineOccurrenceValidation.maximumBytes)
     }
 
+    func sendRoutinePlanningWitness(requestBody: Data) async throws -> RoutinePlanningWitnessResponse {
+        try await send(method: "POST", pathComponents: ["v1", "routine-occurrences", "planning-witness"],
+            body: requestBody, requiredStatusCode: 200,
+            maximumResponseBytes: RoutinePlanningWitnessValidation.maximumBytes)
+    }
+
     private func send<Response: Decodable>(
         method: String,
         pathComponents: [String],
@@ -3292,6 +3298,10 @@ struct DayWeaveAPIClient: Sendable {
 
         let data = result.data
         let httpResponse = result.response
+        if pathComponents == ["v1", "routine-occurrences", "planning-witness"] {
+            guard method == "POST", queryItems.isEmpty else { throw RoutinePlanningWitnessError.invalidData }
+            return try RoutinePlanningWitnessHTTP.decode(Response.self, response: httpResponse, data: data)
+        }
         if pathComponents.prefix(2) == ["v1", "routine-occurrences"] {
             return try RoutineOccurrenceHTTP.decode(Response.self, method: method, response: httpResponse, data: data)
         }

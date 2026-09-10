@@ -59,6 +59,9 @@ final class CanonicalSyncStore: ObservableObject {
     @Published private(set) var lastLocalComposition: LocalScheduleComposition?
     @Published private(set) var lastLocalCompositionScore: DayWeaveSchedulePreview.Plan.Score?
     @Published private(set) var localCompositionWarnings: [String] = []
+    @Published private(set) var isPreparingRoutinePlanningInput = false
+    @Published private(set) var routinePlanningInputMessage = "No saved routine input has been prepared in this session."
+    @Published private var routinePlanningInputForegroundAvailable = false
 
     private let planner: PlannerStore
     private let configurationStore: any SuggestionAPIConfigurationStoring
@@ -66,6 +69,9 @@ final class CanonicalSyncStore: ObservableObject {
     private let authCoordinator: DurableAuthCoordinator?
     private let session: URLSession
     private let localComposer: any LocalScheduleComposing
+    private let occurrenceComposer: any RoutineOccurrenceScheduleComposing
+    private let routinePlanningWitnessTransportProvider:
+        @MainActor @Sendable (DayWeaveAPIClient) -> any RoutinePlanningWitnessTransport
     private let habitCompositionProvider: (any HabitCompositionCheckpointProviding)?
     private let now: @Sendable () -> Date
     private let createPushLimit: Int
@@ -95,6 +101,9 @@ final class CanonicalSyncStore: ObservableObject {
     private var activeLocalOccurrenceGeneration: UInt64 = 0
     private var activeLocalCompositionTask: Task<LocalScheduleComposition, Error>?
     private var activeLocalCompositionScheduleProfile: ScheduleProfile?
+    private var activeRoutinePlanningInputID: UUID?
+    private var activeRoutineWitnessTask: Task<RoutinePlanningWitnessResponse, Error>?
+    private var activeRoutineHelperTask: Task<RoutineOccurrenceLocalComposition, Error>?
     private var foregroundItemPollTask: Task<Void, Never>?
     private var foregroundItemStreamTask: Task<Void, Never>?
     private var foregroundItemDrainTask: Task<Void, Never>?
@@ -128,6 +137,9 @@ final class CanonicalSyncStore: ObservableObject {
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         localComposer: any LocalScheduleComposing = SchedulerHelperClient(),
+        occurrenceComposer: any RoutineOccurrenceScheduleComposing = SchedulerHelperClient(),
+        routinePlanningWitnessTransportProvider: @escaping @MainActor @Sendable
+            (DayWeaveAPIClient) -> any RoutinePlanningWitnessTransport = { $0 },
         habitCompositionProvider: (any HabitCompositionCheckpointProviding)? = nil,
         createPushLimit: Int = CanonicalSyncStore.maximumCreatePushesPerSync,
         authoringPushLimit: Int = CanonicalSyncStore.maximumAuthoringPushesPerSync,
@@ -153,6 +165,8 @@ final class CanonicalSyncStore: ObservableObject {
         self.authCoordinator = authCoordinator
         self.session = session
         self.localComposer = localComposer
+        self.occurrenceComposer = occurrenceComposer
+        self.routinePlanningWitnessTransportProvider = routinePlanningWitnessTransportProvider
         self.habitCompositionProvider = habitCompositionProvider
         self.createPushLimit = max(0, createPushLimit)
         self.authoringPushLimit = max(0, authoringPushLimit)
@@ -246,6 +260,7 @@ final class CanonicalSyncStore: ObservableObject {
     /// bootstrap has attempted to establish the durable URL/auth binding and
     /// item cursor; each delivery path independently rechecks that binding.
     func startForegroundItemInvalidations(every interval: Duration = .seconds(30)) {
+        activateRoutinePlanningInputCapture()
         guard foregroundItemPollTask == nil else { return }
         foregroundItemStreamUnavailableForActivation = false
         foregroundItemGeneration &+= 1
@@ -275,6 +290,10 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     func stopForegroundItemInvalidations() {
+        // Foreground withdrawal includes app-lock and background boundaries.
+        // A late private response cannot keep a saved-input capture alive.
+        routinePlanningInputForegroundAvailable = false
+        cancelRoutinePlanningInputCapture()
         foregroundItemPollTask?.cancel()
         foregroundItemPollTask = nil
         foregroundItemGeneration &+= 1
@@ -974,6 +993,160 @@ final class CanonicalSyncStore: ObservableObject {
         warnings = []
         clearTransientLocalComposition()
         reloadConfigurationStatus()
+    }
+
+    /// The service lifecycle grants foreground permission independently of
+    /// persisted/authenticated source state. It is never restored from disk.
+    func activateRoutinePlanningInputCapture() {
+        routinePlanningInputForegroundAvailable = true
+    }
+
+    /// Eligibility for an explicit authenticated read and fixed-input preparation,
+    /// never schedule installation, publication, or permission to rebase time.
+    var canPrepareRoutinePlanningInput: Bool {
+        guard routinePlanningInputForegroundAvailable else { return false }
+        do {
+            let checkpoint = try requireLocalCompositionPreflight(allowManagedRoutine: true)
+            guard let client = makeClient(reportFailure: false),
+                  client.configurationIdentifier == planner.canonicalConfigurationIdentifier else { return false }
+            return planner.routinePlanningInputPreparationIssue(habitCheckpoint: checkpoint) == nil
+        } catch { return false }
+    }
+
+    @discardableResult
+    func prepareRoutineOccurrencePlanningInput() async -> Bool {
+        guard routinePlanningInputForegroundAvailable, !isPreparingRoutinePlanningInput else { return false }
+        let id = UUID(), generation = configurationGeneration, startedAt = now()
+        var lastObservedClock = startedAt
+        var ownsCanonicalLock = false
+        defer {
+            if ownsCanonicalLock { planner.endCanonicalSync() }
+            if activeRoutinePlanningInputID == id {
+                activeRoutinePlanningInputID = nil
+                activeRoutineWitnessTask = nil; activeRoutineHelperTask = nil
+                isPreparingRoutinePlanningInput = false
+            }
+        }
+        do {
+            let checkpoint = try requireLocalCompositionPreflight(allowManagedRoutine: true)
+            guard let rawOrigin = configurationStore.loadBaseURL(),
+                  let client = makeClient(reportFailure: false),
+                  client.configurationIdentifier == planner.canonicalConfigurationIdentifier else {
+                throw RoutinePlanningInputCapsuleError.configurationChanged
+            }
+            let origin = try DayWeaveAPIBaseURL(rawOrigin).canonicalConfigurationIdentifier
+            let transport = routinePlanningWitnessTransportProvider(client)
+            guard transport.configurationIdentifier == client.configurationIdentifier else {
+                throw RoutinePlanningInputCapsuleError.configurationChanged
+            }
+            planner.flushPersistence()
+            let fence = try planner.captureRoutinePlanningInputFence(habitCheckpoint: checkpoint)
+            guard planner.beginCanonicalSync() else { throw RoutinePlanningInputCapsuleError.superseded }
+            ownsCanonicalLock = true
+            activeRoutinePlanningInputID = id; isPreparingRoutinePlanningInput = true
+            routinePlanningInputMessage = "Fetching private current-source evidence for a fixed routine input…"
+            let savedWarnings = warnings
+            let schedule: DayWeaveSchedulePreviewRequest
+            do { schedule = try makePreviewRequest(habitCheckpoint: checkpoint) }
+            catch { warnings = savedWarnings; throw error }
+            warnings = savedWarnings
+            guard let terminal = fence.environment.routineOccurrenceState.terminalDeltaCursor else {
+                throw RoutinePlanningInputCapsuleError.incompleteSources
+            }
+            let request = try RoutinePlanningWitnessRequest(schedule: schedule,
+                expectedSourceItemRevisions: Dictionary(uniqueKeysWithValues: fence.canonicalItems.map { ($0.id, $0.revision) }),
+                terminalCursor: terminal)
+            let requestBody = try RoutinePlanningWitnessValidation.encode(request)
+            lastObservedClock = try requireRoutinePlanningCaptureCurrent(id: id, generation: generation,
+                origin: origin, binding: client.configurationIdentifier, fence: fence, startedAt: startedAt,
+                notBefore: lastObservedClock, schedule: schedule)
+            let responseTask = Task { try await transport.routinePlanningWitness(request) }
+            activeRoutineWitnessTask = responseTask
+            let response = try await withTaskCancellationHandler { try await responseTask.value }
+                onCancel: { responseTask.cancel() }
+            lastObservedClock = try requireRoutinePlanningCaptureCurrent(id: id, generation: generation,
+                origin: origin, binding: client.configurationIdentifier, fence: fence, startedAt: startedAt,
+                notBefore: lastObservedClock, schedule: schedule)
+            guard case let .qualified(witness) = response.result else {
+                if case let .remoteRequired(reason) = response.result {
+                    routinePlanningInputMessage = reason.preparationMessage
+                }
+                return false
+            }
+            try witness.requireMatches(request)
+            if let prior = fence.priorCapsule, prior.configurationIdentifier == client.configurationIdentifier {
+                try witness.requireMatches(request, expectedWorkspaceID: prior.witness.workspaceID,
+                    expectedUserID: prior.witness.userID)
+            }
+            try witness.validate(canonicalItems: fence.canonicalItems)
+            routinePlanningInputMessage = "Verifying the complete fixed input with the signed routine helper…"
+            let composer = occurrenceComposer, sources = fence.canonicalItems
+            let helperTask = Task.detached(priority: .userInitiated) {
+                try await composer.composeOccurrences(canonicalItems: sources, witness: witness)
+            }
+            activeRoutineHelperTask = helperTask
+            let result = try await withTaskCancellationHandler { try await helperTask.value }
+                onCancel: { helperTask.cancel() }
+            lastObservedClock = try requireRoutinePlanningCaptureCurrent(id: id, generation: generation,
+                origin: origin, binding: client.configurationIdentifier, fence: fence, startedAt: startedAt,
+                notBefore: lastObservedClock, schedule: schedule)
+            guard result.occurrenceSnapshotRevision == witness.occurrenceLifecycle.snapshotRevision,
+                  result.composition.localInputFingerprint == witness.localInputFingerprint,
+                  result.composition.sourceItemRevisions == witness.sourceItemRevisions,
+                  result.composition.sourceItemCount == sources.count,
+                  result.composition.acceptedItemCount == sources.count,
+                  result.composition.rejectedItems.isEmpty else { throw RoutinePlanningWitnessError.invalidData }
+            let capsule = try RoutinePlanningInputCapsule(origin: origin,
+                configurationIdentifier: client.configurationIdentifier, originalRequestBody: requestBody,
+                request: request, witness: witness, canonicalItems: sources,
+                environment: fence.environment, capturedAt: startedAt)
+            _ = try requireRoutinePlanningCaptureCurrent(id: id, generation: generation,
+                origin: origin, binding: client.configurationIdentifier, fence: fence, startedAt: startedAt,
+                notBefore: lastObservedClock, schedule: schedule)
+            try planner.commitRoutinePlanningInputCapsule(capsule, expected: fence,
+                habitCheckpoint: habitCompositionProvider?.habitCompositionCheckpoint)
+            routinePlanningInputMessage = "Fixed routine input saved encrypted. No schedule was installed or published; local recurring planning remains gated."
+            return true
+        } catch {
+            if activeRoutinePlanningInputID == id || !ownsCanonicalLock && activeRoutinePlanningInputID == nil && generation == configurationGeneration {
+                routinePlanningInputMessage = "Routine input could not be prepared. Existing saved input and recovery requests were kept. Sync and try again."
+            }
+            return false
+        }
+    }
+
+    private func requireRoutinePlanningCaptureCurrent(id: UUID, generation: UInt64, origin: String,
+        binding: String, fence: RoutinePlanningInputCaptureFence, startedAt: Date,
+        notBefore: Date, schedule: DayWeaveSchedulePreviewRequest) throws -> Date {
+        guard !Task.isCancelled, routinePlanningInputForegroundAvailable, activeRoutinePlanningInputID == id,
+              configurationGeneration == generation, planner.isCanonicalSyncLocked,
+              makeClient(reportFailure: false)?.configurationIdentifier == binding,
+              let raw = configurationStore.loadBaseURL(),
+              (try? DayWeaveAPIBaseURL(raw).canonicalConfigurationIdentifier) == origin else {
+            throw RoutinePlanningInputCapsuleError.superseded
+        }
+        let current = now()
+        guard current.timeIntervalSinceReferenceDate.isFinite, current >= startedAt, current >= notBefore,
+              current >= schedule.asOf, current < schedule.horizonEnd,
+              let zone = TimeZone(identifier: schedule.timezoneName) else {
+            throw RoutinePlanningInputCapsuleError.clockChanged
+        }
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = zone
+        guard calendar.isDate(startedAt, inSameDayAs: schedule.asOf),
+              calendar.isDate(schedule.asOf, inSameDayAs: current) else {
+            throw RoutinePlanningInputCapsuleError.clockChanged
+        }
+        try planner.requireRoutinePlanningInputFence(fence,
+            habitCheckpoint: habitCompositionProvider?.habitCompositionCheckpoint)
+        return current
+    }
+
+    private func cancelRoutinePlanningInputCapture() {
+        activeRoutineWitnessTask?.cancel(); activeRoutineHelperTask?.cancel()
+        activeRoutinePlanningInputID = nil
+        activeRoutineWitnessTask = nil; activeRoutineHelperTask = nil
+        isPreparingRoutinePlanningInput = false
+        routinePlanningInputMessage = "Saved routine input is retained privately; prepare again after unlocking or reconnecting."
     }
 
     /// Composes from the complete encrypted canonical cache without making a
@@ -4230,8 +4403,8 @@ final class CanonicalSyncStore: ObservableObject {
         }
     }
 
-    private func requireLocalCompositionPreflight() throws -> HabitCompositionCheckpoint? {
-        guard !planner.requiresRemoteRoutineOccurrenceComposition else {
+    private func requireLocalCompositionPreflight(allowManagedRoutine: Bool = false) throws -> HabitCompositionCheckpoint? {
+        guard allowManagedRoutine || !planner.requiresRemoteRoutineOccurrenceComposition else {
             throw LocalCompositionCoordinatorError.occurrenceRemoteCompositionRequired
         }
         guard !Task.isCancelled,
@@ -4239,6 +4412,7 @@ final class CanonicalSyncStore: ObservableObject {
               activeSyncTask == nil,
               activeLocalCompositionID == nil,
               activeLocalCompositionTask == nil,
+              activeRoutinePlanningInputID == nil,
               !isSyncing,
               !planner.isCanonicalSyncLocked else {
             throw LocalCompositionCoordinatorError.busy

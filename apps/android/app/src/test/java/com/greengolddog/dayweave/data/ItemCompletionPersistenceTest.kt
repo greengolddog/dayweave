@@ -44,7 +44,7 @@ class ItemCompletionPersistenceTest {
             val original = completionTestState().copy(canonicalItems = emptyList(), itemCompletionLedger = completionTestLedger().copy(
                 pending = listOf(completionTestMutation(true).copy(disposition = disposition, wasSensitive = true)), needsCanonicalCatchUp = true))
             repository.save(original)
-            assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
             assertFalse(requireNotNull(dao.snapshot).payload.contains("itemCompletionGetProofs"))
             val restored = requireNotNull(repository.load())
             assertEquals(original.itemCompletionLedger, restored.itemCompletionLedger)
@@ -61,11 +61,11 @@ class ItemCompletionPersistenceTest {
         repository.save(state)
         val current = requireNotNull(dao.snapshot)
         dao.snapshot = current.copy(payloadFormat = PlannerSnapshotFormats.JSON_V22,
-            payload = JsonObject(Json.parseToJsonElement(current.payload).jsonObject - "itemCompletionLedger" - "routineOccurrenceLedger").toString())
+            payload = JsonObject(Json.parseToJsonElement(current.payload).jsonObject - "itemCompletionLedger" - "routineOccurrenceLedger" - "routinePlanningInputCapsule").toString())
         val restored = requireNotNull(repository.load())
         assertEquals(state.itemProgressLedger, restored.itemProgressLedger)
         assertEquals(ItemCompletionLedger(), restored.itemCompletionLedger)
-        assertEquals(PlannerSnapshotFormats.JSON_V24, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V25, dao.snapshot?.payloadFormat)
     }
 
     @Test fun legacyInjectionRuntimeProofAndMissingClosedLedgerFieldsFailWithoutRewrite() = runBlocking {
@@ -73,7 +73,8 @@ class ItemCompletionPersistenceTest {
         repository.save(completionTestState(false))
         val original = requireNotNull(dao.snapshot)
         val root = Json.parseToJsonElement(original.payload).jsonObject
-        val variants = listOf(original.copy(payloadFormat = PlannerSnapshotFormats.JSON_V22),
+        val variants = listOf(original.copy(payloadFormat = PlannerSnapshotFormats.JSON_V22,
+                payload = JsonObject(root - "routinePlanningInputCapsule" - "routineOccurrenceLedger").toString()),
             original.copy(payload = JsonObject(root - "itemCompletionLedger").toString()),
             original.copy(payload = JsonObject(root + ("itemCompletionGetProofs" to JsonObject(emptyMap()))).toString()),
             original.copy(payload = JsonObject(root + ("itemCompletionLedger" to JsonObject(root.getValue("itemCompletionLedger").jsonObject - "needsCanonicalCatchUp"))).toString()))

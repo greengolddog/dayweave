@@ -32,7 +32,7 @@ internal class LocalScheduleCompositionLauncher(
     override fun isCurrent(generation: Long): Boolean =
         foregroundActive.get() && generation == this.generation.get()
 
-    fun launch(): Boolean {
+    fun launch(action: suspend (Long) -> Unit = compose): Boolean {
         val admittedGeneration = captureGeneration()
         if (!isCurrent(admittedGeneration)) return false
         if (!actionGate.tryEnter()) return false
@@ -43,7 +43,7 @@ internal class LocalScheduleCompositionLauncher(
 
         lateinit var job: Job
         job = scope.launch(start = CoroutineStart.LAZY) {
-            compose(admittedGeneration)
+            action(admittedGeneration)
         }
         val retained = synchronized(lock) {
             if (retainedJob != null) {

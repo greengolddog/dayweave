@@ -6,6 +6,17 @@ import com.greengolddog.dayweave.model.ItemCompletionObservation
 import com.greengolddog.dayweave.model.ItemCompletionReadProof
 import com.greengolddog.dayweave.model.completionLocalEvidence
 import com.greengolddog.dayweave.model.requiresRemoteRoutineOccurrenceComposition
+import com.greengolddog.dayweave.model.RoutinePlanningInputCapsule
+import com.greengolddog.dayweave.model.RoutinePlanningSchedule
+import com.greengolddog.dayweave.model.RoutinePlanningWitnessRequest
+import com.greengolddog.dayweave.model.RoutinePlanningWitnessResult
+import com.greengolddog.dayweave.model.RoutinePlanningRemoteReason
+import com.greengolddog.dayweave.model.RoutinePlanningWitnessProtocolException
+import com.greengolddog.dayweave.network.RoutinePlanningWitnessTransport
+import com.greengolddog.dayweave.network.OkHttpRoutinePlanningWitnessTransport
+import com.greengolddog.dayweave.network.RoutinePlanningWitnessApiException
+import com.greengolddog.dayweave.network.encodeRoutinePlanningWitnessRequest
+import com.greengolddog.dayweave.scheduler.RoutineLifecycleScheduleComposer
 import com.greengolddog.dayweave.model.hasQualifiedCompletedParent
 import com.greengolddog.dayweave.model.withCompletionObservation
 import com.greengolddog.dayweave.network.ItemCompletionTransport
@@ -101,6 +112,8 @@ import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -189,6 +202,10 @@ class CanonicalSyncManager(
     private val reconcileTimedBreakNotification: suspend () -> Unit = {},
     private val completionTransport: ItemCompletionTransport = OkHttpItemCompletionTransport(),
     private val completionParentReadAllowed: () -> Boolean = { true },
+    private val routinePlanningWitnessTransport: RoutinePlanningWitnessTransport =
+        OkHttpRoutinePlanningWitnessTransport(),
+    private val routineLifecycleScheduleComposer: RoutineLifecycleScheduleComposer? =
+        localScheduleComposer as? RoutineLifecycleScheduleComposer,
 ) {
     private val operationMutex = Mutex()
     private val focusTransitionMutex = Mutex()
@@ -780,6 +797,136 @@ class CanonicalSyncManager(
         }
     }
 
+    /**
+     * Explicit connected preparation of one original clock/horizon. The helper verifies its
+     * inputs before encrypted custody; no schedule, cursor, publication, or execution is changed.
+     * The saved artifact is inert until a separately fenced display workflow is implemented.
+     */
+    suspend fun prepareRoutinePlanningInput(
+        admittedLifecycleGeneration: Long? = null,
+    ): CanonicalRefreshOutcome {
+        if (plannerStore.loadState.first { it != PlannerLoadState.LOADING } != PlannerLoadState.READY) {
+            updateError("Encrypted storage is unavailable; the saved routine input was kept.")
+            return CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        return operationMutex.withLock {
+            val composer = routineLifecycleScheduleComposer ?: run {
+                updateError("The occurrence-aware bundled scheduler is unavailable in this build.")
+                return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+            }
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            try {
+                configuration.withBindingOperation {
+                    val operationContext = currentCoroutineContext()
+                    val lifecycleGeneration = admittedLifecycleGeneration
+                        ?: localCompositionLifecycleFence.captureGeneration()
+                    if (!localCompositionLifecycleFence.isCurrent(lifecycleGeneration)) {
+                        throw LocalCompositionGenerationChangedException()
+                    }
+                    val fence = plannerStore.captureRoutinePlanningInputFence()
+                        ?: throw LocalCompositionUnavailableException(
+                            "Sync complete history and reconcile pending work before preparing routine input.",
+                        )
+                    val expected = fence.state
+                    val origin = configuration.baseUrl.toString()
+                    val binding = configuration.configurationId
+                        ?: throw LocalCompositionUnavailableException("Device authentication is required to prepare routine input.")
+                    requireLocalCompositionPreflight(expected, plannerStore.durableState.value, origin, binding,
+                        allowManagedRoutine = true)
+                    val capturedAt = now()
+                    val instant = capturedAt.truncatedTo(ChronoUnit.MICROS)
+                    val planningZone = compositionPlanningZone(expected.scheduleCompositionProfile)
+                    val planningDate = instant.atZone(planningZone).toLocalDate()
+                    val request = RoutinePlanningWitnessRequest(
+                        schemaVersion = 1,
+                        schedule = RoutinePlanningSchedule.from(previewRequest(
+                            instant, planningZone, expected.canonicalItems, origin, binding,
+                            cachedState = expected, requireCompleteHabitLedger = true,
+                        )),
+                        expectedSourceItemRevisions = expected.canonicalItems.associate { it.id to it.revision },
+                        terminalCursor = requireNotNull(expected.routineOccurrenceLedger.deltaCursor),
+                    )
+                    val originalRequestJson = encodeRoutinePlanningWitnessRequest(request).toString(Charsets.UTF_8)
+                    mutableState.value = CanonicalSyncState(
+                        phase = CanonicalSyncPhase.SYNCING,
+                        message = "Preparing private fixed-clock routine input…",
+                        sourceItemCount = expected.canonicalItems.size,
+                        scheduledBlockCount = expected.schedule.size,
+                    )
+                    var lastObservedClock = capturedAt
+                    suspend fun checkCapture() {
+                        currentCoroutineContext().ensureActive()
+                        requireLocalCompositionCommitFence(configuration, lifecycleGeneration, expected,
+                            capturedAt, planningZone, planningDate)
+                        val clock = now()
+                        if (clock < lastObservedClock || clock.atZone(planningZone).toLocalDate() != planningDate ||
+                            !plannerStore.isRoutinePlanningInputFenceCurrent(fence)) {
+                            throw LocalCompositionGenerationChangedException()
+                        }
+                        lastObservedClock = clock
+                    }
+                    checkCapture()
+                    val response = routinePlanningWitnessTransport.capture(configuration, request)
+                    checkCapture()
+                    response.requireValid()
+                    val result = response.result
+                    if (result is RoutinePlanningWitnessResult.RemoteRequired) {
+                        val reason = when (result.reason) {
+                            RoutinePlanningRemoteReason.FIRST_PUBLICATION_REQUIRED -> "Publish a fresh remote plan and sync occurrence history first."
+                            RoutinePlanningRemoteReason.EXECUTION_EVIDENCE_REQUIRED -> "Execution history currently requires remote planning."
+                            RoutinePlanningRemoteReason.RETAINED_MANUAL_PLACEMENT_REQUIRED -> "Manual placements currently require remote planning."
+                            RoutinePlanningRemoteReason.SOURCE_INELIGIBLE -> "Some current sources cannot yet be prepared locally."
+                            RoutinePlanningRemoteReason.CALENDAR_PROJECTION_INCOMPLETE -> "Refresh complete Calendar coverage first."
+                            RoutinePlanningRemoteReason.COMPOSITION_UNSUPPORTED -> "This planning input currently requires remote composition."
+                        }
+                        updateError("$reason The saved input and pending work were kept.")
+                        return@withBindingOperation CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+                    }
+                    val witness = (result as RoutinePlanningWitnessResult.Qualified).witness
+                    // First scope is attested by this owned authenticated response. A later
+                    // response on the same binding may not replace the retained scope pin.
+                    val prior = expected.routinePlanningInputCapsule
+                    witness.requireMatches(request, prior?.workspaceId ?: witness.workspaceId,
+                        prior?.userId ?: witness.userId, expected.canonicalItems)
+                    val composed = composer.compose(expected.canonicalItems, witness)
+                    checkCapture()
+                    require(composed.occurrenceSnapshotRevision == witness.occurrenceLifecycle.snapshotRevision)
+                    require(composed.composition.localInputFingerprint == witness.localInputFingerprint)
+                    require(composed.composition.sourceItemRevisions == witness.sourceItemRevisions)
+                    require(composed.composition.sourceItemCount == expected.canonicalItems.size &&
+                        composed.composition.acceptedItemCount == expected.canonicalItems.size &&
+                        composed.composition.rejectedItems.isEmpty())
+                    val capsule = RoutinePlanningInputCapsule.create(expected, originalRequestJson, witness, instant.toString())
+                    checkCapture()
+                    val transition = plannerStore.commitRoutinePlanningInputCapsule(capsule, fence) {
+                        val clock = now()
+                        operationContext.isActive && localCompositionLifecycleFence.isCurrent(lifecycleGeneration) && clock >= lastObservedClock &&
+                            clock.atZone(planningZone).toLocalDate() == planningDate
+                    } ?: throw LocalPlannerStorageException()
+                    if (!transition.persistence.awaitDurable()) throw LocalPlannerStorageException()
+                    ensureConfigurationCurrent(configuration)
+                    if (!localCompositionLifecycleFence.isCurrent(lifecycleGeneration) ||
+                        !plannerStore.isRoutinePlanningInputFenceCurrent(transition.postSaveFence) ||
+                        plannerStore.durableState.value?.routinePlanningInputCapsule != capsule) {
+                        throw LocalCompositionGenerationChangedException()
+                    }
+                    mutableState.value = CanonicalSyncState(
+                        phase = CanonicalSyncPhase.READY,
+                        message = "Fixed routine input saved encrypted. " +
+                            "No schedule was installed or published; local recurring planning remains gated.",
+                        sourceItemCount = expected.canonicalItems.size,
+                        scheduledBlockCount = expected.schedule.size,
+                    )
+                    CanonicalRefreshOutcome.SUCCESS
+                }
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
     private suspend fun requireLocalCompositionCommitFence(
         configuration: AuthenticatedApiConfiguration,
         lifecycleGeneration: Long,
@@ -807,8 +954,9 @@ class CanonicalSyncManager(
         durable: com.greengolddog.dayweave.model.DayWeaveUiState?,
         origin: String,
         configurationId: String,
+        allowManagedRoutine: Boolean = false,
     ) {
-        if (expected.requiresRemoteRoutineOccurrenceComposition()) {
+        if (!allowManagedRoutine && expected.requiresRemoteRoutineOccurrenceComposition()) {
             throw LocalCompositionUnavailableException("Recurring work requires a fresh remote composition.")
         }
         if (durable == null || durable != expected) {
@@ -4518,6 +4666,22 @@ class CanonicalSyncManager(
             }
         }
         val (phase, message, outcome) = when (error) {
+            is RoutinePlanningWitnessApiException.Authentication -> Triple(
+                CanonicalSyncPhase.AUTH_REQUIRED,
+                "Routine planning authentication is unavailable. The saved input was kept.",
+                CanonicalRefreshOutcome.AUTH_REQUIRED,
+            )
+            is RoutinePlanningWitnessApiException.Rejected -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "Routine planning evidence needs synchronization or review. The saved input and pending work were kept.",
+                CanonicalRefreshOutcome.PERMANENT_SERVER_FAILURE,
+            )
+            is RoutinePlanningWitnessProtocolException,
+            is RoutinePlanningWitnessApiException.Uncertain -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "Routine planning evidence could not be verified. The saved input and pending work were kept.",
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            )
             is PlannerApiException.Authentication -> Triple(
                 CanonicalSyncPhase.AUTH_REQUIRED,
                 "Authentication failed. Check or replace the stored bearer token.",

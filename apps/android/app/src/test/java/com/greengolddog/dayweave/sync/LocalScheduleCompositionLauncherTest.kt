@@ -11,6 +11,26 @@ import org.junit.Test
 
 class LocalScheduleCompositionLauncherTest {
     @Test
+    fun `explicit preparation shares the foreground gate without invoking ordinary composition`() {
+        val gate = CanonicalActionGate()
+        val compositions = AtomicInteger()
+        val preparations = AtomicInteger()
+        val launcher = LocalScheduleCompositionLauncher(
+            CoroutineScope(SupervisorJob() + Dispatchers.Unconfined), gate,
+            compose = { compositions.incrementAndGet() },
+        )
+        assertFalse(launcher.launch { preparations.incrementAndGet() })
+        launcher.setForegroundActive(true)
+        assertTrue(launcher.launch { generation ->
+            assertTrue(launcher.isCurrent(generation))
+            preparations.incrementAndGet()
+        })
+        assertTrue(preparations.get() == 1 && compositions.get() == 0)
+        assertTrue(gate.tryEnter())
+        gate.leave()
+    }
+
+    @Test
     fun `cancel before lazy start releases gate and permits a later canonical admission`() {
         val gate = CanonicalActionGate()
         val compositions = AtomicInteger()

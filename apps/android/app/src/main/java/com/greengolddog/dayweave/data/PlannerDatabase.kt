@@ -76,11 +76,13 @@ object PlannerSnapshotFormats {
     const val JSON_V23 = "json-v23-item-completion-policy"
     /** Complete occurrence observations and exact member intents live in the encrypted snapshot. */
     const val JSON_V24 = "json-v24-routine-occurrence-ledger"
+    /** Fixed private planning input; an older binary must not silently discard this custody. */
+    const val JSON_V25 = "json-v25-routine-planning-input-capsule"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 24,
+    version = 25,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -266,6 +268,11 @@ object PlannerDatabaseMigrations {
     val MIGRATION_23_24 = object : Migration(23, 24) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /** No plaintext columns change; protected fixed-input custody advances the rollback fence. */
+    val MIGRATION_24_25 = object : Migration(24, 25) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -329,6 +336,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_21_22,
                 PlannerDatabaseMigrations.MIGRATION_22_23,
                 PlannerDatabaseMigrations.MIGRATION_23_24,
+                PlannerDatabaseMigrations.MIGRATION_24_25,
             )
             .build()
     }

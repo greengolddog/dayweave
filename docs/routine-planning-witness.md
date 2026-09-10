@@ -76,9 +76,9 @@ returning evidence.
 Qualification invokes the existing helper-v2 boundary in-process, not through a
 native process or external service. It requires exact prepared planning input,
 full plan and source-accounting parity with authoritative composition. The
-response also carries the successful `local_input_fingerprint` so a future
-native adapter can compare its independent helper computation to this exact
-qualified input.
+response also carries the successful `local_input_fingerprint` so the explicit
+native v2 adapters can compare their independent helper computation to this
+exact qualified input.
 
 The current helper-v2 protocol uses a default execution context. Nonempty
 execution work units—including credit, consumed session indices, dispositions
@@ -102,8 +102,10 @@ The witness grants no mutation, execution, publication or persistent review
 lease. It cannot qualify a changed source snapshot, horizon or request. Native
 consumers must still bind credential configuration and privacy, retain exact
 pending-operation custody, and revalidate captured generations around helper
-execution and durable installation. Native helper-v2 adapters remain disabled
-until those integration and recovery gates are implemented and verified.
+execution and durable installation. The separate [native preparation
+checkpoint](routine-planning-input.md) uses helper-v2 only to verify and retain
+fixed original inputs. It does not enable local schedule installation or grant
+publication/execution authority.
 
 ## Verification and remaining work
 
@@ -137,8 +139,10 @@ two maintenance-only fixture emitters excluded; no tests fail or remain ignored.
 All-target, all-feature workspace Clippy with warnings denied and formatting
 checks pass. Owned test services and the retained native runtime were cleaned up.
 
-Remaining full-product work includes encrypted native witness storage and
-versioned adapters, source/generation/privacy/pending-intent fences, process and
-cross-client recovery, wider local execution/manual-policy representation and
-physical-device acceptance. Routine cadence/rebase/nested recurrence and
-step-specific deferral retain their separate unfinished requirements.
+Native adapters, protected connected preparation and encrypted fixed-input
+custody have a separate [checkpoint and verification boundary](routine-planning-input.md).
+Remaining full-product work includes saved-input display installation with
+source/generation/privacy/pending-intent fences, process and cross-client
+recovery, wider local execution/manual-policy representation and physical-device
+acceptance. Routine cadence/rebase/nested recurrence and step-specific deferral
+retain their separate unfinished requirements.

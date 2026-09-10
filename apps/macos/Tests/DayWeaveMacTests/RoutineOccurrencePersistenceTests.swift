@@ -97,7 +97,7 @@ struct RoutineOccurrencePersistenceTests {
         source["googleSchedulePublicationRecoveryJournal"] = try JSONSerialization.jsonObject(with: publicationEncoder.encode(publication))
         _ = try fixture.write(JSONSerialization.data(withJSONObject: source))
         let migrated = try #require(try fixture.persistence.load()).migratedToCurrentSchema()
-        #expect(migrated.schemaVersion == 28 && migrated.routineOccurrenceState == .empty)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion && migrated.routineOccurrenceState == .empty)
         #expect(migrated.itemCompletionState?.journals == [completion])
         #expect(migrated.itemCompletionState?.needsCanonicalCatchUp == true)
         #expect(migrated.itemProgressState?.journals == [progress])
