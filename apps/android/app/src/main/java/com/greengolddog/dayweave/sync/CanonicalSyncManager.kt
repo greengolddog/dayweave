@@ -96,6 +96,7 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
@@ -342,7 +343,9 @@ class CanonicalSyncManager(
             )
             try {
                 configuration.withBindingOperation {
-                    val instant = now()
+                    // New composition clocks must fit PostgreSQL and the native
+                    // scheduler contract. Saved publication requests remain exact.
+                    val instant = now().truncatedTo(ChronoUnit.MICROS)
                     val planningZone = compositionPlanningZone()
                     ensureDurableWorkspaceBinding(configuration)
                     var update = recoverOrPublishAcceptedSchedule(
@@ -662,7 +665,10 @@ class CanonicalSyncManager(
                         origin = origin,
                         configurationId = configurationId,
                     )
-                    val instant = now()
+                    // Keep the full-resolution capture for clock-rollback fences;
+                    // only scheduler input and its provenance use wire precision.
+                    val capturedAt = now()
+                    val instant = capturedAt.truncatedTo(ChronoUnit.MICROS)
                     val planningZone = compositionPlanningZone(expected.scheduleCompositionProfile)
                     val planningDate = instant.atZone(planningZone).toLocalDate()
                     val request = previewRequest(
@@ -689,7 +695,7 @@ class CanonicalSyncManager(
                         configuration = configuration,
                         lifecycleGeneration = lifecycleGeneration,
                         expected = expected,
-                        capturedAt = instant,
+                        capturedAt = capturedAt,
                         planningZone = planningZone,
                         planningDate = planningDate,
                     )
@@ -728,7 +734,7 @@ class CanonicalSyncManager(
                         configuration = configuration,
                         lifecycleGeneration = lifecycleGeneration,
                         expected = expected,
-                        capturedAt = instant,
+                        capturedAt = capturedAt,
                         planningZone = planningZone,
                         planningDate = planningDate,
                     )

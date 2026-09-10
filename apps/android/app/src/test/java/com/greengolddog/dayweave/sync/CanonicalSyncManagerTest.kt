@@ -44,6 +44,7 @@ import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingHabitMutation
 import com.greengolddog.dayweave.model.PendingHabitMutationDisposition
 import com.greengolddog.dayweave.model.PendingHabitMutationKind
+import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipProofSnapshot
 import com.greengolddog.dayweave.model.PublishedOccurrenceMembershipSnapshot
@@ -95,6 +96,7 @@ import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
+import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.scheduler.LocalScheduleComposer
@@ -1421,6 +1423,165 @@ class CanonicalSyncManagerTest {
             requireNotNull(store.state.value.publishedScheduleProof)
                 .hasCurrentImmutablePlanSeal(),
         )
+    }
+
+    @Test
+    fun remoteCompositionNormalizesNanosecondClockAcrossRequestPublicationAndInstalledProof() = runBlocking {
+        val rawInstant = Instant.parse("2026-09-01T07:00:00.123456789Z")
+        val expectedInstant = "2026-09-01T07:00:00.123456Z"
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-microseconds",
+                false,
+            )
+            previewResult = preview().let { it.copy(plan = it.plan.copy(asOf = expectedInstant)) }
+            publicationHandler = { request ->
+                val journal = requireNotNull(plannerStore.durableState.value?.pendingSchedulePublication)
+                assertEquals(expectedInstant, journal.candidate.generatedAt)
+                assertEquals(request, journal.request)
+                assertEquals(expectedInstant,
+                    Json.decodeFromString<SchedulePublishRequest>(request.bodyJson).schedule.asOf)
+                publicationResponse(request, replayed = false)
+            }
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport, currentInstant = rawInstant).refreshAndCompose())
+
+        assertEquals(expectedInstant, transport.previewRequests.single().asOf)
+        assertEquals(1, transport.publicationRequests.size)
+        val installed = requireNotNull(plannerStore.durableState.value)
+        assertEquals(expectedInstant, installed.scheduleGeneratedAt)
+        assertEquals(expectedInstant, requireNotNull(installed.publishedScheduleProof).asOf)
+        assertTrue(installed.isCanonicalPlanCurrent(rawInstant, ZoneId.of("Europe/Madrid")))
+        assertNull(installed.pendingSchedulePublication)
+    }
+
+    @Test
+    fun changedNanosecondClockAfterRestartReplaysExactPublicationBeforeFreshComposition() = runBlocking {
+        val firstInstant = Instant.parse("2026-09-01T07:00:00.123456789Z")
+        val firstExpected = "2026-09-01T07:00:00.123456Z"
+        val laterInstant = Instant.parse("2026-09-01T07:00:10.987654321Z")
+        val laterExpected = "2026-09-01T07:00:10.987654Z"
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-microseconds",
+                false,
+            )
+            previewResult = preview().let { it.copy(plan = it.plan.copy(asOf = firstExpected)) }
+            publicationError = IOException("Synthetic lost publication response")
+        }
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(plannerStore, transport, currentInstant = firstInstant).refreshAndCompose())
+        val durable = requireNotNull(plannerStore.durableState.value)
+        val journal = requireNotNull(durable.pendingSchedulePublication)
+        val exactRequest = transport.publicationRequests.single()
+        val exactCommand = Json.decodeFromString<SchedulePublishRequest>(exactRequest.bodyJson)
+        assertEquals(firstExpected, exactCommand.schedule.asOf)
+        assertEquals(firstExpected, journal.candidate.generatedAt)
+        assertEquals(journal.candidate.inputDigest, exactCommand.expectedInputDigest)
+        assertTrue(durable.canonicalItems.isEmpty())
+        assertNull(durable.canonicalDeltaCursor)
+        val originalDeltaCalls = transport.deltaCursors.size
+        val originalPreviewCalls = transport.previewRequests.size
+        val restarted = PlannerStore(durable)
+        transport.publicationError = null
+        transport.previewResult = preview().let { it.copy(plan = it.plan.copy(asOf = laterExpected)) }
+        transport.publicationHandler = { replay ->
+            assertEquals(originalDeltaCalls, transport.deltaCursors.size)
+            assertEquals(originalPreviewCalls, transport.previewRequests.size)
+            assertEquals(journal, restarted.state.value.pendingSchedulePublication)
+            assertEquals(journal, restarted.durableState.value?.pendingSchedulePublication)
+            assertEquals(exactRequest, replay)
+            assertEquals(exactRequest.bodyJson, replay.bodyJson)
+            assertEquals(exactRequest.bodySha256, replay.bodySha256)
+            val decoded = Json.decodeFromString<SchedulePublishRequest>(replay.bodyJson)
+            assertEquals(journal.idempotencyKey, decoded.idempotencyKey)
+            assertEquals(journal.candidate.inputDigest, decoded.expectedInputDigest)
+            assertEquals(firstExpected, decoded.schedule.asOf)
+            transport.publicationHandler = null
+            publicationResponse(replay, replayed = true)
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS,
+            manager(restarted, transport, currentInstant = laterInstant).refreshAndCompose())
+
+        assertEquals(3, transport.publicationRequests.size)
+        assertEquals(exactRequest, transport.publicationRequests[1])
+        val fresh = Json.decodeFromString<SchedulePublishRequest>(transport.publicationRequests.last().bodyJson)
+        assertTrue(fresh.idempotencyKey != journal.idempotencyKey)
+        assertEquals(laterExpected, fresh.schedule.asOf)
+        assertEquals(listOf(firstExpected, laterExpected), transport.previewRequests.map { it.asOf })
+        val installed = requireNotNull(restarted.durableState.value)
+        assertNull(installed.pendingSchedulePublication)
+        assertEquals(laterExpected, installed.scheduleGeneratedAt)
+        assertEquals(laterExpected, requireNotNull(installed.publishedScheduleProof).asOf)
+        assertTrue(installed.isCanonicalPlanCurrent(laterInstant, ZoneId.of("Europe/Madrid")))
+    }
+
+    @Test
+    fun legacyNanosecondPublicationReplaysExactSavedCustodyWithoutRoundingOrFreshComposition() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val preparation = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-legacy",
+                false,
+            )
+            previewResult = preview()
+            publicationError = IOException("Synthetic interrupted publication")
+        }
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(plannerStore, preparation).refreshAndCompose())
+        val durable = requireNotNull(plannerStore.durableState.value)
+        val template = requireNotNull(durable.pendingSchedulePublication)
+        val legacyInstant = "2026-09-01T07:00:00.123456789Z"
+        val command = Json.decodeFromString<SchedulePublishRequest>(template.request.bodyJson)
+        // Reconstruct an already-saved pre-fix generation, not a newly authored request.
+        val legacy = template.copy(
+            preparedAt = legacyInstant,
+            request = buildSchedulePublishHttpRequest(CanonicalCredentialStore().authenticatedConfiguration(),
+                command.copy(schedule = command.schedule.copy(asOf = legacyInstant))),
+            candidate = template.candidate.copy(generatedAt = legacyInstant),
+        )
+        val restoredJournal = Json.decodeFromString<PendingSchedulePublication>(
+            Json.encodeToString(PendingSchedulePublication.serializer(), legacy),
+        )
+        assertEquals(legacy, restoredJournal)
+        val restoredState = durable.copy(pendingSchedulePublication = restoredJournal)
+        val restarted = PlannerStore(restoredState)
+        assertEquals(restoredJournal, restarted.durableState.value?.pendingSchedulePublication)
+        val replay = FakeCanonicalTransport().apply {
+            publicationHandler = { request ->
+                assertTrue(deltaCursors.isEmpty())
+                assertTrue(previewRequests.isEmpty())
+                assertEquals(restoredJournal, restarted.durableState.value?.pendingSchedulePublication)
+                assertEquals(legacy.request, request)
+                assertEquals(legacy.request.bodyJson, request.bodyJson)
+                assertEquals(legacy.request.bodySha256, request.bodySha256)
+                val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+                assertEquals(legacy.idempotencyKey, decoded.idempotencyKey)
+                assertEquals(legacy.candidate.inputDigest, decoded.expectedInputDigest)
+                assertEquals(legacyInstant, decoded.schedule.asOf)
+                throw PlannerApiException.Validation(422)
+            }
+        }
+
+        assertEquals(CanonicalRefreshOutcome.PERMANENT_SERVER_FAILURE,
+            manager(restarted, replay, currentInstant = Instant.parse("2026-09-01T07:00:10.987654321Z"))
+                .refreshAndCompose())
+
+        assertEquals(listOf(legacy.request), replay.publicationRequests)
+        assertTrue(replay.deltaCursors.isEmpty())
+        assertTrue(replay.previewRequests.isEmpty())
+        assertEquals(restoredState, restarted.state.value)
+        assertEquals(restoredState, restarted.durableState.value)
+        assertEquals(legacy, restarted.state.value.pendingSchedulePublication)
+        assertNull(restarted.state.value.publishedScheduleProof)
     }
 
     @Test
@@ -6190,6 +6351,73 @@ class CanonicalSyncManagerTest {
         assertTrue(plannerStore.state.value.canonicalRecentlyDeleted.isEmpty())
         assertTrue(plannerStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
         assertEquals(1, transport.restoreRequests.size)
+    }
+
+    @Test
+    fun localCompositionNormalizesNanosecondClockAcrossRequestAndInstalledProvenance() = runBlocking {
+        val rawInstant = Instant.parse("2026-09-01T07:00:00.123456789Z")
+        val expectedInstant = "2026-09-01T07:00:00.123456Z"
+        val plannerStore = PlannerStore(localCompositionReadyState())
+        val transport = FakeCanonicalTransport()
+        var captured: SchedulePreviewRequest? = null
+        val composer = LocalScheduleComposer { _, request ->
+            captured = request
+            assertEquals(expectedInstant, request.asOf)
+            emptyLocalComposition(request)
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport, currentInstant = rawInstant, localScheduleComposer = composer)
+                .composeLocally())
+
+        assertEquals(expectedInstant, requireNotNull(captured).asOf)
+        val installed = requireNotNull(plannerStore.durableState.value)
+        val provenance = requireNotNull(installed.localScheduleCompositionProvenance)
+        assertEquals(expectedInstant, installed.scheduleGeneratedAt)
+        assertEquals(expectedInstant, provenance.generatedAt)
+        assertEquals(expectedInstant, provenance.asOf)
+        assertTrue(provenance.matchesState(installed))
+        assertTrue(installed.isScheduleDisplayCurrent(rawInstant, ZoneId.of("Europe/Madrid")))
+        assertFalse(installed.isCanonicalPlanCurrent(rawInstant, ZoneId.of("Europe/Madrid")))
+        assertNull(installed.publishedScheduleProof)
+        assertTrue(transport.deltaCursors.isEmpty())
+        assertTrue(transport.previewRequests.isEmpty())
+        assertTrue(transport.publicationRequests.isEmpty())
+    }
+
+    @Test
+    fun localSubmicrosecondClockRollbackAtEitherCommitFenceDiscardsWithoutInstall() = runBlocking {
+        val rawInstant = Instant.parse("2026-09-01T07:00:00.123456789Z")
+        for (rollbackAtRead in listOf(2, 3)) {
+            val initial = localCompositionReadyState()
+            val plannerStore = PlannerStore(initial)
+            val transport = FakeCanonicalTransport()
+            var clockReads = 0
+            var composeCalls = 0
+            val outcome = manager(
+                plannerStore,
+                transport,
+                nowProvider = {
+                    clockReads += 1
+                    if (clockReads == rollbackAtRead) rawInstant.minusNanos(1) else rawInstant
+                },
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    composeCalls += 1
+                    assertEquals("2026-09-01T07:00:00.123456Z", request.asOf)
+                    emptyLocalComposition(request)
+                },
+            ).composeLocally()
+
+            assertEquals("Clock rollback at sample $rollbackAtRead", CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+            assertEquals(rollbackAtRead, clockReads)
+            assertEquals(1, composeCalls)
+            assertEquals(initial, plannerStore.state.value)
+            assertEquals(initial, plannerStore.durableState.value)
+            assertNull(plannerStore.state.value.localScheduleCompositionProvenance)
+            assertTrue(transport.deltaCursors.isEmpty())
+            assertTrue(transport.previewRequests.isEmpty())
+            assertTrue(transport.publicationRequests.isEmpty())
+        }
     }
 
     @Test

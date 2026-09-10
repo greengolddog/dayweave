@@ -7,12 +7,14 @@ Compilation, skipped opt-in tests and helper-test success alone do not establish
 this gate. The result covers the bounded synthetic scenario below, not full
 device or product acceptance.
 
-The subsequent full regression gates also passed: macOS 1,059 executed tests
+Full native regression evidence is: macOS 1,059 executed tests
 plus three opt-in skips (1,062 total, 71 suites), with compiler warnings denied;
-Android 1,649 passing JVM tests plus two opt-in skips (1,651 total, 136 suites),
+Android 1,654 passing JVM tests plus two opt-in skips (1,656 total, 136 suites),
 lint zero errors/29 warnings, and both debug APK builds. The live completion
 phases above were executed separately, not inferred from those skipped tests.
-Android instrumentation sources/APK were built, not run on a device or emulator.
+The Android full gate was refreshed after the precision fix; macOS sources are
+unchanged from its full regression checkpoint. Android instrumentation
+sources/APK were checked, not run on a device or emulator.
 
 This gate connects the production macOS and Android completion stores and
 transports to one real HTTP service and disposable PostgreSQL database. It tests
@@ -77,7 +79,7 @@ requiredness. The latter leaf becomes optional only through reviewed operation E
 | Android `catchup_automatic_optional` | Restart with that latch; reject a new GET before canonical catch-up. Restore the blocked root, commit Automatic operation D at root policy revision 3, then optional requiredness operation E at the second leaf's policy revision 1. |
 | macOS `replay` | After the driver restarts the API against the same database, restore A, observe the newer policy, and replay its exact bytes. Settle the historical Complete receipt without replacing newer evidence or changing the current canonical tree/cursor. |
 | macOS `verify_cascade` | After the driver's real canonical PUT completes the required leaf, observe automatic completion of branch and root, with the optional leaf still planned and the root's exact blocked reopening tuple retained. |
-| Android `verify_cascade_and_child` | Observe that cascade, then create a new planned child under the completed branch through the normal native authoring pipeline. Verify its fresh scoped parent GET and submitted journal, followed by branch/root reopening. |
+| Android `verify_cascade_and_child` | Observe that cascade, then create a new planned child under the completed branch through the normal native authoring pipeline. Verify its fresh scoped parent GET and submitted journal, successful real preview/publication with an injected sub-microsecond clock, and branch/root reopening. |
 | macOS `verify_reopen` | Catch up to the same five-item tree: branch planned, root blocked with its original manual reason, required leaf completed and optional/new leaves planned. |
 
 Every native process writes a private, typed checkpoint marker only after its
@@ -165,8 +167,18 @@ provider synchronization and owner acceptance remain separate gates. The shared
 synthetic session and these selected production-store calls do not verify
 those boundaries or complete the full app.
 
-One source-level follow-up remains outside this scenario: Android composition
-uses its injected `Instant` directly, while the server requires PostgreSQL
-microsecond precision. Add a focused sub-microsecond clock regression and
-normalize newly composed instants without rewriting saved publication requests.
-The accepted preview in this gate is not evidence for arbitrary clock precision.
+The 2026-09-10 repeat also passed with Android's canonical manager clock forced
+to sub-microsecond precision on every sample. Real child-authoring preview and
+publication succeeded, and the installed generation timestamp was microsecond
+aligned. New composition input and provenance are normalized together; already
+saved requests are not rewritten. This strengthens the clock boundary without
+changing any of the scenario's completion or cleanup assertions.
+
+All 150 Android sync-manager tests passed, including five focused regressions
+for remote/local precision, restart under a different nanosecond clock, exact
+legacy nanosecond-request custody after a simulated rejection, and one-nanosecond
+backward clock changes at both local commit fences. Four normalization-dependent
+regressions were first run with the old clock behavior and failed as expected.
+The local fences retain the original full-resolution capture, independently of
+the normalized scheduler timestamp. No persistence schema or request serializer
+was changed.

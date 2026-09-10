@@ -10,7 +10,9 @@ import java.net.Proxy
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.time.Instant
 import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
@@ -48,6 +50,9 @@ class NativeCompletionConvergenceTest {
             assertEquals(config.configurationId, store.state.value.canonicalConfigurationId)
             assertTrue("Restart cannot restore GET permission", store.state.value.itemCompletionGetProofs.isEmpty())
             val canonical = CanonicalSyncManager(store, credentials, OkHttpCanonicalPlannerTransport(client),
+                // Always exercise a sub-microsecond clock against the real
+                // preview/publication API, without moving ahead of wall time.
+                now = { Instant.now().truncatedTo(ChronoUnit.MICROS).minusNanos(1) },
                 zoneId = { ZoneId.of("UTC") }, completionTransport = completion)
             val manager = ItemCompletionSyncManager(store, credentials, completion)
             val flow = CompletionFlow(config, directory, disk, repository, store, manager, canonical, completion)
@@ -222,6 +227,7 @@ private class CompletionFlow(
             CanonicalRefreshOutcome.SUCCESS, outcome)
         assertEquals(1, creates)
         assertTrue(durable().pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(0, Instant.parse(requireNotNull(durable().scheduleGeneratedAt)).nano % 1_000)
         catchUp()
         val reopened = fresh(config.rootId)
         assertRootBlocked()

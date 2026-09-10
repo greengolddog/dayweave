@@ -434,6 +434,18 @@ rejected with `422` before digesting or journaling. The API resolves local day
 boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
 
+Android truncates newly captured remote and on-device composition clocks to
+microseconds before building scheduler input. The same normalized instant is
+used in the accepted plan and its display/publication provenance. On-device
+composition separately retains the original full-resolution capture for both
+clock-rollback checks; a one-nanosecond backward change still prevents install.
+This is not a serializer or persistence migration: a saved publication keeps
+its original body, hash, idempotency key, input digest and candidate, even if its
+timestamp has finer precision. Retry sends that exact request before generating
+a new plan; a generic 422 validation rejection does not silently round or
+replace its custody. The existing separately typed, definitive stale-publication
+proof can still authorize the normal discard-and-recompose recovery path.
+
 Production publication, immutable reads, transactional MCP proposal submission,
 execution defer assessment/approval, and attested restart require migrations
 through `0021_execution_defer_approval.sql`. Deploy the migrated server before

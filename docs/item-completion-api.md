@@ -238,8 +238,9 @@ The 2026-09-10 full native regression gates passed after the harness addition:
   are treated as errors. The completion opt-in ran separately in the nine-phase
   live gate below. A synthetic completion review was previously rendered
   and visually inspected; it used no owner data or live service.
-- Android: 1,649 passing JVM tests across 136 suites, with two opt-in tests
-  skipped (1,651 total). Lint reports zero errors and 29 warnings. Both debug APKs and the
+- Android: 1,654 passing JVM tests across 136 suites, with two opt-in tests
+  skipped (1,656 total), after the composition-clock precision fix. Lint reports
+  zero errors and 29 warnings. Both debug APKs and the
   Android instrumentation sources build successfully. The ten completion UI tests
   and Room 22→23 migration test are compiled, not yet executed on a device/emulator.
 - Shared wire: 24 valid and 105 invalid cases in
