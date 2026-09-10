@@ -93,6 +93,13 @@ context then binds assessment and authorization. Any later reviewed policy or
 outcome change—even one preserving status—invalidates the old assessment. Fresh
 publication retains strict head comparison. Native ledger catch-up remains open.
 
+The subsequent [helper v2 bridge](scheduler-helper.md#occurrence-aware-composition-protocol-v2)
+can compose an explicitly supplied lifecycle context, checking complete current
+canonical membership/revisions and binding normalized context/head to a separate
+local fingerprint. Its nine focused regressions and the opaque Android bridge
+bring the shared Rust gate to 333 passing tests. This supplies the bounded engine
+entry point, not authenticated native planning evidence or enabled client adapters.
+
 ## Verification
 
 The 2026-09-10 server/shared checkpoint passes:
@@ -121,12 +128,13 @@ acceptance results.
 - Native macOS/Android protected review, strict transports, encrypted per-instance
   cache/outbox, frozen exact replay and terminal-only convergence.
 - Native local-composition and pending-publication fencing against the occurrence
-  head; current helper v1 must not claim to consume authority it does not carry.
+  head; helper v1 cannot consume this authority, while helper v2 still requires
+  an admitted current-source witness and native adapter integration.
   The private API retains first-source revisions and opaque current eligibility,
   not a current-source planning witness. A native client must not guess that
   witness from its canonical cache or mutate template statuses to feed helper v1.
   Initial native controls need remote recomposition and a local-composition fence
-  until an explicitly versioned, fully qualified local bridge is implemented.
+  until the versioned local bridge has fully qualified evidence and native fences.
 - Explicit review/rebase for semantic template changes. Harmless title/notes/
   estimate changes can retain authority; tree/rule changes do not silently rebind
   history. Ineligible initial terminal or execution-owned template states withhold

@@ -178,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn pure_bridge_preserves_v2_occurrence_composition_and_versioned_rejection() {
+        let request = br#"{"protocol":"dayweave.scheduler.helper","version":2,"operation":"compose","request":{"canonical_items":[],"schedule":{"as_of":"2026-09-01T07:00:00Z","horizon_start":"2026-09-01T00:00:00Z","horizon_end":"2026-09-02T00:00:00Z","timezone_name":"UTC"},"occurrence_lifecycle":{"snapshot_revision":7,"instances":[]}}}"#;
+        let direct = process_bytes(request);
+        assert_eq!(direct.exit_code, 0);
+        assert!(direct.stdout.starts_with(br#"{"protocol":"dayweave.scheduler.helper","version":2,"result":{"type":"composition""#));
+        assert_eq!(process_request_bytes(request), direct.stdout);
+        let malformed = br#"{"protocol":"dayweave.scheduler.helper","version":2,"operation":"compose","request":null}"#;
+        let rejected = process_bytes(malformed);
+        assert_eq!(rejected.exit_code, 2);
+        assert!(rejected.stdout.starts_with(
+            br#"{"protocol":"dayweave.scheduler.helper","version":2,"result":{"type":"error""#
+        ));
+        assert_eq!(process_request_bytes(malformed), rejected.stdout);
+    }
+
+    #[test]
     fn outer_panic_is_sanitized_and_does_not_echo_its_payload() {
         install_private_panic_hook();
         let response = process_contained(|| -> ProcessOutput {

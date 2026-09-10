@@ -4,6 +4,7 @@
 //! response. It deliberately has no file, network, environment, or clock I/O.
 
 mod limits;
+mod occurrence_composition;
 mod shape;
 mod strict_json;
 mod wire;
@@ -58,6 +59,7 @@ pub fn preflight_plan_request(request: &PlanRequest) -> Result<(), PlanPreflight
 
 const PROTOCOL: &str = "dayweave.scheduler.helper";
 const VERSION: u16 = 1;
+const OCCURRENCE_VERSION: u16 = 2;
 const PLAN_OPERATION: &str = "plan";
 const COMPOSE_OPERATION: &str = "compose";
 const LOCAL_FINGERPRINT_DOMAIN: &str = "dayweave.scheduler-helper.local-composition.v1";
@@ -94,6 +96,8 @@ struct CompositionOutput {
     rejected_items: Vec<RejectedScheduleItem>,
     ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
     plan: PlanOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurrence_snapshot_revision: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +110,7 @@ struct ComposeOperationRequest {
 enum OperationRequest<'a> {
     Plan(&'a serde_json::Value),
     Compose(&'a serde_json::Value),
+    ComposeOccurrences(&'a serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -177,8 +182,8 @@ impl ErrorCode {
 #[must_use]
 pub fn process_bytes(input: &[u8]) -> ProcessOutput {
     match process(input) {
-        Ok(result) => encode_success(result),
-        Err(code) => error_output(code),
+        Ok((version, result)) => encode_success(result, version),
+        Err((version, code)) => error_output_at(code, version),
     }
 }
 
@@ -207,23 +212,37 @@ pub fn request_too_large_output() -> ProcessOutput {
     error_output(ErrorCode::RequestTooLarge)
 }
 
-fn process(input: &[u8]) -> Result<ResponseResult, ErrorCode> {
+fn decode_input(input: &[u8]) -> Result<serde_json::Value, ErrorCode> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(ErrorCode::RequestTooLarge);
     }
     if std::str::from_utf8(input).is_err() {
         return Err(ErrorCode::InvalidUtf8);
     }
-    let value = strict_json::parse(input).map_err(|error| match error {
+    strict_json::parse(input).map_err(|error| match error {
         StrictJsonError::Invalid => ErrorCode::InvalidJson,
         StrictJsonError::DuplicateKey => ErrorCode::DuplicateJsonKey,
         StrictJsonError::DepthExceeded => ErrorCode::JsonDepthExceeded,
         StrictJsonError::ResourceLimit => ErrorCode::ResourceLimitExceeded,
-    })?;
-    match decode_envelope(&value)? {
-        OperationRequest::Plan(request_value) => process_plan(request_value),
-        OperationRequest::Compose(request_value) => process_composition(request_value),
-    }
+    })
+}
+
+fn process(input: &[u8]) -> Result<(u16, ResponseResult), (u16, ErrorCode)> {
+    // Until the complete envelope has been admitted, errors retain the fixed
+    // v1 framing used for invocation, byte, JSON and unsupported-version errors.
+    let value = decode_input(input).map_err(|error| (VERSION, error))?;
+    let operation = decode_envelope(&value).map_err(|error| (VERSION, error))?;
+    let (version, result) = match operation {
+        OperationRequest::Plan(request) => (VERSION, process_plan(request)),
+        OperationRequest::Compose(request) => (VERSION, process_composition(request)),
+        OperationRequest::ComposeOccurrences(request) => (
+            OCCURRENCE_VERSION,
+            occurrence_composition::process_composition(request),
+        ),
+    };
+    result
+        .map(|result| (version, result))
+        .map_err(|error| (version, error))
 }
 
 fn process_plan(request_value: &serde_json::Value) -> Result<ResponseResult, ErrorCode> {
@@ -272,6 +291,7 @@ fn process_composition(request_value: &serde_json::Value) -> Result<ResponseResu
             rejected_items,
             ignored_previous_assignments,
             plan,
+            occurrence_snapshot_revision: None,
         },
     })
 }
@@ -291,23 +311,24 @@ fn decode_envelope(value: &serde_json::Value) -> Result<OperationRequest<'_>, Er
     let version = object["version"]
         .as_u64()
         .ok_or(ErrorCode::InvalidRequest)?;
-    if version != u64::from(VERSION) {
+    if version != u64::from(VERSION) && version != u64::from(OCCURRENCE_VERSION) {
         return Err(ErrorCode::UnsupportedVersion);
     }
     let operation = object["operation"]
         .as_str()
         .ok_or(ErrorCode::InvalidRequest)?;
-    match operation {
-        PLAN_OPERATION => Ok(OperationRequest::Plan(&object["request"])),
-        COMPOSE_OPERATION => Ok(OperationRequest::Compose(&object["request"])),
+    match (version, operation) {
+        (1, PLAN_OPERATION) => Ok(OperationRequest::Plan(&object["request"])),
+        (1, COMPOSE_OPERATION) => Ok(OperationRequest::Compose(&object["request"])),
+        (2, COMPOSE_OPERATION) => Ok(OperationRequest::ComposeOccurrences(&object["request"])),
         _ => Err(ErrorCode::UnsupportedOperation),
     }
 }
 
-fn encode_success(result: ResponseResult) -> ProcessOutput {
+fn encode_success(result: ResponseResult, version: u16) -> ProcessOutput {
     let response = ResponseEnvelope {
         protocol: PROTOCOL,
-        version: VERSION,
+        version,
         result,
     };
     match encode(&response) {
@@ -315,15 +336,19 @@ fn encode_success(result: ResponseResult) -> ProcessOutput {
             stdout,
             exit_code: SUCCESS_EXIT_CODE,
         },
-        Err(EncodeError::TooLarge) => error_output(ErrorCode::ResponseTooLarge),
-        Err(EncodeError::Serialization) => internal_failure_output(),
+        Err(EncodeError::TooLarge) => error_output_at(ErrorCode::ResponseTooLarge, version),
+        Err(EncodeError::Serialization) => error_output_at(ErrorCode::InternalFailure, version),
     }
 }
 
 fn error_output(code: ErrorCode) -> ProcessOutput {
+    error_output_at(code, VERSION)
+}
+
+fn error_output_at(code: ErrorCode, version: u16) -> ProcessOutput {
     let response = ResponseEnvelope {
         protocol: PROTOCOL,
-        version: VERSION,
+        version,
         result: ResponseResult::Error {
             error: ErrorOutput {
                 code,
@@ -795,7 +820,7 @@ mod tests {
 
     #[test]
     fn oversized_composition_output_fails_closed_with_the_existing_hard_cap() {
-        let mut result = process(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let mut result = process(COMPOSE_GOLDEN_REQUEST).unwrap().1;
         let ResponseResult::Composition { composition } = &mut result else {
             panic!("golden compose request must return a composition");
         };
@@ -805,7 +830,7 @@ mod tests {
             title: "x".repeat(MAX_OUTPUT_BYTES),
             reason: "synthetic oversized result".into(),
         });
-        let output = encode_success(result);
+        let output = encode_success(result, VERSION);
         assert_eq!(output.exit_code, REJECTED_EXIT_CODE);
         assert_eq!(error_code(&output), "response_too_large");
         assert!(output.stdout.len() <= MAX_OUTPUT_BYTES);
@@ -836,7 +861,7 @@ mod tests {
         assert_eq!(error_code(&protocol), "unsupported_protocol");
 
         let version = process_bytes(
-            br#"{"protocol":"dayweave.scheduler.helper","version":2,"operation":"plan","request":null}"#,
+            br#"{"protocol":"dayweave.scheduler.helper","version":3,"operation":"plan","request":null}"#,
         );
         assert_eq!(error_code(&version), "unsupported_version");
 

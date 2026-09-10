@@ -139,6 +139,53 @@ its local display or execution policy, but must never use its fingerprint to
 authorize publication. The helper cannot establish that a caller's snapshot
 is complete or current; that is an integration responsibility.
 
+### Occurrence-aware composition (protocol v2)
+
+V2 supports `operation: "compose"` with three required request fields:
+`canonical_items`, `schedule`, and `occurrence_lifecycle`. The first two keep
+the v1 canonical composition contract. The third is a closed
+`OccurrenceLifecycleContext` containing `snapshot_revision` and `instances`.
+Each instance carries its exact `root_item_id`, `occurrence_id`, generated
+recurrence `identity`, and complete `members`. Each member requires `item_id`,
+an explicit nullable `parent_id`, current `source_revision`, and `status`.
+Active/Paused state cannot be supplied as occurrence lifecycle authority.
+
+The helper checks complete acyclic occurrence trees, exact generated identity,
+and membership against the full canonical snapshot, including Inbox/rejected
+members omitted from the prepared plan. Current source revisions and every
+child edge must match; the root's parent within its occurrence is null even
+when the canonical series has an outer parent. Lifecycle statuses are applied
+only to that instance's materialized members. Completing a parent does not
+remove its unfinished optional steps. Whole-completion and partial-progress
+claims for managed instances are discarded before planning; unrelated and
+habit claims retain their existing meanings.
+
+Success uses response version 2 and the existing `composition` result with an
+eighth field, `occurrence_snapshot_revision`. The local fingerprint uses the
+separate `dayweave.scheduler-helper.local-composition.v2` domain and additionally
+binds the complete lifecycle context, normalized by instance/member identity.
+Even an empty context has a v2 fingerprint, and changing a positive empty-horizon
+ledger head changes it. The prefix remains non-publishable `local-sha256:`.
+V1 requests, response fixtures and fingerprints remain unchanged.
+
+V2 request-body errors use v2 framing once the complete envelope is admitted.
+Byte/UTF-8/JSON/envelope failures, process I/O failures and outer panic recovery
+retain the fixed v1 error envelope because no valid versioned request was
+established. V2 does not accept `plan`, execution authority or extra body fields.
+Its combined lifecycle membership limit is 10,000; existing byte, JSON, source,
+materialization and work limits also remain in force.
+
+The opaque Android Rust/JNI bridge preserves this versioned result. Native
+composition adapters are not enabled for v2 yet. Neither helper version can
+authenticate a ledger or prove that a cache is current. In particular, the
+[occurrence review API](routine-occurrence-completion.md) exposes immutable
+first-source revisions, not the current-source planning witness required here.
+Native use must wait for qualified terminal ledger/current-source evidence,
+encrypted persistence, pending-operation and lifecycle fencing, and freshness
+rechecks around helper execution and durable installation. Guessing a witness
+from current canonical rows is not a supported bridge. Existing execution-lease
+and local-result execution restrictions must also remain in place.
+
 ### Errors and exit status
 
 A rejected request has a fixed, non-echoing error:
