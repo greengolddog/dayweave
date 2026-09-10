@@ -1,14 +1,21 @@
 //! Opt-in integration against an explicitly supplied disposable `PostgreSQL`.
 //! All scopes, schemas and content here are synthetic; no provider is used.
-use std::{str::FromStr as _, sync::Arc};
+use std::{str::FromStr as _, sync::Arc, time::Duration as StdDuration};
 
+use axum::{
+    body::Body,
+    http::{Request, StatusCode, header},
+};
 use chrono::{DateTime, Duration, Utc};
 use dayweave_api::{
+    AppState,
+    auth::{AuthenticationError, Authenticator, Principal, PrincipalAudience, Scope},
     execution::{
         DeferAssessmentRequest, DeferExecution, ExecutionCommand, ExecutionIdempotencyKey,
         ExecutionRepositoryError, ExecutionService, ExecutionServiceError, ExecutionStatus,
         PauseExecution, StartExecution,
     },
+    http::router,
     item_completion::{ItemCompletionCommand, ItemCompletionMode},
     items::{
         IdempotencyKey, Item, ItemRepository as _, ItemService, ItemStatus, NewItem, ReplaceItem,
@@ -17,7 +24,8 @@ use dayweave_api::{
         DatabaseScope, MIGRATOR, PostgresExecutionRepository, PostgresItemRepository,
         PostgresRoutineOccurrenceRepository,
     },
-    proposals::SystemClock,
+    proposals::{InMemoryProposalRepository, ProposalService, SystemClock},
+    readiness::Readiness,
     routine_occurrences::{
         RoutineOccurrenceAction, RoutineOccurrenceCommand, RoutineOccurrenceError,
         RoutineOccurrenceSnapshot,
@@ -27,13 +35,32 @@ use dayweave_api::{
         PublishScheduleSpec, ScheduleAccess, SchedulePublicationError, compose_canonical_schedule,
     },
 };
+use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use sqlx::{
     AssertSqlSafe, ConnectOptions as _, Executor as _, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tower::ServiceExt as _;
 use uuid::Uuid;
+
+struct LookupAuth(DatabaseScope);
+
+#[async_trait::async_trait]
+impl Authenticator for LookupAuth {
+    async fn authenticate(&self, _: &str) -> Result<Principal, AuthenticationError> {
+        Ok(Principal {
+            subject: self.0.user_id.to_string(),
+            scopes: vec![Scope::ItemsRead],
+            audience: PrincipalAudience::Device,
+            workspace_id: Some(self.0.workspace_id),
+            user_id: Some(self.0.user_id),
+            credential_id: Some(Uuid::from_u128(12)),
+            allowed_origins: Vec::new(),
+        })
+    }
+}
 
 struct Fixture {
     admin: PgPool,
@@ -291,6 +318,139 @@ fn status(snapshot: &RoutineOccurrenceSnapshot, member: Uuid) -> ItemStatus {
 }
 
 #[tokio::test]
+async fn exact_calendar_lookup_is_private_read_only_and_survives_missing_source() {
+    let Some(f) = Fixture::create().await else {
+        return;
+    };
+    let (root, required, _) = f.seed().await;
+    f.publish().await;
+    let before = f.occurrences.list(None, 100).await.unwrap();
+    let selected = &before.changes[0].occurrence;
+    let identity = selected.aggregate.manifest.occurrence_id;
+    let instance = selected.aggregate.manifest.id;
+    let canonical = f.canonical().await;
+    assert_ne!(identity, instance);
+    assert_eq!(
+        f.occurrences.lookup(root, identity).await.unwrap(),
+        *selected
+    );
+    assert_eq!(f.occurrences.get(instance).await.unwrap(), *selected);
+    for (series, occurrence) in [
+        (required, identity),
+        (Uuid::new_v4(), identity),
+        (
+            root,
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, b"synthetic absent occurrence"),
+        ),
+    ] {
+        assert_eq!(
+            f.occurrences.lookup(series, occurrence).await.unwrap_err(),
+            RoutineOccurrenceError::OccurrenceMissing
+        );
+    }
+    let app = router(
+        AppState::new(
+            Arc::new(ProposalService::new(
+                Arc::new(InMemoryProposalRepository::default()),
+                Arc::new(SystemClock),
+                StdDuration::from_hours(24),
+            )),
+            Arc::new(LookupAuth(f.scope)),
+            Readiness::default(),
+        )
+        .with_postgres_scheduling(Arc::new(f.schedules.clone()), Arc::new(Vec::new())),
+    );
+    for (series, expected_status) in [(root, StatusCode::OK), (required, StatusCode::NOT_FOUND)] {
+        let response = app.clone().oneshot(Request::builder()
+            .uri(format!("/v1/routine-occurrences/lookup?series_item_id={series}&occurrence_id={identity}"))
+            .header(header::AUTHORIZATION, "Bearer synthetic-lookup-test")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+        assert!(!response.headers().contains_key("idempotency-replayed"));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        if expected_status == StatusCode::OK {
+            assert_eq!(
+                serde_json::from_slice::<RoutineOccurrenceSnapshot>(&bytes).unwrap(),
+                *selected
+            );
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"],
+                "routine_occurrence_missing"
+            );
+        }
+    }
+    assert_eq!(f.canonical().await, canonical);
+    assert_eq!(f.occurrences.list(None, 100).await.unwrap(), before);
+    let member = f.items.get(required).await.unwrap();
+    f.items
+        .trash(required, member.revision, key())
+        .await
+        .unwrap();
+    let historical = f.occurrences.lookup(root, identity).await.unwrap();
+    assert!(!historical.fresh_edit_eligible);
+    assert_eq!(historical.aggregate, selected.aggregate);
+    assert_eq!(historical, f.occurrences.get(instance).await.unwrap());
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn calendar_lookup_cannot_cross_workspace_or_owner_boundaries() {
+    let Some(f) = Fixture::create().await else {
+        return;
+    };
+    let (root, _, _) = f.seed().await;
+    f.publish().await;
+    let identity = f.occurrences.list(None, 1).await.unwrap().changes[0]
+        .occurrence
+        .aggregate
+        .manifest
+        .occurrence_id;
+    let foreign = DatabaseScope {
+        workspace_id: Uuid::new_v4(),
+        user_id: Uuid::new_v4(),
+    };
+    sqlx::query(
+        "INSERT INTO users(id,auth_subject,display_name) VALUES($1,$2,'Synthetic other owner')",
+    )
+    .bind(foreign.user_id)
+    .bind(foreign.user_id.to_string())
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO workspaces(id,owner_user_id,slug,name) VALUES($1,$2,'other-routine','Synthetic other routine')")
+        .bind(foreign.workspace_id).bind(foreign.user_id).execute(&f.pool).await.unwrap();
+    sqlx::query("INSERT INTO workspace_members(workspace_id,user_id,role) VALUES($1,$2,'owner')")
+        .bind(foreign.workspace_id)
+        .bind(foreign.user_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let foreign_repository = PostgresRoutineOccurrenceRepository::new(f.pool.clone(), foreign);
+    assert_eq!(
+        foreign_repository.lookup(root, identity).await.unwrap_err(),
+        RoutineOccurrenceError::OccurrenceMissing
+    );
+    let wrong_owner = PostgresRoutineOccurrenceRepository::new(
+        f.pool.clone(),
+        DatabaseScope {
+            user_id: foreign.user_id,
+            ..f.scope
+        },
+    );
+    assert_eq!(
+        wrong_owner.lookup(root, identity).await.unwrap_err(),
+        RoutineOccurrenceError::Unavailable
+    );
+    f.cleanup().await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One transaction scenario follows immutable receipts through current-state and restart reads.
 async fn publication_admits_complete_instances_and_member_outcomes_survive_exact_replay() {
     let Some(f) = Fixture::create().await else {
@@ -541,6 +701,14 @@ async fn lifecycle_fences_publication_keeps_optional_work_and_rejects_definition
         "harmless source revisions remain reviewable"
     );
     assert_ne!(after_rename.evidence_hash, receipt.occurrence.evidence_hash);
+    assert_eq!(
+        f.occurrences
+            .lookup(root, after_rename.aggregate.manifest.occurrence_id)
+            .await
+            .unwrap(),
+        after_rename,
+        "calendar lookup refreshes current source evidence, not first-publication proof"
+    );
     let mut edited = replacement(&renamed);
     edited.recurrence = Some(json!({"type":"daily","times_per_day":2}));
     f.items
@@ -549,6 +717,14 @@ async fn lifecycle_fences_publication_keeps_optional_work_and_rejects_definition
         .unwrap();
     let drifted = f.occurrences.get(instance).await.unwrap();
     assert!(!drifted.fresh_edit_eligible);
+    assert_eq!(
+        f.occurrences
+            .lookup(root, drifted.aggregate.manifest.occurrence_id)
+            .await
+            .unwrap(),
+        drifted,
+        "semantic drift preserves exact historical review without fresh edit eligibility"
+    );
     let attempt = command(
         &drifted,
         optional,

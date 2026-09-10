@@ -24,6 +24,7 @@ use uuid::Uuid;
 const TOKEN: &str = "synthetic-routine-occurrence-token";
 const ID: &str = "00000000-0000-0000-0000-000000000001";
 const MEMBER: &str = "00000000-0000-0000-0000-000000000002";
+const PLANNER_OCCURRENCE: &str = "00000000-0000-5000-8000-000000000003";
 
 struct FixedAuth(Principal);
 
@@ -66,6 +67,12 @@ fn routes() -> Vec<(&'static str, String)> {
         (
             "PUT",
             format!("/v1/routine-occurrences/{ID}/members/{MEMBER}"),
+        ),
+        (
+            "GET",
+            format!(
+                "/v1/routine-occurrences/lookup?series_item_id={ID}&occurrence_id={PLANNER_OCCURRENCE}"
+            ),
         ),
     ]
 }
@@ -307,7 +314,94 @@ async fn strict_query_and_path_errors_remain_private_and_bounded() {
 }
 
 #[tokio::test]
-async fn openapi_lists_all_four_owner_only_operations_and_typed_bodies() {
+async fn lookup_validates_closed_selectors_before_storage_without_echoing_private_queries() {
+    let app = router(state(owner(vec![Scope::ItemsRead])));
+    let selectors = format!("series_item_id={ID}&occurrence_id={PLANNER_OCCURRENCE}");
+    for query in [
+        String::new(),
+        format!("series_item_id={ID}"),
+        format!("occurrence_id={PLANNER_OCCURRENCE}"),
+        format!("{selectors}&unknown=private-title-must-not-leak"),
+        format!("{selectors}&series_item_id={ID}"),
+        format!("{selectors}&occurrence_id={PLANNER_OCCURRENCE}"),
+        format!("series_item_id=private-title-must-not-leak&occurrence_id={PLANNER_OCCURRENCE}"),
+        format!("series_item_id={ID}&occurrence_id=private-title-must-not-leak"),
+    ] {
+        let (status, value) = call(
+            &app,
+            "GET",
+            &format!("/v1/routine-occurrences/lookup?{query}"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(value["error"]["code"], "invalid_query");
+        assert!(!value.to_string().contains("private-title-must-not-leak"));
+    }
+    for (series, occurrence) in [
+        (Uuid::nil().to_string(), PLANNER_OCCURRENCE.to_owned()),
+        (ID.to_owned(), Uuid::nil().to_string()),
+        (ID.to_owned(), Uuid::new_v4().to_string()),
+        (
+            ID.to_owned(),
+            "00000000-0000-5000-0000-000000000003".to_owned(),
+        ),
+    ] {
+        let (status, value) = call(
+            &app,
+            "GET",
+            &format!(
+                "/v1/routine-occurrences/lookup?series_item_id={series}&occurrence_id={occurrence}"
+            ),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(value["error"]["code"], "routine_occurrence_invalid");
+    }
+    for scopes in [vec![], vec![Scope::ItemsWrite]] {
+        let forbidden = router(state(owner(scopes)));
+        let (status, _) = call(
+            &forbidden,
+            "GET",
+            "/v1/routine-occurrences/lookup?unknown=private-title-must-not-leak",
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn lookup_repository_rejects_invalid_identity_without_connecting() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://synthetic@127.0.0.1:1/synthetic")
+        .unwrap();
+    let repository = dayweave_api::persistence::PostgresRoutineOccurrenceRepository::new(
+        pool.clone(),
+        DatabaseScope {
+            workspace_id: Uuid::from_u128(10),
+            user_id: Uuid::from_u128(11),
+        },
+    );
+    for (series, occurrence) in [
+        (Uuid::nil(), Uuid::parse_str(PLANNER_OCCURRENCE).unwrap()),
+        (Uuid::from_u128(1), Uuid::nil()),
+        (Uuid::from_u128(1), Uuid::new_v4()),
+    ] {
+        assert_eq!(
+            repository.lookup(series, occurrence).await.unwrap_err(),
+            dayweave_api::routine_occurrences::RoutineOccurrenceError::Invalid
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn openapi_lists_all_five_owner_only_operations_and_typed_bodies() {
     let app = router(state(owner(Vec::new())));
     let (status, document) = call(&app, "GET", "/openapi.json", None, false).await;
     assert_eq!(status, StatusCode::OK);
@@ -320,6 +414,11 @@ async fn openapi_lists_all_four_owner_only_operations_and_typed_bodies() {
         ),
         (
             "/v1/routine-occurrences/{occurrence_id}",
+            "get",
+            "RoutineOccurrenceSnapshot",
+        ),
+        (
+            "/v1/routine-occurrences/lookup",
             "get",
             "RoutineOccurrenceSnapshot",
         ),
@@ -343,4 +442,16 @@ async fn openapi_lists_all_four_owner_only_operations_and_typed_bodies() {
         }
     }
     assert!(document["components"]["schemas"]["RoutineOccurrenceCommand"].is_object());
+    let parameters = document["paths"]["/v1/routine-occurrences/lookup"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert_eq!(parameters.len(), 2);
+    for name in ["series_item_id", "occurrence_id"] {
+        let parameter = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap();
+        assert_eq!(parameter["in"], "query");
+        assert_eq!(parameter["required"], true);
+    }
 }

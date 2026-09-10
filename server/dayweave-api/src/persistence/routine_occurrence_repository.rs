@@ -23,7 +23,7 @@ use crate::{
         RoutineOccurrenceCommand, RoutineOccurrenceError, RoutineOccurrenceEvidence,
         RoutineOccurrenceManifest, RoutineOccurrenceMemberDefinition, RoutineOccurrenceSnapshot,
         RoutineOccurrenceSourceEvidence, RoutineOccurrenceWorkUnit, initialize_routine_occurrence,
-        plan_routine_occurrence, routine_occurrence_snapshot,
+        plan_routine_occurrence, routine_occurrence_snapshot, validate_occurrence_lookup,
     },
     scheduling::ComposeScheduleResult,
 };
@@ -156,6 +156,42 @@ impl PostgresRoutineOccurrenceRepository {
         let mut tx = self.pool.begin().await.map_err(storage)?;
         lock_read(&mut tx, self.scope).await?;
         let aggregate = read_aggregate(&mut tx, self.scope, id).await?;
+        let current = current_evidence(&mut tx, self.scope).await?;
+        let snapshot = snapshot(&aggregate, &current)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(snapshot)
+    }
+
+    /// Resolves the exact public calendar identity to a complete current private
+    /// review. This does not admit an occurrence or grant planning authority.
+    /// Historical instances remain readable when their source is no longer eligible.
+    ///
+    /// # Errors
+    /// Rejects invalid selectors before storage access, unavailable scope, absent
+    /// instances or malformed retained proof.
+    pub async fn lookup(
+        &self,
+        series_item_id: Uuid,
+        occurrence_id: Uuid,
+    ) -> Result<RoutineOccurrenceSnapshot, RoutineOccurrenceError> {
+        validate_occurrence_lookup(series_item_id, occurrence_id)?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        lock_read(&mut tx, self.scope).await?;
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM routine_occurrences WHERE workspace_id=$1 AND series_item_id=$2 AND occurrence_id=$3",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(series_item_id)
+        .bind(occurrence_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let aggregate = read_aggregate(
+            &mut tx,
+            self.scope,
+            id.ok_or(RoutineOccurrenceError::OccurrenceMissing)?,
+        )
+        .await?;
         let current = current_evidence(&mut tx, self.scope).await?;
         let snapshot = snapshot(&aggregate, &current)?;
         tx.commit().await.map_err(storage)?;

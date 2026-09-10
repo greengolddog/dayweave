@@ -515,6 +515,19 @@ pub enum RoutineOccurrenceError {
     Unavailable,
 }
 
+pub(crate) fn validate_occurrence_lookup(
+    series_item_id: Uuid,
+    occurrence_id: Uuid,
+) -> Result<(), RoutineOccurrenceError> {
+    if series_item_id.is_nil()
+        || occurrence_id.get_version_num() != 5
+        || occurrence_id.get_variant() != uuid::Variant::RFC4122
+    {
+        return Err(RoutineOccurrenceError::Invalid);
+    }
+    Ok(())
+}
+
 fn validate_manifest(
     manifest: &RoutineOccurrenceManifest,
 ) -> Result<BTreeMap<Uuid, &RoutineOccurrenceMemberDefinition>, RoutineOccurrenceError> {

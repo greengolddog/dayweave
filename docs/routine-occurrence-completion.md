@@ -37,6 +37,7 @@ state.
 | --- | --- |
 | `GET /v1/routine-occurrences` | Whole-instance current-state pages pinned to an immutable change head. |
 | `GET /v1/routine-occurrences/delta` | Ordered whole-instance changes after a terminal checkpoint. |
+| `GET /v1/routine-occurrences/lookup?series_item_id=…&occurrence_id=…` | Resolve an exact canonical recurring root and planner UUID-v5 occurrence to its current private ledger review, including instances absent from the bounded native cache. |
 | `GET /v1/routine-occurrences/{occurrence_id}` | Full exact-instance review. The path ID is the ledger instance UUID, not the planner occurrence UUID. |
 | `PUT /v1/routine-occurrences/{occurrence_id}/members/{item_id}` | Reviewed leaf outcome/reopening or member required-edge/parent manual policy. |
 
@@ -45,6 +46,19 @@ writes require both `items_write` and `items_read`, because a success or exact
 retry returns the full private snapshot. Legacy and MCP credentials are not
 accepted here. Missing PostgreSQL authority returns 503, never fabricated state.
 Responses are non-cacheable and parser failures do not echo private content.
+
+Lookup accepts exactly the two required UUID selectors: unknown, duplicate,
+missing or malformed query fields return `400 invalid_query`; a nil series or
+non-RFC4122 UUID-v5 planner identity returns `422 routine_occurrence_invalid`
+before storage access. A valid absent pair returns
+`404 routine_occurrence_missing`. Success has the same fresh snapshot as exact
+ledger GET, with `Cache-Control: no-store, max-age=0`, `Pragma: no-cache` and no
+`Idempotency-Replayed` header. Current source evidence is refreshed even after a
+harmless source revision. Definition drift or missing source preserves historical
+review with `fresh_edit_eligible=false`. Lookup never admits an instance, modifies
+the template or occurrence ledger, or supplies a current-source planning witness.
+Subsequent member GET/PUT uses the returned manifest ID, not the planner UUID.
+Deploy the lookup-capable service before enabling the connected native controls.
 
 Wire schema 1 is closed to unknown fields. `set_outcome` accepts Completed or
 Skipped for leaves; `reopen` requires the exact supported open state and blocker
@@ -239,6 +253,20 @@ files; none are in the occurrence additions. Temporary macOS test-runtime copies
 were moved to Trash after verification; the installed toolchain was unchanged.
 
 ## Remaining integration
+
+The exact-calendar lookup checkpoint passes all 679 API tests against a new
+disposable PostgreSQL database, with database-only cases enabled and zero ignored
+tests. The maintenance-only wire fixture emitter is deliberately filtered out.
+Its focused gate passes eight private HTTP tests, seven real PostgreSQL scenarios
+and four shared wire-contract regressions. Coverage includes malformed/duplicate
+selectors before storage, read-only scope, foreign-workspace isolation, uncached
+identity resolution, unchanged canonical/ledger state, refreshed evidence after
+harmless source edits and historical review after definition drift or missing
+source. Workspace all-target/all-feature Clippy with warnings denied and
+formatting pass. The owned database was stopped and its absence verified.
+
+This checkpoint does not yet verify connected native routine controls or
+two-client/service convergence.
 
 - Native macOS/Android protected review, live frozen-request replay and
   terminal-only convergence; strict transports and encrypted custody transitions

@@ -385,6 +385,7 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/items/{item_id}/completion"
             | "/routine-occurrences"
             | "/routine-occurrences/delta"
+            | "/routine-occurrences/lookup"
             | "/routine-occurrences/{occurrence_id}"
             | "/habits/occurrences/delta"
             | "/habits/stream"

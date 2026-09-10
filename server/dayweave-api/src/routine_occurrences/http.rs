@@ -15,7 +15,10 @@ use serde::Deserialize;
 use utoipa::IntoParams;
 use uuid::Uuid;
 
-use super::{RoutineOccurrenceCommand, RoutineOccurrenceError, RoutineOccurrenceSnapshot};
+use super::{
+    RoutineOccurrenceCommand, RoutineOccurrenceError, RoutineOccurrenceSnapshot,
+    validate_occurrence_lookup,
+};
 use crate::{
     AppState,
     auth::{Principal, PrincipalAudience, Scope},
@@ -29,6 +32,7 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/routine-occurrences", get(list_occurrences))
         .route("/routine-occurrences/delta", get(occurrence_delta))
+        .route("/routine-occurrences/lookup", get(lookup_occurrence))
         .route("/routine-occurrences/{occurrence_id}", get(get_occurrence))
         .route(
             "/routine-occurrences/{occurrence_id}/members/{item_id}",
@@ -45,6 +49,51 @@ pub(crate) struct OccurrencePageQuery {
     /// Whole occurrence records per page (default 50, maximum 100); byte limits
     /// can produce a smaller page without splitting one complete occurrence.
     limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct OccurrenceLookupQuery {
+    /// Canonical recurring Task/Routine root, not the selected leaf member.
+    series_item_id: Uuid,
+    /// Exact planner UUID-v5 occurrence identity, not the private manifest ID.
+    occurrence_id: Uuid,
+}
+
+#[utoipa::path(get, path = "/v1/routine-occurrences/lookup", tag = "items",
+    description = "Resolve an exact calendar identity to a current private occurrence review; requires an owner-bound device and items_read. Does not admit instances or grant planning authority.",
+    security(("bearer_token" = [])), params(OccurrenceLookupQuery),
+    responses((status = 200, body = RoutineOccurrenceSnapshot),
+        (status = 400, body = crate::error::ErrorEnvelope),
+        (status = 401, body = crate::error::ErrorEnvelope),
+        (status = 403, body = crate::error::ErrorEnvelope),
+        (status = 404, body = crate::error::ErrorEnvelope),
+        (status = 409, body = crate::error::ErrorEnvelope),
+        (status = 413, body = crate::error::ErrorEnvelope),
+        (status = 422, body = crate::error::ErrorEnvelope),
+        (status = 503, body = crate::error::ErrorEnvelope)))]
+pub(crate) async fn lookup_occurrence(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    query: Result<Query<OccurrenceLookupQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    require_device(&principal, Scope::ItemsRead)?;
+    let query = query
+        .map_err(|_| {
+            ApiError::routine_occurrence(
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+                "Invalid occurrence query",
+            )
+        })?
+        .0;
+    validate_occurrence_lookup(query.series_item_id, query.occurrence_id).map_err(map_error)?;
+    let snapshot = repository(&state, &principal)?
+        .lookup(query.series_item_id, query.occurrence_id)
+        .await
+        .map_err(map_error)?;
+    Ok(no_store(Json(snapshot).into_response()))
 }
 
 #[utoipa::path(get, path = "/v1/routine-occurrences", tag = "items",
