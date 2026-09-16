@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "query", "rustls"] }
 secrecy = "0.10.3"
